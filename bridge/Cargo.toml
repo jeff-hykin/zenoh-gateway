@@ -27,6 +27,13 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 futures = "0.3"
+# codecs (pure Rust decoders; openh264 + zstd build their C sources, cross-compiled via zig)
+openh264 = "0.9"
+zstd = "0.13"
+zune-jpeg = "0.5"
+png = "0.18"
+image-webp = "0.2"
+jxl-oxide = "0.12"
 
 # Vendored with small patches (search "zenoh-web patch"); drop once upstream fixes them:
 # - rtc-sctp: RTO_MIN 1 s -> 200 ms, RTO_MAX 60 s -> 3 s (src/association/timer.rs)

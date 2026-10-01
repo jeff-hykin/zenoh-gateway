@@ -1,6 +1,7 @@
 //! zenoh-web: a dumb pipe between zenoh key expressions and browser WebRTC data channels.
 
 mod acl;
+mod codec;
 mod frame;
 mod options;
 mod peer;

@@ -1,0 +1,1678 @@
+{
+  "description": "zenoh-web codec fixtures: one payload file per zenoh sample (the sample's raw payload bytes)",
+  "pattern": {
+    "image": "320x240, four 160x120 solid quadrants: top_left red, top_right green, bottom_left blue, bottom_right white",
+    "mono8": "quadrants 0 / 85 / 170 / 255 (TL, TR, BL, BR)",
+    "mono16": "quadrants 0 / 21845 / 43690 / 65535 (TL, TR, BL, BR)",
+    "depth_16UC1": "1000 + col + 4*row (mm), little-endian",
+    "depth_32FC1": "0.5 + col/128 + row/64 (m), little-endian, exact in float32",
+    "pointcloud": "20000 points, x=(i%200)*0.05, y=(i//200)*0.05, z=(i%7)*0.125, intensity=i%256, float32 LE",
+    "stamp": {
+      "sec": 1700000000,
+      "nanosec": 500000000
+    }
+  },
+  "key_formats": {
+    "dimos-lcm": "<topic>/<msg_name>  (dimos ZenohPubSub Topic.key_expr), payload = LCM encoding incl. 8-byte fingerprint",
+    "ros2-cdr": "<domain_id>/<topic>/<pkg>::msg::dds_::<Type>_/RIHS01_<sha256> (rmw_zenoh); payload = CDR with 4-byte encapsulation header. rmw_zenoh also sends a zenoh attachment (seq, timestamp, gid) not stored here"
+  },
+  "rihs01_jazzy": {
+    "sensor_msgs/msg/Image": "RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47",
+    "sensor_msgs/msg/CompressedImage": "RIHS01_15640771531571185e2efc8a100baf923961a4d15d5569652e6cb6691e8e371a",
+    "sensor_msgs/msg/PointCloud2": "RIHS01_9198cabf7da3796ae6fe19c4cb3bdd3525492988c70522628af5daa124bae2b5"
+  },
+  "rihs01_source": "computed by rosbags Typestore(ROS2_JAZZY).hash_rihs01 (std_msgs/String matches the known Jazzy hash df668c74...)",
+  "entries": [
+    {
+      "file": "dimos/image_rgb8.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 230477,
+      "format": "raw",
+      "msg_type": "sensor_msgs.Image",
+      "zenoh_key": "dimos/camera/color/sensor_msgs.Image",
+      "frame_id": "camera_color_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "rgb8",
+      "step": 960,
+      "is_bigendian": false,
+      "expected": {
+        "mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ],
+        "quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "pixel_bytes_at_row0_col0": [
+          255,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "file": "dimos/image_bgr8.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 230477,
+      "format": "raw",
+      "msg_type": "sensor_msgs.Image",
+      "zenoh_key": "dimos/camera/color/sensor_msgs.Image",
+      "frame_id": "camera_color_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "bgr8",
+      "step": 960,
+      "is_bigendian": false,
+      "expected": {
+        "mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ],
+        "quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "pixel_bytes_at_row0_col0": [
+          0,
+          0,
+          255
+        ]
+      }
+    },
+    {
+      "file": "dimos/image_mono8.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 76878,
+      "format": "raw",
+      "msg_type": "sensor_msgs.Image",
+      "zenoh_key": "dimos/camera/mono/sensor_msgs.Image",
+      "frame_id": "camera_color_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "mono8",
+      "step": 320,
+      "is_bigendian": false,
+      "expected": {
+        "quadrant_mean": {
+          "top_left": 0.0,
+          "top_right": 85.0,
+          "bottom_left": 170.0,
+          "bottom_right": 255.0
+        }
+      }
+    },
+    {
+      "file": "dimos/image_mono16.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 153679,
+      "format": "raw",
+      "msg_type": "sensor_msgs.Image",
+      "zenoh_key": "dimos/camera/mono/sensor_msgs.Image",
+      "frame_id": "camera_color_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "mono16",
+      "step": 640,
+      "is_bigendian": false,
+      "expected": {
+        "quadrant_mean": {
+          "top_left": 0.0,
+          "top_right": 21845.0,
+          "bottom_left": 43690.0,
+          "bottom_right": 65535.0
+        }
+      }
+    },
+    {
+      "file": "dimos/depth_16UC1.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 153678,
+      "format": "raw",
+      "msg_type": "sensor_msgs.Image",
+      "zenoh_key": "dimos/camera/depth/sensor_msgs.Image",
+      "frame_id": "camera_depth_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "16UC1",
+      "step": 640,
+      "is_bigendian": false,
+      "expected": {
+        "depth_samples": [
+          {
+            "row": 0,
+            "col": 0,
+            "value": 1000
+          },
+          {
+            "row": 0,
+            "col": 319,
+            "value": 1319
+          },
+          {
+            "row": 239,
+            "col": 0,
+            "value": 1956
+          },
+          {
+            "row": 239,
+            "col": 319,
+            "value": 2275
+          },
+          {
+            "row": 120,
+            "col": 160,
+            "value": 1640
+          },
+          {
+            "row": 17,
+            "col": 42,
+            "value": 1110
+          }
+        ],
+        "min": 1000,
+        "max": 2275,
+        "formula": "value = 1000 + col + 4*row (mm)"
+      }
+    },
+    {
+      "file": "dimos/depth_32FC1.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 307278,
+      "format": "raw",
+      "msg_type": "sensor_msgs.Image",
+      "zenoh_key": "dimos/camera/depth/sensor_msgs.Image",
+      "frame_id": "camera_depth_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "32FC1",
+      "step": 1280,
+      "is_bigendian": false,
+      "expected": {
+        "depth_samples": [
+          {
+            "row": 0,
+            "col": 0,
+            "value": 0.5
+          },
+          {
+            "row": 0,
+            "col": 319,
+            "value": 2.9921875
+          },
+          {
+            "row": 239,
+            "col": 0,
+            "value": 4.234375
+          },
+          {
+            "row": 239,
+            "col": 319,
+            "value": 6.7265625
+          },
+          {
+            "row": 120,
+            "col": 160,
+            "value": 3.625
+          },
+          {
+            "row": 17,
+            "col": 42,
+            "value": 1.09375
+          }
+        ],
+        "min": 0.5,
+        "max": 6.7265625,
+        "formula": "value = 0.5 + col/128 + row/64 (m)"
+      }
+    },
+    {
+      "file": "dimos/image_jpeg_in_Image.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 2534,
+      "format": "jpeg",
+      "msg_type": "sensor_msgs.Image",
+      "zenoh_key": "dimos/camera/color/sensor_msgs.Image",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "encoding": "jpeg",
+      "step": 0,
+      "note": "dimos Image.lcm_jpeg_encode: sensor_msgs.Image whose data is a JPEG file and encoding='jpeg'",
+      "expected": {
+        "lossless": false,
+        "tolerance_per_channel": 8,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        },
+        "decoded_quadrant_mean_rgb": {
+          "top_left": [
+            253.494,
+            0.281,
+            0.0
+          ],
+          "top_right": [
+            0.506,
+            254.719,
+            1.113
+          ],
+          "bottom_left": [
+            0.044,
+            0.05,
+            253.644
+          ],
+          "bottom_right": [
+            254.956,
+            254.956,
+            255.0
+          ]
+        },
+        "decoded_mean_rgb": [
+          127.25,
+          127.502,
+          127.439
+        ]
+      }
+    },
+    {
+      "file": "dimos/compressed_jpeg.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 2521,
+      "format": "jpeg",
+      "msg_type": "sensor_msgs.CompressedImage",
+      "zenoh_key": "dimos/camera/color/compressed/sensor_msgs.CompressedImage",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "encoder": "dimos CompressedImage.from_image (turbojpeg q90)",
+      "compressed_bytes_file": "compressed/pattern.jpeg",
+      "expected": {
+        "lossless": false,
+        "tolerance_per_channel": 8,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        },
+        "decoded_quadrant_mean_rgb": {
+          "top_left": [
+            253.494,
+            0.281,
+            0.0
+          ],
+          "top_right": [
+            0.506,
+            254.719,
+            1.113
+          ],
+          "bottom_left": [
+            0.044,
+            0.05,
+            253.644
+          ],
+          "bottom_right": [
+            254.956,
+            254.956,
+            255.0
+          ]
+        },
+        "decoded_mean_rgb": [
+          127.25,
+          127.502,
+          127.439
+        ]
+      }
+    },
+    {
+      "file": "dimos/compressed_png.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 1372,
+      "format": "png",
+      "msg_type": "sensor_msgs.CompressedImage",
+      "zenoh_key": "dimos/camera/color/compressed/sensor_msgs.CompressedImage",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "encoder": "dimos CompressedImage.from_image (cv2)",
+      "compressed_bytes_file": "compressed/pattern.png",
+      "expected": {
+        "lossless": true,
+        "tolerance_per_channel": 0,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        },
+        "decoded_quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "decoded_mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ]
+      }
+    },
+    {
+      "file": "dimos/compressed_jxl.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 322,
+      "format": "jxl",
+      "msg_type": "sensor_msgs.CompressedImage",
+      "zenoh_key": "dimos/camera/color/compressed/sensor_msgs.CompressedImage",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "encoder": "dimos CompressedImage.from_image (imagecodecs, lossy uint8)",
+      "compressed_bytes_file": "compressed/pattern.jxl",
+      "expected": {
+        "lossless": false,
+        "tolerance_per_channel": 8,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        },
+        "decoded_quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "decoded_mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ]
+      }
+    },
+    {
+      "file": "dimos/compressed_webp.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 142,
+      "format": "webp",
+      "msg_type": "sensor_msgs.CompressedImage",
+      "zenoh_key": "dimos/camera/color/compressed/sensor_msgs.CompressedImage",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "encoder": "Pillow lossless WEBP (dimos has no webp encoder)",
+      "compressed_bytes_file": "compressed/pattern.webp",
+      "expected": {
+        "lossless": true,
+        "tolerance_per_channel": 0,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        },
+        "decoded_quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "decoded_mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ]
+      }
+    },
+    {
+      "file": "dimos/compressed_jxl_depth16.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 19747,
+      "format": "jxl",
+      "msg_type": "sensor_msgs.CompressedImage",
+      "zenoh_key": "dimos/camera/depth/compressed/sensor_msgs.CompressedImage",
+      "frame_id": "camera_depth_optical_frame",
+      "width": 320,
+      "height": 240,
+      "encoder": "dimos CompressedImage.from_image (imagecodecs, lossless uint16)",
+      "compressed_bytes_file": "compressed/depth16.jxl",
+      "note": "decodes to a single-channel uint16 image (16UC1 depth, mm)",
+      "expected": {
+        "lossless": true,
+        "depth_samples": [
+          {
+            "row": 0,
+            "col": 0,
+            "value": 1000
+          },
+          {
+            "row": 0,
+            "col": 319,
+            "value": 1319
+          },
+          {
+            "row": 239,
+            "col": 0,
+            "value": 1956
+          },
+          {
+            "row": 239,
+            "col": 319,
+            "value": 2275
+          },
+          {
+            "row": 120,
+            "col": 160,
+            "value": 1640
+          },
+          {
+            "row": 17,
+            "col": 42,
+            "value": 1110
+          }
+        ],
+        "min": 1000,
+        "max": 2275,
+        "formula": "value = 1000 + col + 4*row (mm)"
+      }
+    },
+    {
+      "file": "dimos/pointcloud_xyzi.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 320124,
+      "format": "pointcloud",
+      "msg_type": "sensor_msgs.PointCloud2",
+      "zenoh_key": "dimos/lidar/points/sensor_msgs.PointCloud2",
+      "frame_id": "lidar",
+      "point_count": 20000,
+      "height": 1,
+      "width": 20000,
+      "point_step": 16,
+      "fields": [
+        {
+          "name": "x",
+          "offset": 0,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "y",
+          "offset": 4,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "z",
+          "offset": 8,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "intensity",
+          "offset": 12,
+          "datatype": 7,
+          "count": 1
+        }
+      ],
+      "expected": {
+        "first_points": [
+          {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "intensity": 0.0
+          },
+          {
+            "x": 0.05000000074505806,
+            "y": 0.0,
+            "z": 0.125,
+            "intensity": 1.0
+          },
+          {
+            "x": 0.10000000149011612,
+            "y": 0.0,
+            "z": 0.25,
+            "intensity": 2.0
+          },
+          {
+            "x": 0.15000000596046448,
+            "y": 0.0,
+            "z": 0.375,
+            "intensity": 3.0
+          },
+          {
+            "x": 0.20000000298023224,
+            "y": 0.0,
+            "z": 0.5,
+            "intensity": 4.0
+          },
+          {
+            "x": 0.25,
+            "y": 0.0,
+            "z": 0.625,
+            "intensity": 5.0
+          },
+          {
+            "x": 0.30000001192092896,
+            "y": 0.0,
+            "z": 0.75,
+            "intensity": 6.0
+          },
+          {
+            "x": 0.3499999940395355,
+            "y": 0.0,
+            "z": 0.0,
+            "intensity": 7.0
+          }
+        ],
+        "formula": "x=(i%200)*0.05, y=(i//200)*0.05, z=(i%7)*0.125, intensity=i%256",
+        "min_xyz": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "max_xyz": [
+          9.949999809265137,
+          4.949999809265137,
+          0.75
+        ]
+      }
+    },
+    {
+      "file": "dimos/pointcloud_xyz.lcm",
+      "protocol": "dimos-lcm",
+      "bytes": 320124,
+      "format": "pointcloud",
+      "msg_type": "sensor_msgs.PointCloud2",
+      "zenoh_key": "dimos/lidar/points/sensor_msgs.PointCloud2",
+      "frame_id": "lidar",
+      "point_count": 20000,
+      "height": 1,
+      "width": 20000,
+      "point_step": 16,
+      "fields": [
+        {
+          "name": "x",
+          "offset": 0,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "y",
+          "offset": 4,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "z",
+          "offset": 8,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "intensity",
+          "offset": 12,
+          "datatype": 7,
+          "count": 1
+        }
+      ],
+      "note": "dimos PointCloud2.lcm_encode always emits x,y,z,intensity (point_step 16); an xyz-only cloud carries intensity=0",
+      "expected": {
+        "first_points": [
+          {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "intensity": 0.0
+          },
+          {
+            "x": 0.05000000074505806,
+            "y": 0.0,
+            "z": 0.125,
+            "intensity": 0.0
+          },
+          {
+            "x": 0.10000000149011612,
+            "y": 0.0,
+            "z": 0.25,
+            "intensity": 0.0
+          },
+          {
+            "x": 0.15000000596046448,
+            "y": 0.0,
+            "z": 0.375,
+            "intensity": 0.0
+          },
+          {
+            "x": 0.20000000298023224,
+            "y": 0.0,
+            "z": 0.5,
+            "intensity": 0.0
+          },
+          {
+            "x": 0.25,
+            "y": 0.0,
+            "z": 0.625,
+            "intensity": 0.0
+          },
+          {
+            "x": 0.30000001192092896,
+            "y": 0.0,
+            "z": 0.75,
+            "intensity": 0.0
+          },
+          {
+            "x": 0.3499999940395355,
+            "y": 0.0,
+            "z": 0.0,
+            "intensity": 0.0
+          }
+        ],
+        "formula": "x=(i%200)*0.05, y=(i//200)*0.05, z=(i%7)*0.125, intensity=i%256 (here 0)",
+        "min_xyz": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "max_xyz": [
+          9.949999809265137,
+          4.949999809265137,
+          0.75
+        ]
+      }
+    },
+    {
+      "file": "ros2/image_rgb8.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 230472,
+      "msg_type": "sensor_msgs/msg/Image",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "raw",
+      "zenoh_key": "0/camera/color/image_raw/sensor_msgs::msg::dds_::Image_/RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47",
+      "ros_topic": "/camera/color/image_raw",
+      "frame_id": "camera_color_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "rgb8",
+      "step": 960,
+      "is_bigendian": false,
+      "expected": {
+        "mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ],
+        "quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "pixel_bytes_at_row0_col0": [
+          255,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "file": "ros2/image_bgr8.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 230472,
+      "msg_type": "sensor_msgs/msg/Image",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "raw",
+      "zenoh_key": "0/camera/color/image_raw/sensor_msgs::msg::dds_::Image_/RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47",
+      "ros_topic": "/camera/color/image_raw",
+      "frame_id": "camera_color_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "bgr8",
+      "step": 960,
+      "is_bigendian": false,
+      "expected": {
+        "mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ],
+        "quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "pixel_bytes_at_row0_col0": [
+          0,
+          0,
+          255
+        ]
+      }
+    },
+    {
+      "file": "ros2/image_mono8.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 76872,
+      "msg_type": "sensor_msgs/msg/Image",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "raw",
+      "zenoh_key": "0/camera/mono/image_raw/sensor_msgs::msg::dds_::Image_/RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47",
+      "ros_topic": "/camera/mono/image_raw",
+      "frame_id": "camera_color_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "mono8",
+      "step": 320,
+      "is_bigendian": false,
+      "expected": {
+        "quadrant_mean": {
+          "top_left": 0.0,
+          "top_right": 85.0,
+          "bottom_left": 170.0,
+          "bottom_right": 255.0
+        }
+      }
+    },
+    {
+      "file": "ros2/image_mono16.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 153672,
+      "msg_type": "sensor_msgs/msg/Image",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "raw",
+      "zenoh_key": "0/camera/mono/image_raw/sensor_msgs::msg::dds_::Image_/RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47",
+      "ros_topic": "/camera/mono/image_raw",
+      "frame_id": "camera_color_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "mono16",
+      "step": 640,
+      "is_bigendian": false,
+      "expected": {
+        "quadrant_mean": {
+          "top_left": 0.0,
+          "top_right": 21845.0,
+          "bottom_left": 43690.0,
+          "bottom_right": 65535.0
+        }
+      }
+    },
+    {
+      "file": "ros2/depth_16UC1.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 153672,
+      "msg_type": "sensor_msgs/msg/Image",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "raw",
+      "zenoh_key": "0/camera/depth/image_rect_raw/sensor_msgs::msg::dds_::Image_/RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47",
+      "ros_topic": "/camera/depth/image_rect_raw",
+      "frame_id": "camera_depth_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "16UC1",
+      "step": 640,
+      "is_bigendian": false,
+      "expected": {
+        "depth_samples": [
+          {
+            "row": 0,
+            "col": 0,
+            "value": 1000
+          },
+          {
+            "row": 0,
+            "col": 319,
+            "value": 1319
+          },
+          {
+            "row": 239,
+            "col": 0,
+            "value": 1956
+          },
+          {
+            "row": 239,
+            "col": 319,
+            "value": 2275
+          },
+          {
+            "row": 120,
+            "col": 160,
+            "value": 1640
+          },
+          {
+            "row": 17,
+            "col": 42,
+            "value": 1110
+          }
+        ],
+        "min": 1000,
+        "max": 2275,
+        "formula": "value = 1000 + col + 4*row (mm)"
+      }
+    },
+    {
+      "file": "ros2/depth_32FC1.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 307272,
+      "msg_type": "sensor_msgs/msg/Image",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "raw",
+      "zenoh_key": "0/camera/depth/image_rect_raw/sensor_msgs::msg::dds_::Image_/RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47",
+      "ros_topic": "/camera/depth/image_rect_raw",
+      "frame_id": "camera_depth_optical_frame",
+      "stamp": {
+        "sec": 1700000000,
+        "nanosec": 500000000
+      },
+      "width": 320,
+      "height": 240,
+      "encoding": "32FC1",
+      "step": 1280,
+      "is_bigendian": false,
+      "expected": {
+        "depth_samples": [
+          {
+            "row": 0,
+            "col": 0,
+            "value": 0.5
+          },
+          {
+            "row": 0,
+            "col": 319,
+            "value": 2.9921875
+          },
+          {
+            "row": 239,
+            "col": 0,
+            "value": 4.234375
+          },
+          {
+            "row": 239,
+            "col": 319,
+            "value": 6.7265625
+          },
+          {
+            "row": 120,
+            "col": 160,
+            "value": 3.625
+          },
+          {
+            "row": 17,
+            "col": 42,
+            "value": 1.09375
+          }
+        ],
+        "min": 0.5,
+        "max": 6.7265625,
+        "formula": "value = 0.5 + col/128 + row/64 (m)"
+      }
+    },
+    {
+      "file": "ros2/compressed_jpeg.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 2517,
+      "msg_type": "sensor_msgs/msg/CompressedImage",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "jpeg",
+      "zenoh_key": "0/camera/color/image_raw/compressed/sensor_msgs::msg::dds_::CompressedImage_/RIHS01_15640771531571185e2efc8a100baf923961a4d15d5569652e6cb6691e8e371a",
+      "ros_topic": "/camera/color/image_raw/compressed",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "compressed_bytes_file": "compressed/pattern.jpeg",
+      "note": "format string set the ROS way (image_transport uses e.g. 'rgb8; jpeg compressed bgr8'; here just the codec name)",
+      "expected": {
+        "lossless": false,
+        "tolerance_per_channel": 8,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        },
+        "decoded_quadrant_mean_rgb": {
+          "top_left": [
+            253.494,
+            0.281,
+            0.0
+          ],
+          "top_right": [
+            0.506,
+            254.719,
+            1.113
+          ],
+          "bottom_left": [
+            0.044,
+            0.05,
+            253.644
+          ],
+          "bottom_right": [
+            254.956,
+            254.956,
+            255.0
+          ]
+        },
+        "decoded_mean_rgb": [
+          127.25,
+          127.502,
+          127.439
+        ]
+      }
+    },
+    {
+      "file": "ros2/compressed_png.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 1365,
+      "msg_type": "sensor_msgs/msg/CompressedImage",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "png",
+      "zenoh_key": "0/camera/color/image_raw/compressed/sensor_msgs::msg::dds_::CompressedImage_/RIHS01_15640771531571185e2efc8a100baf923961a4d15d5569652e6cb6691e8e371a",
+      "ros_topic": "/camera/color/image_raw/compressed",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "compressed_bytes_file": "compressed/pattern.png",
+      "note": "format string set the ROS way (image_transport uses e.g. 'rgb8; jpeg compressed bgr8'; here just the codec name)",
+      "expected": {
+        "lossless": true,
+        "tolerance_per_channel": 0,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        },
+        "decoded_quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "decoded_mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ]
+      }
+    },
+    {
+      "file": "ros2/compressed_jxl.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 315,
+      "msg_type": "sensor_msgs/msg/CompressedImage",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "jxl",
+      "zenoh_key": "0/camera/color/image_raw/compressed/sensor_msgs::msg::dds_::CompressedImage_/RIHS01_15640771531571185e2efc8a100baf923961a4d15d5569652e6cb6691e8e371a",
+      "ros_topic": "/camera/color/image_raw/compressed",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "compressed_bytes_file": "compressed/pattern.jxl",
+      "note": "format string set the ROS way (image_transport uses e.g. 'rgb8; jpeg compressed bgr8'; here just the codec name)",
+      "expected": {
+        "lossless": false,
+        "tolerance_per_channel": 8,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        },
+        "decoded_quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "decoded_mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ]
+      }
+    },
+    {
+      "file": "ros2/compressed_webp.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 138,
+      "msg_type": "sensor_msgs/msg/CompressedImage",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "webp",
+      "zenoh_key": "0/camera/color/image_raw/compressed/sensor_msgs::msg::dds_::CompressedImage_/RIHS01_15640771531571185e2efc8a100baf923961a4d15d5569652e6cb6691e8e371a",
+      "ros_topic": "/camera/color/image_raw/compressed",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "compressed_bytes_file": "compressed/pattern.webp",
+      "note": "format string set the ROS way (image_transport uses e.g. 'rgb8; jpeg compressed bgr8'; here just the codec name)",
+      "expected": {
+        "lossless": true,
+        "tolerance_per_channel": 0,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        },
+        "decoded_quadrant_mean_rgb": {
+          "top_left": [
+            255.0,
+            0.0,
+            0.0
+          ],
+          "top_right": [
+            0.0,
+            255.0,
+            0.0
+          ],
+          "bottom_left": [
+            0.0,
+            0.0,
+            255.0
+          ],
+          "bottom_right": [
+            255.0,
+            255.0,
+            255.0
+          ]
+        },
+        "decoded_mean_rgb": [
+          127.5,
+          127.5,
+          127.5
+        ]
+      }
+    },
+    {
+      "file": "ros2/compressed_jxl_depth16.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 19740,
+      "msg_type": "sensor_msgs/msg/CompressedImage",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "jxl",
+      "zenoh_key": "0/camera/depth/image_rect_raw/compressed/sensor_msgs::msg::dds_::CompressedImage_/RIHS01_15640771531571185e2efc8a100baf923961a4d15d5569652e6cb6691e8e371a",
+      "ros_topic": "/camera/depth/image_rect_raw/compressed",
+      "frame_id": "camera_depth_optical_frame",
+      "width": 320,
+      "height": 240,
+      "compressed_bytes_file": "compressed/depth16.jxl",
+      "note": "decodes to a single-channel uint16 image (16UC1 depth, mm)",
+      "expected": {
+        "lossless": true,
+        "depth_samples": [
+          {
+            "row": 0,
+            "col": 0,
+            "value": 1000
+          },
+          {
+            "row": 0,
+            "col": 319,
+            "value": 1319
+          },
+          {
+            "row": 239,
+            "col": 0,
+            "value": 1956
+          },
+          {
+            "row": 239,
+            "col": 319,
+            "value": 2275
+          },
+          {
+            "row": 120,
+            "col": 160,
+            "value": 1640
+          },
+          {
+            "row": 17,
+            "col": 42,
+            "value": 1110
+          }
+        ],
+        "min": 1000,
+        "max": 2275,
+        "formula": "value = 1000 + col + 4*row (mm)"
+      }
+    },
+    {
+      "file": "ros2/pointcloud_xyzi.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 320141,
+      "msg_type": "sensor_msgs/msg/PointCloud2",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "pointcloud",
+      "zenoh_key": "0/lidar/points/sensor_msgs::msg::dds_::PointCloud2_/RIHS01_9198cabf7da3796ae6fe19c4cb3bdd3525492988c70522628af5daa124bae2b5",
+      "ros_topic": "/lidar/points",
+      "frame_id": "lidar",
+      "point_count": 20000,
+      "height": 1,
+      "width": 20000,
+      "point_step": 16,
+      "fields": [
+        {
+          "name": "x",
+          "offset": 0,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "y",
+          "offset": 4,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "z",
+          "offset": 8,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "intensity",
+          "offset": 12,
+          "datatype": 7,
+          "count": 1
+        }
+      ],
+      "expected": {
+        "first_points": [
+          {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "intensity": 0.0
+          },
+          {
+            "x": 0.05000000074505806,
+            "y": 0.0,
+            "z": 0.125,
+            "intensity": 1.0
+          },
+          {
+            "x": 0.10000000149011612,
+            "y": 0.0,
+            "z": 0.25,
+            "intensity": 2.0
+          },
+          {
+            "x": 0.15000000596046448,
+            "y": 0.0,
+            "z": 0.375,
+            "intensity": 3.0
+          },
+          {
+            "x": 0.20000000298023224,
+            "y": 0.0,
+            "z": 0.5,
+            "intensity": 4.0
+          },
+          {
+            "x": 0.25,
+            "y": 0.0,
+            "z": 0.625,
+            "intensity": 5.0
+          },
+          {
+            "x": 0.30000001192092896,
+            "y": 0.0,
+            "z": 0.75,
+            "intensity": 6.0
+          },
+          {
+            "x": 0.3499999940395355,
+            "y": 0.0,
+            "z": 0.0,
+            "intensity": 7.0
+          }
+        ],
+        "formula": "x=(i%200)*0.05, y=(i//200)*0.05, z=(i%7)*0.125, intensity=i%256",
+        "min_xyz": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "max_xyz": [
+          9.949999809265137,
+          4.949999809265137,
+          0.75
+        ]
+      }
+    },
+    {
+      "file": "ros2/pointcloud_xyz.cdr",
+      "protocol": "ros2-cdr",
+      "bytes": 240113,
+      "msg_type": "sensor_msgs/msg/PointCloud2",
+      "cdr_encapsulation_header_hex": "00010000",
+      "format": "pointcloud",
+      "zenoh_key": "0/lidar/points/sensor_msgs::msg::dds_::PointCloud2_/RIHS01_9198cabf7da3796ae6fe19c4cb3bdd3525492988c70522628af5daa124bae2b5",
+      "ros_topic": "/lidar/points",
+      "frame_id": "lidar",
+      "point_count": 20000,
+      "height": 1,
+      "width": 20000,
+      "point_step": 12,
+      "fields": [
+        {
+          "name": "x",
+          "offset": 0,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "y",
+          "offset": 4,
+          "datatype": 7,
+          "count": 1
+        },
+        {
+          "name": "z",
+          "offset": 8,
+          "datatype": 7,
+          "count": 1
+        }
+      ],
+      "expected": {
+        "first_points": [
+          {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          {
+            "x": 0.05000000074505806,
+            "y": 0.0,
+            "z": 0.125
+          },
+          {
+            "x": 0.10000000149011612,
+            "y": 0.0,
+            "z": 0.25
+          },
+          {
+            "x": 0.15000000596046448,
+            "y": 0.0,
+            "z": 0.375
+          },
+          {
+            "x": 0.20000000298023224,
+            "y": 0.0,
+            "z": 0.5
+          },
+          {
+            "x": 0.25,
+            "y": 0.0,
+            "z": 0.625
+          },
+          {
+            "x": 0.30000001192092896,
+            "y": 0.0,
+            "z": 0.75
+          },
+          {
+            "x": 0.3499999940395355,
+            "y": 0.0,
+            "z": 0.0
+          }
+        ],
+        "formula": "x=(i%200)*0.05, y=(i//200)*0.05, z=(i%7)*0.125",
+        "min_xyz": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "max_xyz": [
+          9.949999809265137,
+          4.949999809265137,
+          0.75
+        ]
+      }
+    }
+  ]
+}
