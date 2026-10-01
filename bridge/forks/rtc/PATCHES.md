@@ -12,4 +12,5 @@ Fork of [rtc](https://crates.io/crates/rtc) 0.21.0 (webrtc-rs, MIT OR Apache-2.0
    `zenoh-web-rtc-datachannel` (which uses the same SCTP fork, so their types match).
 
 Manifest: dev-dependencies, examples and tests removed (not vendored).
-Versioning: upstream version + `-zw.N` (`0.21.0-zw.1`); bump `N` for new fork fixes, reset it when rebasing on a new upstream.
+Versioning: upstream version + `-zw.N` (`0.21.0-zw.2`: no new change of its own, it follows the
+SCTP fork's zw.2); bump `N` for new fork fixes, reset it when rebasing on a new upstream.

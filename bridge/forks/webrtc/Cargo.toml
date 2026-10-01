@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "zenoh-web-webrtc"
-version = "0.21.0-zw.1"
+version = "0.21.0-zw.2"
 authors = ["Rain Liu <yliu@webrtc.rs>"]
 build = false
 autolib = false
@@ -75,7 +75,7 @@ default-features = false
 
 [dependencies.rtc]
 package = "zenoh-web-rtc"
-version = "=0.21.0-zw.1"
+version = "=0.21.0-zw.2"
 path = "../rtc"
 default-features = false
 

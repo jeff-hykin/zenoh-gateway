@@ -19,8 +19,8 @@ path = "src/main.rs"
 zenoh = "1.10"
 zenoh-ext = { version = "1.10", features = ["unstable"] }
 # forks of webrtc-rs with small fixes, renamed so they reach crates that depend on zenoh-web (see forks/README.md)
-webrtc = { package = "zenoh-web-webrtc", version = "=0.21.0-zw.1", path = "forks/webrtc" }
-rtc = { package = "zenoh-web-rtc", version = "=0.21.0-zw.1", path = "forks/rtc" }
+webrtc = { package = "zenoh-web-webrtc", version = "=0.21.0-zw.2", path = "forks/webrtc" }
+rtc = { package = "zenoh-web-rtc", version = "=0.21.0-zw.2", path = "forks/rtc" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "cors"] }

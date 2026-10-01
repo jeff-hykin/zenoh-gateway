@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "zenoh-web-rtc-datachannel"
-version = "0.21.0-zw.1"
+version = "0.21.0-zw.2"
 authors = ["Rain Liu <yliu@webrtc.rs>"]
 build = false
 autolib = false
@@ -48,7 +48,7 @@ version = "1"
 
 [dependencies.sctp]
 package = "zenoh-web-rtc-sctp"
-version = "=0.21.0-zw.1"
+version = "=0.21.0-zw.2"
 path = "../rtc-sctp"
 
 [dependencies.shared]

@@ -19,13 +19,14 @@ use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::sample::Sample;
 use zenoh_ext::{AdvancedSubscriberBuilderExt, HistoryConfig};
 
-/// Above this many unacknowledged bytes the channel counts as backed up.
+/// The smallest send window: above this many unacknowledged bytes the channel counts as backed up
+/// (the window grows with the path's bandwidth-delay product, `SendGate::window_bytes`). Sending
+/// resumes once the channel drains to half its window.
 pub const BACKED_UP_BYTES: usize = 64 * 1024;
-/// Resume sending once the channel drains to this.
-pub const RESUME_BYTES: usize = 32 * 1024;
 /// Backstop re-check while backed up, in case a low-water event is missed.
 const BACKSTOP: Duration = Duration::from_millis(20);
-/// Max bytes sent but not yet acknowledged as consumed by the page's JS (see `ack`).
+/// Max bytes sent but not yet acknowledged as consumed by the page's JS (see `ack`), or twice the
+/// send window if larger (the page's acks take a round trip too).
 /// SCTP's buffered amount only covers the network: a busy browser main thread acks SCTP
 /// on its network thread and then queues messages internally without limit.
 pub const UNCONSUMED_WINDOW: usize = 256 * 1024;
@@ -53,6 +54,8 @@ pub struct SubStats {
     pub queued: usize,
     pub queued_bytes: usize,
     pub outstanding_bytes: usize,
+    /// bytes this channel may have in SCTP before it waits (`SendGate::window_bytes`)
+    pub window_bytes: usize,
     pub backed_up: bool,
     pub unconsumed_bytes: usize,
     /// frames (chunks) handed to SCTP; `sent` counts whole messages
@@ -566,7 +569,7 @@ impl SubShared {
 
 /// Runs a `sub` channel until it closes. Video codecs send frames to `video` instead of `dc`.
 pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>, video: Option<Arc<crate::video::VideoTrack>>) {
-    let _ = dc.set_buffered_amount_low_threshold(RESUME_BYTES as u32).await;
+    let _ = dc.set_buffered_amount_low_threshold((shared.gate.window_bytes() / 2) as u32).await;
     let feed = shared.clone();
     let subscriber = session
         .declare_subscriber(label.key.clone())
@@ -619,26 +622,36 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
 struct Pacer {
     probe_interval: Duration,
     acks_seen: u64,
+    /// the low-water mark last given to the channel
+    resume_bytes: usize,
 }
 
 impl Pacer {
     /// After a frame went out: wait while the network or the page is behind.
     async fn wait_writable(&mut self, dc: &Arc<dyn DataChannel>, shared: &SubShared) {
         let mut outstanding = dc.outstanding_bytes().await.unwrap_or(0);
+        let window = shared.gate.window_bytes();
+        let resume_bytes = window / 2;
+        let unconsumed_window = UNCONSUMED_WINDOW.max(2 * window);
+        if resume_bytes != self.resume_bytes {
+            self.resume_bytes = resume_bytes;
+            let _ = dc.set_buffered_amount_low_threshold(resume_bytes as u32).await;
+        }
         let unconsumed = {
             let mut state = shared.state.lock().unwrap();
             state.stats.outstanding_bytes = outstanding;
+            state.stats.window_bytes = window;
             state.stats.unconsumed_bytes
         };
-        if outstanding < BACKED_UP_BYTES && unconsumed < UNCONSUMED_WINDOW {
+        if outstanding < window && unconsumed < unconsumed_window {
             return;
         }
         shared.state.lock().unwrap().stats.backed_up = true;
         let mut probe_at = Instant::now() + self.probe_interval;
-        while (outstanding > RESUME_BYTES || shared.unconsumed_bytes() >= UNCONSUMED_WINDOW)
+        while (outstanding > resume_bytes || shared.unconsumed_bytes() >= unconsumed_window)
             && !shared.closed.load(Ordering::Relaxed)
         {
-            let waiting_on_network = outstanding > RESUME_BYTES;
+            let waiting_on_network = outstanding > resume_bytes;
             let wait_started = Instant::now();
             tokio::select! {
                 _ = shared.drained.notified() => {}
@@ -660,7 +673,7 @@ impl Pacer {
                 self.probe_interval = FIRST_PROBE_AFTER;
                 probe_at = Instant::now() + self.probe_interval;
             }
-            let window_only = outstanding <= RESUME_BYTES;
+            let window_only = outstanding <= resume_bytes;
             if window_only && !shared.delivery.reliable && Instant::now() >= probe_at {
                 shared.state.lock().unwrap().stats.probes += 1;
                 // if this probe isn't acked either, the page is busy rather than the tail lost
@@ -757,7 +770,7 @@ pub struct MessageSender {
 
 impl MessageSender {
     pub fn new() -> Self {
-        MessageSender { pacer: Pacer { probe_interval: FIRST_PROBE_AFTER, acks_seen: 0 }, next_frame_id: 0, warned_send_error: false }
+        MessageSender { pacer: Pacer { probe_interval: FIRST_PROBE_AFTER, acks_seen: 0, resume_bytes: BACKED_UP_BYTES / 2 }, next_frame_id: 0, warned_send_error: false }
     }
 
     pub async fn send(&mut self, dc: &Arc<dyn DataChannel>, shared: &SubShared, key: &str, item: &Pending, payload: &[u8]) -> Sent {

@@ -4,9 +4,15 @@ Fork of [rtc-sctp](https://crates.io/crates/rtc-sctp) 0.21.0 (webrtc-rs, MIT OR 
 <https://github.com/jeff-hykin/zenoh-web/tree/main/bridge/forks/rtc-sctp>. Every change is marked
 `zenoh-web patch` in the source. Library name is unchanged (`rtc_sctp`).
 
-1. **Retransmission timeout floor and cap** (`src/association/timer.rs`). Bug: `RTO_MIN` 1 s and
-   `RTO_MAX` 60 s turned every tail loss into a multi-second stall of the whole association. Change:
-   200 ms / 3 s, matching Chrome's dcsctp data-channel settings.
+1. **Retransmission timeout as Chrome's dcsctp computes it** (`src/association/timer.rs`). Bugs:
+   `RTO_MAX` 60 s turned every tail loss into a multi-second stall of the whole association; and
+   SRTT + 4 x RTTVAR with a 200 ms floor (zw.1) fired on Wi-Fi, where the RTT jumps from tens of ms
+   to 400+ in one round trip with nothing lost: each such T3 timeout cut cwnd to one MTU and resent
+   the whole flight (on a test link with RTT 10-50 ms, stalls to 430 ms and 0.5% loss: 5 timeouts in
+   20 s, latency p95 605 ms, and seconds-long stalls of reliable channels). Change: dcsctp's values,
+   `rto_min` 400 ms, `min_rtt_variance` 220 ms (RTTVAR never counts below it, so RTO >= SRTT +
+   880 ms) and backoff capped at 3 s (Chrome's `max_timer_backoff_duration`). Same link: 0 timeouts,
+   p95 243 ms (`test/throughput.js --profile spiky` in zenoh-web).
 2. **Fragmented partially-reliable messages are abandoned whole** (`src/association/mod.rs`,
    `abandon_whole_messages`; RFC 3758 Sec 3.5 A3). Bug: only single-chunk messages were ever
    abandoned, so on a `maxRetransmits` / `maxPacketLifeTime` channel every message larger than one
@@ -22,4 +28,4 @@ Fork of [rtc-sctp](https://crates.io/crates/rtc-sctp) 0.21.0 (webrtc-rs, MIT OR 
 
 Tests for 2–4 are in `src/endpoint/endpoint_test.rs` and `src/queue/queue_test.rs` (search `zenoh-web patch`).
 
-Versioning: upstream version + `-zw.N` (`0.21.0-zw.1`); bump `N` for new fork fixes, reset it when rebasing on a new upstream.
+Versioning: upstream version + `-zw.N` (`0.21.0-zw.2`); bump `N` for new fork fixes, reset it when rebasing on a new upstream.

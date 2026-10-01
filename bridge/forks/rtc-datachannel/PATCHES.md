@@ -7,4 +7,5 @@ Library name is unchanged (`rtc_datachannel`).
 No source changes. Its `sctp` dependency is `zenoh-web-rtc-sctp` instead of `rtc-sctp`, so the
 SCTP types it shares with `zenoh-web-rtc` come from the same (patched) crate.
 
-Manifest: dev-dependencies removed. Versioning: upstream version + `-zw.N` (`0.21.0-zw.1`).
+Manifest: dev-dependencies removed. Versioning: upstream version + `-zw.N` (`0.21.0-zw.2`, which only
+follows the SCTP fork's zw.2).

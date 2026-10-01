@@ -21,6 +21,13 @@ const CHUNK_MS: f64 = 4.0;
 const GATE_BACKSTOP: Duration = Duration::from_millis(5);
 /// Token-bucket rate = granted rate x this, so a message finishes a little before the next is due.
 pub const PACING_SLACK: f64 = 1.25;
+/// A channel's send window (bytes in SCTP, see [`SendGate::window_bytes`]) is the budget times this
+/// many round trips, between `subscription::BACKED_UP_BYTES` and `MAX_WINDOW_BYTES`.
+const WINDOW_RTTS: f64 = 2.0;
+pub const MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+/// The RTT the window covers is at most the path's minimum plus this, so a queue the window itself
+/// builds can't keep growing it.
+const WINDOW_MAX_EXTRA_RTT_MS: f64 = 500.0;
 
 pub struct SendGate {
     /// strict streams currently sending a message
@@ -31,6 +38,7 @@ pub struct SendGate {
     channels: Mutex<HashMap<usize, Arc<dyn DataChannel>>>,
     inflight_limit: AtomicUsize,
     chunk_bytes: AtomicUsize,
+    window_bytes: AtomicUsize,
     changed: Notify,
 }
 
@@ -42,6 +50,7 @@ impl Default for SendGate {
             channels: Mutex::new(HashMap::new()),
             inflight_limit: AtomicUsize::new(usize::MAX),
             chunk_bytes: AtomicUsize::new(MAX_CHUNK_BYTES),
+            window_bytes: AtomicUsize::new(crate::subscription::BACKED_UP_BYTES),
             changed: Notify::new(),
         }
     }
@@ -70,6 +79,24 @@ impl SendGate {
         let limit = if limit_inflight { (window as usize).max(2 * chunk) } else { usize::MAX };
         self.inflight_limit.store(limit, Ordering::Relaxed);
         self.changed.notify_waiters();
+    }
+
+    /// From the allocator: each channel's send window, about two bandwidth-delay products at the
+    /// path's recent highest RTT. A fixed 64 KB held a channel to 64 KB per round trip: ~150 KB/s
+    /// on a Wi-Fi path whose RTT swings to 400 ms, and SCTP's congestion window never grew past it
+    /// (it grows only while data waits for it).
+    pub fn set_window(&self, budget_bytes_per_sec: f64, min_rtt_ms: Option<f64>, high_rtt_ms: Option<f64>) {
+        let rtt_ms = match (min_rtt_ms, high_rtt_ms) {
+            (Some(min), Some(high)) => high.min(min + WINDOW_MAX_EXTRA_RTT_MS),
+            (min, high) => high.or(min).unwrap_or(0.0),
+        };
+        let window = (budget_bytes_per_sec * WINDOW_RTTS * rtt_ms / 1000.0) as usize;
+        self.window_bytes.store(window.clamp(crate::subscription::BACKED_UP_BYTES, MAX_WINDOW_BYTES), Ordering::Relaxed);
+    }
+
+    /// Bytes a channel may have in SCTP (sent, not yet acknowledged) before it waits.
+    pub fn window_bytes(&self) -> usize {
+        self.window_bytes.load(Ordering::Relaxed)
     }
 
     /// The bulk in-flight limit, if any.
@@ -212,6 +239,20 @@ mod tests {
         let wait = bucket.take(10_000, start);
         assert!((wait.as_secs_f64() - 0.1).abs() < 1e-6, "next waits 10 KB / 100 KB/s: {wait:?}");
         assert!(bucket.take(10_000, start + Duration::from_millis(100)) > Duration::ZERO);
+    }
+
+    #[test]
+    fn send_window_covers_two_round_trips_at_the_highest_rtt() {
+        let gate = SendGate::default();
+        assert_eq!(gate.window_bytes(), crate::subscription::BACKED_UP_BYTES, "64 KB before any RTT is known");
+        gate.set_window(1_000_000.0, Some(10.0), Some(400.0));
+        assert_eq!(gate.window_bytes(), 800_000, "1 MB/s x 2 x 400 ms");
+        gate.set_window(1_000_000.0, Some(10.0), Some(2000.0));
+        assert_eq!(gate.window_bytes(), 1_020_000, "at most the minimum RTT + 500 ms");
+        gate.set_window(100_000.0, Some(10.0), Some(20.0));
+        assert_eq!(gate.window_bytes(), crate::subscription::BACKED_UP_BYTES, "never below 64 KB");
+        gate.set_window(1e9, Some(10.0), Some(400.0));
+        assert_eq!(gate.window_bytes(), MAX_WINDOW_BYTES);
     }
 
     #[test]

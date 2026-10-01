@@ -141,10 +141,14 @@ impl TimerTable {
 // RFC 9260 §16 recommends a one-second initial RTO.  This value is used by
 // both T1-init and T1-cookie before an RTT measurement is available.
 const RTO_INITIAL: u64 = 1000; // msec
-// zenoh-web patch: 1 s floor / 60 s backoff turned every tail loss into multi-second stalls;
-// these match Chrome's dcsctp data-channel settings (low floor, backoff capped at 3 s).
-const RTO_MIN: u64 = 200; // msec
+// zenoh-web patch: Chrome's dcsctp settings. A 60 s backoff turned every tail loss into
+// multi-second stalls (dcsctp caps backoff at 3 s). The floor is dcsctp's 400 ms, and RTTVAR never
+// counts below 220 ms (dcsctp `min_rtt_variance`), so RTO >= SRTT + 880 ms: on Wi-Fi the RTT jumps
+// from tens of ms to 400+ in one round trip, and a lower RTO fired on every such stall (cwnd to one
+// MTU, the whole flight resent) though nothing was lost.
+const RTO_MIN: u64 = 400; // msec
 const RTO_MAX: u64 = 3000; // msec
+const MIN_RTTVAR: f64 = 220.0; // msec
 const RTO_ALPHA: u64 = 1;
 const RTO_BETA: u64 = 2;
 const RTO_BASE: u64 = 8;
@@ -186,6 +190,7 @@ impl RtoManager {
             self.srtt = ((RTO_BASE - RTO_ALPHA) * self.srtt + RTO_ALPHA * rtt) / RTO_BASE;
         }
 
+        self.rttvar = self.rttvar.max(MIN_RTTVAR);
         self.rto = (self.srtt + (4.0 * self.rttvar) as u64).clamp(RTO_MIN, RTO_MAX);
 
         self.srtt
@@ -235,6 +240,20 @@ mod tests {
     fn rto_manager_uses_rfc9260_initial_rto() {
         assert_eq!(RTO_INITIAL, 1000);
         assert_eq!(RtoManager::new().get_rto(), RTO_INITIAL);
+    }
+
+    #[test]
+    fn a_steady_fast_path_keeps_room_for_a_wifi_stall() {
+        let mut rto = RtoManager::new();
+        for _ in 0..50 {
+            rto.set_new_rtt(20);
+        }
+        // zenoh-web patch: SRTT 20 + 4 x 220
+        assert_eq!(rto.get_rto(), 900);
+        for _ in 0..50 {
+            rto.set_new_rtt(3000);
+        }
+        assert_eq!(rto.get_rto(), RTO_MAX);
     }
 
     #[test]

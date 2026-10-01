@@ -174,11 +174,13 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
 ///   Wi-Fi or VPN path whose RTT swings by tens of ms with no load must not read as congested (on
 ///   one, a fixed 5 ms threshold held the estimate at its floor while the link idled). The estimate
 ///   drops at once by 15% and probing pauses 1 s while the queue drains;
-/// - loss/backpressure: senders blocked on SCTP more than 20% of the interval: 0.9 x measured rate.
+/// - loss/backpressure: senders blocked on SCTP more than 20% of the interval: 0.9 x measured rate,
+///   but at most 15% down per interval.
 ///
 /// Otherwise, while streams want more, it probes up: 50% per interval until the first congestion
-/// event (slow start), then 10% per interval below 90% of the level that last triggered
-/// congestion and 2% above it, so overshoot builds queue slowly enough to be caught.
+/// event (slow start), then 10% per interval below 90% of the level that last triggered congestion
+/// and 2% above it, so overshoot builds queue slowly enough to be caught; 10% again once that level
+/// is 5 s old (on Wi-Fi one early stall had held probing at 2% for good).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Estimator {
@@ -196,6 +198,8 @@ pub struct Estimator {
     delay_samples: std::collections::VecDeque<(std::time::Instant, f64)>,
     #[serde(skip)]
     over_threshold: u32,
+    #[serde(skip)]
+    last_congestion: Option<std::time::Instant>,
 }
 
 pub const INITIAL_ESTIMATE: f64 = 1_000_000.0;
@@ -212,6 +216,12 @@ const DELAY_PERSISTENCE: u32 = 2;
 /// How far back the path's usual queue-delay jitter is measured.
 const JITTER_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 const DELAY_DECREASE: f64 = 0.85;
+/// Blocked on SCTP: down to 0.9 x what went out, but by at most this per interval (~halving a
+/// second), since a long round trip blocks the first intervals before the RTT is known.
+const BLOCKED_DECREASE: f64 = 0.85;
+/// Slow probing (2%) near the last congestion level only while that level is this recent; older, it
+/// is stale (on Wi-Fi one early stall had held probing at 2% per interval for good).
+const STALE_CONGESTION: std::time::Duration = std::time::Duration::from_secs(5);
 const HOLD_AFTER_CONGESTION: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Default for Estimator {
@@ -226,6 +236,7 @@ impl Default for Estimator {
             hold_probing_until: None,
             delay_samples: std::collections::VecDeque::new(),
             over_threshold: 0,
+            last_congestion: None,
         }
     }
 }
@@ -256,16 +267,19 @@ impl Estimator {
         let queued = self.queue_building(now, queue_delay_ms);
         if queued && !holding {
             self.congested_at_bytes_per_sec = self.data_bytes_per_sec;
+            self.last_congestion = Some(now);
             self.data_bytes_per_sec *= DELAY_DECREASE;
             self.delay_events += 1;
             self.hold_probing_until = Some(now + HOLD_AFTER_CONGESTION);
         } else if self.network_blocked_fraction > CONGESTED_FRACTION {
             self.congested_at_bytes_per_sec = self.data_bytes_per_sec;
-            self.data_bytes_per_sec = (0.9 * self.sent_bytes_per_sec).max(self.data_bytes_per_sec / 2.0);
+            self.last_congestion = Some(now);
+            self.data_bytes_per_sec = (0.9 * self.sent_bytes_per_sec).max(self.data_bytes_per_sec * BLOCKED_DECREASE);
         } else if !holding && data_demand > self.data_bytes_per_sec * 0.95 {
+            let stale = self.last_congestion.is_some_and(|at| now.duration_since(at) > STALE_CONGESTION);
             let gain = if self.congested_at_bytes_per_sec.is_infinite() {
                 SLOW_START_GAIN
-            } else if self.data_bytes_per_sec > 0.9 * self.congested_at_bytes_per_sec {
+            } else if self.data_bytes_per_sec > 0.9 * self.congested_at_bytes_per_sec && !stale {
                 SLOW_PROBE_GAIN
             } else {
                 FAST_PROBE_GAIN
@@ -388,19 +402,22 @@ mod tests {
         let now = std::time::Instant::now();
         let mut estimator = Estimator::default();
         estimator.update(sample(now, 0.25, 100_000.0, 0.2, 1, 5e6, None));
-        assert!((estimator.data_bytes_per_sec - 500_000.0).abs() < 1.0, "halved at most per step: {estimator:?}");
+        assert!((estimator.data_bytes_per_sec - 850_000.0).abs() < 1.0, "down 15% at most per step: {estimator:?}");
         estimator.update(sample(now, 0.25, 100_000.0, 0.2, 1, 5e6, None));
-        assert!((estimator.data_bytes_per_sec - 360_000.0).abs() < 1.0, "0.9 x 400 KB/s measured: {estimator:?}");
+        assert!((estimator.data_bytes_per_sec - 722_500.0).abs() < 1.0, "{estimator:?}");
+        estimator.update(sample(now, 0.25, 180_000.0, 0.2, 1, 5e6, None));
+        assert!((estimator.data_bytes_per_sec - 648_000.0).abs() < 1.0, "0.9 x 720 KB/s measured: {estimator:?}");
         estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 5e6, None));
-        assert!((estimator.data_bytes_per_sec - 396_000.0).abs() < 1.0, "probes fast below 90% of the last congestion level (500 KB/s): {estimator:?}");
+        assert!((estimator.data_bytes_per_sec - 712_800.0).abs() < 1.0, "probes fast below 90% of the last congestion level (722.5 KB/s): {estimator:?}");
         estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 5e6, None));
-        assert!((estimator.data_bytes_per_sec - 435_600.0).abs() < 1.0, "{estimator:?}");
-        estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 5e6, None));
-        assert!((estimator.data_bytes_per_sec - 479_160.0).abs() < 1.0, "{estimator:?}");
-        estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 5e6, None));
-        assert!((estimator.data_bytes_per_sec - 479_160.0 * 1.02).abs() < 1.0, "slowly above 90% of it: {estimator:?}");
+        assert!((estimator.data_bytes_per_sec - 712_800.0 * 1.02).abs() < 1.0, "slowly around it: {estimator:?}");
         estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 1000.0, None));
-        assert!((estimator.data_bytes_per_sec - 479_160.0 * 1.02).abs() < 1.0, "no probing without demand");
+        assert!((estimator.data_bytes_per_sec - 712_800.0 * 1.02).abs() < 1.0, "no probing without demand");
+        // 5 s after the last congestion event its level is stale: fast again
+        let later = now + STALE_CONGESTION + std::time::Duration::from_millis(1);
+        let before = estimator.data_bytes_per_sec;
+        estimator.update(sample(later, 0.25, 50_000.0, 0.0, 1, 5e6, None));
+        assert!((estimator.data_bytes_per_sec - before * 1.1).abs() < 1.0, "{estimator:?}");
     }
 
     #[test]

@@ -9,6 +9,8 @@
         "e2e:allocation": "deno run --allow-all test/allocation.js",
         "e2e:latency": "deno run --allow-all --unstable-net test/latency.js",
         "e2e:abandoned": "deno run --allow-all test/abandoned.js",
-        "e2e:example": "deno run --allow-all test/example.js"
+        "e2e:example": "deno run --allow-all test/example.js",
+        "e2e:throughput": "deno run --allow-all --unstable-net test/throughput.js",
+        "sctp-baseline": "deno run --allow-all --unstable-net test/sctp_baseline.js"
     }
 }

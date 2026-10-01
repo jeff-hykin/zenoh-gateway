@@ -87,8 +87,12 @@ registerCodec("text-uppercase", (bytes, msg) => new TextDecoder().decode(bytes))
 | `delivery: "latest"` | unordered, maxRetransmits 0 | keep at most `queueSize` (default 1) per key, drop oldest |
 | `+ maxAge: M` (latest) | unordered, maxPacketLifeTime M | also drop anything older than M |
 
-"Backed up" = the channel's unacknowledged bytes are above ~64 KB, or the page has not yet consumed
-~256 KB the bridge sent (the client acks consumption with a 4-byte `u32 seq` message on each `sub`
+"Backed up" = the channel's unacknowledged bytes are above its send window, or the page has not yet
+consumed the larger of ~256 KB and two windows the bridge sent. The window is twice the frontend's
+budget × its highest RTT of the last 10 s (at most the minimum RTT + 500 ms), between 64 KB and 4 MB
+(`windowBytes` in stats); sending resumes at half of it. A fixed 64 KB capped a channel at 64 KB per
+round trip, ~150 KB/s on a Wi-Fi path whose RTT swings to 400 ms, and SCTP's congestion window only
+grows while data waits for it, so it stayed there too. (The page acks consumption with a 4-byte `u32 seq` message on each `sub`
 channel, because browsers queue received messages for the page without limit; on lossy channels a
 sender blocked only by that window sends one probe frame after 50 ms, doubling to 1 s, so a lost tail
 can't wedge it). The bridge drains
@@ -273,7 +277,8 @@ bridge keeps the path's queues short and lets urgent streams skip what queue rem
   standing on the path (a Wi-Fi or VPN path whose RTT swings by tens of ms with no load raises its
   own threshold; a lone spike is ignored): the data
   estimate drops 15% at once and probing pauses 1 s; then it probes up 10% per interval below 90% of
-  the level that caused the queue and 2% above it (before any congestion: 50% per interval, a slow
+  the level that caused the queue and 2% above it, and 10% again once that level is 5 s old (on Wi-Fi
+  one early stall had held probing at 2% for good; before any congestion: 50% per interval, a slow
   start). No loss is needed to react.
 
 Measured by `test/latency.js` through real queueing: a userspace UDP shaper (in the test process)
@@ -287,7 +292,8 @@ Per frontend, every 250 ms:
 1. **Estimate.** Data channels: a delivery-rate estimator over what the `sub` channels pushed into SCTP
    and how long their senders waited on SCTP (webrtc-rs doesn't expose the congestion window), plus the
    delay trigger above: blocked on the network more than 20% of the interval → estimate = 0.9 ×
-   measured rate (at most halving per step); otherwise, while streams want more, probe up (start
+   measured rate (at most 15% down per step: a long round trip blocks the first intervals before
+   the window knows the RTT); otherwise, while streams want more, probe up (start
    1 MB/s). Video: GCC's target bitrate (TWCC feedback), counted while a video track is in use; video
    tracks are paced by the GCC pacer (at 2.5 × the GCC target, as libwebrtc paces), not the bulk gate. Budget = min(`--max-bandwidth-bytes-per-sec`
    if set, target fraction × (data estimate + video estimate)).

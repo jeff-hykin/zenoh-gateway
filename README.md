@@ -411,6 +411,10 @@ their own headless Chrome (never the one on port 9222):
 - `test/abandoned.js`: a viewer whose browser freezes without closing anything: the bridge drops it and
   goes idle.
 - `test/latency.js`: a strict-priority stream's p99 under bulk load through a userspace UDP shaper.
+- `test/throughput.js` (`deno task e2e:throughput`): one data channel's delivered rate through the shaper
+  with delay jitter (`test/shaped_link.js`): at least 2 Mb/s on a ~50 ms ± 20 ms link (it gets
+  ~10 Mb/s), and reported for a Wi-Fi-like link (RTT 10-430 ms) and a spiky, lossy one.
+  `deno task sctp-baseline` measures Chrome-to-Chrome data channels over the same links, for comparison.
 - `test/example.js` (`deno task e2e:example`): the example page served by `--serve examples`, driven
   through its form; checks decoded video frames, drawn points and depth, the raw rate, a control
   re-subscribing, no console errors, and writes `test/artifacts/example.png`. **Needs internet** (esm.sh).

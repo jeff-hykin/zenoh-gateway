@@ -40,6 +40,8 @@ const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
 /// The RTT baseline is the minimum over this window.
 const RTT_BASELINE_WINDOW: Duration = Duration::from_secs(30);
+/// The send window covers the highest RTT over this window.
+const WINDOW_RTT_WINDOW: Duration = Duration::from_secs(10);
 
 /// Bridge-wide allocation settings (builder options / command-line flags).
 #[derive(Debug, Clone, Copy)]
@@ -199,11 +201,18 @@ impl PeerState {
         (newest.zip(minimum).map(|(newest, minimum)| newest - minimum), minimum)
     }
 
+    /// The highest RTT over the last `WINDOW_RTT_WINDOW` (what a send window must cover).
+    fn high_rtt(&self, now: Instant) -> Option<f64> {
+        let samples = self.rtt_samples.lock().unwrap();
+        samples.iter().filter(|(at, _)| now.duration_since(*at) <= WINDOW_RTT_WINDOW).map(|(_, rtt)| *rtt).reduce(f64::max)
+    }
+
     /// One allocation round: measure, update the estimate, divide the budget among streams.
     fn allocate(&self, interval_secs: f64) {
         let now = Instant::now();
         let since = std::mem::replace(&mut *self.last_allocation.lock().unwrap(), now);
         let (queue_delay_ms, min_rtt_ms) = self.queue_delay(since);
+        let high_rtt_ms = self.high_rtt(now);
         let subscriptions = self.subscriptions();
         let usages: Vec<subscription::Usage> = subscriptions.iter().map(|shared| shared.usage(interval_secs)).collect();
         let wants = |demand: &allocator::Demand| demand.fixed_bytes_per_sec.unwrap_or_else(|| (demand.price)(demand.quality_range.map_or(1.0, |(_, max)| max)) * demand.max_hz);
@@ -230,6 +239,7 @@ impl PeerState {
         // the in-flight limit only protects strict streams' latency; without one it only costs throughput
         let strict_present = subscriptions.iter().any(|shared| shared.is_strict());
         self.gate.configure((budget - reserved).max(0.0), min_rtt_ms, allocator::DELAY_THRESHOLD_MS, strict_present);
+        self.gate.set_window(budget, min_rtt_ms, high_rtt_ms);
         let video_cap = video_estimate.min(budget);
         let allocations = allocate_within_video_cap(budget, video_cap, demands, &is_video);
         for (shared, allocation) in subscriptions.iter().zip(allocations) {

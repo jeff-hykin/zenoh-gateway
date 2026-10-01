@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "zenoh-web-rtc-sctp"
-version = "0.21.0-zw.1"
+version = "0.21.0-zw.2"
 authors = ["Rain Liu <yliu@webrtc.rs>"]
 build = false
 autolib = false
@@ -66,6 +66,13 @@ version = "0.4.9"
 
 [dependencies.thiserror]
 version = "2.0.18"
+
+# upstream's, so the unit tests (including the zenoh-web patches' tests) run: `cargo test` in this directory
+[dev-dependencies.assert_matches]
+version = "1.5.0"
+
+[dev-dependencies.lazy_static]
+version = "1.4.0"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
