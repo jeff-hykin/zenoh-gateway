@@ -10,10 +10,10 @@ its changes; license files are upstream's (MIT OR Apache-2.0, © WebRTC.rs).
 | `zenoh-web-rtc-sctp` | `rtc-sctp` | the SCTP fixes |
 | `zenoh-web-rtc-datachannel` | `rtc-datachannel` | unchanged, on the SCTP fork |
 | `zenoh-web-rtc` | `rtc` | the data channel reliability fix, on the two forks above |
-| `zenoh-web-webrtc` | `webrtc` | unchanged, on the rtc fork |
+| `zenoh-web-webrtc` | `webrtc` | the negotiated header extension ids for bound tracks, on the rtc fork |
 
 All four are at `0.21.0-zw.2` (upstream version + `-zw.N`; bump `N` for new fork fixes); `zw.1` is
-on crates.io, `zw.2` (the dcsctp RTO) is not published yet. zenoh-web depends on them by exact version and path: inside this repository (and for a
+on crates.io, `zw.2` (the dcsctp RTO and the track header-extension fix) is not published yet. zenoh-web depends on them by exact version and path: inside this repository (and for a
 git dependency on it) the path is used, and the published zenoh-web uses the crates.io copies.
 Publish order (each needs the previous ones on crates.io): rtc-sctp, rtc-datachannel, rtc, webrtc;
 run `cargo package --list` and `cargo publish --dry-run` in each directory first.

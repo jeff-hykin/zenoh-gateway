@@ -17,6 +17,9 @@ use rtc::peer_connection::configuration::interceptor_registry::{CongestionFeedba
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtp::extension::HeaderExtension;
+use rtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension;
+use rtc::rtp_transceiver::rtp_sender::RTCRtpHeaderExtensionCapability;
 use rtc::rtp_transceiver::rtp_sender::{RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -35,6 +38,9 @@ const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 50_000_000.0;
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
 const PACING_FACTOR: f64 = 2.5;
+/// Asks the browser to show each frame as soon as it is decoded (min = max = 0): no jitter-buffer
+/// smoothing, which on a jittery path held frames ~50-100 ms for even pacing.
+const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
 /// Video metadata frame on the `sub` channel (SPEC "Wire formats").
 pub const METADATA_LEN: usize = 28;
 
@@ -96,6 +102,7 @@ impl BandwidthEstimator for ReportingEstimator {
 pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<AtomicU64>)> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: h264_codec(), payload_type: H264_PAYLOAD_TYPE }, RtpCodecKind::Video)?;
+    media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
     let target_bps = Arc::new(AtomicU64::new(GCC_INITIAL_BPS.to_bits()));
     let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), target_bps: target_bps.clone() };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
@@ -130,7 +137,8 @@ impl VideoTrack {
 
     async fn write(&self, data: Vec<u8>, duration: Duration) -> Result<()> {
         let sample = Sample { data: Bytes::from(data), duration, ..Sample::new(Instant::now()) };
-        self.track.sample_writer(self.ssrc, self.payload_type).write_sample(&sample).await?;
+        let no_playout_delay = HeaderExtension::PlayoutDelay(PlayoutDelayExtension { min_delay: 0, max_delay: 0 });
+        self.track.sample_writer(self.ssrc, self.payload_type).with_extension(no_playout_delay).write_sample(&sample).await?;
         Ok(())
     }
 }

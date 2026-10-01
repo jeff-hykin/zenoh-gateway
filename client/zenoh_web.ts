@@ -1197,6 +1197,13 @@ export class ZenohWeb {
                 throw new Error("connection replaced")
             }
             const transceiver = peer.addTransceiver("video", { direction: "recvonly" })
+            // show frames as soon as they decode (the bridge also asks for zero playout delay)
+            const receiver = transceiver.receiver as unknown as { jitterBufferTarget?: number | null, playoutDelayHint?: number }
+            if ("jitterBufferTarget" in receiver) {
+                receiver.jitterBufferTarget = 0
+            } else {
+                receiver.playoutDelayHint = 0
+            }
             await peer.setLocalDescription(await peer.createOffer())
             const offer = peer.localDescription
             const response = await this._request({ op: "renegotiate", addVideo: true, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)

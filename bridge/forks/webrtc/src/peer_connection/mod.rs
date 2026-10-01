@@ -1036,6 +1036,14 @@ impl PeerConnectionImpl {
             )),
         }
     }
+    /// zenoh-web patch: after a description is applied, every bound track gets its sender's
+    /// negotiated parameters (header extension ids); see `TrackLocal::update_parameters`.
+    async fn refresh_track_parameters(&self) {
+        let transceivers: Vec<_> = self.inner.rtp_transceivers.lock().await.values().cloned().collect();
+        for transceiver in transceivers {
+            transceiver.refresh_track_parameters().await;
+        }
+    }
 }
 
 impl Drop for PeerConnectionImpl {
@@ -1154,6 +1162,7 @@ impl PeerConnection for PeerConnectionImpl {
             let mut core = self.inner.core.lock().await;
             core.set_local_description(self.inner.runtime.now(), desc)?;
         }
+        self.refresh_track_parameters().await;
 
         // Wake the driver with MessageInner::IceGathering. Without this
         // notify the driver would sleep until its previous (possibly 1-day default)
@@ -1201,6 +1210,7 @@ impl PeerConnection for PeerConnectionImpl {
 
             core.set_remote_description(self.inner.runtime.now(), desc)?;
         }
+        self.refresh_track_parameters().await;
         // Wake the driver so it re-polls its timeout. When both local and remote
         // descriptions are set, set_remote_description triggers start_transports
         // internally, which arms the ICE connectivity-check timer. Without this

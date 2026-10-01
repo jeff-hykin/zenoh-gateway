@@ -2,7 +2,7 @@
 // Runs every end-to-end suite (each starts its own peer, bridge and Chrome) and summarizes.
 // Usage: deno run --allow-all test/all.js
 
-const suites = ["e2e.js", "codecs.js", "custom_codec.js", "allocation.js", "latency.js", "abandoned.js", "example.js", "throughput.js"]
+const suites = ["e2e.js", "codecs.js", "custom_codec.js", "allocation.js", "latency.js", "abandoned.js", "example.js", "throughput.js", "video_latency.js"]
 const results = []
 for (const suite of suites) {
     console.log(`\n===== ${suite} =====`)

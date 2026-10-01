@@ -79,7 +79,7 @@ use rtc::media_stream::{
 };
 use rtc::rtp::packetizer::Packetizer;
 use rtc::rtp::sequence::Sequencer;
-use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpEncodingParameters, RtpCodecKind};
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpEncodingParameters, RTCRtpParameters, RtpCodecKind};
 use rtc::rtp_transceiver::{PayloadType, RtpStreamId, SSRC};
 use rtc::shared::error::flatten_errs;
 use rtc::{rtcp, rtp};
@@ -273,6 +273,10 @@ impl TrackLocal for TrackLocalStaticSample {
 
     async fn unbind(&self) {
         self.rtp_track.unbind().await;
+    }
+
+    async fn update_parameters(&self, rtp_parameters: RTCRtpParameters) {
+        self.rtp_track.update_parameters(rtp_parameters).await;
     }
 
     async fn write_rtp(&self, packet: rtp::Packet) -> Result<()> {

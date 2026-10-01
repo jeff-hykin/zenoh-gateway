@@ -415,6 +415,9 @@ their own headless Chrome (never the one on port 9222):
   with delay jitter (`test/shaped_link.js`): at least 2 Mb/s on a ~50 ms ± 20 ms link (it gets
   ~10 Mb/s), and reported for a Wi-Fi-like link (RTT 10-430 ms) and a spiky, lossy one.
   `deno task sctp-baseline` measures Chrome-to-Chrome data channels over the same links, for comparison.
+- `test/video_latency.js` (`deno task e2e:video-latency`): publish -> arrival -> shown for H.264 and
+  `imageTransport: "jpeg"`, frames identified by a send-time stamp the test peer draws into the pixels;
+  H.264 must be shown within 10 ms of arriving (zero playout delay). `--profile jitter50|wifi` shapes it.
 - `test/example.js` (`deno task e2e:example`): the example page served by `--serve examples`, driven
   through its form; checks decoded video frames, drawn points and depth, the raw rate, a control
   re-subscribing, no console errors, and writes `test/artifacts/example.png`. **Needs internet** (esm.sh).

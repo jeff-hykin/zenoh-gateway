@@ -218,6 +218,10 @@ bits per pixel; the encoder's bitrate is that size times the allocated Hz. Keyfr
 frame of every subscription, on PLI/FIR from the browser (`keyframeRequests`), and every 3 s.
 Send-side congestion control: TWCC feedback into GCC (webrtc-rs interceptors), whose target feeds the
 allocator.
+Every RTP packet carries the playout-delay extension with min = max = 0, so Chrome shows each frame
+as soon as it is decoded instead of holding it in its jitter buffer for smooth pacing (the client
+also sets `jitterBufferTarget = 0`). Locally that took receive -> shown from ~22 ms to ~1 ms
+(`test/video_latency.js`); on a jittery link, bursts of frames are shown as they come.
 
 ### JPEG files (`imageTransport: "jpeg"`)
 

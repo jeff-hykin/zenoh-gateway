@@ -100,6 +100,11 @@ pub trait TrackLocal: Track {
     /// Unbinds the track from the peer connection context, cleaning up any resources.
     async fn unbind(&self);
 
+    /// zenoh-web patch: the sender's negotiated RTP parameters, after each applied description.
+    /// `bind` runs when the track is added, before negotiation, so its header extension ids are
+    /// the media engine's guesses; a track that maps extensions by URI must use these instead.
+    async fn update_parameters(&self, _rtp_parameters: RTCRtpParameters) {}
+
     /// Writes an RTP packet to the track.
     ///
     /// The packet passes through the interceptor chain before going out on the wire.

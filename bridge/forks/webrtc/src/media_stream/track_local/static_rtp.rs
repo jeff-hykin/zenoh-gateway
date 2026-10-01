@@ -48,7 +48,7 @@ use rtc::media_stream::{
     MediaStreamId, MediaStreamTrack, MediaStreamTrackId, MediaStreamTrackState,
     MediaTrackCapabilities, MediaTrackConstraints, MediaTrackSettings,
 };
-use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpEncodingParameters, RtpCodecKind};
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpEncodingParameters, RTCRtpParameters, RtpCodecKind};
 use rtc::rtp_transceiver::{RtpStreamId, SSRC};
 use rtc::shared::error::flatten_errs;
 use rtc::shared::marshal::{Marshal, MarshalSize};
@@ -244,6 +244,12 @@ impl TrackLocal for TrackLocalStaticRTP {
     async fn unbind(&self) {
         *self.ctx.lock().await = None;
         *self.evt_rx.lock().await = None;
+    }
+
+    async fn update_parameters(&self, rtp_parameters: RTCRtpParameters) {
+        if let Some(ctx) = &mut *self.ctx.lock().await {
+            ctx.rtp_parameters = rtp_parameters;
+        }
     }
 
     async fn write_rtp(&self, packet: rtp::Packet) -> Result<()> {

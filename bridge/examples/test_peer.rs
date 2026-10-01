@@ -14,6 +14,9 @@
 //!
 //! - `--publish <key>=<file>@<hz>` (repeatable): the file's exact bytes, e.g. a codec fixture
 //! - `--synthetic <key>=<bytes>@<hz>` (repeatable): f64 send time (unix ms) + u32 counter + zeros
+//! - `--stamped-image <key>=<file>:<width>@<hz>` (repeatable): a raw 8-bit RGB image file whose pixels end
+//!   the file (e.g. the dimos rgb8 fixture), its bottom 16 rows overwritten with the send time:
+//!   16 equal blocks, unix ms mod 65536, most significant bit left, white = 1
 //!
 //! `test/big`, `--publish` and `--synthetic` keys only put while someone subscribes.
 //!
@@ -44,6 +47,8 @@ struct Cli {
     publish: Vec<String>,
     #[arg(long)]
     synthetic: Vec<String>,
+    #[arg(long)]
+    stamped_image: Vec<String>,
 }
 
 /// `<key>=<value>@<hz>`
@@ -77,6 +82,20 @@ fn big_payload(counter: u32, length: usize) -> Vec<u8> {
     payload[0..4].copy_from_slice(&counter.to_le_bytes());
     payload[4..8].copy_from_slice(&(length as u32).to_le_bytes());
     payload
+}
+
+/// Paints `stamp` into the bottom 16 rows of the `width`-wide RGB image ending `image`.
+fn stamp_image(image: &mut [u8], width: usize, stamp: u16) {
+    let rows = 16;
+    let start = image.len() - width * rows * 3;
+    for row in 0..rows {
+        for x in 0..width {
+            let bit = 15 - (x * 16 / width);
+            let value = if (stamp >> bit) & 1 == 1 { 255 } else { 0 };
+            let at = start + (row * width + x) * 3;
+            image[at..at + 3].fill(value);
+        }
+    }
 }
 
 fn unix_ms() -> f64 {
@@ -167,6 +186,18 @@ async fn main() -> anyhow::Result<()> {
             payload[0..8].copy_from_slice(&unix_ms().to_le_bytes());
             payload[8..12].copy_from_slice(&counter.to_le_bytes());
             payload
+        })
+        .await?;
+    }
+
+    for spec in &cli.stamped_image {
+        let (key, file, hz) = split_spec(spec)?;
+        let (path, width) = file.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("{spec}: expected <key>=<file>:<width>@<hz>"))?;
+        let (bytes, width) = (std::fs::read(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?, width.parse::<usize>()?);
+        publish_while_matched(&session, key, hz, move |_| {
+            let mut image = bytes.clone();
+            stamp_image(&mut image, width, unix_ms() as u64 as u16);
+            image
         })
         .await?;
     }

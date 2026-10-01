@@ -270,6 +270,16 @@ impl RtpTransceiverImpl {
         }
     }
 
+    /// zenoh-web patch: hands the sender's current (negotiated) parameters to its bound track.
+    pub(crate) async fn refresh_track_parameters(&self) {
+        let sender = self.sender.lock().await.clone();
+        if let Some(sender) = sender
+            && let Ok(params) = sender.get_parameters().await
+        {
+            sender.track().update_parameters(params.rtp_parameters).await;
+        }
+    }
+
     pub(crate) async fn set_receiver(&self, rtp_receiver: Option<Arc<dyn RtpReceiver>>) {
         let mut receiver = self.receiver.lock().await;
         *receiver = rtp_receiver;
