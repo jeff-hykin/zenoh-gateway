@@ -172,8 +172,9 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
 ///   The estimate drops at once by 15% and probing pauses 1 s while the queue drains;
 /// - loss/backpressure: senders blocked on SCTP more than 20% of the interval: 0.9 x measured rate.
 ///
-/// Otherwise, while streams want more, it probes up: 10% per interval below 90% of the level that
-/// last triggered congestion, 2% above it, so overshoot builds queue slowly enough to be caught.
+/// Otherwise, while streams want more, it probes up: 50% per interval until the first congestion
+/// event (slow start), then 10% per interval below 90% of the level that last triggered
+/// congestion and 2% above it, so overshoot builds queue slowly enough to be caught.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Estimator {
@@ -191,6 +192,7 @@ pub const INITIAL_ESTIMATE: f64 = 1_000_000.0;
 const MIN_ESTIMATE: f64 = 16_000.0;
 const MAX_ESTIMATE: f64 = 2e9;
 const CONGESTED_FRACTION: f64 = 0.2;
+const SLOW_START_GAIN: f64 = 1.5;
 const FAST_PROBE_GAIN: f64 = 1.10;
 const SLOW_PROBE_GAIN: f64 = 1.02;
 /// RTT above its recent minimum by this much means a queue is building.
@@ -243,8 +245,14 @@ impl Estimator {
             self.congested_at_bytes_per_sec = self.data_bytes_per_sec;
             self.data_bytes_per_sec = (0.9 * self.sent_bytes_per_sec).max(self.data_bytes_per_sec / 2.0);
         } else if !holding && data_demand > self.data_bytes_per_sec * 0.95 {
-            let near_last_congestion = self.data_bytes_per_sec > 0.9 * self.congested_at_bytes_per_sec;
-            self.data_bytes_per_sec *= if near_last_congestion { SLOW_PROBE_GAIN } else { FAST_PROBE_GAIN };
+            let gain = if self.congested_at_bytes_per_sec.is_infinite() {
+                SLOW_START_GAIN
+            } else if self.data_bytes_per_sec > 0.9 * self.congested_at_bytes_per_sec {
+                SLOW_PROBE_GAIN
+            } else {
+                FAST_PROBE_GAIN
+            };
+            self.data_bytes_per_sec *= gain;
         }
         self.data_bytes_per_sec = self.data_bytes_per_sec.clamp(MIN_ESTIMATE, MAX_ESTIMATE);
     }
@@ -357,13 +365,13 @@ mod tests {
         let now = std::time::Instant::now();
         let mut estimator = Estimator::default();
         estimator.update(sample(now, 0.25, 200_000.0, 0.0, 1, 5e6, Some(3.0)));
-        assert!((estimator.data_bytes_per_sec - 1_100_000.0).abs() < 1.0, "small RTT noise: keeps probing fast");
+        assert!((estimator.data_bytes_per_sec - 1_500_000.0).abs() < 1.0, "small RTT noise: keeps slow-starting");
         estimator.update(sample(now, 0.25, 200_000.0, 0.0, 1, 5e6, Some(25.0)));
-        assert!((estimator.data_bytes_per_sec - 935_000.0).abs() < 1.0, "cut by 15%: {estimator:?}");
+        assert!((estimator.data_bytes_per_sec - 1_275_000.0).abs() < 1.0, "cut by 15%: {estimator:?}");
         assert_eq!(estimator.delay_events, 1);
         estimator.update(sample(now + std::time::Duration::from_millis(250), 0.25, 200_000.0, 0.0, 1, 5e6, Some(25.0)));
-        assert!((estimator.data_bytes_per_sec - 935_000.0).abs() < 1.0, "holds while the queue drains");
+        assert!((estimator.data_bytes_per_sec - 1_275_000.0).abs() < 1.0, "holds while the queue drains");
         estimator.update(sample(now + std::time::Duration::from_millis(1100), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0)));
-        assert!((estimator.data_bytes_per_sec - 1_028_500.0).abs() < 1.0, "then probes again, fast below 90% of the congestion level: {estimator:?}");
+        assert!((estimator.data_bytes_per_sec - 1_402_500.0).abs() < 1.0, "then probes again, 10% below 90% of the congestion level: {estimator:?}");
     }
 }

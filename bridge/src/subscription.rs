@@ -518,6 +518,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     };
     debug!("subscribed {:?} with {:?}", label.key, shared.delivery);
 
+    shared.gate.register(shared.stream_id, dc.clone());
     let sender = match video {
         Some(track) => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), track)),
         None => tokio::spawn(send_loop(dc.clone(), shared.clone())),
@@ -682,7 +683,7 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
-                let gated = shared.gate.wait_bulk_turn(shared.stream_id, frame_len, || async { dc.outstanding_bytes().await.unwrap_or(0) }).await;
+                let gated = shared.gate.wait_bulk_turn(shared.stream_id, frame_len).await;
                 shared.state.lock().unwrap().stats.paced_ms += (wait + gated).as_secs_f64() * 1000.0;
             }
             if let Err(error) = dc.send(frame).await {

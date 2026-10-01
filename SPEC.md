@@ -194,7 +194,8 @@ bridge keeps the path's queues short and lets urgent streams skip what queue rem
   the 1 s control ping: configure `heartbeatHz` for a fast trigger). When the smallest RTT of a 250 ms
   interval is more than 5 ms above the 30 s minimum, a queue is standing on the path: the data
   estimate drops 15% at once and probing pauses 1 s; then it probes up 10% per interval below 90% of
-  the level that caused the queue and 2% above it. No loss is needed to react.
+  the level that caused the queue and 2% above it (before any congestion: 50% per interval, a slow
+  start). No loss is needed to react.
 
 Per frontend, every 250 ms:
 1. **Estimate.** Data channels: a delivery-rate estimator over what the `sub` channels pushed into SCTP

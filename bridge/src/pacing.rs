@@ -7,7 +7,8 @@
 //!   whole-message bursts; chunks are sized to a few milliseconds of the frontend's budget.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use webrtc::data_channel::DataChannel;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -28,6 +29,8 @@ pub struct SendGate {
     strict_busy: AtomicUsize,
     /// bulk bytes outstanding in SCTP, by subscription
     outstanding: Mutex<HashMap<usize, usize>>,
+    /// each bulk subscription's channel, so a waiter can refresh everyone's outstanding bytes
+    channels: Mutex<HashMap<usize, Arc<dyn DataChannel>>>,
     inflight_limit: AtomicUsize,
     chunk_bytes: AtomicUsize,
     changed: Notify,
@@ -38,6 +41,7 @@ impl Default for SendGate {
         SendGate {
             strict_busy: AtomicUsize::new(0),
             outstanding: Mutex::new(HashMap::new()),
+            channels: Mutex::new(HashMap::new()),
             inflight_limit: AtomicUsize::new(usize::MAX),
             chunk_bytes: AtomicUsize::new(MAX_CHUNK_BYTES),
             changed: Notify::new(),
@@ -101,12 +105,30 @@ impl SendGate {
         true
     }
 
-    /// Waits until a bulk chunk of `bytes` may go. `refresh` re-reads this stream's own outstanding bytes.
-    pub async fn wait_bulk_turn<F, Fut>(&self, stream: usize, bytes: usize, mut refresh: F) -> Duration
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = usize>,
-    {
+    pub fn register(&self, stream: usize, channel: Arc<dyn DataChannel>) {
+        self.channels.lock().unwrap().insert(stream, channel);
+    }
+
+    /// Re-reads every bulk channel's outstanding bytes: idle streams don't report on their own,
+    /// and SCTP drains their bytes meanwhile.
+    async fn refresh_all(&self) {
+        let channels: Vec<(usize, Arc<dyn DataChannel>)> = self.channels.lock().unwrap().iter().map(|(id, channel)| (*id, channel.clone())).collect();
+        let mut readings = Vec::with_capacity(channels.len());
+        for (id, channel) in channels {
+            readings.push((id, channel.outstanding_bytes().await.unwrap_or(0)));
+        }
+        let mut outstanding = self.outstanding.lock().unwrap();
+        for (id, bytes) in readings {
+            if bytes == 0 {
+                outstanding.remove(&id);
+            } else {
+                outstanding.insert(id, bytes);
+            }
+        }
+    }
+
+    /// Waits until a bulk chunk of `bytes` from `stream` may go.
+    pub async fn wait_bulk_turn(&self, stream: usize, bytes: usize) -> Duration {
         let started = Instant::now();
         loop {
             let notified = self.changed.notified();
@@ -117,12 +139,12 @@ impl SendGate {
                 _ = notified => {}
                 _ = tokio::time::sleep(GATE_BACKSTOP) => {}
             }
-            let own = refresh().await;
-            self.report_outstanding(stream, own);
+            self.refresh_all().await;
         }
     }
 
     pub fn forget(&self, stream: usize) {
+        self.channels.lock().unwrap().remove(&stream);
         self.report_outstanding(stream, 0);
     }
 }
