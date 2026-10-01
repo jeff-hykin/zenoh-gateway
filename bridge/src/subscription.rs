@@ -2,7 +2,8 @@
 //! into the data channel only while it is not backed up.
 
 use crate::allocator::{Allocation, Demand};
-use crate::codec::{self, Codec, Output};
+use crate::codec::registry::{self, CodecRegistry};
+use crate::codec::{Codec, CodecOutput, CodecSample};
 use crate::frame;
 use crate::options::{Delivery, Label, SubOpts};
 use crate::pacing::{PACING_SLACK, SendGate, TokenBucket};
@@ -14,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
-use zenoh::bytes::ZBytes;
+use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::sample::Sample;
 use zenoh_ext::{AdvancedSubscriberBuilderExt, HistoryConfig};
 
@@ -89,6 +90,7 @@ pub struct SubStats {
 
 pub struct Pending {
     pub payload: ZBytes,
+    pub encoding: Encoding,
     pub timestamp_ms: f64,
     pub seq: u32,
     arrived: Instant,
@@ -159,7 +161,9 @@ pub struct SubShared {
     delivery: Delivery,
     min_interval: Option<Duration>,
     priority_override: Option<u8>,
-    pub codec: Option<Codec>,
+    pub codec: Option<Arc<dyn Codec>>,
+    /// the server's codecs, with the caches that share work across frontends
+    pub codecs: Arc<CodecRegistry>,
     max_hz: Option<f64>,
     min_hz: f64,
     weight: f64,
@@ -192,7 +196,7 @@ fn sample_timestamp_ms(sample: &Sample) -> f64 {
 }
 
 impl SubShared {
-    pub fn new(opts: &SubOpts, gate: Arc<SendGate>, strict_threshold: u8) -> Self {
+    pub fn new(opts: &SubOpts, codec: Option<Arc<dyn Codec>>, codecs: Arc<CodecRegistry>, gate: Arc<SendGate>, strict_threshold: u8) -> Self {
         static NEXT_STREAM: AtomicUsize = AtomicUsize::new(0);
         SubShared {
             gate,
@@ -203,7 +207,8 @@ impl SubShared {
             delivery: opts.delivery(),
             min_interval: opts.min_interval(),
             priority_override: opts.zenoh_priority().map(|p| p as u8),
-            codec: opts.codec().ok().flatten(),
+            codec,
+            codecs,
             max_hz: opts.max_hz,
             min_hz: opts.dangerous_min_hz.unwrap_or(0.0),
             weight: opts.bandwidth_priority.unwrap_or(1.0),
@@ -265,6 +270,11 @@ impl SubShared {
         }
     }
 
+    /// A video codec's subscription (frames go to a video track, not the data channel).
+    pub fn is_video(&self) -> bool {
+        self.codec.as_ref().is_some_and(|codec| codec.output() == CodecOutput::Video)
+    }
+
     pub fn note_video_source(&self, width: u32, height: u32) {
         self.state.lock().unwrap().video_source = Some((width, height));
     }
@@ -285,22 +295,26 @@ impl SubShared {
         state.accounted_bytes_sent = state.stats.bytes_sent;
         state.accounted_blocked_ms = state.stats.blocked_on_network_ms;
         let payload_bytes = state.payload_bytes;
-        let price: crate::allocator::Price = match self.codec {
+        let price: crate::allocator::Price = match &self.codec {
             None => {
                 let message_bytes = if state.message_bytes > 0.0 { state.message_bytes } else { payload_bytes + FRAME_OVERHEAD_BYTES };
                 Box::new(move |_| message_bytes)
             }
-            Some(codec) if codec.output() == Output::Video => {
+            Some(codec) if codec.output() == CodecOutput::Video => {
                 let (width, height) = state.video_source.unwrap_or((640, 480));
-                Box::new(move |quality| codec::video::bytes_per_frame(width, height, quality))
+                Box::new(move |quality| crate::codec::video::bytes_per_frame(width, height, quality))
             }
             Some(codec) => {
+                // measured sizes, scaled between qualities by the codec's own estimate
+                let codec = codec.clone();
+                let payload_len = payload_bytes.round() as usize;
                 let measured: Vec<(f64, f64)> = state.encoded_bytes.iter().map(|(&bucket, &bytes)| (bucket as f64 / 1000.0, bytes)).collect();
                 Box::new(move |quality| {
+                    let estimate = |quality: f64| codec.estimated_bytes(payload_len, quality).max(0.0);
                     let nearest = measured.iter().min_by(|a, b| (a.0 - quality).abs().total_cmp(&(b.0 - quality).abs()));
                     match nearest {
-                        Some(&(measured_quality, bytes)) => bytes * codec.size_prior(quality) / codec.size_prior(measured_quality).max(1e-9),
-                        None => payload_bytes * codec.compression_prior() * codec.size_prior(quality),
+                        Some(&(measured_quality, bytes)) => bytes * estimate(quality) / estimate(measured_quality).max(1e-9),
+                        None => estimate(quality) + FRAME_OVERHEAD_BYTES,
                     }
                 })
             }
@@ -309,12 +323,12 @@ impl SubShared {
             weight: self.weight,
             max_hz,
             min_hz,
-            quality_range: self.codec.map(|_| self.quality_range),
+            quality_range: self.codec.as_ref().map(|_| self.quality_range),
             tradeoff: self.tradeoff,
             price,
             fixed_bytes_per_sec: (self.delivery.reliable || self.is_strict()).then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
         };
-        Usage { demand, bytes_sent, network_blocked_ms, is_video: self.codec.is_some_and(|codec| codec.output() == Output::Video) }
+        Usage { demand, bytes_sent, network_blocked_ms, is_video: self.is_video() }
     }
 
     pub fn apply(&self, allocation: Allocation) {
@@ -342,7 +356,7 @@ impl SubShared {
         let mut state = self.state.lock().unwrap();
         state.stats.codec_errors += 1;
         if state.stats.last_codec_error.as_deref() != Some(error) {
-            warn!("codec {}: {error}", self.codec.map_or("?", |codec| codec.name()));
+            warn!("codec {}: {error}", self.codec.as_ref().map_or("?", |codec| codec.name()));
             state.stats.last_codec_error = Some(error.to_owned());
         }
     }
@@ -380,6 +394,7 @@ impl SubShared {
             let timestamp_ms = sample_timestamp_ms(&sample);
             state.stats.max_receive_lag_ms = state.stats.max_receive_lag_ms.max(now_unix_ms() - timestamp_ms);
             let pending = Pending {
+                encoding: sample.encoding().clone(),
                 timestamp_ms,
                 seq,
                 arrived: Instant::now(),
@@ -615,18 +630,18 @@ impl Body<'_> {
 }
 
 /// Transcodes off the async runtime (shared with other frontends asking for the same encode).
-async fn encode(shared: &SubShared, codec: Codec, key: &str, item: &Pending) -> Option<Arc<Vec<u8>>> {
+async fn encode(shared: &SubShared, codec: Arc<dyn Codec>, key: &str, item: &Pending) -> Option<Arc<Vec<u8>>> {
     let quality = shared.current_quality();
     let payload = item.payload.to_bytes().into_owned();
-    let key = key.to_owned();
+    let (key, encoding, codecs) = (key.to_owned(), item.encoding.clone(), shared.codecs.clone());
     let outcome = tokio::task::spawn_blocking(move || {
-        let hash = codec::payload_hash(&key, &payload);
-        codec::encode_shared(codec, quality, hash, &payload)
+        let sample = CodecSample::new(&key, &payload, &encoding);
+        codecs.encode_shared(&*codec, &sample, registry::sample_hash(&sample), quality)
     })
     .await;
     match outcome {
         Ok((Ok(encoded), reused)) => {
-            shared.record_encode(codec::quality_bucket(quality), quality, encoded.len(), reused);
+            shared.record_encode(registry::quality_bucket(quality), quality, encoded.len(), reused);
             Some(encoded)
         }
         Ok((Err(error), _)) => {
@@ -651,8 +666,8 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             continue;
         };
         // encode on send: only messages the pacing and queues let through get transcoded
-        let body = match shared.codec {
-            Some(codec) => match encode(&shared, codec, &key, &item).await {
+        let body = match &shared.codec {
+            Some(codec) => match encode(&shared, codec.clone(), &key, &item).await {
                 Some(encoded) => Body::Encoded(encoded),
                 None => continue,
             },
@@ -740,7 +755,8 @@ mod tests {
     use super::*;
 
     fn shared(opts: &str) -> SubShared {
-        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Arc::default(), 2)
+        let registry = Arc::new(CodecRegistry::new([]).unwrap());
+        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), None, registry, Arc::default(), 2)
     }
 
     #[test]
@@ -754,7 +770,7 @@ mod tests {
     }
 
     fn pending(seq: u32, priority: u8, arrived: Instant) -> Pending {
-        Pending { payload: ZBytes::from(vec![0u8; 10]), timestamp_ms: 0.0, seq, arrived, priority }
+        Pending { payload: ZBytes::from(vec![0u8; 10]), encoding: Encoding::default(), timestamp_ms: 0.0, seq, arrived, priority }
     }
 
     fn insert(shared: &SubShared, key: &str, item: Pending, cap: Option<usize>) {

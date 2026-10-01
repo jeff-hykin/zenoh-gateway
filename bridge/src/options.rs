@@ -1,8 +1,10 @@
 //! Data channel labels: `{"type":"sub"|"pub"|"heartbeat", "key":..., "id":..., "opts":{...}}`.
 
-use crate::codec::{Codec, Output};
+use crate::codec::registry::CodecRegistry;
+use crate::codec::{Codec, CodecOutput};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,17 +134,18 @@ impl SubOpts {
         if self.min_quality.unwrap_or(0.0) > self.max_quality.unwrap_or(1.0) {
             return Err("minQuality must be <= maxQuality".into());
         }
-        if let Some(codec) = self.codec()?
-            && codec.output() == Output::Video
-            && self.delivery == DeliveryKind::Reliable
-        {
-            return Err(format!("{} is a video codec: frames go over a lossy video track, use delivery \"latest\"", codec.name()));
-        }
         Ok(())
     }
 
-    pub fn codec(&self) -> Result<Option<Codec>, String> {
-        self.codec.as_deref().map(Codec::parse).transpose()
+    /// The subscription's codec from `registry` (None = raw); unknown names and video codecs on
+    /// reliable delivery are refused.
+    pub fn resolve_codec(&self, registry: &CodecRegistry) -> Result<Option<Arc<dyn Codec>>, String> {
+        let Some(name) = self.codec.as_deref() else { return Ok(None) };
+        let codec = registry.get(name)?;
+        if codec.output() == CodecOutput::Video && self.delivery == DeliveryKind::Reliable {
+            return Err(format!("{name} is a video codec: frames go over a lossy video track, use delivery \"latest\""));
+        }
+        Ok(Some(codec))
     }
 
     pub fn quality_range(&self) -> (f64, f64) {
@@ -248,9 +251,12 @@ mod tests {
         assert!(sub(r#"{"minQuality":0.8,"maxQuality":0.2}"#).is_err());
         assert!(sub(r#"{"qualityToHzTradeoff":2}"#).is_err());
         assert!(sub(r#"{"maxHz":5,"dangerousMinHz":10}"#).is_err());
-        assert!(sub(r#"{"codec":"ros2-jpeg"}"#).unwrap_err().contains("unknown codec"));
-        assert!(sub(r#"{"codec":"ros2-image","delivery":"reliable"}"#).is_err(), "video is lossy");
-        assert!(sub(r#"{"codec":"dimos-depth","delivery":"reliable"}"#).is_ok());
+        let registry = CodecRegistry::new([]).unwrap();
+        let resolve = |opts: &str| sub(opts).unwrap().resolve_codec(&registry).map(|codec| codec.map(|codec| codec.name().to_owned()));
+        assert!(resolve(r#"{"codec":"ros2-jpeg"}"#).unwrap_err().contains("unknown codec"));
+        assert!(resolve(r#"{"codec":"ros2-image","delivery":"reliable"}"#).unwrap_err().contains("video codec"), "video is lossy");
+        assert_eq!(resolve(r#"{"codec":"dimos-depth","delivery":"reliable"}"#).unwrap().as_deref(), Some("dimos-depth"));
+        assert_eq!(resolve(r#"{}"#).unwrap(), None);
         let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"dangerousMinHz":1,"minQuality":0.3,"maxQuality":0.9,"qualityToHzTradeoff":0.7}"#).unwrap();
         assert_eq!(full.normalized()["bandwidthPriority"], 2.0);
         assert_eq!(full.min_interval(), Some(Duration::from_millis(50)));

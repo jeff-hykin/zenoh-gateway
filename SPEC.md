@@ -7,18 +7,18 @@ A browser UI that views and drives a zenoh system over a squeezed network, witho
 ```
 zenoh peers (publishers we don't control)
         │  zenoh
-   zenoh-web bridge (Rust, one process)
+   zenoh-web bridge (Rust: the zenoh-web command, or a library inside another application)
         │  WebRTC data channels (UDP) + one HTTP endpoint for signaling
    browser page (plain JS client, live-editable)
 ```
 
 The bridge is a dumb pipe: one data channel ↔ one zenoh key expression. It never parses payloads,
-except when a subscription explicitly picks one of the hardcoded codecs (see "Codecs").
+except when a subscription explicitly picks one of its codecs (see "Codecs").
 
 ## JS API
 
 ```js
-import { connect, Priority } from "./zenoh_web.ts"   // via esm.sh, or bundled: see "Client"
+import { connect, Priority, registerCodec } from "./zenoh_web.ts"   // via esm.sh, or bundled: see "Client"
 
 const z = await connect("http://robot.local:7448", {
     heartbeatHz: 5,         // 0 (default) = no heartbeat; needed for deadmen
@@ -37,8 +37,8 @@ const sub = z.subscribe("camera/**", {
     minQuality: 0.3,             // 0-1, transcoded streams only
     maxQuality: 1.0,
     qualityToHzTradeoff: 0.7,    // 0 = keep quality, drop hz; 1 = keep hz, drop quality
-    codec: "ros2-image",         // optional transcoder, see "Codecs"; unknown names throw
-}, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.depth, msg.points, msg.video, msg.mediaStream })
+    codec: "ros2-image",         // optional transcoder, see "Codecs"; names not in z.codecs throw
+}, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.depth, msg.points, msg.decoded, msg.video, msg.mediaStream })
 sub.mediaStream  // video codecs: a MediaStream for a <video> element
 sub.close()
 
@@ -51,7 +51,7 @@ const cmd = z.publisher("cmd_vel", {
 cmd.put(bytes)                    // or cmd.put(bytes, { timestamp: z.now() - delay })
 await cmd.setDeadman(stopBytes)   // throws if connect() had no heartbeat
 await cmd.clearDeadman()
-cmd.state                         // "connecting" | "open" | "tripped" | "closed"
+cmd.state                         // "connecting" | "open" | "tripped" | "rejected" | "closed"
 cmd.onTripped((reason) => {})     // "heartbeat" | "disconnected" | "shutdown"
 cmd.close()
 
@@ -66,6 +66,9 @@ z.bridgeStats.bandwidth  // this frontend's estimate, cap, budget, demand (see "
 z.clockOffsetMs  // bridge clock - browser clock
 z.rttMs
 z.onState(fn)    // "connecting" | "connected" | "degraded" | "lost"
+z.codecs         // [{ name, output: "video" | "data" }]: the bridge's codecs, fetched on connect
+
+registerCodec("text-uppercase", (bytes, msg) => new TextDecoder().decode(bytes))  // browser side of a data codec: msg.decoded
 ```
 
 - `Priority` mirrors zenoh / zenoh-ts: REAL_TIME=1, INTERACTIVE_HIGH=2, INTERACTIVE_LOW=3, DATA_HIGH=4, DATA=5, DATA_LOW=6, BACKGROUND=7 (lower = more important).
@@ -106,6 +109,24 @@ esm.sh pinned to a commit, so `zenoh-web --serve examples` serves it at `/` (dir
 `index.html`); `?client=<url>` swaps in another copy of the client (e.g. `/client/zenoh_web.js` from a
 `--serve build` root) and `?bridge=<url>` another bridge.
 
+## Server (Rust library)
+
+The bridge is the `zenoh-web` crate: a library plus the `zenoh-web` command, a thin wrapper over it
+(same flags). `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`,
+repeatable `connect`) or an existing `session` (never closed by the server; its admin space must be
+readable for `listTopics`' routing-table sources), `serve_dir`, `max_bandwidth_bytes_per_sec`,
+`bandwidth_target_fraction`, `strict_priority` and external `codec`s; `build().await` validates them
+and opens the session. Then `bind(addr)` serves on a background task (`RunningServer::local_addr`,
+`shutdown()`), `serve(addr)` / `serve_with_shutdown(addr, signal)` serve in place, or `router()` returns
+the axum routes (`POST /offer`, static files) for the host's own HTTP server. Shutdown fires every
+frontend's deadmen (reason `"shutdown"`), closes the browser connections, then the session if the
+server opened it.
+
+The webrtc-rs fixes the bridge relies on (see "Delivery → transport mapping", "Large messages") are
+in renamed forks under `bridge/forks/` (`zenoh-web-webrtc` → `zenoh-web-rtc` →
+`zenoh-web-rtc-datachannel`, `zenoh-web-rtc-sctp`), which zenoh-web depends on directly, so crates that
+depend on zenoh-web build the fixed code; a `[patch.crates-io]` would only apply in zenoh-web's own workspace.
+
 ## Large messages
 
 Any size: the bridge splits a message into 64 KiB chunks (one frame each, sharing the message's `seq`)
@@ -118,13 +139,33 @@ one completes or more than 8 are pending (`partialDropped`).
 
 ## Codecs
 
-Picked explicitly per subscription with `codec`. The name is `<protocol>-<input type>`; the input
-type decides the output. No `codec` = raw passthrough (Hz is the only degradation). An unknown name
-throws in the client and is refused by the bridge (`rejected` event). There is no auto-detection.
+Picked explicitly per subscription with `codec`. No `codec` = raw passthrough (Hz is the only
+degradation). There is no auto-detection. The bridge has a registry of codecs by name: the built-in
+ones below, plus any an application embedding the bridge as a Rust library registered
+(`ServerBuilder::codec`; a name registered twice fails the build). The client fetches the registry
+on connect (`control` op `codecs` → `{codecs: [{name, output}]}`, as `z.codecs`); an unknown name
+throws in the client and is refused by the bridge (`rejected` event), both listing the known names.
+
+Every codec, built-in or not, implements the same Rust trait (`zenoh_web::Codec`):
+
+- `name()`, and `output()`: **video** or **data**.
+- `decode(sample)`: the sample's key, payload and zenoh encoding → a decoded frame. A video codec's
+  frame is a picture (packed RGB8 or planar I420, any size).
+- data codecs: `encode(frame, quality)` → the bytes sent on the data channel (quality 0..1, from the
+  allocator). The page decodes them with the decoder registered for that name
+  (`registerCodec(name, decoder)` → `msg.decoded`); without one it gets `msg.bytes` (and a warning).
+- video codecs: the bridge scales the picture to the allocated quality, encodes H.264 and sends it on
+  the subscription's video track (see "Video"); the page needs no codec code. They require
+  `delivery: "latest"`.
+- `estimated_bytes(payloadBytes, quality)`: optional cost model for data codecs (bytes per message),
+  the allocator's prior until sizes are measured and its shape between measured qualities (default:
+  10–100 % of the payload, linear in quality). Video is priced by the bridge's own model.
+
+The built-in codecs are named `<protocol>-<input type>`; the input type decides the output:
 
 | codec | input message | output |
 |---|---|---|
-| `ros2-image`, `dimos-image` | `sensor_msgs/Image`: rgb8, bgr8, rgba8, bgra8, mono8, mono16/16UC1 (top 8 bits), or `jpeg`/`png` data in an Image (dimos `lcm_jpeg_encode`) | H.264 video track |
+| `ros2-image`, `dimos-image` | `sensor_msgs/Image`: rgb8, bgr8, rgba8, bgra8, mono8, mono16/16UC1 (top 8 bits), or `jpeg`/`png` data in an Image (dimos' jpeg-encoded Image) | H.264 video track |
 | `ros2-compressed-image`, `dimos-compressed-image` | `sensor_msgs/CompressedImage`: jpeg, png, webp, jxl (magic bytes first, `format` string second) | H.264 video track |
 | `ros2-depth`, `dimos-depth` | `sensor_msgs/Image`: 16UC1, 32FC1, mono16 | lossless depth, data channel |
 | `ros2-compressed-depth`, `dimos-compressed-depth` | `sensor_msgs/CompressedImage`: 16-bit gray png or jxl, ROS `compressedDepth` png (12-byte header skipped; its quantized 32FC1 form is refused) | lossless depth, data channel |
@@ -133,18 +174,19 @@ throws in the client and is refused by the bridge (`rejected` event). There is n
 Inputs:
 - ROS 2 over rmw_zenoh: key `<domain>/<topic>/<pkg>::msg::dds_::<Type>_/RIHS01_<hash>`, payload CDR with
   the 4-byte encapsulation header (little or big endian honored).
-- dimos over zenoh: key `<topic>/<msg_name>` (e.g. `dimos/camera/color/sensor_msgs.Image`), payload LCM
-  (big endian) with the 8-byte type fingerprint, which the bridge checks (a wrong type is an error, counted
-  in `codecErrors` / `lastCodecError` stats).
+- dimos over zenoh: key `<topic>/<msg_name>` (e.g. `dimos/camera/color/sensor_msgs.Image`), payload in
+  the dimos message format (big endian) with its 8-byte type fingerprint, which the bridge checks (a
+  wrong type is an error, counted in `codecErrors` / `lastCodecError` stats).
 - mono16 is ambiguous (IR intensity or depth-like); the subscriber decides: `*-image` shows its top
   8 bits as gray video, `*-depth` delivers it losslessly with encoding `mono16`.
 - Decoders are pure Rust (zune-jpeg, png, image-webp, jxl-oxide); H.264 is openh264, compression zstd.
 
 Work happens lazily and on send: only messages the pacing/queues let through are transcoded, on
-tokio's blocking pool. Data-channel encodes are shared across frontends through a small cache keyed by
-(codec, quality, payload hash): identical requests compute once (`encodes` vs `sharedEncodes` in
-stats). For video only the decode to RGB is shared; each (frontend, subscription) has its own H.264
-encoder, because rate control and reference frames are per receiver.
+tokio's blocking pool. Work is shared across frontends through two small caches per bridge: decoded
+frames keyed by (codec, key + payload hash), and data-channel encodes keyed by (codec, quality in
+1/1000 steps, key + payload hash). Identical requests compute once (`encodes` vs `sharedEncodes` in
+stats: data codecs count shared encodes, video codecs shared decodes). Each (frontend, subscription)
+has its own H.264 encoder, because rate control and reference frames are per receiver.
 
 ### Video
 
@@ -219,8 +261,9 @@ Per frontend, every 250 ms:
    if set, target fraction × (data estimate + video estimate)).
 2. **Demand.** Each subscription wants `price(maxQuality) × Hz`, Hz being each key's measured source
    rate capped by `maxHz`, summed over its keys. Price = bytes per message: measured for raw streams
-   and data-channel codecs (per quality, scaled by a size prior between measured qualities), modeled
-   for video (resolution × bits per pixel). Floor = `price(minQuality) × dangerousMinHz` (per key,
+   and data-channel codecs (per quality, scaled by the codec's `estimated_bytes` between measured
+   qualities, which is also the prior before anything was measured), modeled for video (resolution ×
+   bits per pixel). Floor = `price(minQuality) × dangerousMinHz` (per key,
    never above the key's rate). Strict-priority and reliable streams are reserved at their measured
    rate instead.
 3. **Shrink.** If demand exceeds the budget, streams shrink like CSS flex items: the deficit is split in
@@ -285,7 +328,8 @@ resolving so the bridge has an offset before the first put.
   `heartbeatHz` beats; every beat is also a clock-sync ping.
 - `publisher.setDeadman(bytes)` stores (at most) one deadman per publisher stream per frontend on the bridge.
 - When that frontend's heartbeat misses `heartbeatMisses` beats, when it disconnects (control channel
-  closes, connection fails, or stays disconnected 15 s), or when the bridge gets SIGINT/SIGTERM, the
+  closes, connection fails, or stays disconnected 15 s), or when the bridge shuts down (SIGINT/SIGTERM,
+  or the embedding application's `shutdown()`), the
   bridge publishes every armed deadman of that frontend **once**, at REAL_TIME with CongestionControl
   Block (reliable), before anything else on that stream.
 - No re-arm: the stream is then *tripped*. The bridge rejects further puts on it (counted as
@@ -297,11 +341,12 @@ resolving so the bridge has an offset before the first put.
 ## Wire format
 
 - Signaling: `POST /offer` with the browser's SDP offer (non-trickle), returns the answer.
-- The bridge can also serve a static directory (`--serve <dir>`) so the UI is live-editable on disk.
+- The bridge can also serve a static directory (`--serve <dir>`, `ServerBuilder::serve_dir`) so the UI is live-editable on disk.
 - Each subscribe/publisher is its own data channel. Its label is JSON: `{"type":"sub"|"pub", "key":..., "id":n, "opts":{...}}`.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.
-- One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`, `setDeadman`, `clearDeadman`)
-  and events: `accepted` / `rejected` (per sub/pub channel, by label id) and `tripped`.
+- One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
+  `codecs`, `configure`, `renegotiate`, `setDeadman`, `clearDeadman`) and events: `accepted` / `rejected`
+  (per sub/pub channel, by label id) and `tripped`.
 - Bridge → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | chunk`,
   little endian. `seq` numbers messages per channel, `frameId` numbers frames; the page acks the highest
   `frameId` it has processed with a 4-byte `u32` message on the same channel.
@@ -324,7 +369,10 @@ resolving so the bridge has an offset before the first put.
 
 1. Bridge pipe + JS client: subscribe (with history), publisher, get, delivery queues (queueSize, maxAge),
    maxHz cap, stats, clock sync, latencyLimit, heartbeat + deadman.
-2. Done: bandwidth allocation and the hardcoded codecs above. Transcoding runs inside the bridge's
-   subscription (so only while a browser subscribes), not on separate zenoh keys; encodes are shared
-   through an in-process cache instead.
-3. Later: WASM degrade functions shipped from the frontend.
+2. Done: bandwidth allocation and the built-in codecs above. Transcoding runs inside the bridge's
+   subscription (so only while a browser subscribes), not on separate zenoh keys; decodes and encodes
+   are shared through in-process caches instead.
+3. Done: the bridge as a Rust library (builder, existing zenoh session, graceful shutdown that fires
+   deadmen) with external codecs in Rust through the same `Codec` trait as the built-ins, and
+   `registerCodec` for their browser decoders.
+4. Later: WASM degrade functions shipped from the frontend.

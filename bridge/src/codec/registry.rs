@@ -1,0 +1,178 @@
+//! The server's codecs by name, and the caches that share decodes and encodes across frontends.
+
+use super::{Codec, CodecOutput, CodecSample, DecodedFrame, builtin};
+use anyhow::{Result, bail};
+use std::collections::{BTreeMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Encoded results kept for sharing (they are small).
+const ENCODED_CAPACITY: usize = 64;
+/// Decoded frames kept for sharing; they are large (6 MB for a 1080p picture), so few.
+const DECODED_CAPACITY: usize = 8;
+
+type Shared<T> = Arc<OnceLock<Result<Arc<T>, String>>>;
+
+/// A tiny FIFO of in-flight or finished results. Concurrent callers for the same key block on
+/// one `OnceLock`, so each key is computed once while it stays cached.
+struct WorkCache<K, T> {
+    capacity: usize,
+    entries: Mutex<VecDeque<(K, Shared<T>)>>,
+}
+
+impl<K: PartialEq, T> WorkCache<K, T> {
+    fn new(capacity: usize) -> Self {
+        WorkCache { capacity, entries: Mutex::new(VecDeque::new()) }
+    }
+
+    /// Runs `compute` unless someone already did (or is doing) it; `true` = shared result.
+    fn get_or_compute(&self, key: K, compute: impl FnOnce() -> Result<T, String>) -> (Result<Arc<T>, String>, bool) {
+        let (cell, shared) = {
+            let mut entries = self.entries.lock().unwrap();
+            match entries.iter().find(|(existing, _)| *existing == key) {
+                Some((_, cell)) => (cell.clone(), true),
+                None => {
+                    let cell: Shared<T> = Arc::default();
+                    entries.push_back((key, cell.clone()));
+                    while entries.len() > self.capacity {
+                        entries.pop_front();
+                    }
+                    (cell, false)
+                }
+            }
+        };
+        let mut computed_here = false;
+        let result = cell.get_or_init(|| {
+            computed_here = true;
+            compute().map(Arc::new)
+        });
+        (result.clone(), shared && !computed_here)
+    }
+}
+
+/// Identity of a sample, for sharing work across frontends.
+pub fn sample_hash(sample: &CodecSample<'_>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sample.key.hash(&mut hasher);
+    sample.payload.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Quality as a cache-key bucket (1/1000 steps; the allocator picks from 0.1 steps and the bounds).
+pub fn quality_bucket(quality: f64) -> u16 {
+    (quality.clamp(0.0, 1.0) * 1000.0).round() as u16
+}
+
+/// Name → codec, built-ins first, plus the decode/encode caches.
+pub struct CodecRegistry {
+    codecs: BTreeMap<String, Arc<dyn Codec>>,
+    decoded: WorkCache<(String, u64), DecodedFrame>,
+    encoded: WorkCache<(String, u16, u64), Vec<u8>>,
+}
+
+impl CodecRegistry {
+    /// The built-in codecs plus `extra`; a name registered twice is an error.
+    pub fn new(extra: impl IntoIterator<Item = Arc<dyn Codec>>) -> Result<Self> {
+        let mut codecs: BTreeMap<String, Arc<dyn Codec>> = BTreeMap::new();
+        for codec in builtin::all().into_iter().chain(extra) {
+            let name = codec.name().to_owned();
+            if name.is_empty() {
+                bail!("a codec's name must not be empty");
+            }
+            if codecs.insert(name.clone(), codec).is_some() {
+                bail!("codec {name:?} is registered twice (built-in codecs: {})", builtin::all().iter().map(|codec| codec.name().to_owned()).collect::<Vec<_>>().join(", "));
+            }
+        }
+        Ok(CodecRegistry { codecs, decoded: WorkCache::new(DECODED_CAPACITY), encoded: WorkCache::new(ENCODED_CAPACITY) })
+    }
+
+    /// The codec called `name`, or the error a subscription is rejected with.
+    pub fn get(&self, name: &str) -> Result<Arc<dyn Codec>, String> {
+        self.codecs.get(name).cloned().ok_or_else(|| format!("unknown codec {name:?} (known: {})", self.codecs.keys().cloned().collect::<Vec<_>>().join(", ")))
+    }
+
+    /// Every codec's (name, output), sorted by name.
+    pub fn list(&self) -> impl Iterator<Item = (&str, CodecOutput)> {
+        self.codecs.iter().map(|(name, codec)| (name.as_str(), codec.output()))
+    }
+
+    /// Blocking: decodes `sample` (or reuses another frontend's decode of it). `true` = reused.
+    pub fn decode_shared(&self, codec: &dyn Codec, sample: &CodecSample<'_>, hash: u64) -> (Result<Arc<DecodedFrame>, String>, bool) {
+        self.decoded.get_or_compute((codec.name().to_owned(), hash), || {
+            let frame = codec.decode(sample).map_err(|error| format!("{error:#}"))?;
+            match (codec.output(), &frame) {
+                (CodecOutput::Video, DecodedFrame::Data(_)) => Err(format!("video codec {:?} decoded to a data frame (expected DecodedFrame::Video)", codec.name())),
+                _ => Ok(frame),
+            }
+        })
+    }
+
+    /// Blocking: a data codec's bytes for `sample` at `quality` (or another frontend's identical
+    /// encode). `true` = reused.
+    pub fn encode_shared(&self, codec: &dyn Codec, sample: &CodecSample<'_>, hash: u64, quality: f64) -> (Result<Arc<Vec<u8>>, String>, bool) {
+        self.encoded.get_or_compute((codec.name().to_owned(), quality_bucket(quality), hash), || {
+            let (frame, _) = self.decode_shared(codec, sample, hash);
+            codec.encode(&*frame?, quality).map_err(|error| format!("{error:#}"))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Named(&'static str);
+
+    impl Codec for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn output(&self) -> CodecOutput {
+            CodecOutput::Data
+        }
+
+        fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame> {
+            Ok(DecodedFrame::data(sample.payload.to_vec()))
+        }
+    }
+
+    #[test]
+    fn builtins_registered_unknown_and_duplicate_fail() {
+        let registry = CodecRegistry::new([Arc::new(Named("custom")) as Arc<dyn Codec>]).unwrap();
+        for name in ["ros2-image", "dimos-pointcloud2", "custom"] {
+            assert_eq!(registry.get(name).unwrap().name(), name);
+        }
+        let error = registry.get("ros2-jpeg").err().unwrap();
+        assert!(error.contains("unknown codec") && error.contains("dimos-pointcloud2") && error.contains("custom"), "{error}");
+        let duplicate = CodecRegistry::new([Arc::new(Named("ros2-depth")) as Arc<dyn Codec>]).err().unwrap();
+        assert!(duplicate.to_string().contains("registered twice"), "{duplicate}");
+        assert!(CodecRegistry::new([Arc::new(Named("")) as Arc<dyn Codec>]).is_err());
+    }
+
+    #[test]
+    fn cache_computes_once() {
+        let cache: WorkCache<u32, u32> = WorkCache::new(2);
+        let (first, shared) = cache.get_or_compute(1, || Ok(10));
+        assert_eq!((*first.unwrap(), shared), (10, false));
+        let (again, shared) = cache.get_or_compute(1, || panic!("must not recompute"));
+        assert_eq!((*again.unwrap(), shared), (10, true));
+        let _ = cache.get_or_compute(2, || Ok(20));
+        let _ = cache.get_or_compute(3, || Ok(30));
+        let (evicted, shared) = cache.get_or_compute(1, || Ok(11));
+        assert_eq!((*evicted.unwrap(), shared), (11, false), "oldest entry evicted at capacity");
+    }
+
+    #[test]
+    fn default_encode_errors_and_encodes_share_decodes() {
+        let registry = CodecRegistry::new([Arc::new(Named("custom")) as Arc<dyn Codec>]).unwrap();
+        let codec = registry.get("custom").unwrap();
+        let encoding = zenoh::bytes::Encoding::default();
+        let sample = CodecSample::new("a/b", b"xyz", &encoding);
+        let hash = sample_hash(&sample);
+        let (encoded, _) = registry.encode_shared(&*codec, &sample, hash, 1.0);
+        assert!(encoded.unwrap_err().contains("no data-channel encoder"));
+        let (_, reused) = registry.decode_shared(&*codec, &sample, hash);
+        assert!(reused, "the encode attempt's decode is cached");
+    }
+}

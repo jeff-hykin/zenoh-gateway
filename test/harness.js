@@ -113,19 +113,20 @@ export function loadManifest() {
 export function fixtureKey(entry) {
     const stem = entry.file.split("/").pop()?.replace(/\.[^.]+$/, "")
     const parts = entry.zenoh_key.split("/")
-    if (entry.protocol === "dimos-lcm") {
+    if (entry.protocol === "dimos") {
         return `dimos/fixture/${stem}/${parts.at(-1)}`
     }
     return `${parts[0]}/fixture/${stem}/${parts.at(-2)}/${parts.at(-1)}`
 }
 
 /**
- * Builds the bridge + test peer (release) and the web root.
+ * Builds the bridge + test peer (+ `examples`, release) and the web root.
  * @param {import("https://esm.sh/dax-sh@0.42.0").Path} scratch
+ * @param {string[]} examples
  */
-export async function buildAll(scratch) {
-    $.logStep("building bridge + test peer (release)")
-    await $`cargo build --release --bin zenoh-web --example test_peer`.cwd(bridgeDir)
+export async function buildAll(scratch, examples = []) {
+    $.logStep(`building bridge + test peer${examples.map((example) => ` + ${example}`).join("")} (release)`)
+    await $`cargo build --release --bin zenoh-web --example test_peer ${examples.flatMap((example) => ["--example", example])}`.cwd(bridgeDir)
     $.logStep("building the web root")
     return await buildWeb(scratch.join("web").toString())
 }
@@ -149,17 +150,19 @@ export async function startPeer(extraArgs) {
 }
 
 /**
+ * Starts the bridge (or another binary taking the same --port/--zenoh-config/--connect/--serve flags).
  * @param {import("https://esm.sh/dax-sh@0.42.0").Path} scratch
  * @param {number} zenohPort
  * @param {import("https://esm.sh/dax-sh@0.42.0").Path} webRoot
  * @param {string[]} extraArgs
+ * @param {string} binary
  */
-export async function startBridge(scratch, zenohPort, webRoot, extraArgs = []) {
+export async function startBridge(scratch, zenohPort, webRoot, extraArgs = [], binary = bridgeDir.join("target/release/zenoh-web").toString()) {
     const httpPort = freePort()
     const configPath = scratch.join(`bridge_zenoh_${httpPort}.json5`)
     // isolated zenoh: no multicast scouting, so the test never touches other zenoh systems
     configPath.writeTextSync(JSON.stringify({ mode: "peer", scouting: { multicast: { enabled: false } }, listen: { endpoints: [] } }))
-    const bridge = $`${bridgeDir.join("target/release/zenoh-web")} --port ${httpPort} --zenoh-config ${configPath} --connect tcp/127.0.0.1:${zenohPort} --serve ${webRoot} ${extraArgs}`
+    const bridge = $`${binary} --port ${httpPort} --zenoh-config ${configPath} --connect tcp/127.0.0.1:${zenohPort} --serve ${webRoot} ${extraArgs}`
         .env("RUST_LOG", Deno.env.get("RUST_LOG") ?? "info,zenoh=warn,zenoh_web=info")
         .stdout("inherit").stderr("piped").noThrow().spawn()
     children.push(bridge)

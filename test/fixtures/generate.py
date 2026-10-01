@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate every fixture: dimos LCM payloads (dimos venv), then ROS 2 CDR payloads (rosbags env), then manifest.json.
+"""Regenerate every fixture: dimos message-format payloads (dimos venv), then ROS 2 CDR payloads (rosbags env), then manifest.json.
 
 Usage: python3 generate.py [--dimos-python PATH] [--ros-python PATH]
   --dimos-python  default ~/repos/dimos/.venv/bin/python
@@ -42,7 +42,7 @@ manifest = {
         "stamp": {"sec": 1700000000, "nanosec": 500000000},
     },
     "key_formats": {
-        "dimos-lcm": "<topic>/<msg_name>  (dimos ZenohPubSub Topic.key_expr), payload = LCM encoding incl. 8-byte fingerprint",
+        "dimos": "<topic>/<msg_name>  (dimos ZenohPubSub Topic.key_expr), payload = the dimos message format incl. its 8-byte type fingerprint",
         "ros2-cdr": "<domain_id>/<topic>/<pkg>::msg::dds_::<Type>_/RIHS01_<sha256> (rmw_zenoh); payload = CDR with 4-byte encapsulation header. rmw_zenoh also sends a zenoh attachment (seq, timestamp, gid) not stored here",
     },
     "rihs01_jazzy": ros["rihs01"],

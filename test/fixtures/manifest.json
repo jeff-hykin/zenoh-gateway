@@ -13,7 +13,7 @@
     }
   },
   "key_formats": {
-    "dimos-lcm": "<topic>/<msg_name>  (dimos ZenohPubSub Topic.key_expr), payload = LCM encoding incl. 8-byte fingerprint",
+    "dimos": "<topic>/<msg_name>  (dimos ZenohPubSub Topic.key_expr), payload = the dimos message format incl. its 8-byte type fingerprint",
     "ros2-cdr": "<domain_id>/<topic>/<pkg>::msg::dds_::<Type>_/RIHS01_<sha256> (rmw_zenoh); payload = CDR with 4-byte encapsulation header. rmw_zenoh also sends a zenoh attachment (seq, timestamp, gid) not stored here"
   },
   "rihs01_jazzy": {
@@ -24,8 +24,8 @@
   "rihs01_source": "computed by rosbags Typestore(ROS2_JAZZY).hash_rihs01 (std_msgs/String matches the known Jazzy hash df668c74...)",
   "entries": [
     {
-      "file": "dimos/image_rgb8.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/image_rgb8.bin",
+      "protocol": "dimos",
       "bytes": 230477,
       "format": "raw",
       "msg_type": "sensor_msgs.Image",
@@ -76,8 +76,8 @@
       }
     },
     {
-      "file": "dimos/image_bgr8.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/image_bgr8.bin",
+      "protocol": "dimos",
       "bytes": 230477,
       "format": "raw",
       "msg_type": "sensor_msgs.Image",
@@ -128,8 +128,8 @@
       }
     },
     {
-      "file": "dimos/image_mono8.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/image_mono8.bin",
+      "protocol": "dimos",
       "bytes": 76878,
       "format": "raw",
       "msg_type": "sensor_msgs.Image",
@@ -154,8 +154,8 @@
       }
     },
     {
-      "file": "dimos/image_mono16.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/image_mono16.bin",
+      "protocol": "dimos",
       "bytes": 153679,
       "format": "raw",
       "msg_type": "sensor_msgs.Image",
@@ -180,8 +180,8 @@
       }
     },
     {
-      "file": "dimos/depth_16UC1.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/depth_16UC1.bin",
+      "protocol": "dimos",
       "bytes": 153678,
       "format": "raw",
       "msg_type": "sensor_msgs.Image",
@@ -235,8 +235,8 @@
       }
     },
     {
-      "file": "dimos/depth_32FC1.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/depth_32FC1.bin",
+      "protocol": "dimos",
       "bytes": 307278,
       "format": "raw",
       "msg_type": "sensor_msgs.Image",
@@ -290,8 +290,8 @@
       }
     },
     {
-      "file": "dimos/image_jpeg_in_Image.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/image_jpeg_in_Image.bin",
+      "protocol": "dimos",
       "bytes": 2534,
       "format": "jpeg",
       "msg_type": "sensor_msgs.Image",
@@ -357,8 +357,8 @@
       }
     },
     {
-      "file": "dimos/compressed_jpeg.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/compressed_jpeg.bin",
+      "protocol": "dimos",
       "bytes": 2521,
       "format": "jpeg",
       "msg_type": "sensor_msgs.CompressedImage",
@@ -423,8 +423,8 @@
       }
     },
     {
-      "file": "dimos/compressed_png.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/compressed_png.bin",
+      "protocol": "dimos",
       "bytes": 1372,
       "format": "png",
       "msg_type": "sensor_msgs.CompressedImage",
@@ -489,8 +489,8 @@
       }
     },
     {
-      "file": "dimos/compressed_jxl.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/compressed_jxl.bin",
+      "protocol": "dimos",
       "bytes": 322,
       "format": "jxl",
       "msg_type": "sensor_msgs.CompressedImage",
@@ -555,8 +555,8 @@
       }
     },
     {
-      "file": "dimos/compressed_webp.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/compressed_webp.bin",
+      "protocol": "dimos",
       "bytes": 142,
       "format": "webp",
       "msg_type": "sensor_msgs.CompressedImage",
@@ -621,8 +621,8 @@
       }
     },
     {
-      "file": "dimos/compressed_jxl_depth16.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/compressed_jxl_depth16.bin",
+      "protocol": "dimos",
       "bytes": 19747,
       "format": "jxl",
       "msg_type": "sensor_msgs.CompressedImage",
@@ -673,8 +673,8 @@
       }
     },
     {
-      "file": "dimos/pointcloud_xyzi.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/pointcloud_xyzi.bin",
+      "protocol": "dimos",
       "bytes": 320124,
       "format": "pointcloud",
       "msg_type": "sensor_msgs.PointCloud2",
@@ -775,8 +775,8 @@
       }
     },
     {
-      "file": "dimos/pointcloud_xyz.lcm",
-      "protocol": "dimos-lcm",
+      "file": "dimos/pointcloud_xyz.bin",
+      "protocol": "dimos",
       "bytes": 320124,
       "format": "pointcloud",
       "msg_type": "sensor_msgs.PointCloud2",

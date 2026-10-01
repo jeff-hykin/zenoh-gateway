@@ -15,7 +15,7 @@ console.log(`machine load at start: ${await machineLoad()}`)
  * @returns {{ codec: string, kind: "video" | "depth" | "pointcloud" }[]}
  */
 function plansFor(entry) {
-    const protocol = entry.protocol === "dimos-lcm" ? "dimos" : "ros2"
+    const protocol = entry.protocol === "dimos" ? "dimos" : "ros2"
     const type = entry.msg_type.split(/[./]/).pop()
     if (type === "PointCloud2") {
         return [{ codec: `${protocol}-pointcloud2`, kind: "pointcloud" }]

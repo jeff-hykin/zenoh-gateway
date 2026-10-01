@@ -1,0 +1,135 @@
+use super::*;
+use shared::error::{Error, Result};
+
+// The first byte in a `Message` that specifies its type:
+pub(crate) const MESSAGE_TYPE_THRESHOLD: u8 = 0x00; // reuse 0x00 for internal usage
+pub(crate) const MESSAGE_TYPE_CLOSE: u8 = 0x01; // reuse 0x01 for internal usage
+pub(crate) const MESSAGE_TYPE_ACK: u8 = 0x02;
+pub(crate) const MESSAGE_TYPE_OPEN: u8 = 0x03;
+pub(crate) const MESSAGE_TYPE_LEN: usize = 1;
+
+/// The one-byte type that prefixes a DCEP message.
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
+#[non_exhaustive]
+pub enum MessageType {
+    /// A buffered-amount threshold crossing. Internal to this crate.
+    DataChannelThreshold, // internal usage only
+    /// A channel close notification. Internal to this crate.
+    DataChannelClose, // internal usage only
+    /// `DATA_CHANNEL_ACK` (`0x02`).
+    DataChannelAck,
+    /// `DATA_CHANNEL_OPEN` (`0x03`).
+    DataChannelOpen,
+}
+
+impl MarshalSize for MessageType {
+    fn marshal_size(&self) -> usize {
+        MESSAGE_TYPE_LEN
+    }
+}
+
+impl Marshal for MessageType {
+    fn marshal_to(&self, mut buf: &mut [u8]) -> Result<usize> {
+        let b = match self {
+            MessageType::DataChannelThreshold => MESSAGE_TYPE_THRESHOLD, // internal usage only
+            MessageType::DataChannelClose => MESSAGE_TYPE_CLOSE,         // internal usage only
+            MessageType::DataChannelAck => MESSAGE_TYPE_ACK,
+            MessageType::DataChannelOpen => MESSAGE_TYPE_OPEN,
+        };
+
+        buf.put_u8(b);
+
+        Ok(1)
+    }
+}
+
+impl Unmarshal for MessageType {
+    fn unmarshal<B>(buf: &mut B) -> Result<Self>
+    where
+        B: Buf,
+    {
+        let required_len = MESSAGE_TYPE_LEN;
+        if buf.remaining() < required_len {
+            return Err(Error::UnexpectedEndOfBuffer {
+                expected: required_len,
+                actual: buf.remaining(),
+            });
+        }
+
+        let b = buf.get_u8();
+
+        match b {
+            MESSAGE_TYPE_THRESHOLD => Ok(MessageType::DataChannelThreshold), // internal usage only
+            MESSAGE_TYPE_CLOSE => Ok(MessageType::DataChannelClose),         // internal usage only
+            MESSAGE_TYPE_ACK => Ok(Self::DataChannelAck),
+            MESSAGE_TYPE_OPEN => Ok(Self::DataChannelOpen),
+            _ => Err(Error::InvalidMessageType(b)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::{Bytes, BytesMut};
+
+    use super::*;
+
+    #[test]
+    fn test_message_type_unmarshal_open_success() -> Result<()> {
+        let mut bytes = Bytes::from_static(&[0x03]);
+        let msg_type = MessageType::unmarshal(&mut bytes)?;
+
+        assert_eq!(msg_type, MessageType::DataChannelOpen);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_message_type_unmarshal_ack_success() -> Result<()> {
+        let mut bytes = Bytes::from_static(&[0x02]);
+        let msg_type = MessageType::unmarshal(&mut bytes)?;
+
+        assert_eq!(msg_type, MessageType::DataChannelAck);
+        Ok(())
+    }
+
+    #[test]
+    fn test_message_type_unmarshal_invalid() -> Result<()> {
+        let mut bytes = Bytes::from_static(&[0x04]);
+        match MessageType::unmarshal(&mut bytes) {
+            Ok(_) => panic!("expected Error, but got Ok"),
+            Err(err) => {
+                if Error::InvalidMessageType(0x04) == err {
+                    return Ok(());
+                }
+                panic!(
+                    "unexpected err {:?}, want {:?}",
+                    err,
+                    Error::InvalidMessageType(0x04)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_message_type_marshal_size() -> Result<()> {
+        let ack = MessageType::DataChannelAck;
+        let marshal_size = ack.marshal_size();
+
+        assert_eq!(marshal_size, MESSAGE_TYPE_LEN);
+        Ok(())
+    }
+
+    #[test]
+    fn test_message_type_marshal() -> Result<()> {
+        let mut buf = BytesMut::with_capacity(MESSAGE_TYPE_LEN);
+        buf.resize(MESSAGE_TYPE_LEN, 0u8);
+        let msg_type = MessageType::DataChannelAck;
+        let n = msg_type.marshal_to(&mut buf)?;
+        let bytes = buf.freeze();
+
+        assert_eq!(n, MESSAGE_TYPE_LEN);
+        assert_eq!(&bytes[..], &[0x02]);
+        Ok(())
+    }
+}

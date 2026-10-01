@@ -2,6 +2,7 @@
 //! to packed RGB8 (for video) or to lossless depth values (u16 / f32).
 
 use crate::codec::wire::RawImage;
+use crate::codec::{PixelFormat, VideoImage};
 use anyhow::{Context, Result, bail, ensure};
 use std::io::Cursor;
 
@@ -10,6 +11,12 @@ pub struct Rgb8 {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+}
+
+impl From<Rgb8> for VideoImage {
+    fn from(rgb: Rgb8) -> Self {
+        VideoImage { width: rgb.width, height: rgb.height, format: PixelFormat::Rgb8, data: rgb.pixels }
+    }
 }
 
 /// Depth wire encodings (see SPEC "Wire formats": depth header byte 1).
@@ -265,10 +272,10 @@ mod tests {
         for file in ["ros2/image_rgb8.cdr", "ros2/image_bgr8.cdr"] {
             assert_pattern(&raw_to_rgb(&parse_image(Protocol::Ros2, &fixture(file)).unwrap()).unwrap(), 0.0, file);
         }
-        for file in ["dimos/image_rgb8.lcm", "dimos/image_bgr8.lcm"] {
+        for file in ["dimos/image_rgb8.bin", "dimos/image_bgr8.bin"] {
             assert_pattern(&raw_to_rgb(&parse_image(Protocol::Dimos, &fixture(file)).unwrap()).unwrap(), 0.0, file);
         }
-        assert_pattern(&raw_to_rgb(&parse_image(Protocol::Dimos, &fixture("dimos/image_jpeg_in_Image.lcm")).unwrap()).unwrap(), 8.0, "jpeg in Image");
+        assert_pattern(&raw_to_rgb(&parse_image(Protocol::Dimos, &fixture("dimos/image_jpeg_in_Image.bin")).unwrap()).unwrap(), 8.0, "jpeg in Image");
         let mono = raw_to_rgb(&parse_image(Protocol::Ros2, &fixture("ros2/image_mono16.cdr")).unwrap()).unwrap();
         assert_eq!(quadrant_means(&mono).map(|m| m[0]), [0.0, 85.0, 170.0, 255.0]);
     }
@@ -276,7 +283,7 @@ mod tests {
     #[test]
     fn compressed_formats() {
         for (format, tolerance) in [("jpeg", 8.0), ("png", 0.0), ("webp", 0.0), ("jxl", 8.0)] {
-            for (protocol, file) in [(Protocol::Ros2, format!("ros2/compressed_{format}.cdr")), (Protocol::Dimos, format!("dimos/compressed_{format}.lcm"))] {
+            for (protocol, file) in [(Protocol::Ros2, format!("ros2/compressed_{format}.cdr")), (Protocol::Dimos, format!("dimos/compressed_{format}.bin"))] {
                 let payload = fixture(&file);
                 let message = parse_compressed_image(protocol, &payload).unwrap();
                 assert_pattern(&compressed_to_rgb(message.data, &message.format).unwrap(), tolerance, &file);
@@ -291,7 +298,7 @@ mod tests {
         let depth = raw_to_depth(&image).unwrap();
         let DepthValues::U16(values) = depth.values else { panic!("u16 expected") };
         assert!(values.iter().enumerate().all(|(i, &v)| v as usize == 1000 + i % 320 + 4 * (i / 320)));
-        let payload = fixture("dimos/depth_32FC1.lcm");
+        let payload = fixture("dimos/depth_32FC1.bin");
         let image = parse_image(Protocol::Dimos, &payload).unwrap();
         let DepthValues::F32(values) = raw_to_depth(&image).unwrap().values else { panic!("f32 expected") };
         assert!(values.iter().enumerate().all(|(i, &v)| v == 0.5 + (i % 320) as f32 / 128.0 + (i / 320) as f32 / 64.0));

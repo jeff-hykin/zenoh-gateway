@@ -22,7 +22,7 @@ export type ConnectionState = "connecting" | "connected" | "degraded" | "lost"
 export type PublisherState = "connecting" | "open" | "tripped" | "rejected" | "closed"
 export type SubscriptionState = "connecting" | "open" | "rejected" | "closed"
 
-/** Transcoders the bridge runs, picked with the subscribe option `codec` (SPEC "Codecs"). */
+/** The bridge's built-in transcoders, picked with the subscribe option `codec` (SPEC "Codecs"). A bridge may register more (`ZenohWeb.codecs`). */
 export const CODECS = Object.freeze([
     "ros2-image",
     "ros2-compressed-image",
@@ -37,13 +37,60 @@ export const CODECS = Object.freeze([
 ] as const)
 
 export type CodecName = typeof CODECS[number]
+/** What a built-in codec delivers: a video track, lossless depth or a point cloud. */
 export type CodecOutput = "video" | "depth" | "pointcloud"
+/** Where any codec's output goes: the bridge's H.264 video track, or bytes on the data channel. */
+export type CodecKind = "video" | "data"
 
+/** A codec the bridge has registered (built-in or the host application's own). */
+export interface CodecInfo {
+    name: string
+    output: CodecKind
+}
+
+/**
+ * Turns a data codec's bytes into what `msg.decoded` carries. It may also set other message
+ * fields (the built-in depth and point cloud decoders set `msg.depth` / `msg.points`).
+ */
+export type CodecDecoder = (bytes: Uint8Array, message: Message) => unknown
+
+/** The output of a built-in codec. */
 export function codecOutput(codec: CodecName): CodecOutput {
     if (codec.endsWith("pointcloud2")) {
         return "pointcloud"
     }
     return codec.endsWith("depth") ? "depth" : "video"
+}
+
+const builtinCodecInfos: readonly CodecInfo[] = CODECS.map((name) => ({ name, output: codecOutput(name) === "video" ? "video" : "data" }))
+const codecDecoders = new Map<string, CodecDecoder>()
+
+/**
+ * Registers the browser decoder for a data codec the bridge runs (e.g. a Rust codec the host
+ * application added with `ServerBuilder::codec`). Messages of subscriptions using that codec get
+ * `msg.decoded = decoder(msg.bytes, msg)`. Video codecs need no decoder. Registering a different
+ * decoder under a name that already has one throws.
+ */
+export function registerCodec(name: string, decoder: CodecDecoder): void {
+    if (typeof name !== "string" || name.length === 0) {
+        throw new TypeError(`zenoh-web: registerCodec needs a codec name, got ${String(name)}`)
+    }
+    if (typeof decoder !== "function") {
+        throw new TypeError(`zenoh-web: registerCodec("${name}") needs a decoder function`)
+    }
+    const existing = codecDecoders.get(name)
+    if (existing !== undefined && existing !== decoder) {
+        throw new Error(`zenoh-web: a decoder for codec "${name}" is already registered`)
+    }
+    codecDecoders.set(name, decoder)
+}
+
+for (const name of CODECS) {
+    if (codecOutput(name) === "depth") {
+        registerCodec(name, (bytes, message) => (message.depth = decodeDepth(bytes)))
+    } else if (codecOutput(name) === "pointcloud") {
+        registerCodec(name, (bytes, message) => (message.points = decodePointCloud(bytes)))
+    }
 }
 
 /** Lossless depth, downscaled by `stride` (nearest neighbor) at lower quality. */
@@ -96,6 +143,8 @@ export interface Message {
     seq: number
     depth?: DepthImage
     points?: PointCloud
+    /** data codecs: what the codec's registered decoder returned (see `registerCodec`) */
+    decoded?: unknown
     video?: VideoFrameInfo
     mediaStream?: MediaStream
 }
@@ -111,7 +160,8 @@ export interface SubscribeOptions {
     minQuality?: number
     maxQuality?: number
     qualityToHzTradeoff?: number
-    codec?: CodecName
+    /** a built-in codec or any other name the bridge registered (`ZenohWeb.codecs`) */
+    codec?: CodecName | (string & Record<never, never>)
 }
 
 export interface PublisherOptions {
@@ -270,7 +320,11 @@ function checkCommon(options: object, allowed: Set<string>, where: string): void
     checkNumber("priority", priority, (v) => Number.isInteger(v) && v >= 1 && v <= 7, "an integer 1..7 (see Priority)")
 }
 
-export function validateSubscribeOptions(options: SubscribeOptions): void {
+/**
+ * Throws on an invalid option. `codecs` is what the bridge has (`ZenohWeb.codecs`); without it
+ * only the built-in codecs are known.
+ */
+export function validateSubscribeOptions(options: SubscribeOptions, codecs: readonly CodecInfo[] = builtinCodecInfos): void {
     checkCommon(options, subscribeOptionNames, "subscribe")
     const isUnit = (v: number) => v >= 0 && v <= 1
     checkNumber("bandwidthPriority", options.bandwidthPriority, (v) => Number.isFinite(v) && v >= 0, ">= 0")
@@ -285,10 +339,11 @@ export function validateSubscribeOptions(options: SubscribeOptions): void {
         throw new RangeError("zenoh-web: minQuality must be <= maxQuality")
     }
     if (options.codec !== undefined) {
-        if (!(CODECS as readonly string[]).includes(options.codec)) {
-            throw new TypeError(`zenoh-web: unknown codec "${String(options.codec)}" (known: ${CODECS.join(", ")})`)
+        const codec = codecs.find((info) => info.name === options.codec)
+        if (codec === undefined) {
+            throw new TypeError(`zenoh-web: unknown codec "${String(options.codec)}" (the bridge has: ${codecs.map((info) => info.name).join(", ")})`)
         }
-        if (codecOutput(options.codec) === "video" && options.delivery === "reliable") {
+        if (codec.output === "video" && options.delivery === "reliable") {
             throw new TypeError(`zenoh-web: ${options.codec} is a video codec (a lossy video track); use delivery "latest"`)
         }
     }
@@ -589,7 +644,9 @@ export class Subscription extends Endpoint {
     decodeErrors = 0
     /** video codecs: the decoded video (also on each message as `mediaStream`) */
     mediaStream: MediaStream | null = null
-    readonly codecOutput: CodecOutput | null
+    /** where the codec's output arrives (null: no codec, raw bytes) */
+    readonly codecKind: CodecKind | null
+    #warnedNoDecoder = false
     #videoTransceiver: RTCRtpTransceiver | null = null
     /** drops before the current channel (each new channel restarts seq at 0) */
     #droppedBefore = 0
@@ -603,7 +660,7 @@ export class Subscription extends Endpoint {
 
     constructor(owner: ZenohWeb, id: number, key: string, readonly options: SubscribeOptions, readonly callback: (message: Message) => void) {
         super(owner, id, key)
-        this.codecOutput = options.codec ? codecOutput(options.codec) : null
+        this.codecKind = options.codec === undefined ? null : owner.codecs.find((info) => info.name === options.codec)?.output ?? "data"
     }
 
     get state(): SubscriptionState {
@@ -631,7 +688,7 @@ export class Subscription extends Endpoint {
         this.#bytesSinceAck = 0
         this.#partials.clear()
         const acceptance = this.beginAttempt()
-        if (this.codecOutput !== "video") {
+        if (this.codecKind !== "video") {
             this.#openChannel(peer, acceptance, null)
             return
         }
@@ -728,13 +785,18 @@ export class Subscription extends Endpoint {
     /** Adds the codec's decoded form; false if it can't be decoded. */
     #decode(message: Message): boolean {
         try {
-            if (this.codecOutput === "depth") {
-                message.depth = decodeDepth(message.bytes)
-            } else if (this.codecOutput === "pointcloud") {
-                message.points = decodePointCloud(message.bytes)
-            } else if (this.codecOutput === "video") {
+            if (this.codecKind === "video") {
                 message.video = decodeVideoFrameInfo(message.bytes)
                 message.mediaStream = this.mediaStream ?? undefined
+                return true
+            }
+            const name = String(this.options.codec)
+            const decoder = codecDecoders.get(name)
+            if (decoder !== undefined) {
+                message.decoded = decoder(message.bytes, message)
+            } else if (!this.#warnedNoDecoder) {
+                this.#warnedNoDecoder = true
+                console.warn(`zenoh-web: no decoder registered for codec "${name}" (registerCodec("${name}", decoder)); msg.bytes carries its encoded bytes`)
             }
             return true
         } catch (error) {
@@ -745,7 +807,7 @@ export class Subscription extends Endpoint {
     }
 
     #deliver(message: Message): void {
-        if (this.codecOutput !== null && !this.#decode(message)) {
+        if (this.codecKind !== null && !this.#decode(message)) {
             return
         }
         this.received++
@@ -963,6 +1025,8 @@ export class ZenohWeb {
     clockOffsetMs: number | null = null
     /** bridge-side heartbeat, clock and access-control stats */
     bridgeStats: BridgeStats | null = null
+    /** the codecs the bridge runs (built-in and its host application's), fetched on connect */
+    codecs: readonly CodecInfo[] = builtinCodecInfos
     readonly url: string
     readonly options: ResolvedConnectOptions
     /** this client's clock in ms; put timestamps and clock sync use it */
@@ -1136,6 +1200,7 @@ export class ZenohWeb {
             if (this.options.bandwidthTargetFraction !== undefined) {
                 await this._request({ op: "configure", bandwidthTargetFraction: this.options.bandwidthTargetFraction }, pingTimeoutMs)
             }
+            this.codecs = Object.freeze((await this._request({ op: "codecs" }, pingTimeoutMs)).codecs as CodecInfo[])
             // a few quick samples so the bridge knows the clock offset before the first put
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()
@@ -1264,7 +1329,7 @@ export class ZenohWeb {
     }
 
     subscribe(key: string, options: SubscribeOptions, callback: (message: Message) => void): Subscription {
-        validateSubscribeOptions(options ?? {})
+        validateSubscribeOptions(options ?? {}, this.codecs)
         const subscription = new Subscription(this, this.#nextId++, key, { ...options }, callback)
         this.#addEndpoint(subscription)
         return subscription

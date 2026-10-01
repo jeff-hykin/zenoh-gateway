@@ -1,14 +1,16 @@
-//! RGB8 frames to H.264 (openh264, constrained baseline) for a WebRTC video track.
+//! Video codecs' frames (RGB8 or I420) to H.264 (openh264, constrained baseline) for a WebRTC video track.
 //!
 //! Quality `q` (0..1) sets resolution scale `0.25 + 0.75 q` and a bits-per-pixel target
 //! `0.03 + 0.12 q`; the allocator's (quality, Hz) becomes the encoder's resolution, frame rate and
 //! target bitrate (`bytes_per_frame(q) * hz`).
 
-use crate::codec::image::Rgb8;
+use crate::codec::{PixelFormat, VideoImage};
 use anyhow::{Result, anyhow};
 use openh264::OpenH264API;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile, RateControlMode, UsageType};
 use openh264::formats::{RgbSliceU8, YUVBuffer};
+#[cfg(test)]
+use crate::codec::image::Rgb8;
 
 const MIN_DIMENSION: u32 = 16;
 /// Keyframe at least this often (seconds), on top of PLI/FIR requests from the browser.
@@ -37,38 +39,63 @@ pub fn bytes_per_frame(width: u32, height: u32, quality: f64) -> f64 {
     scaled_width as f64 * scaled_height as f64 * bits_per_pixel(quality) / 8.0
 }
 
-/// Box-filter downscale (or nearest upscale for the even-size rounding) of packed RGB8.
-pub fn resize(rgb: &Rgb8, width: u32, height: u32) -> Vec<u8> {
-    if (width, height) == (rgb.width, rgb.height) {
-        return rgb.pixels.clone();
+/// Box-filter downscale (or nearest upscale for the even-size rounding) of a packed plane with
+/// `channels` bytes per pixel.
+fn resize_plane(source: &[u8], (source_width, source_height): (u32, u32), channels: usize, (width, height): (u32, u32)) -> Vec<u8> {
+    if (width, height) == (source_width, source_height) {
+        return source[..width as usize * height as usize * channels].to_vec();
     }
-    let mut out = vec![0u8; width as usize * height as usize * 3];
+    let mut out = vec![0u8; width as usize * height as usize * channels];
     let span = |dest: u32, dest_len: u32, source_len: u32| {
         let start = (dest as u64 * source_len as u64 / dest_len as u64) as u32;
         let end = (((dest as u64 + 1) * source_len as u64).div_ceil(dest_len as u64) as u32).clamp(start + 1, source_len);
         (start, end)
     };
+    let mut sum = vec![0u32; channels];
     for y in 0..height {
-        let (y0, y1) = span(y, height, rgb.height);
+        let (y0, y1) = span(y, height, source_height);
         for x in 0..width {
-            let (x0, x1) = span(x, width, rgb.width);
-            let mut sum = [0u32; 3];
+            let (x0, x1) = span(x, width, source_width);
+            sum.fill(0);
             for source_y in y0..y1 {
-                let row = &rgb.pixels[(source_y as usize * rgb.width as usize + x0 as usize) * 3..(source_y as usize * rgb.width as usize + x1 as usize) * 3];
-                for pixel in row.as_chunks::<3>().0 {
-                    for channel in 0..3 {
-                        sum[channel] += pixel[channel] as u32;
+                let row_start = source_y as usize * source_width as usize;
+                let row = &source[(row_start + x0 as usize) * channels..(row_start + x1 as usize) * channels];
+                for pixel in row.chunks_exact(channels) {
+                    for (total, &value) in sum.iter_mut().zip(pixel) {
+                        *total += value as u32;
                     }
                 }
             }
             let count = (y1 - y0) * (x1 - x0);
-            let destination = &mut out[(y as usize * width as usize + x as usize) * 3..][..3];
-            for channel in 0..3 {
-                destination[channel] = ((sum[channel] + count / 2) / count) as u8;
+            let destination = &mut out[(y as usize * width as usize + x as usize) * channels..][..channels];
+            for (value, total) in destination.iter_mut().zip(&sum) {
+                *value = ((total + count / 2) / count) as u8;
             }
         }
     }
     out
+}
+
+/// The picture scaled to `width × height` (both even) as an I420 buffer for the encoder.
+fn to_yuv(image: &VideoImage, width: u32, height: u32) -> YUVBuffer {
+    let source = (image.width(), image.height());
+    match image.format() {
+        PixelFormat::Rgb8 => {
+            let pixels = resize_plane(image.data(), source, 3, (width, height));
+            YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (width as usize, height as usize)))
+        }
+        PixelFormat::I420 => {
+            let luma_len = source.0 as usize * source.1 as usize;
+            let (luma, chroma) = image.data().split_at(luma_len);
+            let (u, v) = chroma.split_at(luma_len / 4);
+            let half_source = (source.0 / 2, source.1 / 2);
+            let half = (width / 2, height / 2);
+            let mut yuv = resize_plane(luma, source, 1, (width, height));
+            yuv.extend(resize_plane(u, half_source, 1, half));
+            yuv.extend(resize_plane(v, half_source, 1, half));
+            YUVBuffer::from_vec(yuv, width as usize, height as usize)
+        }
+    }
 }
 
 pub struct EncodedFrame {
@@ -99,10 +126,10 @@ impl VideoEncoder {
         self.keyframe_requested = true;
     }
 
-    pub fn encode(&mut self, rgb: &Rgb8, quality: f64, hz: f64) -> Result<EncodedFrame> {
-        let (width, height) = scaled_size(rgb.width, rgb.height, quality);
+    pub fn encode(&mut self, image: &VideoImage, quality: f64, hz: f64) -> Result<EncodedFrame> {
+        let (width, height) = scaled_size(image.width(), image.height(), quality);
         let hz = hz.max(0.1);
-        let bitrate_bps = (bytes_per_frame(rgb.width, rgb.height, quality) * hz * 8.0).max(10_000.0) as u32;
+        let bitrate_bps = (bytes_per_frame(image.width(), image.height(), quality) * hz * 8.0).max(10_000.0) as u32;
         let wanted = Settings { width, height, bitrate_bps, fps: hz as f32 };
         let drifted = |old: f64, new: f64| old / new > RECONFIGURE_RATIO || new / old > RECONFIGURE_RATIO;
         let reconfigure = match &self.encoder {
@@ -130,8 +157,7 @@ impl VideoEncoder {
         if std::mem::take(&mut self.keyframe_requested) {
             encoder.force_intra_frame();
         }
-        let pixels = resize(rgb, width, height);
-        let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (width as usize, height as usize)));
+        let yuv = to_yuv(image, width, height);
         let bitstream = encoder.encode(&yuv).map_err(|e| anyhow!("openh264: {e}"))?;
         let keyframe = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);
         Ok(EncodedFrame { data: bitstream.to_vec(), width, height, keyframe })
@@ -142,7 +168,7 @@ impl VideoEncoder {
 mod tests {
     use super::*;
 
-    fn pattern(width: u32, height: u32) -> Rgb8 {
+    fn pattern(width: u32, height: u32) -> VideoImage {
         let mut pixels = Vec::with_capacity((width * height * 3) as usize);
         for y in 0..height {
             for x in 0..width {
@@ -154,7 +180,7 @@ mod tests {
                 });
             }
         }
-        Rgb8 { width, height, pixels }
+        Rgb8 { width, height, pixels }.into()
     }
 
     #[test]
@@ -167,7 +193,7 @@ mod tests {
 
     #[test]
     fn resize_averages_quadrants() {
-        let small = resize(&pattern(320, 240), 2, 2);
+        let small = resize_plane(pattern(320, 240).data(), (320, 240), 3, (2, 2));
         assert_eq!(small, vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
     }
 
@@ -184,5 +210,19 @@ mod tests {
         assert!(encoder.encode(&frame, 1.0, 10.0).unwrap().keyframe);
         let low = encoder.encode(&frame, 0.0, 10.0).unwrap();
         assert_eq!((low.width, low.height), (80, 60));
+    }
+
+    #[test]
+    fn encodes_i420() {
+        let (width, height) = (64u32, 48u32);
+        let mut data = vec![200u8; (width * height) as usize];
+        data.extend(vec![90u8; (width * height / 2) as usize]);
+        let image = VideoImage::i420(width, height, data).unwrap();
+        let mut encoder = VideoEncoder::default();
+        let frame = encoder.encode(&image, 0.5, 10.0).unwrap();
+        assert!(frame.keyframe && frame.data.starts_with(&[0, 0, 0, 1]));
+        assert_eq!((frame.width, frame.height), scaled_size(width, height, 0.5));
+        assert!(VideoImage::i420(63, 48, vec![0; 63 * 48 * 3 / 2]).is_err(), "odd sizes are refused");
+        assert!(VideoImage::rgb8(2, 2, vec![0; 11]).is_err(), "wrong length is refused");
     }
 }

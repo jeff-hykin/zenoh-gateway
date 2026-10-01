@@ -1,35 +1,14 @@
-//! zenoh-web: a dumb pipe between zenoh key expressions and browser WebRTC data channels.
+//! The `zenoh-web` command: a thin wrapper over [`zenoh_web::Server`].
 
-mod acl;
-mod allocator;
-mod codec;
-mod frame;
-mod options;
-mod pacing;
-mod peer;
-mod publisher;
-mod subscription;
-mod video;
-
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::{Json, Router};
 use clap::Parser;
-use log::{error, info};
-use peer::Bridge;
+use log::info;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
-use webrtc::peer_connection::RTCSessionDescription;
 
 #[derive(Parser, Debug)]
-#[command(name = "zenoh-web", about = "Bridge zenoh to browsers over WebRTC data channels")]
+#[command(name = "zenoh-web", version, about = "Bridge zenoh to browsers over WebRTC data channels")]
 struct Cli {
     /// HTTP port for signaling (POST /offer) and static files.
-    #[arg(long, default_value_t = 7448)]
+    #[arg(long, default_value_t = zenoh_web::DEFAULT_PORT)]
     port: u16,
     /// zenoh config file (json5).
     #[arg(long)]
@@ -55,63 +34,42 @@ struct Cli {
     strict_priority: u8,
 }
 
-async fn offer(State(bridge): State<Arc<Bridge>>, Json(offer): Json<RTCSessionDescription>) -> Response {
-    match bridge.answer(offer).await {
-        Ok(answer) => Json(answer).into_response(),
+/// Resolves on SIGINT or SIGTERM.
+async fn terminated() {
+    let mut terminate = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(terminate) => terminate,
         Err(error) => {
-            error!("offer failed: {error:#}");
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            log::warn!("no SIGTERM handler: {error}");
+            let _ = tokio::signal::ctrl_c().await;
+            info!("SIGINT");
+            return;
         }
-    }
-}
-
-fn zenoh_config(cli: &Cli) -> anyhow::Result<zenoh::Config> {
-    let mut config = match &cli.zenoh_config {
-        Some(path) => zenoh::Config::from_file(path).map_err(|e| anyhow::anyhow!("{e}"))?,
-        None => zenoh::Config::default(),
     };
-    if !cli.connect.is_empty() {
-        let endpoints = serde_json::to_string(&cli.connect)?;
-        config.insert_json5("connect/endpoints", &endpoints).map_err(|e| anyhow::anyhow!("{e}"))?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!("SIGINT"),
+        _ = terminate.recv() => info!("SIGTERM"),
     }
-    Ok(config)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zenoh=warn,zenoh_ext=warn,zenoh_web=info,rtc=warn,webrtc=warn")).init();
     let cli = Cli::parse();
-    let mut config = zenoh_config(&cli)?;
-    let access_control = acl::AccessControl::from_config(&config)?;
-    if access_control.enabled() {
-        info!("access_control enabled: browser puts/subscribes/gets are checked against it");
+    let mut builder = zenoh_web::Server::builder()
+        .bandwidth_target_fraction(cli.bandwidth_target_fraction)
+        .strict_priority(cli.strict_priority);
+    if let Some(path) = &cli.zenoh_config {
+        builder = builder.zenoh_config_file(path)?;
     }
-    // listTopics reads this bridge's own routing tables through the admin space (read-only)
-    config.insert_json5("adminspace/enabled", "true").map_err(|e| anyhow::anyhow!("{e}"))?;
-    config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let session = zenoh::open(config).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    anyhow::ensure!(cli.bandwidth_target_fraction > 0.0 && cli.bandwidth_target_fraction <= 1.0, "--bandwidth-target-fraction must be within (0, 1]");
-    let allocation = peer::AllocationConfig { max_bandwidth: cli.max_bandwidth_bytes_per_sec, target_fraction: cli.bandwidth_target_fraction, strict_priority: cli.strict_priority };
-    let bridge = Bridge::new(session.clone(), access_control, allocation);
-
-    let mut app = Router::new().route("/offer", post(offer)).with_state(bridge.clone()).layer(CorsLayer::permissive());
-    if let Some(dir) = &cli.serve {
-        app = app.fallback_service(ServeDir::new(dir));
+    for endpoint in cli.connect {
+        builder = builder.connect(endpoint);
     }
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", cli.port)).await?;
-    info!("zenoh-web listening on http://{}", listener.local_addr()?);
-    if let Some(dir) = &cli.serve {
-        info!("serving {}", dir.display());
+    if let Some(dir) = cli.serve {
+        builder = builder.serve_dir(dir);
     }
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = axum::serve(listener, app) => result?,
-        _ = tokio::signal::ctrl_c() => info!("SIGINT"),
-        _ = terminate.recv() => info!("SIGTERM"),
+    if let Some(cap) = cli.max_bandwidth_bytes_per_sec {
+        builder = builder.max_bandwidth_bytes_per_sec(cap);
     }
     // every frontend's deadmen go out (reliably) before the zenoh session closes
-    bridge.shutdown().await;
-    session.close().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    info!("shut down");
-    Ok(())
+    builder.build().await?.serve_with_shutdown(("0.0.0.0", cli.port), terminated()).await
 }

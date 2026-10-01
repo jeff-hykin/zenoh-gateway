@@ -2,7 +2,8 @@
 
 use crate::acl::{AccessControl, AclMessage};
 use crate::allocator::{self, Estimator};
-use crate::codec::Output;
+use crate::codec::registry::CodecRegistry;
+use crate::codec::{Codec, CodecOutput};
 use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
 use crate::pacing::SendGate;
 use crate::publisher::{self, PubShared};
@@ -38,7 +39,7 @@ const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
 /// The RTT baseline is the minimum over this window.
 const RTT_BASELINE_WINDOW: Duration = Duration::from_secs(30);
 
-/// Bridge-wide allocation settings (command-line flags).
+/// Bridge-wide allocation settings (builder options / command-line flags).
 #[derive(Debug, Clone, Copy)]
 pub struct AllocationConfig {
     /// cap on each frontend's budget, bytes/s
@@ -109,6 +110,7 @@ struct PeerState {
     peer_id: u64,
     session: zenoh::Session,
     access_control: Arc<AccessControl>,
+    codecs: Arc<CodecRegistry>,
     /// browser requests refused by access_control
     access_denied: AtomicU64,
     channels: Mutex<HashMap<u64, ChannelEntry>>,
@@ -140,11 +142,13 @@ struct PeerState {
 }
 
 impl PeerState {
-    fn new(peer_id: u64, session: zenoh::Session, access_control: Arc<AccessControl>, video_target_bps: Arc<AtomicU64>, config: AllocationConfig) -> Self {
+    fn new(peer_id: u64, bridge: &Bridge, video_target_bps: Arc<AtomicU64>) -> Self {
+        let config = bridge.allocation;
         PeerState {
             peer_id,
-            session,
-            access_control,
+            session: bridge.session.clone(),
+            access_control: bridge.access_control.clone(),
+            codecs: bridge.codecs.clone(),
             access_denied: AtomicU64::new(0),
             channels: Mutex::new(HashMap::new()),
             next_channel: AtomicU64::new(0),
@@ -328,19 +332,22 @@ struct PeerEntry {
     state: Arc<PeerState>,
 }
 
+/// Every connected browser, and what they share: the zenoh session, access control, codecs.
 pub struct Bridge {
-    pub session: zenoh::Session,
+    session: zenoh::Session,
     access_control: Arc<AccessControl>,
+    codecs: Arc<CodecRegistry>,
     allocation: AllocationConfig,
     peers: Mutex<HashMap<u64, PeerEntry>>,
     next_peer: AtomicU64,
 }
 
 impl Bridge {
-    pub fn new(session: zenoh::Session, access_control: AccessControl, allocation: AllocationConfig) -> Arc<Self> {
+    pub fn new(session: zenoh::Session, access_control: AccessControl, codecs: CodecRegistry, allocation: AllocationConfig) -> Arc<Self> {
         Arc::new(Bridge {
             session,
             access_control: Arc::new(access_control),
+            codecs: Arc::new(codecs),
             allocation,
             peers: Mutex::new(HashMap::new()),
             next_peer: AtomicU64::new(1),
@@ -352,7 +359,7 @@ impl Bridge {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
         let (media_engine, interceptors, video_target_bps) = video::media_setup()?;
-        let state = Arc::new(PeerState::new(peer_id, self.session.clone(), self.access_control.clone(), video_target_bps, self.allocation));
+        let state = Arc::new(PeerState::new(peer_id, self, video_target_bps));
         let handler = Arc::new(Handler { bridge: Arc::downgrade(self), peer_id, gathered_tx, state: state.clone() });
         let setting_engine = SettingEngineBuilder::new()
             .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
@@ -397,7 +404,7 @@ impl Bridge {
         }
     }
 
-    /// SIGINT/SIGTERM: fire every frontend's deadmen before the process exits.
+    /// Fires every frontend's deadmen ("shutdown") and closes its connection.
     pub async fn shutdown(&self) {
         let peers: Vec<PeerEntry> = self.peers.lock().unwrap().drain().map(|(_, entry)| entry).collect();
         for entry in &peers {
@@ -509,9 +516,13 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
         return;
     }
     let rejected = match label.kind.as_str() {
-        "sub" => match SubOpts::parse(&label.opts).and_then(|opts| bind_video(&state, &opts, &label).map(|video| (opts, video))) {
-            Ok((opts, video)) => {
-                let shared = Arc::new(SubShared::new(&opts, state.gate.clone(), state.config.strict_priority));
+        "sub" => match SubOpts::parse(&label.opts).and_then(|opts| {
+            let codec = opts.resolve_codec(&state.codecs)?;
+            let video = bind_video(&state, codec.as_deref(), &label)?;
+            Ok((opts, codec, video))
+        }) {
+            Ok((opts, codec, video)) => {
+                let shared = Arc::new(SubShared::new(&opts, codec, state.codecs.clone(), state.gate.clone(), state.config.strict_priority));
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
                 state.send_accepted(label.id).await;
                 subscription::run(dc.clone(), label.clone(), session, shared, video).await;
@@ -553,11 +564,8 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
 }
 
 /// A video codec subscription claims the track the browser renegotiated for it (by mid).
-fn bind_video(state: &PeerState, opts: &SubOpts, label: &Label) -> Result<Option<Arc<VideoTrack>>, String> {
-    let Some(codec) = opts.codec()? else { return Ok(None) };
-    if codec.output() != Output::Video {
-        return Ok(None);
-    }
+fn bind_video(state: &PeerState, codec: Option<&dyn Codec>, label: &Label) -> Result<Option<Arc<VideoTrack>>, String> {
+    let Some(codec) = codec.filter(|codec| codec.output() == CodecOutput::Video) else { return Ok(None) };
     let mid = label.mid.as_deref().ok_or_else(|| format!("{} is a video codec: the label needs the mid of a renegotiated video transceiver", codec.name()))?;
     let track = state.video_tracks.lock().unwrap().get(mid).cloned().ok_or_else(|| format!("no video track for mid {mid:?} (renegotiate with addVideo first)"))?;
     if !track.claim() {
@@ -723,6 +731,10 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "access": access, "bandwidth": bandwidth}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
+            "codecs" => {
+                let codecs: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
+                ok(&request.id, json!({"codecs": codecs}))
+            }
             "configure" => match request.bandwidth_target_fraction {
                 Some(fraction) if fraction > 0.0 && fraction <= 1.0 => {
                     *state.target_fraction_override.lock().unwrap() = Some(fraction);

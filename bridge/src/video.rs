@@ -4,7 +4,9 @@
 //! transceiver's mid. A subscription's `sub` data channel names the mid in its label and carries a
 //! small metadata frame per video frame. Tracks are reused by later subscriptions on the same mid.
 
-use crate::codec::{self, video::VideoEncoder};
+use crate::codec::registry;
+use crate::codec::video::{EncodedFrame, VideoEncoder};
+use crate::codec::{CodecSample, DecodedFrame};
 use crate::subscription::{self, SubShared};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -201,7 +203,7 @@ fn rand_ssrc() -> u32 {
 
 /// `u8 version=1 | u8 flags (bit0 keyframe) | u16 0 | u32 width | u32 height | u32 sourceWidth |
 ///  u32 sourceHeight | f32 quality | u32 encodedBytes`, little endian.
-fn metadata(frame: &codec::video::EncodedFrame, source: (u32, u32), quality: f64) -> [u8; METADATA_LEN] {
+fn metadata(frame: &EncodedFrame, source: (u32, u32), quality: f64) -> [u8; METADATA_LEN] {
     let mut out = [0u8; METADATA_LEN];
     out[0] = 1;
     out[1] = frame.keyframe as u8;
@@ -217,7 +219,7 @@ fn metadata(frame: &codec::video::EncodedFrame, source: (u32, u32), quality: f64
 /// Sends a video subscription's frames: pick (paced by maxHz and the allocation), decode (shared
 /// across frontends), encode at the allocated quality and Hz (off the runtime), write to the track.
 pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: Arc<VideoTrack>) {
-    let Some(codec) = shared.codec else { return };
+    let Some(codec) = shared.codec.clone() else { return };
     let mut encoder = Some(VideoEncoder::default());
     let mut next_frame_id: u32 = 0;
     let mut last_write: Option<Instant> = None;
@@ -235,15 +237,16 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         let keyframe = track.keyframe_requested.swap(false, Ordering::AcqRel);
         let payload = item.payload.to_bytes().into_owned();
         let mut working = encoder.take().unwrap_or_default();
-        let hash_key = key.clone();
+        let (hash_key, encoding, codecs, codec) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone());
         let outcome = tokio::task::spawn_blocking(move || {
-            let hash = codec::payload_hash(&hash_key, &payload);
-            let (rgb, reused) = codec::decode_shared(codec, hash, &payload);
-            let result = rgb.and_then(|rgb| {
+            let sample = CodecSample::new(&hash_key, &payload, &encoding);
+            let (decoded, reused) = codecs.decode_shared(&*codec, &sample, registry::sample_hash(&sample));
+            let result = decoded.and_then(|decoded| {
+                let DecodedFrame::Video(image) = &*decoded else { return Err(format!("video codec {:?} decoded to a data frame", codec.name())) };
                 if keyframe {
                     working.request_keyframe();
                 }
-                working.encode(&rgb, quality, hz).map(|frame| (frame, (rgb.width, rgb.height), reused)).map_err(|error| format!("{error:#}"))
+                working.encode(image, quality, hz).map(|frame| (frame, (image.width(), image.height()), reused)).map_err(|error| format!("{error:#}"))
             });
             (working, result)
         })

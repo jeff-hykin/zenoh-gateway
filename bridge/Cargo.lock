@@ -3050,40 +3050,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtc"
-version = "0.21.0"
-dependencies = [
- "bytes",
- "hex",
- "log",
- "pem 3.0.6",
- "rand 0.10.3",
- "rcgen",
- "rtc-crypto",
- "rtc-datachannel",
- "rtc-dtls",
- "rtc-ice",
- "rtc-interceptor",
- "rtc-mdns",
- "rtc-media",
- "rtc-rtcp",
- "rtc-rtp",
- "rtc-sctp",
- "rtc-sdp",
- "rtc-shared",
- "rtc-srtp",
- "rtc-stun",
- "rtc-turn",
- "rustls",
- "sansio",
- "serde",
- "serde_json",
- "unicase",
- "url",
- "x509-parser 0.16.0",
-]
-
-[[package]]
 name = "rtc-crypto"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3100,19 +3066,6 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "zeroize",
-]
-
-[[package]]
-name = "rtc-datachannel"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c670c43316afb11bf0b40070717915ff4368666350bad59042c0a89a2a1fd33"
-dependencies = [
- "bytes",
- "log",
- "rtc-sctp",
- "rtc-shared",
- "sansio",
 ]
 
 [[package]]
@@ -3216,20 +3169,6 @@ dependencies = [
  "rand 0.10.3",
  "rtc-shared",
  "serde",
-]
-
-[[package]]
-name = "rtc-sctp"
-version = "0.21.0"
-dependencies = [
- "bytes",
- "crc32c",
- "log",
- "rand 0.10.3",
- "rtc-shared",
- "rustc-hash",
- "slab",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4600,24 +4539,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "webrtc"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3cc7db94f14a20c9401202f7300f38071dcac4446177b40e12dc2df34b2256b"
-dependencies = [
- "async-broadcast",
- "async-channel",
- "async-trait",
- "bytes",
- "event-listener",
- "futures",
- "log",
- "quinn-udp 0.6.3",
- "rtc",
- "tokio",
-]
-
-[[package]]
 name = "wide"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5429,7 +5350,7 @@ dependencies = [
 
 [[package]]
 name = "zenoh-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5444,16 +5365,91 @@ dependencies = [
  "log",
  "openh264",
  "png",
- "rtc",
  "serde",
  "serde_json",
  "tokio",
  "tower-http",
- "webrtc",
  "zenoh",
  "zenoh-ext",
+ "zenoh-web-rtc",
+ "zenoh-web-webrtc",
  "zstd",
  "zune-jpeg",
+]
+
+[[package]]
+name = "zenoh-web-rtc"
+version = "0.21.0-zw.1"
+dependencies = [
+ "bytes",
+ "hex",
+ "log",
+ "pem 3.0.6",
+ "rand 0.10.3",
+ "rcgen",
+ "rtc-crypto",
+ "rtc-dtls",
+ "rtc-ice",
+ "rtc-interceptor",
+ "rtc-mdns",
+ "rtc-media",
+ "rtc-rtcp",
+ "rtc-rtp",
+ "rtc-sdp",
+ "rtc-shared",
+ "rtc-srtp",
+ "rtc-stun",
+ "rtc-turn",
+ "rustls",
+ "sansio",
+ "serde",
+ "serde_json",
+ "unicase",
+ "url",
+ "x509-parser 0.16.0",
+ "zenoh-web-rtc-datachannel",
+ "zenoh-web-rtc-sctp",
+]
+
+[[package]]
+name = "zenoh-web-rtc-datachannel"
+version = "0.21.0-zw.1"
+dependencies = [
+ "bytes",
+ "log",
+ "rtc-shared",
+ "sansio",
+ "zenoh-web-rtc-sctp",
+]
+
+[[package]]
+name = "zenoh-web-rtc-sctp"
+version = "0.21.0-zw.1"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "log",
+ "rand 0.10.3",
+ "rtc-shared",
+ "rustc-hash",
+ "slab",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "zenoh-web-webrtc"
+version = "0.21.0-zw.1"
+dependencies = [
+ "async-broadcast",
+ "async-channel",
+ "async-trait",
+ "bytes",
+ "event-listener",
+ "futures",
+ "log",
+ "quinn-udp 0.6.3",
+ "tokio",
+ "zenoh-web-rtc",
 ]
 
 [[package]]

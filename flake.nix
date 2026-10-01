@@ -16,7 +16,7 @@
             systems = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
             forAllSystems = lib.genAttrs systems;
             pname = "zenoh-web";
-            version = "0.1.0";
+            version = "0.2.0";
             linuxTarget = "aarch64-unknown-linux-gnu";
             linuxX86Target = "x86_64-unknown-linux-gnu";
             darwinX86Target = "x86_64-apple-darwin";
@@ -34,7 +34,7 @@
                     pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
                     rustToolchain = pkgs.rust-bin.stable.latest.minimal.override { targets = [ linuxTarget linuxX86Target darwinX86Target ]; };
                     rustPlatform = pkgs.makeRustPlatform { cargo = rustToolchain; rustc = rustToolchain; };
-                    # registry crates only; the [patch.crates-io] path crates (vendor/rtc, vendor/rtc-sctp) come with src
+                    # registry crates only; the forked webrtc-rs crates (path dependencies in forks/) come with src
                     cargoDeps = rustPlatform.importCargoLock { lockFile = ./bridge/Cargo.lock; };
                     isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 
@@ -55,7 +55,6 @@
                         '';
                         meta = {
                             description = "zenoh <-> WebRTC bridge for browsers";
-                            license = [ lib.licenses.mit lib.licenses.asl20 ];
                             mainProgram = pname;
                         };
                     };
@@ -110,15 +109,24 @@
                         "${pname}-aarch64-linux" = crossLinux linuxTarget;
                         "${pname}-x86_64-linux" = crossLinux linuxX86Target;
                         "${pname}-x86_64-darwin" = crossX86Darwin;
-                        # all four release binaries as result/<target-triple>/zenoh-web
-                        release = pkgs.runCommand "${pname}-release-${version}" { } (lib.concatMapStrings (entry: ''
+                        # all four release binaries as result/<target-triple>/zenoh-web, plus the release assets:
+                        # result/dist/zenoh-web-<version>-<target-triple>.tar.gz (binary + README.md) and SHA256SUMS.
+                        # GNU tar in the sandbox: no macOS xattrs/AppleDouble files, fixed owner and mtime.
+                        release = pkgs.runCommand "${pname}-release-${version}" { nativeBuildInputs = [ pkgs.gnutar pkgs.gzip ]; } (lib.concatMapStrings (entry: ''
                             install -Dm755 ${entry.package}/bin/${pname} $out/${entry.target}/${pname}
+                            mkdir -p staging/${entry.target} $out/dist
+                            install -m755 ${entry.package}/bin/${pname} staging/${entry.target}/${pname}
+                            install -m644 ${./README.md} staging/${entry.target}/README.md
+                            tar --create --format=gnu --no-xattrs --owner=0 --group=0 --numeric-owner --mtime=@1 --sort=name \
+                                --directory=staging/${entry.target} ${pname} README.md | gzip -9n > $out/dist/${pname}-${version}-${entry.target}.tar.gz
                         '') [
                             { target = "aarch64-apple-darwin"; package = native; }
                             { target = darwinX86Target; package = crossX86Darwin; }
                             { target = linuxTarget; package = crossLinux linuxTarget; }
                             { target = linuxX86Target; package = crossLinux linuxX86Target; }
-                        ]);
+                        ] + ''
+                            (cd $out/dist && sha256sum *.tar.gz > SHA256SUMS)
+                        '');
                     };
 
                     apps.default = { type = "app"; program = "${native}/bin/${pname}"; };

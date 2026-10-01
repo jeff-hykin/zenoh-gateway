@@ -14,6 +14,7 @@
 
 use crate::codec::wire::{PointCloud, PointField};
 use anyhow::{Context, Result, bail, ensure};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 pub const HEADER_LEN: usize = 40;
@@ -69,13 +70,20 @@ impl FieldReader {
     }
 }
 
+#[derive(Clone)]
 struct Point {
     xyz: [f64; 3],
     intensity: f64,
 }
 
+/// A cloud's finite points, owned (the decoded frame shared across frontends).
+pub struct Points {
+    points: Vec<Point>,
+    has_intensity: bool,
+}
+
 /// Every finite point of the cloud, honoring offsets, point_step, row_step and endianness.
-fn read_points(cloud: &PointCloud) -> Result<(Vec<Point>, bool)> {
+pub fn read_points(cloud: &PointCloud) -> Result<Points> {
     let field = |name: &str| cloud.fields.iter().find(|field| field.name == name);
     let reader = |name: &str| -> Result<FieldReader> {
         FieldReader::new(field(name).with_context(|| format!("PointCloud2 has no {name:?} field"))?, cloud.point_step, cloud.big_endian)
@@ -97,13 +105,13 @@ fn read_points(cloud: &PointCloud) -> Result<(Vec<Point>, bool)> {
             }
         }
     }
-    Ok((points, intensity.is_some()))
+    Ok(Points { points, has_intensity: intensity.is_some() })
 }
 
 /// Replaces the points in each occupied voxel with one point at the voxel's center (mean intensity).
-fn voxel_downsample(points: Vec<Point>, voxel: f64) -> Vec<Point> {
+fn voxel_downsample(points: &[Point], voxel: f64) -> Cow<'_, [Point]> {
     if voxel <= 0.0 {
-        return points;
+        return Cow::Borrowed(points);
     }
     let mut cells: HashMap<[i64; 3], (f64, u32)> = HashMap::with_capacity(points.len() / 2);
     let mut order = Vec::new();
@@ -122,7 +130,8 @@ fn voxel_downsample(points: Vec<Point>, voxel: f64) -> Vec<Point> {
             let (intensity_sum, count) = cells[&cell];
             Point { xyz: cell.map(|index| (index as f64 + 0.5) * voxel), intensity: intensity_sum / count as f64 }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .into()
 }
 
 /// (origin, scale) so every point fits int16. With voxels the grid is voxel-aligned: centers land
@@ -140,15 +149,20 @@ fn quantization_grid(low: [f64; 3], high: [f64; 3], voxel: f64) -> ([f64; 3], f6
     (center, finest.max(f32::MIN_POSITIVE as f64))
 }
 
+#[cfg(test)]
 pub fn encode(cloud: &PointCloud, quality: f64) -> Result<Vec<u8>> {
-    let (points, has_intensity) = read_points(cloud)?;
-    let source_count = points.len();
+    encode_points(&read_points(cloud)?, quality)
+}
+
+pub fn encode_points(cloud: &Points, quality: f64) -> Result<Vec<u8>> {
+    let has_intensity = cloud.has_intensity;
+    let source_count = cloud.points.len();
     let voxel = voxel_size(quality);
-    let points = voxel_downsample(points, voxel);
+    let points = voxel_downsample(&cloud.points, voxel);
     let mut low = [f64::INFINITY; 3];
     let mut high = [f64::NEG_INFINITY; 3];
     let (mut intensity_low, mut intensity_high) = (f64::INFINITY, f64::NEG_INFINITY);
-    for point in &points {
+    for point in points.iter() {
         for axis in 0..3 {
             low[axis] = low[axis].min(point.xyz[axis]);
             high[axis] = high[axis].max(point.xyz[axis]);
@@ -163,7 +177,7 @@ pub fn encode(cloud: &PointCloud, quality: f64) -> Result<Vec<u8>> {
     let intensity_min = if points.is_empty() { 0.0 } else { intensity_low as f32 };
 
     let mut body = Vec::with_capacity(points.len() * if has_intensity { 7 } else { 6 });
-    for point in &points {
+    for point in points.iter() {
         for (value, axis_origin) in point.xyz.iter().zip(origin) {
             let quantized = ((value - axis_origin as f64) / scale as f64).round().clamp(-QUANT_MAX, QUANT_MAX) as i16;
             body.extend_from_slice(&quantized.to_le_bytes());
@@ -204,7 +218,7 @@ mod tests {
 
     #[test]
     fn full_quality_within_bound() {
-        for (protocol, file, intensity) in [(Protocol::Ros2, "ros2/pointcloud_xyz.cdr", false), (Protocol::Dimos, "dimos/pointcloud_xyzi.lcm", true)] {
+        for (protocol, file, intensity) in [(Protocol::Ros2, "ros2/pointcloud_xyz.cdr", false), (Protocol::Dimos, "dimos/pointcloud_xyzi.bin", true)] {
             let payload = fixture(file);
             let encoded = encode(&parse_point_cloud(protocol, &payload).unwrap(), 1.0).unwrap();
             let (positions, intensities, scale) = decode(&encoded);

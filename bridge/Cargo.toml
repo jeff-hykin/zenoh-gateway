@@ -1,9 +1,15 @@
 [package]
 name = "zenoh-web"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Minimal zenoh <-> WebRTC data channel bridge"
-license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+description = "View and drive a zenoh system from a browser over WebRTC (data channels, H.264 video, bandwidth allocation, deadmen); a CLI and an embeddable server with pluggable codecs"
+repository = "https://github.com/jeff-hykin/zenoh-web"
+readme = "../README.md"
+keywords = ["zenoh", "webrtc", "robotics", "browser", "bridge"]
+categories = ["network-programming", "web-programming", "science::robotics", "command-line-utilities"]
+# only what building the library and the CLI needs (no fixtures, examples, forks or artifacts)
+include = ["/src/**/*.rs", "/Cargo.toml"]
 
 [[bin]]
 name = "zenoh-web"
@@ -12,8 +18,9 @@ path = "src/main.rs"
 [dependencies]
 zenoh = "1.10"
 zenoh-ext = { version = "1.10", features = ["unstable"] }
-webrtc = "0.21.0"
-rtc = "0.21.0"
+# forks of webrtc-rs with small fixes, renamed so they reach crates that depend on zenoh-web (see forks/README.md)
+webrtc = { package = "zenoh-web-webrtc", version = "=0.21.0-zw.1", path = "forks/webrtc" }
+rtc = { package = "zenoh-web-rtc", version = "=0.21.0-zw.1", path = "forks/rtc" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
@@ -34,10 +41,3 @@ zune-jpeg = "0.5"
 png = "0.18"
 image-webp = "0.2"
 jxl-oxide = "0.12"
-
-# Vendored with small patches (search "zenoh-web patch"); drop once upstream fixes them:
-# - rtc-sctp: RTO_MIN 1 s -> 200 ms, RTO_MAX 60 s -> 3 s (src/association/timer.rs)
-# - rtc: apply the peer's DCEP reliability to channels the peer opens (src/peer_connection/handler/sctp.rs)
-[patch.crates-io]
-rtc-sctp = { path = "vendor/rtc-sctp" }
-rtc = { path = "vendor/rtc" }

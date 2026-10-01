@@ -4,6 +4,8 @@ View and drive a [zenoh](https://zenoh.io) system from a browser over a squeezed
 weak wifi), without a heavy bridge: one small Rust process, WebRTC to the browser, and a dependency-free
 TypeScript client. Camera images arrive as H.264 video, depth stays lossless, point clouds are
 quantized, and a per-browser bandwidth allocator decides who gets what when the link is short.
+It is a command (`zenoh-web`) and a Rust library for embedding the server in another application,
+with codecs of your own ([Use as a Rust library](#use-as-a-rust-library)).
 [SPEC.md](SPEC.md) is the detailed contract; this README is the overview.
 
 ![the example page: topic list, H.264 video, point cloud, depth, a raw stream and live allocation stats](test/artifacts/example.png)
@@ -63,9 +65,9 @@ No robot handy? Start the test peer first; it publishes the repo's fixtures (a 3
 
 ```sh
 cargo run --release --manifest-path bridge/Cargo.toml --example test_peer -- --listen tcp/127.0.0.1:7447 \
-    --publish demo/camera/sensor_msgs.Image=test/fixtures/dimos/image_rgb8.lcm@10 \
-    --publish demo/lidar/sensor_msgs.PointCloud2=test/fixtures/dimos/pointcloud_xyzi.lcm@10 \
-    --publish demo/depth/sensor_msgs.Image=test/fixtures/dimos/depth_16UC1.lcm@10
+    --publish demo/camera/sensor_msgs.Image=test/fixtures/dimos/image_rgb8.bin@10 \
+    --publish demo/lidar/sensor_msgs.PointCloud2=test/fixtures/dimos/pointcloud_xyzi.bin@10 \
+    --publish demo/depth/sensor_msgs.Image=test/fixtures/dimos/depth_16UC1.bin@10
 ```
 
 Then on the page type a key (e.g. `demo/camera/sensor_msgs.Image`; the codec select guesses
@@ -93,7 +95,7 @@ Logging: `RUST_LOG=info,zenoh=warn`.
 ## Client API
 
 ```js
-import { connect, Priority, CODECS } from "https://esm.sh/gh/jeff-hykin/zenoh-web@<commit or tag>/client/zenoh_web.ts"
+import { connect, Priority, registerCodec } from "https://esm.sh/gh/jeff-hykin/zenoh-web@<commit or tag>/client/zenoh_web.ts"
 
 const z = await connect("http://robot.local:7448", { heartbeatHz: 5, heartbeatMisses: 3 })
 const sub = z.subscribe("camera/**", { codec: "ros2-image", maxHz: 15 }, (msg) => {})
@@ -123,10 +125,11 @@ Options are validated in the client (unknown names and out-of-range values throw
 
 | member | |
 |---|---|
-| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, bytes, timestamp, seq, depth?, points?, video?, mediaStream? }` |
+| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, bytes, timestamp, seq, depth?, points?, decoded?, video?, mediaStream? }` |
 | `publisher(key, options)` → `Publisher` | |
 | `get(key, { timeoutMs = 5000 })` → `[{ key, bytes, error? }]` | zenoh query |
 | `listTopics(filter = "**", { probeMs = 600 })` → `[{ key, sources }]` | live keys; `sources` ⊂ `subscriber`, `queryable`, `token`, `advancedPublisher`, `sample` (SPEC "Topic enumeration") |
+| `codecs` | `[{ name, output }]`: every codec the bridge runs (`output` `"video"` or `"data"`), fetched on connect |
 | `stats` | per key: `received`, `dropped`, `backlogBytes`, `rttMs`, `bridge` (normalized options, bridge counters, `allocation`) |
 | `bridgeStats` | `clock`, `heartbeat`, `access` (`enabled`, `denied`), `bandwidth` (estimate, cap, budget, demand, queue delay, …) |
 | `rttMs`, `clockOffsetMs` | round trip and bridge-minus-page clock offset |
@@ -149,11 +152,12 @@ Options are validated in the client (unknown names and out-of-range values throw
 | `dangerousMinHz` | 0 | floor kept even if it starves others (≤ `maxHz`) |
 | `minQuality`, `maxQuality` | 0, 1 | quality bounds for codec streams |
 | `qualityToHzTradeoff` | 0.5 | 0 = keep quality, drop Hz; 1 = keep Hz, drop quality |
-| `codec` | none (raw bytes) | see "Codecs"; unknown names throw |
+| `codec` | none (raw bytes) | a name from `z.codecs` (see "Codecs"); unknown names throw, listing the bridge's codecs |
 
 `Subscription`: `ready()` (resolves when the bridge accepted it and the channel is open, rejects with
 the bridge's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"`), `mediaStream`
-(video codecs), `received`, `dropped`, `partialDropped`, `decodeErrors`, `bridgeStats`, `close()`.
+(video codecs), `codecKind` (`"video"`, `"data"` or `null`), `received`, `dropped`, `partialDropped`,
+`decodeErrors`, `bridgeStats`, `close()`.
 
 ### Publisher options and methods
 
@@ -168,14 +172,21 @@ the bridge's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"
 `clearDeadman()`, `state` (`"connecting"`, `"open"`, `"tripped"`, `"rejected"`, `"closed"`),
 `onTripped(fn)`, `tripReason`, `sent`, `dropped`, `ready()`, `close()`.
 
+`registerCodec(name, decoder)` supplies the browser decoder of a data codec the bridge's host
+application added (see [Use as a Rust library](#use-as-a-rust-library)): each message then gets
+`msg.decoded = decoder(msg.bytes, msg)`. Without a decoder, `msg.bytes` still carries the codec's
+bytes (and the page warns once). Video codecs need no decoder.
+
 Also exported: `Priority` (`REAL_TIME` 1, `INTERACTIVE_HIGH` 2, `INTERACTIVE_LOW` 3, `DATA_HIGH` 4,
-`DATA` 5, `DATA_LOW` 6, `BACKGROUND` 7), `CODECS`, `codecOutput(codec)`, the wire helpers
-`decodeFrame`, `decodeDepth`, `decodePointCloud`, `decodeVideoFrameInfo`, `encodePut`, and
-`validateSubscribeOptions`, `validatePublisherOptions`.
+`DATA` 5, `DATA_LOW` 6, `BACKGROUND` 7), `CODECS` (the built-in names), `codecOutput(codec)` (a
+built-in's `"video"`, `"depth"` or `"pointcloud"`), the wire helpers `decodeFrame`, `decodeDepth`,
+`decodePointCloud`, `decodeVideoFrameInfo`, `encodePut`, and `validateSubscribeOptions(options, codecs?)`,
+`validatePublisherOptions`.
 
 ## Codecs
 
-Picked explicitly per subscription; there is no auto-detection. No codec = raw bytes, rate is the only degradation.
+Picked explicitly per subscription; there is no auto-detection. No codec = raw bytes, rate is the only
+degradation. These are built in; an application embedding the server can add its own (next section).
 
 | codec | input | browser gets |
 |---|---|---|
@@ -186,9 +197,85 @@ Picked explicitly per subscription; there is no auto-detection. No codec = raw b
 | `ros2-pointcloud2`, `dimos-pointcloud2` | `sensor_msgs/PointCloud2`, any field layout | quantized points: `msg.points.positions` (`Float32Array`), `intensity` |
 
 `ros2-*` reads CDR as published by rmw_zenoh (`<domain>/<topic>/<type>/RIHS01_<hash>` keys);
-`dimos-*` reads LCM as published by dimos over zenoh (`<topic>/<msg_name>` keys, fingerprint checked).
+`dimos-*` reads the dimos message format as dimos publishes it over zenoh (`<topic>/<msg_name>` keys,
+type fingerprint checked).
 Lower quality = smaller video (resolution and bitrate), a coarser depth stride (values stay exact), a
 voxel-downsampled cloud. Details and wire formats: SPEC.md "Codecs".
+
+## Use as a Rust library
+
+The crate is a library too: an application (e.g. a desktop app) can run the server in-process,
+hand it the zenoh session it already has, and add codecs written in Rust.
+
+```toml
+[dependencies]
+zenoh-web = { git = "https://github.com/jeff-hykin/zenoh-web" }   # pin a rev or tag
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust
+let server = zenoh_web::Server::builder()
+    .connect("tcp/192.168.1.2:7447")       // or .session(existing_session), or .zenoh_config(config)
+    .serve_dir("ui")                       // optional static files
+    .bandwidth_target_fraction(0.75)
+    .codec(TextUppercase)                  // an external codec, below
+    .build()
+    .await?;
+let running = server.bind(("0.0.0.0", 7448)).await?;   // background task; port 0 = any free port
+println!("listening on {}", running.local_addr());
+// ... when the app quits: deadmen fire, browsers disconnect, the session closes (if zenoh-web opened it)
+running.shutdown().await?;
+```
+
+Also `server.serve(addr)`, `server.serve_with_shutdown(addr, signal)`, and `server.router()` (an axum
+`Router` with `POST /offer` and the static files, to mount in your own HTTP server; then call
+`server.shutdown()` yourself). The `zenoh-web` command is a thin wrapper over this builder. API docs:
+`cargo doc --open` in `bridge/`.
+
+### Custom codecs
+
+Implement `zenoh_web::Codec`: decode a zenoh sample (key, payload, encoding) once, then produce
+either **video** (`DecodedFrame::Video(VideoImage::rgb8(..)` or `::i420(..))`: the bridge scales it
+to the allocated quality, encodes H.264 and sends it on a video track, so the page just shows
+`sub.mediaStream`) or **data** (`encode(frame, quality)` returns bytes for the data channel; the
+page decodes them with `registerCodec`). Decodes are shared across browsers per sample, data encodes
+per (sample, quality). `estimated_bytes(payload_bytes, quality)` is an optional cost model for the
+allocator.
+
+```rust
+use zenoh_web::{Codec, CodecOutput, CodecSample, DecodedFrame};
+
+struct TextUppercase;
+
+impl Codec for TextUppercase {
+    fn name(&self) -> &str { "text-uppercase" }
+    fn output(&self) -> CodecOutput { CodecOutput::Data }
+    fn decode(&self, sample: &CodecSample<'_>) -> anyhow::Result<DecodedFrame> {
+        Ok(DecodedFrame::data(std::str::from_utf8(sample.payload)?.to_uppercase()))
+    }
+    fn encode(&self, frame: &DecodedFrame, quality: f64) -> anyhow::Result<Vec<u8>> {
+        let text = frame.downcast::<String>()?;   // lower quality: a shorter prefix
+        Ok(text.chars().take((text.chars().count() as f64 * quality).ceil() as usize).collect::<String>().into_bytes())
+    }
+}
+```
+
+```js
+import { connect, registerCodec } from "./zenoh_web.ts"
+registerCodec("text-uppercase", (bytes) => new TextDecoder().decode(bytes))
+const z = await connect("http://localhost:7448")
+z.subscribe("chat/**", { codec: "text-uppercase" }, (msg) => console.log(msg.decoded))
+```
+
+A name that is already registered (built-in or not) makes `build()` fail; an unknown name is refused
+by the client and the bridge with the list of codecs the bridge has. `bridge/examples/custom_codec.rs`
+is a complete program (its own zenoh session, the data codec above and a video codec producing I420
+frames); `test/custom_codec.js` drives it from Chrome.
+
+The webrtc-rs fixes zenoh-web needs live in renamed forks (`zenoh-web-webrtc`, `zenoh-web-rtc`,
+`zenoh-web-rtc-datachannel`, `zenoh-web-rtc-sctp`, in `bridge/forks/`, each with a `PATCHES.md`)
+that zenoh-web depends on directly, so a dependent crate gets the fixed code without any
+`[patch]` section. `cargo tree -i rtc-sctp` in a dependent finds nothing; `cargo tree -i zenoh-web-rtc-sctp` finds the fork.
 
 ## Access control
 
@@ -221,8 +308,8 @@ state `"rejected"`, `ready()` rejects and `put` throws; `z.bridgeStats.access.de
 
 `connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })` sends beats on an unreliable channel (they are
 also clock-sync samples). `await publisher.setDeadman(stopBytes)` stores one message on the bridge per
-publisher. If the beats stop for `misses / hz` seconds, the page disconnects, or the bridge gets
-SIGINT/SIGTERM, the bridge publishes it **once** (REAL_TIME, reliable). The publisher is then
+publisher. If the beats stop for `misses / hz` seconds, the page disconnects, or the bridge shuts down
+(SIGINT/SIGTERM, or `shutdown()` when embedded), the bridge publishes it **once** (REAL_TIME, reliable). The publisher is then
 `"tripped"` (`onTripped(reason)` with `"heartbeat"`, `"disconnected"` or `"shutdown"`); puts throw and a
 new publisher is needed. Background tabs throttle timers to ≥ 1 s, so keep `misses / hz` well above 1 s.
 
@@ -254,8 +341,8 @@ nix develop                            # Rust (+ aarch64-linux target), clippy, 
   and the loader (C++ runtime linked statically), and its newest symbol is `GLIBC_2.34`.
 - The macOS binary links `/usr/lib/libiconv.2.dylib` (rewritten from nix's copy), so it runs on Macs without nix.
   The Intel one is built by the same clang/SDK with `--target x86_64-apple-darwin` (macOS ≥ 14).
-- Cargo dependencies come from `bridge/Cargo.lock` (`importCargoLock`); the patched crates in
-  `bridge/vendor/` are path dependencies and travel with the source.
+- Cargo dependencies come from `bridge/Cargo.lock` (`importCargoLock`); the forked crates in
+  `bridge/forks/` are path dependencies and travel with the source.
 
 ## Releases
 
@@ -265,15 +352,17 @@ All four release binaries are built on an Apple Silicon Mac, with no remote buil
 nix build .#release --builders ''   # result/<target-triple>/zenoh-web for
                                     # aarch64-apple-darwin, x86_64-apple-darwin,
                                     # aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu
+gh release create v<version> result/dist/*  # the tarballs + SHA256SUMS
 ```
 
-Each is packaged as `zenoh-web-<version>-<target-triple>.tar.gz` (binary + README.md) with a
-`SHA256SUMS`, and uploaded with `gh release create v<version>`; `install.sh` reads those names.
+`result/dist/` holds `zenoh-web-<version>-<target-triple>.tar.gz` (binary + README.md) and
+`SHA256SUMS`, made by GNU tar inside the build (no macOS extended attributes, fixed owner and
+mtime); `install.sh` reads those names.
 
 ## Tests
 
 ```sh
-cd bridge && cargo test && cargo clippy    # unit tests
+cd bridge && cargo test && cargo clippy --all-targets && cargo doc --no-deps   # unit + doc tests, lints, API docs
 deno task check                            # type-check the client
 deno task e2e                              # every end-to-end suite (several minutes)
 ```
@@ -282,7 +371,13 @@ The end-to-end suites start a real zenoh test peer (`bridge/examples/test_peer.r
 their own headless Chrome (never the one on port 9222):
 
 - `test/e2e.js`: pipe, delivery modes, clock sync, deadman, ACL, chunked messages, topic listing.
-- `test/codecs.js`: every fixture in `test/fixtures/` (made by dimos's own `lcm_encode` and by rosbags), byte-exact through each codec.
+- `test/codecs.js`: every fixture in `test/fixtures/` (made by dimos's own encoder and by rosbags)
+  through each built-in codec: depth values exact at full and half resolution, point clouds within the
+  documented quantization bound (intensity exact), video by its quadrant colors within ±10 of the
+  pattern (H.264 is lossy), plus unknown-codec errors and encodes shared across frontends.
+- `test/custom_codec.js`: `bridge/examples/custom_codec.rs` (the library with its own zenoh session and
+  two external codecs): a data codec's text exact through a `registerCodec` decoder (full and half
+  quality), a video codec's I420 frames by their color within ±20, unknown names on both sides.
 - `test/allocation.js`: flex-shrink and the quality/Hz tradeoff under `--max-bandwidth-bytes-per-sec`.
 - `test/latency.js`: a strict-priority stream's p99 under bulk load through a userspace UDP shaper.
 - `test/example.js` (`deno task e2e:example`): the example page served by `--serve examples`, driven
@@ -297,9 +392,10 @@ their own headless Chrome (never the one on port 9222):
 - The browser decodes zstd in JS (vendored fzstd) because `DecompressionStream("zstd")` isn't universal yet.
 - Access control is bridge-wide; there is no per-user identity or auth on `/offer`. Run it on a trusted network.
 - No TURN/relay configuration on the bridge side: the browser must reach the bridge's UDP ports (LAN, VPN).
-- Codecs are a fixed list compiled into the bridge (WASM user codecs are a later phase).
+- Codecs are compiled in: the built-ins, plus Rust codecs of an application that embeds the library
+  (codecs shipped from the browser as WASM are a later phase).
 - Changing a subscription's options means closing it and subscribing again (the example page does that).
-- `bridge/vendor/` carries small fixes to webrtc-rs (`rtc`, `rtc-sctp`; search "zenoh-web patch") until upstream has them:
-  browser-opened channels honor their reliability, a reset stream's unsent chunks are dropped, fragmented
-  partially-reliable messages are abandoned whole, a repeated stream reset isn't re-run, and the
-  retransmission timeout floor/cap are 200 ms / 3 s.
+- `bridge/forks/` carries small fixes to webrtc-rs (see each `PATCHES.md`; search "zenoh-web patch") until
+  upstream has them: browser-opened channels honor their reliability, a reset stream's unsent chunks are
+  dropped, fragmented partially-reliable messages are abandoned whole, a repeated stream reset isn't re-run,
+  and the retransmission timeout floor/cap are 200 ms / 3 s.

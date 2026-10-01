@@ -21,9 +21,9 @@ const entryFor = (file) => {
     return entry
 }
 const streams = [
-    { name: "video", file: "dimos/image_rgb8.lcm", codec: "dimos-image" },
-    { name: "pointcloud", file: "dimos/pointcloud_xyzi.lcm", codec: "dimos-pointcloud2" },
-    { name: "depth", file: "dimos/depth_16UC1.lcm", codec: "dimos-depth" },
+    { name: "video", file: "dimos/image_rgb8.bin", codec: "dimos-image" },
+    { name: "pointcloud", file: "dimos/pointcloud_xyzi.bin", codec: "dimos-pointcloud2" },
+    { name: "depth", file: "dimos/depth_16UC1.bin", codec: "dimos-depth" },
 ].map((stream) => ({ ...stream, key: fixtureKey(entryFor(stream.file)) }))
 const rawKey = "example/raw"
 

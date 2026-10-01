@@ -12,9 +12,9 @@ console.log(`machine load at start: ${await machineLoad()}`)
 
 const rawBudget = 480_000
 const videoBudget = 12_000
-const videoEntry = loadManifest().entries.find((entry) => entry.file === "dimos/image_rgb8.lcm")
+const videoEntry = loadManifest().entries.find((entry) => entry.file === "dimos/image_rgb8.bin")
 if (!videoEntry) {
-    throw new Error("fixture dimos/image_rgb8.lcm missing from manifest")
+    throw new Error("fixture dimos/image_rgb8.bin missing from manifest")
 }
 const videoKey = fixtureKey(videoEntry).replace("/fixture/", "/allocation/")
 

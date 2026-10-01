@@ -1,4 +1,4 @@
-"""Stage 1 (dimos venv): encode with dimos's own msg classes, round-trip with lcm_decode, write dimos/*.lcm."""
+"""Stage 1 (dimos venv): encode with dimos's own msg classes, round-trip with lcm_decode, write dimos/*.bin."""
 
 import io
 import json
@@ -34,9 +34,9 @@ def key(topic, cls):
 
 
 def write(name, payload, **meta):
-    path = OUT / f"{name}.lcm"
+    path = OUT / f"{name}.bin"
     path.write_bytes(payload)
-    entries.append({"file": f"dimos/{path.name}", "protocol": "dimos-lcm", "bytes": len(payload), **meta})
+    entries.append({"file": f"dimos/{path.name}", "protocol": "dimos", "bytes": len(payload), **meta})
 
 
 def assert_header(msg_obj, frame_id):

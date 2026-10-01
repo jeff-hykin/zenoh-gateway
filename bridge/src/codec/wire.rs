@@ -269,7 +269,7 @@ pub mod tests {
 
     #[test]
     fn images_from_both_protocols() {
-        for (protocol, file) in [(Protocol::Ros2, "ros2/image_rgb8.cdr"), (Protocol::Dimos, "dimos/image_rgb8.lcm")] {
+        for (protocol, file) in [(Protocol::Ros2, "ros2/image_rgb8.cdr"), (Protocol::Dimos, "dimos/image_rgb8.bin")] {
             let payload = fixture(file);
             let image = parse_image(protocol, &payload).unwrap();
             assert_eq!((image.width, image.height, image.step), (320, 240, 960), "{file}");
@@ -282,7 +282,7 @@ pub mod tests {
 
     #[test]
     fn compressed_images_from_both_protocols() {
-        for (protocol, file) in [(Protocol::Ros2, "ros2/compressed_png.cdr"), (Protocol::Dimos, "dimos/compressed_png.lcm")] {
+        for (protocol, file) in [(Protocol::Ros2, "ros2/compressed_png.cdr"), (Protocol::Dimos, "dimos/compressed_png.bin")] {
             let payload = fixture(file);
             let image = parse_compressed_image(protocol, &payload).unwrap();
             assert!(image.format.contains("png"), "{file}: {}", image.format);
@@ -292,7 +292,7 @@ pub mod tests {
 
     #[test]
     fn point_clouds_from_both_protocols() {
-        for (protocol, file, step) in [(Protocol::Ros2, "ros2/pointcloud_xyz.cdr", 12), (Protocol::Dimos, "dimos/pointcloud_xyzi.lcm", 16)] {
+        for (protocol, file, step) in [(Protocol::Ros2, "ros2/pointcloud_xyz.cdr", 12), (Protocol::Dimos, "dimos/pointcloud_xyzi.bin", 16)] {
             let payload = fixture(file);
             let cloud = parse_point_cloud(protocol, &payload).unwrap();
             assert_eq!((cloud.width, cloud.height, cloud.point_step), (20000, 1, step), "{file}");
@@ -303,7 +303,7 @@ pub mod tests {
 
     #[test]
     fn wrong_type_is_an_error() {
-        assert!(parse_image(Protocol::Dimos, &fixture("dimos/compressed_png.lcm")).is_err(), "fingerprint mismatch");
+        assert!(parse_image(Protocol::Dimos, &fixture("dimos/compressed_png.bin")).is_err(), "fingerprint mismatch");
         assert!(parse_image(Protocol::Ros2, &fixture("ros2/compressed_png.cdr")).is_err(), "truncated");
         assert!(parse_point_cloud(Protocol::Ros2, &[0, 1, 0, 0, 1]).is_err());
     }
