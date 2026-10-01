@@ -192,7 +192,7 @@ bridge keeps the path's queues short and lets urgent streams skip what queue rem
   bulk never bursts whole messages into the link.
 - **Delay trigger.** The browser reports its RTT with every clock-sync sample (each heartbeat, else
   the 1 s control ping: configure `heartbeatHz` for a fast trigger). When the smallest RTT of a 250 ms
-  interval is more than 10 ms above the 30 s minimum, a queue is standing on the path: the data
+  interval is more than 5 ms above the 30 s minimum, a queue is standing on the path: the data
   estimate drops 15% at once and probing pauses 1 s; then it probes up 10% per interval below 90% of
   the level that caused the queue and 2% above it. No loss is needed to react.
 

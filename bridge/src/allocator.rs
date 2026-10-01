@@ -194,7 +194,7 @@ const CONGESTED_FRACTION: f64 = 0.2;
 const FAST_PROBE_GAIN: f64 = 1.10;
 const SLOW_PROBE_GAIN: f64 = 1.02;
 /// RTT above its recent minimum by this much means a queue is building.
-pub const DELAY_THRESHOLD_MS: f64 = 10.0;
+pub const DELAY_THRESHOLD_MS: f64 = 5.0;
 const DELAY_DECREASE: f64 = 0.85;
 const HOLD_AFTER_CONGESTION: std::time::Duration = std::time::Duration::from_secs(1);
 
