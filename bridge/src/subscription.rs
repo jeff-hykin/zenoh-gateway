@@ -320,7 +320,7 @@ impl SubShared {
     pub fn apply(&self, allocation: Allocation) {
         // bulk streams trickle at their grant; strict and reliable ones aren't paced
         let paced = !self.delivery.reliable && !self.is_strict() && allocation.demand_bytes_per_sec > 0.0;
-        let rate = paced.then(|| allocation.budget_bytes_per_sec * PACING_SLACK);
+        let rate = paced.then_some(allocation.budget_bytes_per_sec * PACING_SLACK);
         self.bucket.lock().unwrap().set_rate(rate, 2 * self.gate.chunk_bytes());
         self.state.lock().unwrap().allocation = allocation;
         self.data_ready.notify_one();

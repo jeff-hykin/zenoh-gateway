@@ -205,7 +205,7 @@ impl PeerState {
         let total_demand: f64 = usages.iter().map(|usage| wants(&usage.demand)).sum();
         let estimator = {
             let mut estimator = self.estimator.lock().unwrap();
-            estimator.update(now, interval_secs, sent as f64, blocked_ms / 1000.0, active, data_demand, queue_delay_ms);
+            estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, active_senders: active, data_demand, queue_delay_ms });
             estimator.clone()
         };
         let has_video = usages.iter().any(|usage| usage.is_video);

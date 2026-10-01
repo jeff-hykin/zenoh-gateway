@@ -211,10 +211,23 @@ impl Default for Estimator {
     }
 }
 
+/// What the frontend's streams did during one allocation interval.
+#[derive(Debug, Clone, Copy)]
+pub struct Interval {
+    pub now: std::time::Instant,
+    pub secs: f64,
+    pub sent_bytes: f64,
+    /// time senders waited on SCTP, summed over `active_senders` channels
+    pub blocked_secs: f64,
+    pub active_senders: usize,
+    pub data_demand: f64,
+    /// the interval's smallest RTT minus the recent minimum, if any sample came in
+    pub queue_delay_ms: Option<f64>,
+}
+
 impl Estimator {
-    /// `blocked_secs` is summed over `active_senders` channels during `interval_secs`;
-    /// `queue_delay_ms` is the latest RTT minus the recent minimum, if known.
-    pub fn update(&mut self, now: std::time::Instant, interval_secs: f64, sent_bytes: f64, blocked_secs: f64, active_senders: usize, data_demand: f64, queue_delay_ms: Option<f64>) {
+    pub fn update(&mut self, interval: Interval) {
+        let Interval { now, secs: interval_secs, sent_bytes, blocked_secs, active_senders, data_demand, queue_delay_ms } = interval;
         if interval_secs <= 0.0 {
             return;
         }
@@ -315,23 +328,27 @@ mod tests {
         assert_eq!(floored.quality, Some(0.4));
     }
 
+    fn sample(now: std::time::Instant, secs: f64, sent_bytes: f64, blocked_secs: f64, active_senders: usize, data_demand: f64, queue_delay_ms: Option<f64>) -> Interval {
+        Interval { now, secs, sent_bytes, blocked_secs, active_senders, data_demand, queue_delay_ms }
+    }
+
     #[test]
     fn estimator_backs_off_when_blocked_and_probes_when_wanted() {
         let now = std::time::Instant::now();
         let mut estimator = Estimator::default();
-        estimator.update(now, 0.25, 100_000.0, 0.2, 1, 5e6, None);
+        estimator.update(sample(now, 0.25, 100_000.0, 0.2, 1, 5e6, None));
         assert!((estimator.data_bytes_per_sec - 500_000.0).abs() < 1.0, "halved at most per step: {estimator:?}");
-        estimator.update(now, 0.25, 100_000.0, 0.2, 1, 5e6, None);
+        estimator.update(sample(now, 0.25, 100_000.0, 0.2, 1, 5e6, None));
         assert!((estimator.data_bytes_per_sec - 360_000.0).abs() < 1.0, "0.9 x 400 KB/s measured: {estimator:?}");
-        estimator.update(now, 0.25, 50_000.0, 0.0, 1, 5e6, None);
+        estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 5e6, None));
         assert!((estimator.data_bytes_per_sec - 396_000.0).abs() < 1.0, "probes fast below 90% of the last congestion level (500 KB/s): {estimator:?}");
-        estimator.update(now, 0.25, 50_000.0, 0.0, 1, 5e6, None);
+        estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 5e6, None));
         assert!((estimator.data_bytes_per_sec - 435_600.0).abs() < 1.0, "{estimator:?}");
-        estimator.update(now, 0.25, 50_000.0, 0.0, 1, 5e6, None);
+        estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 5e6, None));
         assert!((estimator.data_bytes_per_sec - 479_160.0).abs() < 1.0, "{estimator:?}");
-        estimator.update(now, 0.25, 50_000.0, 0.0, 1, 5e6, None);
+        estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 5e6, None));
         assert!((estimator.data_bytes_per_sec - 479_160.0 * 1.02).abs() < 1.0, "slowly above 90% of it: {estimator:?}");
-        estimator.update(now, 0.25, 50_000.0, 0.0, 1, 1000.0, None);
+        estimator.update(sample(now, 0.25, 50_000.0, 0.0, 1, 1000.0, None));
         assert!((estimator.data_bytes_per_sec - 479_160.0 * 1.02).abs() < 1.0, "no probing without demand");
     }
 
@@ -339,14 +356,14 @@ mod tests {
     fn delay_cuts_and_holds() {
         let now = std::time::Instant::now();
         let mut estimator = Estimator::default();
-        estimator.update(now, 0.25, 200_000.0, 0.0, 1, 5e6, Some(3.0));
+        estimator.update(sample(now, 0.25, 200_000.0, 0.0, 1, 5e6, Some(3.0)));
         assert!((estimator.data_bytes_per_sec - 1_100_000.0).abs() < 1.0, "small RTT noise: keeps probing fast");
-        estimator.update(now, 0.25, 200_000.0, 0.0, 1, 5e6, Some(25.0));
+        estimator.update(sample(now, 0.25, 200_000.0, 0.0, 1, 5e6, Some(25.0)));
         assert!((estimator.data_bytes_per_sec - 935_000.0).abs() < 1.0, "cut by 15%: {estimator:?}");
         assert_eq!(estimator.delay_events, 1);
-        estimator.update(now + std::time::Duration::from_millis(250), 0.25, 200_000.0, 0.0, 1, 5e6, Some(25.0));
+        estimator.update(sample(now + std::time::Duration::from_millis(250), 0.25, 200_000.0, 0.0, 1, 5e6, Some(25.0)));
         assert!((estimator.data_bytes_per_sec - 935_000.0).abs() < 1.0, "holds while the queue drains");
-        estimator.update(now + std::time::Duration::from_millis(1100), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0));
+        estimator.update(sample(now + std::time::Duration::from_millis(1100), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0)));
         assert!((estimator.data_bytes_per_sec - 1_028_500.0).abs() < 1.0, "then probes again, fast below 90% of the congestion level: {estimator:?}");
     }
 }
