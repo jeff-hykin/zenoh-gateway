@@ -255,11 +255,12 @@ const CPU_EWMA_GAIN: f64 = 0.2;
 
 /// Keeps a video stream within what the machine's cores can encode at the granted rate. The
 /// allocator picks quality for bandwidth; on a small CPU (a Jetson with a 1920x1536 camera) the
-/// encoder then fell behind and the frame rate collapsed instead. When decoding or encoding a frame
-/// (the two overlap, so the slower one sets the rate) takes more than `CPU_HEADROOM` of the frame
-/// interval, the ceiling steps down (never below minQuality), trading resolution for frames the
-/// way a bandwidth shortfall would; it steps back up when the encode cost predicted at the next
-/// step (it scales with pixels) fits again.
+/// encoder then fell behind and the frame rate collapsed instead. When scaling + encoding a frame
+/// takes more than `CPU_HEADROOM` of the frame interval, the ceiling steps down (never below
+/// minQuality), trading resolution for frames the way a bandwidth shortfall would; it steps back up
+/// when the encode cost predicted at the next step (it scales with pixels) fits again. Decoding
+/// overlaps encoding and does not depend on quality, so it never moves the ceiling: a slow decode
+/// caps the frame rate whatever the resolution.
 struct CpuGovernor {
     cap: f64,
     decode_ms: Option<f64>,
@@ -288,9 +289,8 @@ impl CpuGovernor {
         let settled = self.changed_at.is_none_or(|at| now.duration_since(at) >= CPU_SETTLE);
         if let (true, Some(encode_ms)) = (settled, self.encode_ms) {
             let budget_ms = 1000.0 / hz.max(0.1) * CPU_HEADROOM;
-            let decode_ms = self.decode_ms.unwrap_or(0.0);
             let current = allocated.min(self.cap);
-            if decode_ms.max(encode_ms) > budget_ms && current > floor + 1e-9 {
+            if encode_ms > budget_ms && current > floor + 1e-9 {
                 self.cap = (current - CPU_STEP).max(floor);
                 self.encode_ms = None;
                 self.changed_at = Some(now);
@@ -298,7 +298,7 @@ impl CpuGovernor {
                 let next = (self.cap + CPU_STEP).min(1.0);
                 let pixels = |quality: f64| crate::codec::video::resolution_scale(quality).powi(2);
                 let predicted_ms = encode_ms * pixels(next) / pixels(self.cap);
-                if decode_ms.max(predicted_ms) < budget_ms * 0.9 {
+                if predicted_ms < budget_ms * 0.9 {
                     self.cap = next;
                     self.encode_ms = None;
                     self.changed_at = Some(now);
@@ -440,6 +440,11 @@ mod tests {
         assert!((governor.quality(0.8, 0.1, 30.0, start + Duration::from_millis(100)) - 0.7).abs() < 1e-9, "settles before the next step");
         governor.observe_encode(45.0);
         assert!((governor.quality(0.8, 0.1, 30.0, start + CPU_SETTLE) - 0.6).abs() < 1e-9);
+        // a slow decode alone (it does not depend on quality) leaves the ceiling alone
+        let mut decode_bound = CpuGovernor::new();
+        decode_bound.observe_decode(40.0, false);
+        decode_bound.observe_encode(10.0);
+        assert_eq!(decode_bound.quality(0.8, 0.1, 30.0, start), 0.8);
         // never below minQuality
         let mut floor = CpuGovernor::new();
         floor.observe_encode(500.0);

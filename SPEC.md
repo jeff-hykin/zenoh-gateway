@@ -184,10 +184,11 @@ Inputs:
   through RGB; everything else decodes to RGB8. Scaling is a box filter; RGB → I420 is integer BT.601.
 - A video subscription decodes its next frame while it encodes the current one (two blocking-pool
   tasks), so the rate is set by the slower stage, not their sum.
-- CPU governor: when the slower of decode and scale+encode takes more than 85% of the frame interval
-  at the granted Hz, the stream's quality ceiling drops 0.1 (never below `minQuality`), at most once a
-  second; it rises 0.1 when the encode cost predicted at the next step (∝ pixels) fits in 90% of
-  that. So a small CPU keeps the frame rate and gives up resolution, as a bandwidth shortfall would.
+- CPU governor: when scale+encode takes more than 85% of the frame interval at the granted Hz, the
+  stream's quality ceiling drops 0.1 (never below `minQuality`), at most once a second; it rises 0.1
+  when the encode cost predicted at the next step (∝ pixels) fits in 90% of that. So a small CPU
+  keeps the frame rate and gives up resolution, as a bandwidth shortfall would. Decode time does not
+  move it (it does not depend on quality; a slow decode caps the rate at any resolution).
   Stats: `decodeMs`, `encodeMs`, `cpuQualityCap`.
 
 Work happens lazily and on send: only messages the pacing/queues let through are transcoded, on
