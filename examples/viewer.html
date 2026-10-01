@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>zenoh-web viewer</title>
+    <style>
+        :root { color-scheme: light dark; --muted: #888; --line: #8884; }
+        body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; }
+        header { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+        #state { font-weight: 600; }
+        #state.connected { color: #2a2; }
+        #state.degraded { color: #c80; }
+        #state.lost { color: #c33; }
+        .muted { color: var(--muted); }
+        table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+        th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+        td.key { font-family: ui-monospace, monospace; word-break: break-all; }
+        #images { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+        figure { margin: 0; }
+        figure img { max-width: min(100%, 480px); display: block; border: 1px solid var(--line); }
+        figcaption { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
+    </style>
+</head>
+<body>
+    <header>
+        <strong>zenoh-web</strong>
+        <span id="state">connecting</span>
+        <span class="muted" id="bridge"></span>
+        <span class="muted" id="rtt"></span>
+    </header>
+    <table>
+        <thead><tr><th>key</th><th>Hz</th><th>last size</th><th>received</th></tr></thead>
+        <tbody id="keys"></tbody>
+    </table>
+    <div id="images"></div>
+    <script type="module">
+        import { connect } from "../client/zenoh_web.js"
+
+        const params = new URLSearchParams(location.search)
+        const bridgeUrl = params.get("bridge") ?? location.origin
+        const keyExpr = params.get("key") ?? "**"
+        const stateElement = document.getElementById("state")
+        const keysElement = document.getElementById("keys")
+        const imagesElement = document.getElementById("images")
+        document.getElementById("bridge").textContent = `${bridgeUrl} ${keyExpr}`
+
+        /** @type {Map<string, { count: number, countAtLastTick: number, hz: number, lastSize: number, row: HTMLTableRowElement, image: HTMLImageElement | null, pendingJpeg: Uint8Array | null }>} */
+        const keys = new Map()
+
+        /** @param {Uint8Array} bytes */
+        const looksLikeJpeg = (bytes) => bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+
+        /** @param {string} key */
+        function entryFor(key) {
+            let entry = keys.get(key)
+            if (!entry) {
+                const row = document.createElement("tr")
+                row.innerHTML = `<td class="key"></td><td class="hz"></td><td class="size"></td><td class="count"></td>`
+                row.querySelector(".key").textContent = key
+                const rows = [...keysElement.children]
+                const before = rows.find((existing) => existing.querySelector(".key").textContent > key)
+                keysElement.insertBefore(row, before ?? null)
+                entry = { count: 0, countAtLastTick: 0, hz: 0, lastSize: 0, row, image: null, pendingJpeg: null }
+                keys.set(key, entry)
+            }
+            return entry
+        }
+
+        /** @param {string} key */
+        function imageFor(key) {
+            const figure = document.createElement("figure")
+            const image = document.createElement("img")
+            image.alt = key
+            const caption = document.createElement("figcaption")
+            caption.textContent = key
+            figure.append(image, caption)
+            imagesElement.append(figure)
+            return image
+        }
+
+        function render() {
+            for (const [key, entry] of keys) {
+                entry.row.querySelector(".hz").textContent = entry.hz.toFixed(1)
+                entry.row.querySelector(".size").textContent = `${entry.lastSize} B`
+                entry.row.querySelector(".count").textContent = String(entry.count)
+                if (entry.pendingJpeg) {
+                    entry.image ??= imageFor(key)
+                    const previous = entry.image.src
+                    entry.image.src = URL.createObjectURL(new Blob([entry.pendingJpeg], { type: "image/jpeg" }))
+                    if (previous) {
+                        URL.revokeObjectURL(previous)
+                    }
+                    entry.pendingJpeg = null
+                }
+            }
+            requestAnimationFrame(render)
+        }
+
+        const client = await connect(bridgeUrl)
+        stateElement.textContent = client.state
+        stateElement.className = client.state
+        client.onState((state) => {
+            stateElement.textContent = state
+            stateElement.className = state
+        })
+        client.subscribe(keyExpr, { delivery: "latest", hz: [0, 30] }, (message) => {
+            const entry = entryFor(message.key)
+            entry.count++
+            entry.lastSize = message.bytes.length
+            if (looksLikeJpeg(message.bytes)) {
+                entry.pendingJpeg = message.bytes.slice()
+            }
+        })
+        setInterval(() => {
+            for (const entry of keys.values()) {
+                entry.hz = entry.count - entry.countAtLastTick
+                entry.countAtLastTick = entry.count
+            }
+            document.getElementById("rtt").textContent = client.rttMs == null ? "" : `rtt ${client.rttMs.toFixed(1)} ms`
+        }, 1000)
+        requestAnimationFrame(render)
+        window.zenohClient = client
+    </script>
+</body>
+</html>
