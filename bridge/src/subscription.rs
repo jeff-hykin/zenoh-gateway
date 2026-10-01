@@ -86,6 +86,11 @@ pub struct SubStats {
     pub keyframe_requests: u64,
     pub video_width: u32,
     pub video_height: u32,
+    /// video: smoothed time to decode / to scale and encode one frame, and the quality ceiling
+    /// the CPU governor holds (1 = none) so both fit the frame interval
+    pub decode_ms: Option<f64>,
+    pub encode_ms: Option<f64>,
+    pub cpu_quality_cap: Option<f64>,
 }
 
 pub struct Pending {
@@ -240,6 +245,11 @@ impl SubShared {
         priority != 0 && priority <= self.strict_threshold
     }
 
+    /// The subscription's minQuality.
+    pub fn min_quality(&self) -> f64 {
+        self.quality_range.0
+    }
+
     /// Quality to transcode at now: the allocation's, or the best allowed before the first one.
     pub fn current_quality(&self) -> f64 {
         self.state.lock().unwrap().allocation.quality.unwrap_or(self.quality_range.1)
@@ -359,6 +369,14 @@ impl SubShared {
             warn!("codec {}: {error}", self.codec.as_ref().map_or("?", |codec| codec.name()));
             state.stats.last_codec_error = Some(error.to_owned());
         }
+    }
+
+    /// The video pipeline's per-frame costs and the CPU governor's quality ceiling.
+    pub fn record_video_timing(&self, decode_ms: Option<f64>, encode_ms: Option<f64>, cpu_quality_cap: f64) {
+        let mut state = self.state.lock().unwrap();
+        state.stats.decode_ms = decode_ms;
+        state.stats.encode_ms = encode_ms;
+        state.stats.cpu_quality_cap = Some(cpu_quality_cap);
     }
 
     /// A video frame went to the track.

@@ -28,8 +28,9 @@ use webrtc::peer_connection::{PeerConnection, RTCSessionDescription};
 use webrtc::rtp_transceiver::RtpSender;
 
 const H264_PAYLOAD_TYPE: u8 = 102;
-/// Google Congestion Control bounds, bits/s.
-const GCC_INITIAL_BPS: f64 = 1_000_000.0;
+/// Google Congestion Control bounds, bits/s. It starts where the data-channel estimator starts
+/// (`allocator::INITIAL_ESTIMATE`, 1 MB/s), since video is allocated no more than this estimate.
+const GCC_INITIAL_BPS: f64 = crate::allocator::INITIAL_ESTIMATE * 8.0;
 const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 50_000_000.0;
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
@@ -227,17 +228,85 @@ fn metadata(frame: &EncodedFrame, source: (u32, u32), quality: f64) -> [u8; META
 struct Decoding {
     key: String,
     item: subscription::Pending,
-    task: tokio::task::JoinHandle<(std::result::Result<Arc<DecodedFrame>, String>, bool)>,
+    /// (decoded frame, reused another frontend's decode, milliseconds it took)
+    task: tokio::task::JoinHandle<(std::result::Result<Arc<DecodedFrame>, String>, bool, f64)>,
 }
 
 fn start_decode(shared: &SubShared, codec: &Arc<dyn Codec>, key: String, item: subscription::Pending) -> Decoding {
     let payload = item.payload.to_bytes().into_owned();
     let (hash_key, encoding, codecs, codec) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone());
     let task = tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
         let sample = CodecSample::new(&hash_key, &payload, &encoding);
-        codecs.decode_shared(&*codec, &sample, registry::sample_hash(&sample))
+        let (decoded, reused) = codecs.decode_shared(&*codec, &sample, registry::sample_hash(&sample));
+        (decoded, reused, started.elapsed().as_secs_f64() * 1000.0)
     });
     Decoding { key, item, task }
+}
+
+/// Quality steps the CPU governor moves by.
+const CPU_STEP: f64 = 0.1;
+/// Share of the frame interval the slower pipeline stage may take before quality steps down.
+const CPU_HEADROOM: f64 = 0.85;
+/// Time after a step before the next, so the costs are measured at the new size.
+const CPU_SETTLE: Duration = Duration::from_secs(1);
+/// Weight of the newest sample in the cost averages.
+const CPU_EWMA_GAIN: f64 = 0.2;
+
+/// Keeps a video stream within what the machine's cores can encode at the granted rate. The
+/// allocator picks quality for bandwidth; on a small CPU (a Jetson with a 1920x1536 camera) the
+/// encoder then fell behind and the frame rate collapsed instead. When decoding or encoding a frame
+/// (the two overlap, so the slower one sets the rate) takes more than `CPU_HEADROOM` of the frame
+/// interval, the ceiling steps down (never below minQuality), trading resolution for frames the
+/// way a bandwidth shortfall would; it steps back up when the encode cost predicted at the next
+/// step (it scales with pixels) fits again.
+struct CpuGovernor {
+    cap: f64,
+    decode_ms: Option<f64>,
+    encode_ms: Option<f64>,
+    changed_at: Option<Instant>,
+}
+
+impl CpuGovernor {
+    fn new() -> Self {
+        CpuGovernor { cap: 1.0, decode_ms: None, encode_ms: None, changed_at: None }
+    }
+
+    fn observe_decode(&mut self, ms: f64, reused: bool) {
+        if !reused {
+            self.decode_ms = Some(self.decode_ms.map_or(ms, |average| average + CPU_EWMA_GAIN * (ms - average)));
+        }
+    }
+
+    fn observe_encode(&mut self, ms: f64) {
+        self.encode_ms = Some(self.encode_ms.map_or(ms, |average| average + CPU_EWMA_GAIN * (ms - average)));
+    }
+
+    /// The quality to encode at: `allocated`, lowered to the governor's ceiling.
+    fn quality(&mut self, allocated: f64, min_quality: f64, hz: f64, now: Instant) -> f64 {
+        let floor = min_quality.min(allocated);
+        let settled = self.changed_at.is_none_or(|at| now.duration_since(at) >= CPU_SETTLE);
+        if let (true, Some(encode_ms)) = (settled, self.encode_ms) {
+            let budget_ms = 1000.0 / hz.max(0.1) * CPU_HEADROOM;
+            let decode_ms = self.decode_ms.unwrap_or(0.0);
+            let current = allocated.min(self.cap);
+            if decode_ms.max(encode_ms) > budget_ms && current > floor + 1e-9 {
+                self.cap = (current - CPU_STEP).max(floor);
+                self.encode_ms = None;
+                self.changed_at = Some(now);
+            } else if self.cap < 1.0 && self.cap < allocated {
+                let next = (self.cap + CPU_STEP).min(1.0);
+                let pixels = |quality: f64| crate::codec::video::resolution_scale(quality).powi(2);
+                let predicted_ms = encode_ms * pixels(next) / pixels(self.cap);
+                if decode_ms.max(predicted_ms) < budget_ms * 0.9 {
+                    self.cap = next;
+                    self.encode_ms = None;
+                    self.changed_at = Some(now);
+                }
+            }
+        }
+        allocated.min(self.cap).max(floor)
+    }
 }
 
 /// Sends a video subscription's frames: pick (paced by maxHz and the allocation), decode (shared
@@ -252,6 +321,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
     let mut last_write: Option<Instant> = None;
     let mut warned_write = false;
     let mut next: Option<Decoding> = None;
+    let mut governor = CpuGovernor::new();
     // a new subscriber starts from a keyframe (the new encoder's first frame is one anyway)
     track.keyframe_requested.store(true, Ordering::Release);
     while !shared.is_closed() {
@@ -268,8 +338,11 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         };
         let Decoding { key, item, task } = decoding;
         let (decoded, reused) = match task.await {
-            Ok((Ok(decoded), reused)) => (decoded, reused),
-            Ok((Err(error), _)) => {
+            Ok((Ok(decoded), reused, decode_ms)) => {
+                governor.observe_decode(decode_ms, reused);
+                (decoded, reused)
+            }
+            Ok((Err(error), _, _)) => {
                 shared.record_codec_error(&error);
                 continue;
             }
@@ -278,8 +351,8 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 continue;
             }
         };
-        let quality = shared.current_quality();
         let hz = shared.key_hz(&key);
+        let quality = governor.quality(shared.current_quality(), shared.min_quality(), hz, Instant::now());
         let keyframe = track.keyframe_requested.swap(false, Ordering::AcqRel);
         let mut working = encoder.take().unwrap_or_default();
         let codec_name = codec.name().to_owned();
@@ -290,7 +363,11 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             if keyframe {
                 working.request_keyframe();
             }
-            let result = working.encode(image, quality, hz).map(|frame| (frame, (image.width(), image.height()))).map_err(|error| format!("{error:#}"));
+            let started = Instant::now();
+            let result = working
+                .encode(image, quality, hz)
+                .map(|frame| (frame, (image.width(), image.height()), started.elapsed().as_secs_f64() * 1000.0))
+                .map_err(|error| format!("{error:#}"));
             (working, result)
         });
         // while it encodes, pick the next frame and start decoding it as soon as one may go
@@ -309,9 +386,11 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             }
         };
         let (frame, source) = match outcome {
-            Ok((returned, Ok(encoded))) => {
+            Ok((returned, Ok((frame, source, encode_ms)))) => {
                 encoder = Some(returned);
-                encoded
+                governor.observe_encode(encode_ms);
+                shared.record_video_timing(governor.decode_ms, governor.encode_ms, governor.cap);
+                (frame, source)
             }
             Ok((returned, Err(error))) => {
                 encoder = Some(returned);
@@ -344,4 +423,33 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         next_frame_id = next_frame_id.wrapping_add(1);
     }
     track.release();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_governor_trades_resolution_for_frame_rate() {
+        let start = Instant::now();
+        let mut governor = CpuGovernor::new();
+        // 30 Hz leaves 33 ms a frame; encoding takes 50
+        governor.observe_decode(15.0, false);
+        governor.observe_encode(50.0);
+        assert!((governor.quality(0.8, 0.1, 30.0, start) - 0.7).abs() < 1e-9, "one step down");
+        assert!((governor.quality(0.8, 0.1, 30.0, start + Duration::from_millis(100)) - 0.7).abs() < 1e-9, "settles before the next step");
+        governor.observe_encode(45.0);
+        assert!((governor.quality(0.8, 0.1, 30.0, start + CPU_SETTLE) - 0.6).abs() < 1e-9);
+        // never below minQuality
+        let mut floor = CpuGovernor::new();
+        floor.observe_encode(500.0);
+        assert_eq!(floor.quality(0.5, 0.5, 30.0, start), 0.5);
+        // cheap again: steps back up when the next step's predicted cost fits
+        governor.observe_encode(5.0);
+        let later = start + CPU_SETTLE * 3;
+        assert!((governor.quality(0.8, 0.1, 30.0, later) - 0.7).abs() < 1e-9, "steps up");
+        // and never above what the allocator granted
+        governor.observe_encode(1.0);
+        assert!(governor.quality(0.3, 0.1, 30.0, later + CPU_SETTLE) <= 0.3 + 1e-9);
+    }
 }

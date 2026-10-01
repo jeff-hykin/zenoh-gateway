@@ -218,10 +218,12 @@ impl PeerState {
         let target_fraction = self.target_fraction_override.lock().unwrap().unwrap_or(self.config.target_fraction);
         let usable = estimate * target_fraction;
         let budget = self.config.max_bandwidth.map_or(usable, |cap| cap.min(usable));
+        let is_video: Vec<bool> = usages.iter().map(|usage| usage.is_video).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
         self.gate.configure((budget - reserved).max(0.0), min_rtt_ms);
-        let allocations = allocator::allocate(budget, &demands);
+        let video_cap = video_estimate.min(budget);
+        let allocations = allocate_within_video_cap(budget, video_cap, demands, &is_video);
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
             shared.apply(allocation);
         }
@@ -574,6 +576,37 @@ fn bind_video(state: &PeerState, codec: Option<&dyn Codec>, label: &Label) -> Re
     Ok(Some(track))
 }
 
+/// `allocator::allocate` over every stream, except that video streams together get no more than
+/// `video_cap` (GCC's target): their bytes leave through the GCC-paced RTP track, not the data channels, so a
+/// share of the data-channel estimate is bandwidth they cannot use. Granting it anyway made the
+/// encoders outrun the pacer, and the excess queued there as latency (seconds, after a subscription
+/// started, while GCC was still climbing from its initial rate). Data streams get what is left.
+fn allocate_within_video_cap(budget: f64, video_cap: f64, demands: Vec<allocator::Demand>, is_video: &[bool]) -> Vec<allocator::Allocation> {
+    let joint = allocator::allocate(budget, &demands);
+    let video_total: f64 = joint.iter().zip(is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
+    if video_total <= video_cap * (1.0 + 1e-9) {
+        return joint;
+    }
+    let (mut video_indices, mut video_demands, mut data_indices, mut data_demands) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (index, demand) in demands.into_iter().enumerate() {
+        if is_video[index] {
+            video_indices.push(index);
+            video_demands.push(demand);
+        } else {
+            data_indices.push(index);
+            data_demands.push(demand);
+        }
+    }
+    let video_allocations = allocator::allocate(video_cap, &video_demands);
+    let video_used: f64 = video_allocations.iter().map(|allocation| allocation.budget_bytes_per_sec).sum();
+    let data_allocations = allocator::allocate((budget - video_used).max(0.0), &data_demands);
+    let mut out: Vec<Option<allocator::Allocation>> = vec![None; is_video.len()];
+    for (index, allocation) in video_indices.into_iter().zip(video_allocations).chain(data_indices.into_iter().zip(data_allocations)) {
+        out[index] = Some(allocation);
+    }
+    out.into_iter().map(|allocation| allocation.expect("every stream allocated")).collect()
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClockSample {
@@ -905,4 +938,24 @@ fn collect_stats(state: &PeerState) -> Vec<Value> {
             json!({"id": entry.label.id, "type": entry.label.kind, "key": entry.label.key, "opts": entry.opts, "stats": stats, "allocation": allocation})
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(bytes_per_message: f64, hz: f64) -> allocator::Demand {
+        allocator::Demand { weight: 1.0, max_hz: hz, min_hz: 0.0, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None }
+    }
+
+    #[test]
+    fn video_gets_no_more_than_its_cap_and_data_gets_the_rest() {
+        // budget 1 MB/s; the video stream wants 500 KB/s but GCC allows 100 KB/s; data wants 500 KB/s
+        let allocations = allocate_within_video_cap(1_000_000.0, 100_000.0, vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)], &[true, false]);
+        assert!(allocations[0].budget_bytes_per_sec <= 100_000.0 + 1e-6, "{:?}", allocations[0]);
+        assert_eq!(allocations[1].budget_bytes_per_sec, 500_000.0, "{:?}", allocations[1]);
+        // under the cap nothing changes
+        let allocations = allocate_within_video_cap(1_000_000.0, 600_000.0, vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)], &[true, false]);
+        assert_eq!((allocations[0].budget_bytes_per_sec, allocations[1].budget_bytes_per_sec), (500_000.0, 500_000.0));
+    }
 }
