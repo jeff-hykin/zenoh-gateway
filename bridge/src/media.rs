@@ -9,7 +9,7 @@ use crate::codec::{Codec, CodecOutput, CodecSample, DecodedFrame};
 use crate::subscription::{self, SubShared};
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use rtc::interceptor::{BandwidthEstimator, EstimatorStats, Gcc, PacketReport, Registry};
+use rtc::interceptor::{Attribute, BandwidthEstimator, EstimatorStats, Gcc, Interceptor, Packet, PacketReport, Registry, Slot, StreamInfo, TaggedPacket};
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::{CongestionFeedback, configure_congestion_control, register_default_interceptors};
@@ -108,6 +108,52 @@ impl BandwidthEstimator for ReportingEstimator {
     }
 }
 
+/// Hands inbound PLI/FIR to the track's RTCP reader: the interceptor chain ends every RTCP packet no
+/// interceptor marked for the application, so without it keyframe requests never reached the encoder.
+#[derive(Default)]
+struct KeyframeRequests {
+    read: VecDeque<TaggedPacket>,
+    write: VecDeque<TaggedPacket>,
+}
+
+impl rtc::sansio::Protocol<TaggedPacket, TaggedPacket, ()> for KeyframeRequests {
+    type Rout = TaggedPacket;
+    type Wout = TaggedPacket;
+    type Eout = ();
+    type Error = rtc::shared::error::Error;
+    type Time = Instant;
+
+    fn handle_read(&mut self, mut message: TaggedPacket) -> Result<(), Self::Error> {
+        if let Packet::Rtcp(packets) = &message.message.packet
+            && packets.iter().any(|packet| packet.as_any().is::<PictureLossIndication>() || packet.as_any().is::<FullIntraRequest>())
+        {
+            message.message.add(Attribute::DeliverToApplication);
+        }
+        self.read.push_back(message);
+        Ok(())
+    }
+
+    fn poll_read(&mut self) -> Option<TaggedPacket> {
+        self.read.pop_front()
+    }
+
+    fn handle_write(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
+        self.write.push_back(message);
+        Ok(())
+    }
+
+    fn poll_write(&mut self) -> Option<TaggedPacket> {
+        self.write.pop_front()
+    }
+}
+
+impl Interceptor for KeyframeRequests {
+    fn bind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
+}
+
 /// Track formats, RTCP reports, NACK and TWCC-fed GCC; returns the GCC target (f64 bits/s as bits in an AtomicU64).
 pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<AtomicU64>)> {
     let mut media_engine = MediaEngine::default();
@@ -119,7 +165,7 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<AtomicU64>)> {
     let target_bps = Arc::new(AtomicU64::new(GCC_INITIAL_BPS.to_bits()));
     let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), target_bps: target_bps.clone() };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
-    let registry = register_default_interceptors(registry, &mut media_engine)?;
+    let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default());
     Ok((media_engine, registry, target_bps))
 }
 
