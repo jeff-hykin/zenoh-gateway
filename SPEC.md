@@ -101,6 +101,11 @@ transpiles it (`https://esm.sh/gh/<owner>/zenoh-web@<tag>/client/zenoh_web.ts`),
 `deno task build` runs `deno bundle` (the same esbuild transform) into `build/client/zenoh_web.js` next
 to copies of `examples/` and `test/`, so `zenoh-web --serve build` works offline. The e2e test does the same.
 
+The example page (`examples/index.html`, `examples/app.js`: plain JS, no build) imports the client from
+esm.sh pinned to a commit, so `zenoh-web --serve examples` serves it at `/` (directories serve their
+`index.html`); `?client=<url>` swaps in another copy of the client (e.g. `/client/zenoh_web.js` from a
+`--serve build` root) and `?bridge=<url>` another bridge.
+
 ## Large messages
 
 Any size: the bridge splits a message into 64 KiB chunks (one frame each, sharing the message's `seq`)
