@@ -1,12 +1,14 @@
 //! zenoh-web: a dumb pipe between zenoh key expressions and browser WebRTC data channels.
 
 mod acl;
+mod allocator;
 mod codec;
 mod frame;
 mod options;
 mod peer;
 mod publisher;
 mod subscription;
+mod video;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -37,6 +39,10 @@ struct Cli {
     /// Serve this directory over HTTP (so the UI is live-editable on disk).
     #[arg(long)]
     serve: Option<PathBuf>,
+    /// Cap each frontend's bandwidth budget (bytes/s) below the estimate, e.g. for a known-slow
+    /// link or to test allocation on localhost.
+    #[arg(long)]
+    max_bandwidth_bytes_per_sec: Option<f64>,
 }
 
 async fn offer(State(bridge): State<Arc<Bridge>>, Json(offer): Json<RTCSessionDescription>) -> Response {
@@ -74,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     config.insert_json5("adminspace/enabled", "true").map_err(|e| anyhow::anyhow!("{e}"))?;
     config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).map_err(|e| anyhow::anyhow!("{e}"))?;
     let session = zenoh::open(config).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    let bridge = Bridge::new(session.clone(), access_control);
+    let bridge = Bridge::new(session.clone(), access_control, cli.max_bandwidth_bytes_per_sec);
 
     let mut app = Router::new().route("/offer", post(offer)).with_state(bridge.clone()).layer(CorsLayer::permissive());
     if let Some(dir) = &cli.serve {

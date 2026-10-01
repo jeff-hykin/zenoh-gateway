@@ -1,17 +1,20 @@
 //! One browser = one PeerConnection; each data channel it opens is dispatched by its label.
 
 use crate::acl::{AccessControl, AclMessage};
+use crate::allocator::{self, Estimator};
+use crate::codec::Output;
 use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
 use crate::publisher::{self, PubShared};
 use crate::subscription::{self, SubShared, now_unix_ms};
+use crate::video::{self, VideoTrack};
 use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::{
@@ -29,6 +32,26 @@ const DEFAULT_LIST_PROBE_MS: u64 = 600;
 const ADMIN_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// A connection that stays `disconnected` this long is treated as gone.
 const DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
+/// How often each frontend's bandwidth is re-estimated and re-allocated.
+const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The frontend-level side of allocation, reported in stats as `bandwidth`.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BandwidthStats {
+    /// data channels: delivery-rate estimate (see allocator::Estimator)
+    data_estimate_bytes_per_sec: f64,
+    /// video tracks: GCC target from TWCC feedback (counted only while a video track is in use)
+    video_estimate_bytes_per_sec: f64,
+    /// `--max-bandwidth-bytes-per-sec`
+    cap_bytes_per_sec: Option<f64>,
+    /// min(cap, data + video estimate): what the allocator divides
+    budget_bytes_per_sec: f64,
+    demand_bytes_per_sec: f64,
+    sent_bytes_per_sec: f64,
+    network_blocked_fraction: f64,
+    constrained: bool,
+}
 
 enum ChannelStats {
     Sub(Arc<SubShared>),
@@ -76,10 +99,20 @@ struct PeerState {
     deadmen: Mutex<HashMap<u64, Deadman>>,
     control: Mutex<Option<Arc<dyn DataChannel>>>,
     heartbeat: Mutex<HeartbeatStats>,
+    /// set once built; cleared when the peer goes (it holds the handler, which holds us)
+    connection: Mutex<Option<Arc<dyn PeerConnection>>>,
+    /// one renegotiation at a time
+    negotiation: tokio::sync::Mutex<()>,
+    video_tracks: Mutex<HashMap<String, Arc<VideoTrack>>>,
+    video_target_bps: Arc<AtomicU64>,
+    max_bandwidth: Option<f64>,
+    estimator: Mutex<Estimator>,
+    bandwidth: Mutex<BandwidthStats>,
+    gone: AtomicBool,
 }
 
 impl PeerState {
-    fn new(peer_id: u64, session: zenoh::Session, access_control: Arc<AccessControl>) -> Self {
+    fn new(peer_id: u64, session: zenoh::Session, access_control: Arc<AccessControl>, video_target_bps: Arc<AtomicU64>, max_bandwidth: Option<f64>) -> Self {
         PeerState {
             peer_id,
             session,
@@ -93,7 +126,63 @@ impl PeerState {
             deadmen: Mutex::new(HashMap::new()),
             control: Mutex::new(None),
             heartbeat: Mutex::new(HeartbeatStats::default()),
+            connection: Mutex::new(None),
+            negotiation: tokio::sync::Mutex::new(()),
+            video_tracks: Mutex::new(HashMap::new()),
+            video_target_bps,
+            max_bandwidth,
+            estimator: Mutex::new(Estimator::default()),
+            bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: max_bandwidth, ..Default::default() }),
+            gone: AtomicBool::new(false),
         }
+    }
+
+    fn subscriptions(&self) -> Vec<Arc<SubShared>> {
+        let channels = self.channels.lock().unwrap();
+        channels
+            .values()
+            .filter_map(|entry| match &entry.stats {
+                ChannelStats::Sub(shared) => Some(shared.clone()),
+                ChannelStats::Pub(_) => None,
+            })
+            .collect()
+    }
+
+    /// One allocation round: measure, update the estimate, divide the budget among streams.
+    fn allocate(&self, interval_secs: f64) {
+        let subscriptions = self.subscriptions();
+        let usages: Vec<subscription::Usage> = subscriptions.iter().map(|shared| shared.usage(interval_secs)).collect();
+        let wants = |demand: &allocator::Demand| demand.fixed_bytes_per_sec.unwrap_or_else(|| (demand.price)(demand.quality_range.map_or(1.0, |(_, max)| max)) * demand.max_hz);
+        let data_usages = || usages.iter().filter(|usage| !usage.is_video);
+        let sent: u64 = data_usages().map(|usage| usage.bytes_sent).sum();
+        let blocked_ms: f64 = data_usages().map(|usage| usage.network_blocked_ms).sum();
+        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.network_blocked_ms > 0.0).count();
+        let data_demand: f64 = data_usages().map(|usage| wants(&usage.demand)).sum();
+        let total_demand: f64 = usages.iter().map(|usage| wants(&usage.demand)).sum();
+        let estimator = {
+            let mut estimator = self.estimator.lock().unwrap();
+            estimator.update(interval_secs, sent as f64, blocked_ms / 1000.0, active, data_demand);
+            estimator.clone()
+        };
+        let has_video = usages.iter().any(|usage| usage.is_video);
+        let video_estimate = if has_video { video::gcc_target_bytes_per_sec(&self.video_target_bps) } else { 0.0 };
+        let estimate = estimator.data_bytes_per_sec + video_estimate;
+        let budget = self.max_bandwidth.map_or(estimate, |cap| cap.min(estimate));
+        let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
+        let allocations = allocator::allocate(budget, &demands);
+        for (shared, allocation) in subscriptions.iter().zip(allocations) {
+            shared.apply(allocation);
+        }
+        *self.bandwidth.lock().unwrap() = BandwidthStats {
+            data_estimate_bytes_per_sec: estimator.data_bytes_per_sec,
+            video_estimate_bytes_per_sec: video_estimate,
+            cap_bytes_per_sec: self.max_bandwidth,
+            budget_bytes_per_sec: budget,
+            demand_bytes_per_sec: total_demand,
+            sent_bytes_per_sec: estimator.sent_bytes_per_sec,
+            network_blocked_fraction: estimator.network_blocked_fraction,
+            constrained: total_demand > budget,
+        };
     }
 
     /// Clock sample reported by the browser (it has all four NTP timestamps).
@@ -182,15 +271,18 @@ struct PeerEntry {
 pub struct Bridge {
     pub session: zenoh::Session,
     access_control: Arc<AccessControl>,
+    /// test/ops cap on each frontend's budget (bytes/s)
+    max_bandwidth: Option<f64>,
     peers: Mutex<HashMap<u64, PeerEntry>>,
     next_peer: AtomicU64,
 }
 
 impl Bridge {
-    pub fn new(session: zenoh::Session, access_control: AccessControl) -> Arc<Self> {
+    pub fn new(session: zenoh::Session, access_control: AccessControl, max_bandwidth: Option<f64>) -> Arc<Self> {
         Arc::new(Bridge {
             session,
             access_control: Arc::new(access_control),
+            max_bandwidth,
             peers: Mutex::new(HashMap::new()),
             next_peer: AtomicU64::new(1),
         })
@@ -200,7 +292,8 @@ impl Bridge {
     pub async fn answer(self: &Arc<Self>, offer: RTCSessionDescription) -> anyhow::Result<RTCSessionDescription> {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
-        let state = Arc::new(PeerState::new(peer_id, self.session.clone(), self.access_control.clone()));
+        let (media_engine, interceptors, video_target_bps) = video::media_setup()?;
+        let state = Arc::new(PeerState::new(peer_id, self.session.clone(), self.access_control.clone(), video_target_bps, self.max_bandwidth));
         let handler = Arc::new(Handler { bridge: Arc::downgrade(self), peer_id, gathered_tx, state: state.clone() });
         let setting_engine = SettingEngineBuilder::new()
             .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
@@ -208,6 +301,8 @@ impl Bridge {
         let peer_connection = PeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
             .with_setting_engine(setting_engine)
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(interceptors)
             .with_handler(handler)
             .with_udp_addrs(vec!["0.0.0.0:0".to_string(), "127.0.0.1:0".to_string()])
             .build()
@@ -222,7 +317,10 @@ impl Bridge {
             .local_description()
             .await
             .ok_or_else(|| anyhow::anyhow!("no local description"))?;
-        self.peers.lock().unwrap().insert(peer_id, PeerEntry { connection: Arc::new(peer_connection), state });
+        let connection: Arc<dyn PeerConnection> = Arc::new(peer_connection);
+        *state.connection.lock().unwrap() = Some(connection.clone());
+        tokio::spawn(run_allocator(Arc::downgrade(&state)));
+        self.peers.lock().unwrap().insert(peer_id, PeerEntry { connection, state });
         info!("peer {peer_id}: answered");
         Ok(local)
     }
@@ -230,6 +328,9 @@ impl Bridge {
     fn drop_peer(&self, peer_id: u64) {
         if let Some(entry) = self.peers.lock().unwrap().remove(&peer_id) {
             info!("peer {peer_id}: gone");
+            entry.state.gone.store(true, Ordering::Relaxed);
+            entry.state.connection.lock().unwrap().take();
+            entry.state.video_tracks.lock().unwrap().clear();
             tokio::spawn(async move {
                 entry.state.fire_deadmen("disconnected").await;
                 let _ = entry.connection.close().await;
@@ -246,6 +347,22 @@ impl Bridge {
         for entry in peers {
             let _ = entry.connection.close().await;
         }
+    }
+}
+
+/// Re-allocates the frontend's bandwidth every ALLOCATION_INTERVAL until it goes.
+async fn run_allocator(state: Weak<PeerState>) {
+    let mut ticker = tokio::time::interval(ALLOCATION_INTERVAL);
+    let mut last = Instant::now();
+    loop {
+        ticker.tick().await;
+        let Some(state) = state.upgrade() else { break };
+        if state.gone.load(Ordering::Relaxed) {
+            break;
+        }
+        let now = Instant::now();
+        state.allocate(now.duration_since(last).as_secs_f64());
+        last = now;
     }
 }
 
@@ -333,12 +450,12 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
         return;
     }
     let rejected = match label.kind.as_str() {
-        "sub" => match SubOpts::parse(&label.opts) {
-            Ok(opts) => {
+        "sub" => match SubOpts::parse(&label.opts).and_then(|opts| bind_video(&state, &opts, &label).map(|video| (opts, video))) {
+            Ok((opts, video)) => {
                 let shared = Arc::new(SubShared::new(&opts));
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
                 state.send_accepted(label.id).await;
-                subscription::run(dc.clone(), label.clone(), session, shared).await;
+                subscription::run(dc.clone(), label.clone(), session, shared, video).await;
                 None
             }
             Err(error) => Some(error),
@@ -374,6 +491,20 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     {
         state.deadmen.lock().unwrap().remove(&id);
     }
+}
+
+/// A video codec subscription claims the track the browser renegotiated for it (by mid).
+fn bind_video(state: &PeerState, opts: &SubOpts, label: &Label) -> Result<Option<Arc<VideoTrack>>, String> {
+    let Some(codec) = opts.codec()? else { return Ok(None) };
+    if codec.output() != Output::Video {
+        return Ok(None);
+    }
+    let mid = label.mid.as_deref().ok_or_else(|| format!("{} is a video codec: the label needs the mid of a renegotiated video transceiver", codec.name()))?;
+    let track = state.video_tracks.lock().unwrap().get(mid).cloned().ok_or_else(|| format!("no video track for mid {mid:?} (renegotiate with addVideo first)"))?;
+    if !track.claim() {
+        return Err(format!("video track {mid:?} is in use by another subscription"));
+    }
+    Ok(Some(track))
 }
 
 #[derive(Deserialize)]
@@ -454,6 +585,10 @@ struct ControlRequest {
     probe_ms: Option<u64>,
     #[serde(default)]
     bytes: Option<String>,
+    #[serde(default)]
+    sdp: Option<RTCSessionDescription>,
+    #[serde(default)]
+    add_video: bool,
 }
 
 fn ok(id: &Value, extra: Value) -> Value {
@@ -523,9 +658,20 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock().unwrap(), "rttMs": *state.rtt_ms.lock().unwrap()});
                 let heartbeat = serde_json::to_value(state.heartbeat.lock().unwrap().clone()).unwrap_or_default();
                 let access = json!({"enabled": state.access_control.enabled(), "denied": state.access_denied.load(Ordering::Relaxed)});
-                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "access": access}))
+                let bandwidth = serde_json::to_value(state.bandwidth.lock().unwrap().clone()).unwrap_or_default();
+                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "access": access, "bandwidth": bandwidth}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
+            // can wait on the peer connection's driver; keep stats and pings flowing meanwhile
+            "renegotiate" => {
+                let dc = dc.clone();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let response = handle_renegotiate(&state, request).await;
+                    let _ = dc.send_text(&response.to_string()).await;
+                });
+                continue;
+            }
             "clearDeadman" => {
                 let pub_id = request.pub_id.unwrap_or_default();
                 if let Some(deadman) = state.deadmen.lock().unwrap().remove(&pub_id) {
@@ -536,6 +682,28 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             other => fail(&request.id, format!("unknown op {other}")),
         };
         let _ = dc.send_text(&response.to_string()).await;
+    }
+}
+
+/// Browser-initiated renegotiation (it added a recvonly video transceiver): answer, and with
+/// `addVideo` report the mid of the new track.
+async fn handle_renegotiate(state: &PeerState, request: ControlRequest) -> Value {
+    let Some(offer) = request.sdp else { return fail(&request.id, "renegotiate needs sdp") };
+    let Some(connection) = state.connection.lock().unwrap().clone() else { return fail(&request.id, "peer is gone") };
+    let _negotiating = state.negotiation.lock().await;
+    match video::renegotiate(&connection, offer, request.add_video).await {
+        Ok((answer, track)) => {
+            let mid = track.map(|track| {
+                let mid = track.mid.clone();
+                state.video_tracks.lock().unwrap().insert(mid.clone(), track);
+                mid
+            });
+            ok(&request.id, json!({"sdp": answer, "mid": mid}))
+        }
+        Err(error) => {
+            warn!("peer {}: renegotiation failed: {error:#}", state.peer_id);
+            fail(&request.id, format!("{error:#}"))
+        }
     }
 }
 
@@ -641,11 +809,11 @@ fn collect_stats(state: &PeerState) -> Vec<Value> {
     channels
         .values()
         .map(|entry| {
-            let stats = match &entry.stats {
-                ChannelStats::Sub(shared) => serde_json::to_value(shared.stats()).unwrap_or_default(),
-                ChannelStats::Pub(shared) => serde_json::to_value(shared.snapshot()).unwrap_or_default(),
+            let (stats, allocation) = match &entry.stats {
+                ChannelStats::Sub(shared) => (serde_json::to_value(shared.stats()).unwrap_or_default(), serde_json::to_value(shared.allocation()).unwrap_or_default()),
+                ChannelStats::Pub(shared) => (serde_json::to_value(shared.snapshot()).unwrap_or_default(), Value::Null),
             };
-            json!({"id": entry.label.id, "type": entry.label.kind, "key": entry.label.key, "opts": entry.opts, "stats": stats})
+            json!({"id": entry.label.id, "type": entry.label.kind, "key": entry.label.key, "opts": entry.opts, "stats": stats, "allocation": allocation})
         })
         .collect()
 }

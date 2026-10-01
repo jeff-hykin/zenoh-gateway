@@ -1,5 +1,6 @@
 //! Data channel labels: `{"type":"sub"|"pub"|"heartbeat", "key":..., "id":..., "opts":{...}}`.
 
+use crate::codec::{Codec, Output};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -15,6 +16,9 @@ pub struct Label {
     pub id: Option<u64>,
     #[serde(default)]
     pub opts: Value,
+    /// video codecs: the browser transceiver (renegotiated earlier) whose track carries the frames
+    #[serde(default)]
+    pub mid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
@@ -30,8 +34,8 @@ fn present_or_null<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<
     Option::<f64>::deserialize(deserializer).map(Some)
 }
 
-/// Subscribe options. Phase 1 enforces delivery, queueSize, maxAge, maxHz, priority; the
-/// bandwidth/quality fields are validated and reported but only used by phase 2 allocation.
+/// Subscribe options. bandwidthPriority, dangerousMinHz, the quality range and the tradeoff feed
+/// the per-frontend allocator; `codec` picks a transcoder (none = raw passthrough).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubOpts {
@@ -47,6 +51,7 @@ pub struct SubOpts {
     pub min_quality: Option<f64>,
     pub max_quality: Option<f64>,
     pub quality_to_hz_tradeoff: Option<f64>,
+    pub codec: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -127,7 +132,21 @@ impl SubOpts {
         if self.min_quality.unwrap_or(0.0) > self.max_quality.unwrap_or(1.0) {
             return Err("minQuality must be <= maxQuality".into());
         }
+        if let Some(codec) = self.codec()?
+            && codec.output() == Output::Video
+            && self.delivery == DeliveryKind::Reliable
+        {
+            return Err(format!("{} is a video codec: frames go over a lossy video track, use delivery \"latest\"", codec.name()));
+        }
         Ok(())
+    }
+
+    pub fn codec(&self) -> Result<Option<Codec>, String> {
+        self.codec.as_deref().map(Codec::parse).transpose()
+    }
+
+    pub fn quality_range(&self) -> (f64, f64) {
+        (self.min_quality.unwrap_or(0.0), self.max_quality.unwrap_or(1.0))
     }
 
     pub fn delivery(&self) -> Delivery {
@@ -164,6 +183,7 @@ impl SubOpts {
             "minQuality": self.min_quality.unwrap_or(0.0),
             "maxQuality": self.max_quality.unwrap_or(1.0),
             "qualityToHzTradeoff": self.quality_to_hz_tradeoff.unwrap_or(0.5),
+            "codec": self.codec,
         })
     }
 }
@@ -228,6 +248,9 @@ mod tests {
         assert!(sub(r#"{"minQuality":0.8,"maxQuality":0.2}"#).is_err());
         assert!(sub(r#"{"qualityToHzTradeoff":2}"#).is_err());
         assert!(sub(r#"{"maxHz":5,"dangerousMinHz":10}"#).is_err());
+        assert!(sub(r#"{"codec":"ros2-jpeg"}"#).unwrap_err().contains("unknown codec"));
+        assert!(sub(r#"{"codec":"ros2-image","delivery":"reliable"}"#).is_err(), "video is lossy");
+        assert!(sub(r#"{"codec":"dimos-depth","delivery":"reliable"}"#).is_ok());
         let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"dangerousMinHz":1,"minQuality":0.3,"maxQuality":0.9,"qualityToHzTradeoff":0.7}"#).unwrap();
         assert_eq!(full.normalized()["bandwidthPriority"], 2.0);
         assert_eq!(full.min_interval(), Some(Duration::from_millis(50)));

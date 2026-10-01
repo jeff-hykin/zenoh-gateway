@@ -1,11 +1,13 @@
 //! One `sub` data channel: a zenoh AdvancedSubscriber feeding per-key delivery queues, drained
 //! into the data channel only while it is not backed up.
 
+use crate::allocator::{Allocation, Demand};
+use crate::codec::{self, Codec, Output};
 use crate::frame;
 use crate::options::{Delivery, Label, SubOpts};
 use log::{debug, warn};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -31,6 +33,12 @@ const ASSUME_LOST_AFTER: Duration = Duration::from_secs(1);
 /// while no ack comes back): if the window's tail was lost, the probe's ack releases it.
 const FIRST_PROBE_AFTER: Duration = Duration::from_millis(50);
 const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// An allocation never paces a key slower than this (a starved key still trickles).
+const MIN_ALLOCATED_HZ: f64 = 0.05;
+/// Weight of the newest sample in rate and size averages.
+const EWMA_GAIN: f64 = 0.5;
+/// Per-frame overhead on the wire besides the payload (frame header + key, SCTP/DTLS/UDP).
+const FRAME_OVERHEAD_BYTES: f64 = 90.0;
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,12 +65,26 @@ pub struct SubStats {
     pub blocked_on_page_ms: f64,
     /// Bridge receive time minus sample timestamp (upstream lag), largest seen.
     pub max_receive_lag_ms: f64,
+    /// frame bytes handed to SCTP (data channel) or video bytes handed to the track
+    pub bytes_sent: u64,
+    /// transcodes this subscription ran / reused from another frontend's identical request
+    pub encodes: u64,
+    pub shared_encodes: u64,
+    pub codec_errors: u64,
+    pub last_codec_error: Option<String>,
+    /// quality of the last transcoded message
+    pub quality: Option<f64>,
+    pub keyframes: u64,
+    /// PLI/FIR keyframe requests the browser sent on this stream's track
+    pub keyframe_requests: u64,
+    pub video_width: u32,
+    pub video_height: u32,
 }
 
-struct Pending {
-    payload: ZBytes,
-    timestamp_ms: f64,
-    seq: u32,
+pub struct Pending {
+    pub payload: ZBytes,
+    pub timestamp_ms: f64,
+    pub seq: u32,
     arrived: Instant,
     priority: u8,
 }
@@ -71,6 +93,9 @@ struct Pending {
 struct KeyQueue {
     items: VecDeque<Pending>,
     last_sent: Option<Instant>,
+    /// arrivals since the allocator last looked, and the resulting source rate
+    arrivals: u32,
+    rate_hz: f64,
 }
 
 #[derive(Default)]
@@ -82,6 +107,29 @@ struct SubState {
     unconsumed: VecDeque<(u32, usize, Instant)>,
     /// acks that released something; lets a blocked sender notice progress
     acks_with_progress: u64,
+    allocation: Allocation,
+    payload_bytes: f64,
+    /// bytes on the wire per message (untranscoded)
+    message_bytes: f64,
+    /// transcoded bytes per message, by quality bucket
+    encoded_bytes: BTreeMap<u16, f64>,
+    /// source resolution of a video stream
+    video_source: Option<(u32, u32)>,
+    /// counters as of the allocator's previous look
+    accounted_bytes_sent: u64,
+    accounted_blocked_ms: f64,
+}
+
+fn ewma(previous: f64, sample: f64) -> f64 {
+    if previous <= 0.0 { sample } else { previous + EWMA_GAIN * (sample - previous) }
+}
+
+/// What the allocator learns from one subscription since its previous look.
+pub struct Usage {
+    pub demand: Demand,
+    pub bytes_sent: u64,
+    pub network_blocked_ms: f64,
+    pub is_video: bool,
 }
 
 impl SubState {
@@ -105,6 +153,12 @@ pub struct SubShared {
     delivery: Delivery,
     min_interval: Option<Duration>,
     priority_override: Option<u8>,
+    pub codec: Option<Codec>,
+    max_hz: Option<f64>,
+    min_hz: f64,
+    weight: f64,
+    quality_range: (f64, f64),
+    tradeoff: f64,
     state: Mutex<SubState>,
     data_ready: Notify,
     drained: Notify,
@@ -129,6 +183,12 @@ impl SubShared {
             delivery: opts.delivery(),
             min_interval: opts.min_interval(),
             priority_override: opts.zenoh_priority().map(|p| p as u8),
+            codec: opts.codec().ok().flatten(),
+            max_hz: opts.max_hz,
+            min_hz: opts.dangerous_min_hz.unwrap_or(0.0),
+            weight: opts.bandwidth_priority.unwrap_or(1.0),
+            quality_range: opts.quality_range(),
+            tradeoff: opts.quality_to_hz_tradeoff.unwrap_or(0.5),
             state: Mutex::new(SubState::default()),
             data_ready: Notify::new(),
             drained: Notify::new(),
@@ -138,6 +198,139 @@ impl SubShared {
 
     pub fn stats(&self) -> SubStats {
         self.state.lock().unwrap().stats.clone()
+    }
+
+    pub fn allocation(&self) -> Allocation {
+        self.state.lock().unwrap().allocation.clone()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
+    /// Quality to transcode at now: the allocation's, or the best allowed before the first one.
+    pub fn current_quality(&self) -> f64 {
+        self.state.lock().unwrap().allocation.quality.unwrap_or(self.quality_range.1)
+    }
+
+    /// Granted Hz for one key of this stream (video encoders size their bitrate by it).
+    pub fn key_hz(&self, key: &str) -> f64 {
+        let state = self.state.lock().unwrap();
+        let rate = state.keys.get(key).map_or(0.0, |queue| queue.rate_hz);
+        self.allocated_key_hz(rate, &state.allocation).or(self.max_hz).unwrap_or(if rate > 0.0 { rate } else { 30.0 })
+    }
+
+    /// Per-key Hz cap from the allocation (None = no allocation cap).
+    fn allocated_key_hz(&self, rate_hz: f64, allocation: &Allocation) -> Option<f64> {
+        if self.delivery.reliable || !allocation.constrained || rate_hz <= 0.0 {
+            return None;
+        }
+        let wanted = self.max_hz.map_or(rate_hz, |max| max.min(rate_hz));
+        let floor = self.min_hz.min(wanted);
+        Some((wanted * allocation.hz_fraction).max(floor).max(MIN_ALLOCATED_HZ))
+    }
+
+    /// Spacing between two sends of a key: maxHz, tightened by the allocation.
+    fn key_interval(&self, queue: &KeyQueue, allocation: &Allocation) -> Option<Duration> {
+        match self.allocated_key_hz(queue.rate_hz, allocation) {
+            Some(hz) => Some(Duration::from_secs_f64(1.0 / hz).max(self.min_interval.unwrap_or_default())),
+            None => self.min_interval,
+        }
+    }
+
+    pub fn note_video_source(&self, width: u32, height: u32) {
+        self.state.lock().unwrap().video_source = Some((width, height));
+    }
+
+    /// Measures rates since the previous call and describes what this stream wants.
+    pub fn usage(&self, interval_secs: f64) -> Usage {
+        let mut state = self.state.lock().unwrap();
+        let (mut max_hz, mut min_hz) = (0.0, 0.0);
+        for queue in state.keys.values_mut() {
+            queue.rate_hz = ewma(queue.rate_hz, queue.arrivals as f64 / interval_secs.max(1e-3));
+            queue.arrivals = 0;
+            let wanted = self.max_hz.map_or(queue.rate_hz, |max| max.min(queue.rate_hz));
+            max_hz += wanted;
+            min_hz += self.min_hz.min(wanted);
+        }
+        let bytes_sent = state.stats.bytes_sent - state.accounted_bytes_sent;
+        let network_blocked_ms = state.stats.blocked_on_network_ms - state.accounted_blocked_ms;
+        state.accounted_bytes_sent = state.stats.bytes_sent;
+        state.accounted_blocked_ms = state.stats.blocked_on_network_ms;
+        let payload_bytes = state.payload_bytes;
+        let price: crate::allocator::Price = match self.codec {
+            None => {
+                let message_bytes = if state.message_bytes > 0.0 { state.message_bytes } else { payload_bytes + FRAME_OVERHEAD_BYTES };
+                Box::new(move |_| message_bytes)
+            }
+            Some(codec) if codec.output() == Output::Video => {
+                let (width, height) = state.video_source.unwrap_or((640, 480));
+                Box::new(move |quality| codec::video::bytes_per_frame(width, height, quality))
+            }
+            Some(codec) => {
+                let measured: Vec<(f64, f64)> = state.encoded_bytes.iter().map(|(&bucket, &bytes)| (bucket as f64 / 1000.0, bytes)).collect();
+                Box::new(move |quality| {
+                    let nearest = measured.iter().min_by(|a, b| (a.0 - quality).abs().total_cmp(&(b.0 - quality).abs()));
+                    match nearest {
+                        Some(&(measured_quality, bytes)) => bytes * codec.size_prior(quality) / codec.size_prior(measured_quality).max(1e-9),
+                        None => payload_bytes * codec.compression_prior() * codec.size_prior(quality),
+                    }
+                })
+            }
+        };
+        let demand = Demand {
+            weight: self.weight,
+            max_hz,
+            min_hz,
+            quality_range: self.codec.map(|_| self.quality_range),
+            tradeoff: self.tradeoff,
+            price,
+            fixed_bytes_per_sec: self.delivery.reliable.then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
+        };
+        Usage { demand, bytes_sent, network_blocked_ms, is_video: self.codec.is_some_and(|codec| codec.output() == Output::Video) }
+    }
+
+    pub fn apply(&self, allocation: Allocation) {
+        self.state.lock().unwrap().allocation = allocation;
+        self.data_ready.notify_one();
+    }
+
+    fn record_encode(&self, bucket: u16, quality: f64, encoded_len: usize, shared: bool) {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.encoded_bytes.get(&bucket).copied().unwrap_or(0.0);
+        state.encoded_bytes.insert(bucket, ewma(previous, encoded_len as f64 + FRAME_OVERHEAD_BYTES));
+        state.stats.quality = Some(quality);
+        if shared {
+            state.stats.shared_encodes += 1;
+        } else {
+            state.stats.encodes += 1;
+        }
+    }
+
+    pub fn record_codec_error(&self, error: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.stats.codec_errors += 1;
+        if state.stats.last_codec_error.as_deref() != Some(error) {
+            warn!("codec {}: {error}", self.codec.map_or("?", |codec| codec.name()));
+            state.stats.last_codec_error = Some(error.to_owned());
+        }
+    }
+
+    /// A video frame went to the track.
+    pub fn record_video_frame(&self, bytes: usize, (width, height): (u32, u32), quality: f64, keyframe: bool, shared_decode: bool, keyframe_requests: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.stats.keyframe_requests = keyframe_requests;
+        state.stats.bytes_sent += bytes as u64;
+        state.stats.sent += 1;
+        state.stats.video_width = width;
+        state.stats.video_height = height;
+        state.stats.quality = Some(quality);
+        state.stats.keyframes += keyframe as u64;
+        if shared_decode {
+            state.stats.shared_encodes += 1;
+        } else {
+            state.stats.encodes += 1;
+        }
     }
 
     fn push(&self, sample: Sample) {
@@ -168,6 +361,8 @@ impl SubShared {
                 None => state.keys.entry(key.to_owned()).or_default(),
             };
             queue.items.push_back(pending);
+            queue.arrivals += 1;
+            state.payload_bytes = ewma(state.payload_bytes, payload_len as f64);
             if let Some(cap) = self.delivery.queue {
                 while queue.items.len() > cap {
                     let dropped = queue.items.pop_front().unwrap();
@@ -181,7 +376,7 @@ impl SubShared {
     }
 
     /// Next frame to send (highest priority, then oldest), or when to look again.
-    fn pick(&self, now: Instant) -> (Option<(String, Pending)>, Option<Instant>) {
+    pub fn pick(&self, now: Instant) -> (Option<(String, Pending)>, Option<Instant>) {
         let mut state = self.state.lock().unwrap();
         let state = &mut *state;
         if let Some(max_age_ms) = self.delivery.max_age_ms {
@@ -199,7 +394,7 @@ impl SubShared {
         let mut wake_at: Option<Instant> = None;
         for (key, queue) in state.keys.iter() {
             let Some(head) = queue.items.front() else { continue };
-            if let (Some(interval), Some(last_sent)) = (self.min_interval, queue.last_sent) {
+            if let (Some(interval), Some(last_sent)) = (self.key_interval(queue, &state.allocation), queue.last_sent) {
                 let ready_at = last_sent + interval;
                 if ready_at > now {
                     wake_at = Some(wake_at.map_or(ready_at, |w| w.min(ready_at)));
@@ -251,6 +446,19 @@ impl SubShared {
         state.stats.unconsumed_bytes
     }
 
+    /// Waits for new data or until `wake_at` (a key's pacing), whichever comes first.
+    pub async fn wait_for_data(&self, wake_at: Option<Instant>) {
+        match wake_at {
+            Some(at) => {
+                tokio::select! {
+                    _ = self.data_ready.notified() => {}
+                    _ = tokio::time::sleep_until(at.into()) => {}
+                }
+            }
+            None => self.data_ready.notified().await,
+        }
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         self.data_ready.notify_one();
@@ -258,8 +466,8 @@ impl SubShared {
     }
 }
 
-/// Runs a `sub` channel until it closes.
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>) {
+/// Runs a `sub` channel until it closes. Video codecs send frames to `video` instead of `dc`.
+pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>, video: Option<Arc<crate::video::VideoTrack>>) {
     let _ = dc.set_buffered_amount_low_threshold(RESUME_BYTES as u32).await;
     let feed = shared.clone();
     let subscriber = session
@@ -278,7 +486,10 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     };
     debug!("subscribed {:?} with {:?}", label.key, shared.delivery);
 
-    let sender = tokio::spawn(send_loop(dc.clone(), shared.clone()));
+    let sender = match video {
+        Some(track) => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), track)),
+        None => tokio::spawn(send_loop(dc.clone(), shared.clone())),
+    };
     while let Some(event) = dc.poll().await {
         match event {
             DataChannelEvent::OnBufferedAmountLow => shared.drained.notify_one(),
@@ -354,6 +565,47 @@ impl Pacer {
     }
 }
 
+/// A message's bytes as sent: the sample payload, or a transcoder's output.
+enum Body<'a> {
+    Raw(std::borrow::Cow<'a, [u8]>),
+    Encoded(Arc<Vec<u8>>),
+}
+
+impl Body<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Body::Raw(bytes) => bytes,
+            Body::Encoded(bytes) => bytes,
+        }
+    }
+}
+
+/// Transcodes off the async runtime (shared with other frontends asking for the same encode).
+async fn encode(shared: &SubShared, codec: Codec, key: &str, item: &Pending) -> Option<Arc<Vec<u8>>> {
+    let quality = shared.current_quality();
+    let payload = item.payload.to_bytes().into_owned();
+    let key = key.to_owned();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let hash = codec::payload_hash(&key, &payload);
+        codec::encode_shared(codec, quality, hash, &payload)
+    })
+    .await;
+    match outcome {
+        Ok((Ok(encoded), reused)) => {
+            shared.record_encode(codec::quality_bucket(quality), quality, encoded.len(), reused);
+            Some(encoded)
+        }
+        Ok((Err(error), _)) => {
+            shared.record_codec_error(&error);
+            None
+        }
+        Err(error) => {
+            shared.record_codec_error(&format!("encoder task failed: {error}"));
+            None
+        }
+    }
+}
+
 async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
     let mut warned_send_error = false;
     let mut pacer = Pacer { probe_interval: FIRST_PROBE_AFTER, acks_seen: 0 };
@@ -361,20 +613,21 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
     while !shared.closed.load(Ordering::Relaxed) {
         let (next, wake_at) = shared.pick(Instant::now());
         let Some((key, item)) = next else {
-            match wake_at {
-                Some(at) => {
-                    tokio::select! {
-                        _ = shared.data_ready.notified() => {}
-                        _ = tokio::time::sleep_until(at.into()) => {}
-                    }
-                }
-                None => shared.data_ready.notified().await,
-            }
+            shared.wait_for_data(wake_at).await;
             continue;
         };
-        let payload = item.payload.to_bytes();
+        // encode on send: only messages the pacing and queues let through get transcoded
+        let body = match shared.codec {
+            Some(codec) => match encode(&shared, codec, &key, &item).await {
+                Some(encoded) => Body::Encoded(encoded),
+                None => continue,
+            },
+            None => Body::Raw(item.payload.to_bytes()),
+        };
+        let payload = body.bytes();
         let chunk_count = frame::chunk_count(payload.len());
         let mut completed = true;
+        let mut message_bytes = 0usize;
         for chunk_index in 0..chunk_count {
             // a lossy channel stops a chunked message that outlived maxAge; otherwise it finishes
             // what it started, so big messages make progress even when newer ones keep arriving
@@ -386,7 +639,7 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             let frame_id = next_frame_id;
             next_frame_id = next_frame_id.wrapping_add(1);
             let header = frame::FrameHeader { key: &key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index, chunk_count };
-            let frame = frame::encode(&header, frame::chunk(&payload, chunk_index));
+            let frame = frame::encode(&header, frame::chunk(payload, chunk_index));
             let frame_len = frame.len();
             if let Err(error) = dc.send(frame).await {
                 if shared.closed.load(Ordering::Relaxed) {
@@ -403,11 +656,13 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
                 completed = false;
                 break;
             }
+            message_bytes += frame_len;
             {
                 let mut state = shared.state.lock().unwrap();
                 state.unconsumed.push_back((frame_id, frame_len, Instant::now()));
                 state.stats.unconsumed_bytes += frame_len;
                 state.stats.frames_sent += 1;
+                state.stats.bytes_sent += frame_len as u64;
             }
             pacer.wait_writable(&dc, &shared).await;
             if shared.closed.load(Ordering::Relaxed) {
@@ -415,9 +670,19 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             }
         }
         if completed {
-            shared.state.lock().unwrap().stats.sent += 1;
+            let mut state = shared.state.lock().unwrap();
+            state.stats.sent += 1;
+            state.message_bytes = ewma(state.message_bytes, message_bytes as f64);
         }
     }
+}
+
+/// Sends one small frame (e.g. a video frame's metadata) without pacing; returns its size.
+pub async fn send_small_frame(dc: &Arc<dyn DataChannel>, key: &str, item: &Pending, frame_id: u32, payload: &[u8]) -> Result<usize, webrtc::error::Error> {
+    let header = frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index: 0, chunk_count: 1 };
+    let frame = frame::encode(&header, payload);
+    let length = frame.len();
+    dc.send(frame).await.map(|_| length)
 }
 
 #[cfg(test)]
