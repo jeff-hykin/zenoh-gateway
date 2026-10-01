@@ -246,12 +246,12 @@ Depth stays lossless: quality only lowers resolution, by an integer stride `roun
 
 Point clouds: points with a non-finite x, y or z are skipped; fields are read by name (`x`, `y`, `z`,
 optional `intensity`) at their offsets with any PointField datatype, honoring `point_step`, `row_step`
-and `is_bigendian`. Quality q < 1 voxel-downsamples with voxel edge `0.2 m × (1 − q)`: each occupied
-voxel becomes one point at its center (mean intensity). Coordinates are int16 around a per-message
-origin: `x = originX + qx × scale`. Error per axis against the source point is at most `scale / 2`
-without voxels, where `scale = (largest bounding-box extent / 2) / 32767` (e.g. 0.76 mm for a
-100 m wide cloud), plus f32 rounding (~1e-7 relative); with voxels, at most `voxelSize / 2`
-(`msg.points.maxError`). Intensity is scaled to u8 over the message's min..max (`intensityMin`,
+and `is_bigendian`. Quality q thins the cloud to 1 point in every `round(1 / q)` (1 at q = 1, 2 at
+0.5, 3 at 0.33, at most 16 at q = 0): points 0, N, 2N, ... in message order, never moved or merged,
+with no assumption about units or spacing (`msg.points.keepEvery`). Coordinates are int16 around a
+per-message origin: `x = originX + qx × scale`. Error per axis of a sent point against its source point
+is at most `scale / 2`, where `scale = (largest bounding-box extent / 2) / 32767` in the cloud's own
+units (e.g. 0.76 mm for a 100 m wide cloud), plus f32 rounding (~1e-7 relative) (`msg.points.maxError`). Intensity is scaled to u8 over the message's min..max (`intensityMin`,
 `intensityScale`). `msg.points.positions` is a `Float32Array` (x, y, z per point).
 
 ## Bandwidth allocation
@@ -407,8 +407,8 @@ resolving so the bridge has an offset before the first put.
 - Video `sub` label: adds `"mid"`. The payload of a codec message (little endian):
   - depth: `u8 version=1 | u8 encoding (1 16UC1, 2 32FC1, 3 mono16) | u16 stride | u32 width |
     u32 height | u32 sourceWidth | u32 sourceHeight | zstd(width × height values)`
-  - point cloud: `u8 version=1 | u8 flags (bit0 intensity) | u16 0 | u32 pointCount | u32 sourcePointCount |
-    f32 originX | f32 originY | f32 originZ | f32 scale | f32 voxelSize | f32 intensityMin |
+  - point cloud: `u8 version=2 | u8 flags (bit0 intensity) | u16 0 | u32 pointCount | u32 sourcePointCount |
+    f32 originX | f32 originY | f32 originZ | f32 scale | u32 keepEvery | f32 intensityMin |
     f32 intensityScale | zstd(i16 x, y, z per point, then u8 intensity per point if flagged)`
   - video metadata: `u8 version=1 | u8 flags (bit0 keyframe) | u16 0 | u32 width | u32 height |
     u32 sourceWidth | u32 sourceHeight | f32 quality | u32 encodedBytes`

@@ -216,7 +216,7 @@ class PointCloudView {
     draw(points) {
         this.points = points
         this.render()
-        this.caption.textContent = `${points.count} points (source ${points.sourceCount}), voxel ${formatNumber(points.voxelSize * 100, 1)} cm, max error ${formatNumber(points.maxError * 1000, 2)} mm`
+        this.caption.textContent = `${points.count} points (source ${points.sourceCount}), 1 in ${points.keepEvery} kept, max error ${formatNumber(points.maxError, 4)}`
     }
 
     render() {

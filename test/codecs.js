@@ -359,7 +359,7 @@ try {
             results.push({
                 file: testCase.file, codec: testCase.codec,
                 count: points.count, sourceCount: points.sourceCount, maxError: points.maxError, worstError, hasIntensity: points.intensity !== null, intensityExact, bytes: full.bytes,
-                reduced: { count: reduced.points.count, bytes: reduced.bytes, voxelSize: reduced.points.voxelSize, maxError: reduced.points.maxError, outside },
+                reduced: { count: reduced.points.count, bytes: reduced.bytes, keepEvery: reduced.points.keepEvery, maxError: reduced.points.maxError, outside },
             })
         }
         client.close()
@@ -377,8 +377,8 @@ try {
             `${label}: ${result.count} points, worst axis error ${result.worstError.toExponential(2)} m <= documented bound ${result.maxError.toExponential(2)} m (${result.bytes} bytes for ${result.sourceCount} source points)`)
         const wantsIntensity = !result.file.includes("ros2/pointcloud_xyz.")
         check(result.hasIntensity === wantsIntensity && (result.intensityExact ?? true), `${label}: intensity ${result.hasIntensity ? (result.intensityExact ? "exact" : "WRONG") : "absent"} (expected ${wantsIntensity ? "present" : "absent"})`)
-        check(result.reduced.bytes < result.bytes && result.reduced.count < result.count && result.reduced.outside === 0 && result.reduced.voxelSize > 0,
-            `${label}: maxQuality 0.5 sends fewer bytes (${result.reduced.bytes} < ${result.bytes}) and points (${result.reduced.count}, voxel ${result.reduced.voxelSize.toFixed(2)} m), all within the source box + ${result.reduced.maxError.toFixed(3)} m`)
+        check(result.reduced.count < result.count && result.reduced.outside === 0 && result.reduced.keepEvery === 2 && result.reduced.count === Math.ceil(result.count / 2),
+            `${label}: maxQuality 0.5 sends half the points (${result.reduced.count}, 1 in ${result.reduced.keepEvery}), all within the source box + ${result.reduced.maxError.toExponential(2)}`)
     }
 
     $.logStep("codec selection errors and shared encodes")

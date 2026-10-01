@@ -211,7 +211,7 @@ picture.
 `dimos-*` reads the dimos message format as dimos publishes it over zenoh (`<topic>/<msg_name>` keys,
 type fingerprint checked).
 Lower quality = smaller video (resolution and bitrate), a coarser depth stride (values stay exact), a
-voxel-downsampled cloud. Details and wire formats: SPEC.md "Codecs".
+thinned cloud (every 2nd, 3rd, ... point). Details and wire formats: SPEC.md "Codecs".
 
 ## Use as a Rust library
 

@@ -4,7 +4,7 @@
 //! The input type decides the output:
 //! - `*-image`, `*-compressed-image`: color/mono images, H.264 on a WebRTC video track
 //! - `*-depth`, `*-compressed-depth`: lossless depth (u16/f32) on the data channel, zstd
-//! - `*-pointcloud2`: voxel + int16 quantized points on the data channel, zstd
+//! - `*-pointcloud2`: thinned (every Nth point) + int16 quantized points on the data channel, zstd
 
 use super::wire::{self, Protocol};
 use super::{Codec, CodecOutput, CodecSample, DecodedFrame, depth, image, pointcloud};
@@ -87,8 +87,8 @@ impl Codec for Builtin {
         match self.input {
             // lossless zstd roughly halves depth; lower quality sends 1/stride² of the pixels
             Input::Depth | Input::CompressedDepth => payload_bytes * 0.5 * depth::size_factor(quality),
-            // voxel thinning depends on point density; a rough monotone guess until measured
-            Input::PointCloud2 => payload_bytes * 0.25 * (0.15 + 0.85 * quality.clamp(0.0, 1.0)),
+            // int16 + zstd roughly quarters a float cloud; thinning sends 1 point in keep_every
+            Input::PointCloud2 => payload_bytes * 0.25 / pointcloud::keep_every(quality) as f64,
             // priced by the bridge's video model, never asked
             Input::Image | Input::CompressedImage => payload_bytes * 0.05,
         }

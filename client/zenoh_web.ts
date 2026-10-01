@@ -107,7 +107,7 @@ export interface DepthImage {
 
 export interface PointCloud {
     count: number
-    /** finite points in the source message, before voxel downsampling */
+    /** finite points in the source message, before thinning */
     sourceCount: number
     /** x, y, z per point */
     positions: Float32Array
@@ -116,11 +116,11 @@ export interface PointCloud {
     intensityMin: number
     intensityScale: number
     origin: [number, number, number]
-    /** meters per quantization step */
+    /** cloud units per quantization step */
     scale: number
-    /** 0 = no downsampling */
-    voxelSize: number
-    /** largest per-axis error against a source point: voxelSize / 2, or scale / 2 without voxels */
+    /** 1 point kept in every `keepEvery` source points (1 = all) */
+    keepEvery: number
+    /** largest per-axis error of a sent point against its source point: scale / 2 */
     maxError: number
 }
 
@@ -474,14 +474,14 @@ export function decodeDepth(bytes: Uint8Array): DepthImage {
 /** Point cloud codec payload: 40-byte header + zstd(int16 xyz, u8 intensity), see SPEC "Wire formats". */
 export function decodePointCloud(bytes: Uint8Array): PointCloud {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    if (bytes[0] !== 1) {
+    if (bytes[0] !== 2) {
         throw new Error(`zenoh-web: unknown point cloud format version ${bytes[0]}`)
     }
     const hasIntensity = (bytes[1] & 1) === 1
     const count = view.getUint32(4, true)
     const origin: [number, number, number] = [view.getFloat32(12, true), view.getFloat32(16, true), view.getFloat32(20, true)]
     const scale = view.getFloat32(24, true)
-    const voxelSize = view.getFloat32(28, true)
+    const keepEvery = view.getUint32(28, true)
     const body = zstdDecompress(bytes.subarray(40)) as Uint8Array
     const quantized = new DataView(body.buffer, body.byteOffset, body.byteLength)
     const positions = new Float32Array(count * 3)
@@ -497,8 +497,8 @@ export function decodePointCloud(bytes: Uint8Array): PointCloud {
         intensityScale: view.getFloat32(36, true),
         origin,
         scale,
-        voxelSize,
-        maxError: voxelSize > 0 ? voxelSize / 2 : scale / 2,
+        keepEvery,
+        maxError: scale / 2,
     }
 }
 

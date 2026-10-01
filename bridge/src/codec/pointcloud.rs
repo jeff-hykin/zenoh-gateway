@@ -1,31 +1,29 @@
-//! PointCloud2 to a compact data-channel format: optional voxel downsample, xyz quantized to int16
-//! around a per-message origin, optional u8 intensity, zstd.
+//! PointCloud2 to a compact data-channel format: optional thinning (keep every Nth point), xyz
+//! quantized to int16 around a per-message origin, optional u8 intensity, zstd.
 //!
 //! Wire format (little endian), see SPEC "Wire formats":
-//! `u8 version=1 | u8 flags (bit0 intensity) | u16 reserved | u32 pointCount | u32 sourcePointCount |
-//!  f32 originX | f32 originY | f32 originZ | f32 scale | f32 voxelSize | f32 intensityMin |
+//! `u8 version=2 | u8 flags (bit0 intensity) | u16 reserved | u32 pointCount | u32 sourcePointCount |
+//!  f32 originX | f32 originY | f32 originZ | f32 scale | u32 keepEvery | f32 intensityMin |
 //!  f32 intensityScale | zstd(i16 x,y,z per point, then u8 intensity per point if flagged)`
 //!
-//! Decoded `x = originX + qx * scale`. Without voxels (quality 1) the error per axis is at most
-//! `scale / 2`, where `scale = (largest bounding-box extent / 2) / 32767` (plus f32 rounding,
-//! ~1e-7 relative). With voxels, each occupied voxel becomes one point at the voxel's center (its
-//! intensity the mean), on a quantization grid aligned to the voxels, so the error per axis
-//! against any original point in that voxel is at most `voxelSize / 2`.
+//! Decoded `x = originX + qx * scale`. The error per axis of each sent point is at most `scale / 2`,
+//! where `scale = (largest bounding-box extent / 2) / 32767` (plus f32 rounding, ~1e-7 relative), in
+//! whatever units the cloud uses. Thinning keeps points 0, N, 2N, ... in message order: it never
+//! moves a point and assumes nothing about units or spacing.
 
 use crate::codec::wire::{PointCloud, PointField};
 use anyhow::{Context, Result, bail, ensure};
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 pub const HEADER_LEN: usize = 40;
 const ZSTD_LEVEL: i32 = 3;
-/// Voxel edge at quality 0, meters; quality q uses `MAX_VOXEL * (1 - q)`, none at quality 1.
-pub const MAX_VOXEL: f64 = 0.2;
+/// Thinning at quality 0: keep 1 point in this many.
+pub const MAX_KEEP_EVERY: u32 = 16;
 const QUANT_MAX: f64 = 32767.0;
 
-pub fn voxel_size(quality: f64) -> f64 {
-    let size = MAX_VOXEL * (1.0 - quality.clamp(0.0, 1.0));
-    if size < 1e-3 { 0.0 } else { size }
+/// Keep 1 point in N, N = round(1 / quality): 1 at quality 1, 2 at 0.5, 3 at 0.33, MAX_KEEP_EVERY at 0.
+pub fn keep_every(quality: f64) -> u32 {
+    (1.0 / quality.clamp(1.0 / MAX_KEEP_EVERY as f64, 1.0)).round() as u32
 }
 
 /// Reads one numeric field of a point as f64, for any PointField datatype.
@@ -108,45 +106,19 @@ pub fn read_points(cloud: &PointCloud) -> Result<Points> {
     Ok(Points { points, has_intensity: intensity.is_some() })
 }
 
-/// Replaces the points in each occupied voxel with one point at the voxel's center (mean intensity).
-fn voxel_downsample(points: &[Point], voxel: f64) -> Cow<'_, [Point]> {
-    if voxel <= 0.0 {
+/// Points 0, N, 2N, ... (N = `keep_every`), in message order.
+fn thin(points: &[Point], keep_every: u32) -> Cow<'_, [Point]> {
+    if keep_every <= 1 {
         return Cow::Borrowed(points);
     }
-    let mut cells: HashMap<[i64; 3], (f64, u32)> = HashMap::with_capacity(points.len() / 2);
-    let mut order = Vec::new();
-    for point in points {
-        let cell = point.xyz.map(|value| (value / voxel).floor() as i64);
-        let entry = cells.entry(cell).or_insert_with(|| {
-            order.push(cell);
-            (0.0, 0)
-        });
-        entry.0 += point.intensity;
-        entry.1 += 1;
-    }
-    order
-        .into_iter()
-        .map(|cell| {
-            let (intensity_sum, count) = cells[&cell];
-            Point { xyz: cell.map(|index| (index as f64 + 0.5) * voxel), intensity: intensity_sum / count as f64 }
-        })
-        .collect::<Vec<_>>()
-        .into()
+    points.iter().step_by(keep_every as usize).cloned().collect::<Vec<_>>().into()
 }
 
-/// (origin, scale) so every point fits int16. With voxels the grid is voxel-aligned: centers land
-/// on exact integers, which keeps the quantized values regular (and zstd effective).
-fn quantization_grid(low: [f64; 3], high: [f64; 3], voxel: f64) -> ([f64; 3], f64) {
+/// (origin, scale) so every point fits int16.
+fn quantization_grid(low: [f64; 3], high: [f64; 3]) -> ([f64; 3], f64) {
     let half_extent = (0..3).map(|axis| (high[axis] - low[axis]) / 2.0).fold(0.0, f64::max);
-    let finest = half_extent / QUANT_MAX;
     let center: [f64; 3] = std::array::from_fn(|axis| (low[axis] + high[axis]) / 2.0);
-    if voxel > 0.0 {
-        // centers sit at odd multiples of voxel/2, so a finer step would carry no information
-        if voxel / 2.0 >= finest {
-            return (center.map(|value| (value / voxel).round() * voxel), voxel / 2.0);
-        }
-    }
-    (center, finest.max(f32::MIN_POSITIVE as f64))
+    (center, (half_extent / QUANT_MAX).max(f32::MIN_POSITIVE as f64))
 }
 
 #[cfg(test)]
@@ -157,8 +129,8 @@ pub fn encode(cloud: &PointCloud, quality: f64) -> Result<Vec<u8>> {
 pub fn encode_points(cloud: &Points, quality: f64) -> Result<Vec<u8>> {
     let has_intensity = cloud.has_intensity;
     let source_count = cloud.points.len();
-    let voxel = voxel_size(quality);
-    let points = voxel_downsample(&cloud.points, voxel);
+    let keep_every = keep_every(quality);
+    let points = thin(&cloud.points, keep_every);
     let mut low = [f64::INFINITY; 3];
     let mut high = [f64::NEG_INFINITY; 3];
     let (mut intensity_low, mut intensity_high) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -170,7 +142,7 @@ pub fn encode_points(cloud: &Points, quality: f64) -> Result<Vec<u8>> {
         intensity_low = intensity_low.min(point.intensity);
         intensity_high = intensity_high.max(point.intensity);
     }
-    let (origin, scale) = if points.is_empty() { ([0.0; 3], 1.0) } else { quantization_grid(low, high, voxel) };
+    let (origin, scale) = if points.is_empty() { ([0.0; 3], 1.0) } else { quantization_grid(low, high) };
     let origin = origin.map(|value| value as f32);
     let scale = scale as f32;
     let intensity_scale = if intensity_high > intensity_low { ((intensity_high - intensity_low) / 255.0) as f32 } else { 1.0 };
@@ -187,12 +159,16 @@ pub fn encode_points(cloud: &Points, quality: f64) -> Result<Vec<u8>> {
         body.extend(points.iter().map(|point| ((point.intensity - intensity_min as f64) / intensity_scale as f64).round().clamp(0.0, 255.0) as u8));
     }
     let mut out = Vec::with_capacity(HEADER_LEN + body.len() / 2);
-    out.push(1);
+    out.push(2);
     out.push(has_intensity as u8);
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(&(points.len() as u32).to_le_bytes());
     out.extend_from_slice(&(source_count as u32).to_le_bytes());
-    for value in [origin[0], origin[1], origin[2], scale, voxel as f32, intensity_min, intensity_scale] {
+    for value in [origin[0], origin[1], origin[2], scale] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&keep_every.to_le_bytes());
+    for value in [intensity_min, intensity_scale] {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out.extend_from_slice(&zstd::bulk::compress(&body, ZSTD_LEVEL)?);
@@ -239,13 +215,62 @@ mod tests {
 
     #[test]
     fn lower_quality_is_smaller() {
-        let payload = fixture("ros2/pointcloud_xyzi.cdr");
-        let cloud = parse_point_cloud(Protocol::Ros2, &payload).unwrap();
-        let full = encode(&cloud, 1.0).unwrap();
-        let half = encode(&cloud, 0.5).unwrap();
-        let lowest = encode(&cloud, 0.0).unwrap();
+        // a scan-like cloud with noise (the grid fixtures compress so well that thinning them can grow the output)
+        let mut seed = 1u64;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let points = (0..20000).map(|index| Point { xyz: [index as f64 * 0.001 + noise(), noise() * 5.0, noise()], intensity: 0.0 }).collect();
+        let cloud = Points { points, has_intensity: false };
+        let [full, half, lowest] = [1.0, 0.5, 0.0].map(|quality| encode_points(&cloud, quality).unwrap());
         assert!(half.len() * 4 < full.len() * 3 && lowest.len() < half.len(), "{} / {} / {}", full.len(), half.len(), lowest.len());
-        assert!(u32::from_le_bytes(half[4..8].try_into().unwrap()) < 20000);
+        assert_eq!(u32::from_le_bytes(half[4..8].try_into().unwrap()), 10000);
+    }
+
+    #[test]
+    fn keep_every_from_quality() {
+        let mapped: Vec<u32> = [1.0, 0.9, 0.5, 0.34, 0.25, 0.1, 0.0, -1.0].map(keep_every).to_vec();
+        assert_eq!(mapped, [1, 1, 2, 3, 4, 10, MAX_KEEP_EVERY, MAX_KEEP_EVERY]);
+    }
+
+    #[test]
+    fn thinning_keeps_every_nth_source_point_unmoved() {
+        let payload = fixture("ros2/pointcloud_xyz.cdr");
+        let cloud = parse_point_cloud(Protocol::Ros2, &payload).unwrap();
+        for (quality, keep) in [(0.5, 2usize), (1.0 / 3.0, 3)] {
+            let encoded = encode(&cloud, quality).unwrap();
+            assert_eq!(u32::from_le_bytes(encoded[28..32].try_into().unwrap()) as usize, keep);
+            let (positions, _, scale) = decode(&encoded);
+            assert_eq!(positions.len(), 20000usize.div_ceil(keep));
+            for (sent, position) in positions.iter().enumerate() {
+                let index = sent * keep;
+                let expected = [(index % 200) as f32 * 0.05, (index / 200) as f32 * 0.05, (index % 7) as f32 * 0.125];
+                for axis in 0..3 {
+                    assert!((position[axis] - expected[axis]).abs() <= scale / 2.0 + 1e-5, "q {quality} point {index}: {position:?} vs {expected:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn units_do_not_matter() {
+        // the same cloud in mm, m and km: same points kept, same error relative to the cloud's size
+        let points: Vec<Point> = (0..5000).map(|index| Point { xyz: [(index % 100) as f64, (index / 100) as f64, (index % 7) as f64 * 0.3], intensity: 0.0 }).collect();
+        for unit in [1e-3, 1.0, 1e3] {
+            let cloud = Points { points: points.iter().map(|point| Point { xyz: point.xyz.map(|value| value * unit), intensity: 0.0 }).collect(), has_intensity: false };
+            for quality in [1.0, 0.5, 0.0] {
+                let (positions, _, scale) = decode(&encode_points(&cloud, quality).unwrap());
+                let keep = keep_every(quality) as usize;
+                assert_eq!(positions.len(), 5000usize.div_ceil(keep), "unit {unit} q {quality}");
+                for (sent, position) in positions.iter().enumerate() {
+                    for (decoded, source) in position.iter().zip(cloud.points[sent * keep].xyz) {
+                        let error = (*decoded as f64 - source).abs();
+                        assert!(error <= scale as f64 / 2.0 + 99.0 * unit * 1e-6, "unit {unit} q {quality} point {sent}: error {error}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
