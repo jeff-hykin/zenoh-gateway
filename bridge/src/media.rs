@@ -3,8 +3,8 @@
 //! naming the codec; the bridge answers with a track of that codec's format bound to the transceiver's mid, which the
 //! `sub` channel's label names (it then carries a small frame per media frame). Later subscriptions reuse the track.
 
-use crate::codec::registry;
-use crate::codec::video::{EncodedVideo, target};
+use crate::codec::registry::{self, CodecRegistry};
+use crate::codec::video::{EncodedVideo, VideoEncoder, VideoPolicy, target};
 use crate::codec::{Codec, CodecOutput, CodecSample, DecodedFrame};
 use crate::subscription::{self, SubShared};
 use anyhow::{Context, Result};
@@ -20,8 +20,9 @@ use rtc::rtp::extension::HeaderExtension;
 use rtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension;
 use rtc::rtp_transceiver::rtp_sender::RTCRtpHeaderExtensionCapability;
 use rtc::rtp_transceiver::rtp_sender::{RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use webrtc::data_channel::DataChannel;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -33,10 +34,11 @@ use webrtc::rtp_transceiver::RtpSender;
 const FORMATS: [(&str, u8); 5] = [("video/H264", 102), ("video/VP8", 96), ("video/VP9", 98), ("video/AV1", 45), (OPUS, 111)];
 const OPUS: &str = "audio/opus";
 /// Google Congestion Control bounds, bits/s. It starts where the data-channel estimator starts
-/// (`allocator::INITIAL_ESTIMATE`, 1 MB/s), since video is allocated no more than this estimate.
+/// (`allocator::INITIAL_ESTIMATE`, 1 MB/s), since video is allocated no more than this estimate. The ceiling is only a
+/// sanity bound (at 50 Mbit/s it capped 8 HD cameras on an idle link): streams' `maxBitrate` bounds what video asks for.
 const GCC_INITIAL_BPS: f64 = crate::allocator::INITIAL_ESTIMATE * 8.0;
 const GCC_MIN_BPS: f64 = 50_000.0;
-const GCC_MAX_BPS: f64 = 50_000_000.0;
+const GCC_MAX_BPS: f64 = 2_000_000_000.0;
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
 const PACING_FACTOR: f64 = 2.5;
 /// Asks the browser to show each frame as soon as it is decoded (min = max = 0): no jitter-buffer
@@ -60,9 +62,9 @@ fn rtp_codec(mime: &str) -> RTCRtpCodec {
 }
 
 /// The track format a media codec needs: its encoder's video format, or Opus.
-pub fn track_mime(codec: &dyn Codec) -> Option<&'static str> {
+pub fn track_mime(codecs: &CodecRegistry, codec: &dyn Codec) -> Option<&'static str> {
     match codec.output() {
-        CodecOutput::Video => Some(codec.video_encoder().format().mime_type()),
+        CodecOutput::Video => Some(codecs.video_encoder(codec).format().mime_type()),
         CodecOutput::Audio => Some(OPUS),
         _ => None,
     }
@@ -255,8 +257,8 @@ type DecodeOutcome = std::result::Result<(Arc<DecodedFrame>, bool), String>;
 pub struct Decoding {
     pub key: String,
     pub item: subscription::Pending,
-    /// (what came of the sample, milliseconds it took)
-    pub task: tokio::task::JoinHandle<(DecodeOutcome, f64)>,
+    /// (what came of the sample, milliseconds it took, its identity across frontends: key + payload hash)
+    pub task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>,
 }
 
 /// Starts decoding a picked sample.
@@ -266,15 +268,16 @@ pub fn start_decode(shared: &SubShared, codec: &Arc<dyn Codec>, key: String, ite
     let task = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let sample = CodecSample::new(&hash_key, &payload, &encoding);
-        let (decoded, reused) = codecs.decode_shared(&*codec, &sample, registry::sample_hash(&sample));
-        (decoded.map(|decoded| (decoded, reused)), started.elapsed().as_secs_f64() * 1000.0)
+        let hash = registry::sample_hash(&sample);
+        let (decoded, reused) = codecs.decode_shared(&*codec, &sample, hash);
+        (decoded.map(|decoded| (decoded, reused)), started.elapsed().as_secs_f64() * 1000.0, hash)
     });
     Decoding { key, item, task }
 }
 
-/// Quality steps the CPU governor moves by.
+/// Resolution-scale steps the CPU governor moves by.
 const CPU_STEP: f64 = 0.1;
-/// Share of the frame interval the slower pipeline stage may take before quality steps down.
+/// Share of the frame interval an encode may take before the picture steps down.
 const CPU_HEADROOM: f64 = 0.85;
 /// Time after a step before the next, so the costs are measured at the new size.
 const CPU_SETTLE: Duration = Duration::from_secs(1);
@@ -285,74 +288,272 @@ const CPU_UP_SETTLE: Duration = Duration::from_secs(5);
 /// Weight of the newest sample in the cost averages.
 const CPU_EWMA_GAIN: f64 = 0.2;
 
-/// Keeps a video stream within what the cores can encode at the granted rate (on a small CPU the frame rate collapsed):
-/// past `CPU_HEADROOM` of the frame interval the quality ceiling steps down (never below minQuality), and back up when
-/// the encode cost predicted at the next step (it scales with pixels) fits. Decode cost never moves it: it overlaps
-/// encoding and does not depend on quality.
+fn ewma(average: Option<f64>, sample: f64) -> f64 {
+    average.map_or(sample, |average| average + CPU_EWMA_GAIN * (sample - average))
+}
+
+/// Keeps an encode session within what the cores can encode at its frame rate (on a small CPU the rate collapsed): past
+/// `CPU_HEADROOM` of the frame interval the picture's scale ceiling steps down from the scale in use (never below
+/// `minResolutionScale`), and back up when the encode cost predicted at the next step (it scales with pixels) fits. It
+/// only ever lowers the size the bitrate policy picked, never the bitrate or the rate, so the two can't fight; a
+/// hardware encoder rarely moves it. Decode cost never moves it: it overlaps encoding and does not depend on size.
 struct CpuGovernor {
     cap: f64,
-    decode_ms: Option<f64>,
     encode_ms: Option<f64>,
     changed_at: Option<Instant>,
 }
 
 impl CpuGovernor {
     fn new() -> Self {
-        CpuGovernor { cap: 1.0, decode_ms: None, encode_ms: None, changed_at: None }
-    }
-
-    fn observe_decode(&mut self, ms: f64, reused: bool) {
-        if !reused {
-            self.decode_ms = Some(self.decode_ms.map_or(ms, |average| average + CPU_EWMA_GAIN * (ms - average)));
-        }
+        CpuGovernor { cap: 1.0, encode_ms: None, changed_at: None }
     }
 
     fn observe_encode(&mut self, ms: f64) {
-        self.encode_ms = Some(self.encode_ms.map_or(ms, |average| average + CPU_EWMA_GAIN * (ms - average)));
+        self.encode_ms = Some(ewma(self.encode_ms, ms));
     }
 
-    /// The quality to encode at: `allocated`, lowered to the governor's ceiling.
-    fn quality(&mut self, allocated: f64, min_quality: f64, hz: f64, now: Instant) -> f64 {
-        let floor = min_quality.min(allocated);
+    /// The ceiling on the picture's scale, given the scale the last frame was encoded at.
+    fn scale_cap(&mut self, current: f64, floor: f64, hz: f64, now: Instant) -> f64 {
         let since_change = self.changed_at.map(|at| now.duration_since(at));
         let settled = since_change.is_none_or(|elapsed| elapsed >= CPU_SETTLE);
         if let (true, Some(encode_ms)) = (settled, self.encode_ms) {
-            let budget_ms = 1000.0 / hz.max(0.1) * CPU_HEADROOM;
-            let current = allocated.min(self.cap);
-            if encode_ms > budget_ms && current > floor + 1e-9 {
+            let interval_ms = 1000.0 / hz.max(0.1);
+            let current = current.min(self.cap);
+            if encode_ms > interval_ms * CPU_HEADROOM && current > floor + 1e-9 {
                 self.cap = (current - CPU_STEP).max(floor);
                 self.encode_ms = None;
                 self.changed_at = Some(now);
-            } else if self.cap < 1.0 && self.cap < allocated && since_change.is_none_or(|elapsed| elapsed >= CPU_UP_SETTLE) {
+            } else if self.cap < 1.0 && since_change.is_none_or(|elapsed| elapsed >= CPU_UP_SETTLE) {
                 let next = (self.cap + CPU_STEP).min(1.0);
-                let pixels = |quality: f64| crate::codec::video::resolution_scale(quality).powi(2);
-                let predicted_ms = encode_ms * pixels(next) / pixels(self.cap);
-                if predicted_ms < 1000.0 / hz.max(0.1) * CPU_UP_HEADROOM {
+                if encode_ms * (next / self.cap).powi(2) < interval_ms * CPU_UP_HEADROOM {
                     self.cap = next;
                     self.encode_ms = None;
                     self.changed_at = Some(now);
                 }
             }
         }
-        allocated.min(self.cap).max(floor)
+        self.cap.max(floor)
     }
 }
 
-/// Sends a video subscription's frames: pick (paced), decode (shared across frontends), encode at the allocated quality
-/// and Hz (off the runtime), write to the track. The next decode overlaps this encode, so the slower of the two sets the
-/// rate (in series a 1920x1536 jpeg on a Jetson Orin core, ~16 ms + ~20 ms, could not keep up with 30 Hz).
+/// Encoded frames a session keeps for members that are a frame or two behind.
+const SESSION_LOG: usize = 8;
+/// One sample seen by two frontends: same payload, timestamps this close.
+const SAME_SAMPLE_MS: f64 = 2.0;
+/// Viewers share an encode while their grants are within this ratio of each other (it runs at the lowest).
+const SHARE_RATIO: f64 = 1.25;
+
+/// The encodes of every video stream, shared by viewers of one stream at one target (SPEC "Video"). Each member of a
+/// session sends every frame of it, in order, so one encoder's reference chain serves them all.
+#[derive(Default)]
+pub struct VideoSessions {
+    sessions: Mutex<Vec<Arc<EncodeSession>>>,
+    next_member: AtomicU64,
+    next_session: AtomicU64,
+}
+
+struct EncodeSession {
+    /// creation order: a lone member moves to an older session it fits, so two never stay apart at one grant
+    id: u64,
+    codec: String,
+    key: String,
+    policy: VideoPolicy,
+    /// member → (bits/s, frames/s) it is granted
+    grants: Mutex<HashMap<u64, (f64, f64)>>,
+    state: tokio::sync::Mutex<SessionState>,
+}
+
+struct SessionState {
+    encoder: Option<Box<dyn VideoEncoder>>,
+    governor: CpuGovernor,
+    log: VecDeque<Arc<SessionFrame>>,
+    next_seq: u64,
+    /// the newest sample encoded: (timestamp ms, decode hash)
+    last_input: Option<(f64, u64)>,
+    keyframe_wanted: bool,
+    source: (u32, u32),
+    scale: f64,
+}
+
+struct SessionFrame {
+    seq: u64,
+    frame: EncodedVideo,
+    source: (u32, u32),
+    timestamp_ms: f64,
+    encoded_by: u64,
+}
+
+impl EncodeSession {
+    /// Whether a member granted `bitrate` can share this session: the others' grants and its own are close.
+    fn fits(&self, member: u64, bitrate: f64) -> bool {
+        let grants = self.grants.lock().unwrap();
+        let others = grants.iter().filter(|(id, _)| **id != member).map(|(_, (bps, _))| *bps);
+        let (low, high) = others.fold((bitrate, bitrate), |(low, high), bps| (low.min(bps), high.max(bps)));
+        high <= low.max(1.0) * SHARE_RATIO
+    }
+}
+
+impl VideoSessions {
+    /// The session `member` encodes in at `grant`: `current` while it still fits (unless it is alone there and an older
+    /// session of the same stream and policy fits too), else the oldest such session that fits, else a new one.
+    fn place(&self, current: Option<Arc<EncodeSession>>, member: u64, (codec, key): (&str, &str), policy: VideoPolicy, grant: (f64, f64)) -> Arc<EncodeSession> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let oldest_fit = sessions.iter().filter(|session| session.codec == codec && session.key == key && session.policy == policy && session.fits(member, grant.0)).min_by_key(|session| session.id).cloned();
+        let session = match (current, oldest_fit) {
+            (Some(current), oldest) if current.fits(member, grant.0) && (current.grants.lock().unwrap().len() > 1 || oldest.as_ref().is_none_or(|oldest| oldest.id >= current.id)) => current,
+            (current, oldest) => {
+                if let Some(current) = current {
+                    Self::leave_locked(&mut sessions, &current, member);
+                }
+                oldest.filter(|oldest| sessions.iter().any(|session| Arc::ptr_eq(session, oldest))).unwrap_or_else(|| {
+                    let state = SessionState { encoder: None, governor: CpuGovernor::new(), log: VecDeque::new(), next_seq: 0, last_input: None, keyframe_wanted: true, source: (640, 480), scale: 1.0 };
+                    let id = self.next_session.fetch_add(1, Ordering::Relaxed);
+                    let session = Arc::new(EncodeSession { id, codec: codec.to_owned(), key: key.to_owned(), policy, grants: Mutex::default(), state: tokio::sync::Mutex::new(state) });
+                    sessions.push(session.clone());
+                    session
+                })
+            }
+        };
+        session.grants.lock().unwrap().insert(member, grant);
+        session
+    }
+
+    fn leave(&self, session: &Arc<EncodeSession>, member: u64) {
+        Self::leave_locked(&mut self.sessions.lock().unwrap(), session, member);
+    }
+
+    fn leave_locked(sessions: &mut Vec<Arc<EncodeSession>>, session: &Arc<EncodeSession>, member: u64) {
+        let mut grants = session.grants.lock().unwrap();
+        grants.remove(&member);
+        if grants.is_empty() {
+            sessions.retain(|other| !Arc::ptr_eq(other, session));
+        }
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+}
+
+/// One viewer's place in its session: the next frame it hasn't sent, and whether it has had a keyframe there.
+struct Member {
+    id: u64,
+    session: Option<Arc<EncodeSession>>,
+    next_seq: Option<u64>,
+    synced: bool,
+}
+
+/// A picked, decoded sample to encode.
+struct Input {
+    decoded: Arc<DecodedFrame>,
+    timestamp_ms: f64,
+    hash: u64,
+    quality: f64,
+    keyframe_requested: bool,
+}
+
+/// What one step gave a member: frames to send, and how the encode went (if it ran one).
+#[derive(Default)]
+struct Step {
+    frames: Vec<Arc<SessionFrame>>,
+    encode_ms: Option<f64>,
+    error: Option<String>,
+    scale_cap: f64,
+}
+
+/// One member's turn with one sample: encode it if it is newer than anything the session encoded (otherwise another
+/// member already did), then take every frame of the session this member hasn't sent, from a keyframe on.
+async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, codecs: Arc<CodecRegistry>, codec: Arc<dyn Codec>) -> Step {
+    let mut state = session.state.lock().await;
+    let mut out = Step::default();
+    // a new member starts at the newest frame if that is a keyframe, else at the next one
+    let next_seq = *member.next_seq.get_or_insert_with(|| state.log.back().filter(|logged| logged.frame.keyframe).map_or(state.next_seq, |logged| logged.seq));
+    let can_sync = member.synced || state.log.iter().any(|logged| logged.seq >= next_seq && logged.frame.keyframe);
+    if !can_sync || input.keyframe_requested {
+        state.keyframe_wanted = true;
+    }
+    // without zenoh timestamps each frontend stamps a sample on arrival, so the same sample differs by a little
+    let newer = state.last_input.is_none_or(|(timestamp_ms, hash)| if hash == input.hash { input.timestamp_ms > timestamp_ms + SAME_SAMPLE_MS } else { input.timestamp_ms >= timestamp_ms });
+    if newer {
+        state.last_input = Some((input.timestamp_ms, input.hash));
+        let is_picture = if let DecodedFrame::Video(image) = &*input.decoded {
+            state.source = (image.width(), image.height());
+            true
+        } else {
+            false
+        };
+        let grants: Vec<(f64, f64)> = session.grants.lock().unwrap().values().copied().collect();
+        let bitrate = grants.iter().map(|grant| grant.0).fold(f64::INFINITY, f64::min);
+        let hz = grants.iter().map(|grant| grant.1).fold(0.0, f64::max);
+        let floor = session.policy.min_resolution_scale;
+        let (scale, source) = (state.scale, state.source);
+        out.scale_cap = state.governor.scale_cap(scale, floor, hz, Instant::now());
+        let target = target(&session.policy, source, input.quality, bitrate, hz, out.scale_cap, state.keyframe_wanted);
+        let mut encoder = state.encoder.take().unwrap_or_else(|| codecs.video_encoder(&*codec));
+        let decoded = input.decoded.clone();
+        let encoding = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let result = encoder.encode(&decoded, &target).map_err(|error| format!("{error:#}"));
+            (encoder, result, started.elapsed().as_secs_f64() * 1000.0)
+        });
+        match encoding.await {
+            Ok((encoder, result, encode_ms)) => {
+                state.encoder = Some(encoder);
+                state.governor.observe_encode(encode_ms);
+                out.encode_ms = state.governor.encode_ms;
+                match result {
+                    Ok(Some(frame)) => {
+                        if !is_picture {
+                            state.source = (frame.width, frame.height);
+                        }
+                        state.scale = frame.width as f64 / state.source.0.max(1) as f64;
+                        state.keyframe_wanted &= !frame.keyframe;
+                        let seq = state.next_seq;
+                        state.next_seq += 1;
+                        let logged = SessionFrame { seq, source: state.source, frame, timestamp_ms: input.timestamp_ms, encoded_by: member.id };
+                        state.log.push_back(Arc::new(logged));
+                        if state.log.len() > SESSION_LOG {
+                            state.log.pop_front();
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => out.error = Some(error),
+                }
+            }
+            Err(error) => out.error = Some(format!("encoder task failed: {error}")),
+        }
+    } else {
+        out.scale_cap = state.governor.cap;
+    }
+    if member.synced && state.log.front().is_some_and(|oldest| next_seq < oldest.seq) {
+        // fell further behind than the log reaches: start over from a keyframe
+        member.synced = false;
+        state.keyframe_wanted = true;
+    }
+    for frame in state.log.iter().filter(|frame| frame.seq >= next_seq) {
+        member.synced |= frame.frame.keyframe;
+        if member.synced {
+            out.frames.push(frame.clone());
+        }
+    }
+    member.next_seq = Some(state.next_seq);
+    out
+}
+
+/// Sends a video subscription's frames: pick (paced), decode (shared across frontends), encode in the encode session
+/// of its grant (shared by viewers at that grant, off the runtime), write to the track. The next decode overlaps this
+/// encode, so the slower of the two sets the rate (in series a 1920x1536 jpeg on a Jetson Orin core, ~16 ms + ~20 ms,
+/// could not keep up with 30 Hz).
 pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: Arc<MediaTrack>) {
     let Some(codec) = shared.codec.clone() else { return };
-    let mut encoder = Some(codec.video_encoder());
-    // the picture size the target scales (an encoder fed other frames reports it by its output)
-    let mut source = (640, 480);
+    let sessions = &shared.codecs.video_sessions;
+    let mut member = Member { id: sessions.next_member.fetch_add(1, Ordering::Relaxed), session: None, next_seq: None, synced: false };
     let mut next_frame_id: u32 = 0;
     let mut last_write: Option<Instant> = None;
     let mut warned_write = false;
     let mut next: Option<Decoding> = None;
-    let mut governor = CpuGovernor::new();
-    // a new subscriber starts from a keyframe (the new encoder's first frame is one anyway)
-    track.keyframe_requested.store(true, Ordering::Release);
+    let mut decode_ms: Option<f64> = None;
     while !shared.is_closed() {
         let decoding = match next.take() {
             Some(decoding) => decoding,
@@ -366,12 +567,14 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             }
         };
         let Decoding { key, item, task } = decoding;
-        let (decoded, reused) = match task.await {
-            Ok((Ok((decoded, reused)), decode_ms)) => {
-                governor.observe_decode(decode_ms, reused);
-                (decoded, reused)
+        let (decoded, hash) = match task.await {
+            Ok((Ok((decoded, reused)), ms, hash)) => {
+                if !reused {
+                    decode_ms = Some(ewma(decode_ms, ms));
+                }
+                (decoded, hash)
             }
-            Ok((Err(error), _)) => {
+            Ok((Err(error), _, _)) => {
                 shared.record_codec_error(&error);
                 continue;
             }
@@ -380,75 +583,62 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 continue;
             }
         };
-        let hz = shared.key_hz(&key);
-        let quality = governor.quality(shared.current_quality(), shared.min_quality(), hz, Instant::now());
-        let is_picture = matches!(&*decoded, DecodedFrame::Video(_));
-        if let DecodedFrame::Video(image) = &*decoded {
-            source = (image.width(), image.height());
+        let (quality, bitrate, hz) = shared.video_grant(&key);
+        let previous = member.session.take();
+        let session = sessions.place(previous.clone(), member.id, (codec.name(), &key), shared.video_policy, (bitrate, hz));
+        if previous.is_none_or(|previous| !Arc::ptr_eq(&previous, &session)) {
+            (member.next_seq, member.synced) = (None, false);
         }
-        let target = target(source.0, source.1, quality, hz, track.keyframe_requested.swap(false, Ordering::AcqRel));
-        let mut working = encoder.take();
-        let mut encoding = tokio::task::spawn_blocking(move || {
-            let started = Instant::now();
-            let result = working.as_mut().expect("the encoder comes back with every frame").encode(&decoded, &target);
-            (working, result.map(|frame| (frame, started.elapsed().as_secs_f64() * 1000.0)).map_err(|error| format!("{error:#}")))
-        });
-        // while it encodes, pick the next frame and start decoding it as soon as one may go
-        let outcome = loop {
-            if next.is_some() {
-                break (&mut encoding).await;
-            }
-            let (picked, wake_at) = shared.pick(Instant::now());
-            if let Some((key, item)) = picked {
-                next = Some(start_decode(&shared, &codec, key, item));
-                continue;
-            }
-            tokio::select! {
-                outcome = &mut encoding => break outcome,
-                _ = shared.wait_for_data(wake_at) => {}
+        member.session = Some(session.clone());
+        let input = Input { decoded, timestamp_ms: item.timestamp_ms, hash, quality, keyframe_requested: track.keyframe_requested.swap(false, Ordering::AcqRel) };
+        let outcome = {
+            let stepping = step(session, &mut member, input, shared.codecs.clone(), codec.clone());
+            tokio::pin!(stepping);
+            // while it encodes, pick the next frame and start decoding it as soon as one may go
+            loop {
+                if next.is_some() {
+                    break (&mut stepping).await;
+                }
+                let (picked, wake_at) = shared.pick(Instant::now());
+                if let Some((key, item)) = picked {
+                    next = Some(start_decode(&shared, &codec, key, item));
+                    continue;
+                }
+                tokio::select! {
+                    outcome = &mut stepping => break outcome,
+                    _ = shared.wait_for_data(wake_at) => {}
+                }
             }
         };
-        let frame = match outcome {
-            Ok((returned, Ok((frame, encode_ms)))) => {
-                encoder = returned;
-                governor.observe_encode(encode_ms);
-                shared.record_video_timing(governor.decode_ms, governor.encode_ms, governor.cap);
-                frame
-            }
-            Ok((returned, Err(error))) => {
-                encoder = returned;
-                shared.record_codec_error(&error);
+        if let Some(error) = &outcome.error {
+            shared.record_codec_error(error);
+        }
+        shared.record_video_timing(decode_ms, outcome.encode_ms, outcome.scale_cap);
+        for logged in outcome.frames {
+            let frame = &logged.frame;
+            shared.note_video_source(logged.source.0, logged.source.1);
+            let now = Instant::now();
+            let duration = last_write.map_or(Duration::from_secs_f64(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
+            last_write = Some(now);
+            let meta = metadata(frame, logged.source, quality);
+            if let Err(error) = track.write(frame.data.clone(), duration).await {
+                if !warned_write {
+                    log::warn!("video track {}: write failed: {error:#}", track.mid);
+                    warned_write = true;
+                }
+                shared.record_codec_error(&format!("track write: {error:#}"));
                 continue;
             }
-            Err(error) => {
-                encoder = Some(codec.video_encoder());
-                shared.record_codec_error(&format!("encoder task failed: {error}"));
-                continue;
+            let shared_encode = logged.encoded_by != member.id;
+            shared.record_video_frame(frame.data.len(), (frame.width, frame.height), quality, frame.keyframe, shared_encode, track.keyframe_requests.load(Ordering::Relaxed));
+            if subscription::send_small_frame(&dc, &key, logged.timestamp_ms, item.seq, next_frame_id, &meta).await.is_err() && shared.is_closed() {
+                break;
             }
-        };
-        let Some(frame) = frame else { continue };
-        if !is_picture {
-            source = (frame.width, frame.height);
+            next_frame_id = next_frame_id.wrapping_add(1);
         }
-        shared.note_video_source(source.0, source.1);
-        let now = Instant::now();
-        let duration = last_write.map_or(Duration::from_secs_f64(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
-        last_write = Some(now);
-        let meta = metadata(&frame, source, quality);
-        let encoded_len = frame.data.len();
-        if let Err(error) = track.write(frame.data, duration).await {
-            if !warned_write {
-                log::warn!("video track {}: write failed: {error:#}", track.mid);
-                warned_write = true;
-            }
-            shared.record_codec_error(&format!("track write: {error:#}"));
-            continue;
-        }
-        shared.record_video_frame(encoded_len, (frame.width, frame.height), quality, frame.keyframe, reused, track.keyframe_requests.load(Ordering::Relaxed));
-        if subscription::send_small_frame(&dc, &key, &item, next_frame_id, &meta).await.is_err() && shared.is_closed() {
-            break;
-        }
-        next_frame_id = next_frame_id.wrapping_add(1);
+    }
+    if let Some(session) = member.session.take() {
+        sessions.leave(&session, member.id);
     }
     track.release();
 }
@@ -456,40 +646,115 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::{CodecSample, VideoFormat, VideoImage, VideoTarget};
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn cpu_governor_trades_resolution_for_frame_rate() {
         let start = Instant::now();
         let mut governor = CpuGovernor::new();
         // 30 Hz leaves 33 ms a frame; encoding takes 50
-        governor.observe_decode(15.0, false);
         governor.observe_encode(50.0);
-        assert!((governor.quality(0.8, 0.1, 30.0, start) - 0.7).abs() < 1e-9, "one step down");
-        assert!((governor.quality(0.8, 0.1, 30.0, start + Duration::from_millis(100)) - 0.7).abs() < 1e-9, "settles before the next step");
+        assert!((governor.scale_cap(1.0, 0.25, 30.0, start) - 0.9).abs() < 1e-9, "one step down");
+        governor.observe_encode(50.0);
+        assert!((governor.scale_cap(0.9, 0.25, 30.0, start + Duration::from_millis(100)) - 0.9).abs() < 1e-9, "settles before the next step");
         governor.observe_encode(45.0);
-        assert!((governor.quality(0.8, 0.1, 30.0, start + CPU_SETTLE) - 0.6).abs() < 1e-9);
-        // a slow decode alone (it does not depend on quality) leaves the ceiling alone
-        let mut decode_bound = CpuGovernor::new();
-        decode_bound.observe_decode(40.0, false);
-        decode_bound.observe_encode(10.0);
-        assert_eq!(decode_bound.quality(0.8, 0.1, 30.0, start), 0.8);
-        // never below minQuality
+        assert!((governor.scale_cap(0.9, 0.25, 30.0, start + CPU_SETTLE) - 0.8).abs() < 1e-9);
+        // steps down from the scale in use: the bitrate policy had already shrunk the picture to 0.5
+        let mut shrunk = CpuGovernor::new();
+        shrunk.observe_encode(50.0);
+        assert!((shrunk.scale_cap(0.5, 0.25, 30.0, start) - 0.4).abs() < 1e-9);
+        // never below minResolutionScale
         let mut floor = CpuGovernor::new();
         floor.observe_encode(500.0);
-        assert_eq!(floor.quality(0.5, 0.5, 30.0, start), 0.5);
+        assert_eq!(floor.scale_cap(0.6, 0.5, 30.0, start), 0.5);
+        floor.observe_encode(500.0);
+        assert_eq!(floor.scale_cap(0.5, 0.5, 30.0, start + CPU_SETTLE), 0.5);
         // cheap again: steps back up when the next step's predicted cost fits
         governor.observe_encode(5.0);
         let later = start + CPU_SETTLE + CPU_UP_SETTLE;
-        assert!((governor.quality(0.8, 0.1, 30.0, start + CPU_SETTLE * 2) - 0.6).abs() < 1e-9, "waits longer to step up");
-        assert!((governor.quality(0.8, 0.1, 30.0, later) - 0.7).abs() < 1e-9, "steps up");
-        // and never above what the allocator granted
-        governor.observe_encode(1.0);
-        assert!(governor.quality(0.3, 0.1, 30.0, later + CPU_UP_SETTLE) <= 0.3 + 1e-9);
+        assert!((governor.scale_cap(0.8, 0.25, 30.0, start + CPU_SETTLE * 2) - 0.8).abs() < 1e-9, "waits longer to step up");
+        assert!((governor.scale_cap(0.8, 0.25, 30.0, later) - 0.9).abs() < 1e-9, "steps up");
         // a step up that would land near the budget is not taken (no flapping)
         let mut near = CpuGovernor::new();
         near.observe_encode(40.0);
-        assert!((near.quality(0.8, 0.1, 30.0, start) - 0.7).abs() < 1e-9);
-        near.observe_encode(20.0);
-        assert!((near.quality(0.8, 0.1, 30.0, start + CPU_UP_SETTLE) - 0.7).abs() < 1e-9, "20 ms now, ~24 predicted: stays");
+        assert!((near.scale_cap(1.0, 0.25, 30.0, start) - 0.9).abs() < 1e-9);
+        near.observe_encode(17.0);
+        assert!((near.scale_cap(0.9, 0.25, 30.0, start + CPU_UP_SETTLE) - 0.9).abs() < 1e-9, "17 ms now, ~21 predicted: stays");
+    }
+
+    /// Counts the frames it encodes; each is a keyframe when asked for.
+    struct Counting(Arc<AtomicUsize>);
+
+    impl VideoEncoder for Counting {
+        fn format(&self) -> VideoFormat {
+            VideoFormat::H264
+        }
+
+        fn encode(&mut self, _: &DecodedFrame, target: &VideoTarget) -> anyhow::Result<Option<EncodedVideo>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(EncodedVideo { data: vec![0; 10], width: target.width, height: target.height, keyframe: target.keyframe }))
+        }
+    }
+
+    struct Camera(Arc<AtomicUsize>);
+
+    impl Codec for Camera {
+        fn name(&self) -> &str {
+            "camera"
+        }
+
+        fn output(&self) -> CodecOutput {
+            CodecOutput::Video
+        }
+
+        fn video_encoder(&self) -> Option<Box<dyn VideoEncoder>> {
+            Some(Box::new(Counting(self.0.clone())))
+        }
+
+        fn decode(&self, _: &CodecSample<'_>) -> anyhow::Result<DecodedFrame> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn viewers_at_one_grant_share_one_encode() {
+        let encodes = Arc::new(AtomicUsize::new(0));
+        let codec: Arc<dyn Codec> = Arc::new(Camera(encodes.clone()));
+        let codecs = Arc::new(CodecRegistry::new([codec.clone()]).unwrap());
+        let sessions = &codecs.video_sessions;
+        let picture = Arc::new(DecodedFrame::Video(VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap()));
+        let mut viewers: Vec<Member> = (0..3).map(|id| Member { id, session: None, next_seq: None, synced: false }).collect();
+        let grants = [(4e6, 30.0), (4.4e6, 30.0), (1e6, 30.0)];
+        let mut sent = vec![Vec::new(); 3];
+        for sample in 0..10u64 {
+            for (index, viewer) in viewers.iter_mut().enumerate() {
+                let session = sessions.place(viewer.session.take(), viewer.id, ("camera", "cam0"), VideoPolicy::default(), grants[index]);
+                viewer.session = Some(session.clone());
+                let input = Input { decoded: picture.clone(), timestamp_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false };
+                let step = step(session, viewer, input, codecs.clone(), codec.clone()).await;
+                sent[index].extend(step.frames.iter().map(|frame| (frame.seq, frame.frame.keyframe, frame.encoded_by)));
+            }
+        }
+        assert_eq!(sessions.count(), 2, "4 and 4.4 Mbit/s share one session, 1 Mbit/s has its own");
+        // a viewer that started alone (its first grant was a guess) joins the older session once its grant fits there
+        let late = sessions.place(None, 9, ("camera", "cam0"), VideoPolicy::default(), (16e6, 30.0));
+        assert_eq!(sessions.count(), 3);
+        let merged = sessions.place(Some(late), 9, ("camera", "cam0"), VideoPolicy::default(), (4.2e6, 30.0));
+        assert!(Arc::ptr_eq(&merged, viewers[0].session.as_ref().unwrap()) && sessions.count() == 2);
+        sessions.leave(&merged, 9);
+        assert_eq!(encodes.load(Ordering::Relaxed), 20, "10 samples, encoded once per session");
+        assert_eq!(sent[0], sent[1], "both viewers send the same frames, in order");
+        assert!(sent[0][0].1 && sent[2][0].1, "each viewer starts at a keyframe");
+        assert_eq!(sent[1].iter().filter(|frame| frame.2 == 0).count(), 10, "viewer 1 sent the frames viewer 0 encoded");
+        // a viewer whose grant moves away leaves for a session of its own, from a keyframe
+        let session = sessions.place(viewers[1].session.take(), 1, ("camera", "cam0"), VideoPolicy::default(), (12e6, 30.0));
+        assert!(!Arc::ptr_eq(&session, viewers[0].session.as_ref().unwrap()));
+        assert_eq!(sessions.count(), 3);
+        for viewer in viewers.iter().filter(|viewer| viewer.session.is_some()) {
+            sessions.leave(viewer.session.as_ref().unwrap(), viewer.id);
+        }
+        sessions.leave(&session, 1);
+        assert_eq!(sessions.count(), 0, "a session ends with its last viewer");
     }
 }

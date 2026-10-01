@@ -3,7 +3,7 @@
 
 use crate::allocator::{Allocation, Demand};
 use crate::codec::registry::{self, CodecRegistry};
-use crate::codec::{Codec, CodecOutput, CodecSample, Compress};
+use crate::codec::{Codec, CodecOutput, CodecSample, Compress, VideoPolicy};
 use crate::frame;
 use crate::options::{Delivery, Label, SubOpts};
 use crate::pacing::{PACING_SLACK, SendGate, TokenBucket};
@@ -37,6 +37,8 @@ const MIN_ALLOCATED_HZ: f64 = 0.05;
 const EWMA_GAIN: f64 = 0.5;
 /// Per-frame overhead on the wire besides the payload (frame header + key, SCTP/DTLS/UDP).
 const FRAME_OVERHEAD_BYTES: f64 = 90.0;
+/// A video stream's picture size until its first frame.
+const DEFAULT_VIDEO_SOURCE: (u32, u32) = (640, 480);
 /// Streams at this zenoh priority or more urgent (2 INTERACTIVE_HIGH, 1 REAL_TIME) bypass allocation and pacing.
 const STRICT_PRIORITY: u8 = 2;
 
@@ -73,7 +75,8 @@ pub struct SubStats {
     pub max_send_lag_ms: f64,
     /// frame bytes handed to SCTP (data channel) or video bytes handed to the track
     pub bytes_sent: u64,
-    /// transcodes this subscription ran / reused from another frontend's identical request
+    /// transcodes this subscription ran / reused from another frontend's identical request (video: frames another
+    /// viewer's subscription encoded in the shared encode session)
     pub encodes: u64,
     pub shared_encodes: u64,
     pub codec_errors: u64,
@@ -85,10 +88,10 @@ pub struct SubStats {
     pub keyframe_requests: u64,
     pub video_width: u32,
     pub video_height: u32,
-    /// video: smoothed decode / scale+encode time per frame, and the CPU governor's quality ceiling (1 = none)
+    /// video: smoothed decode / scale+encode time per frame, and the CPU governor's ceiling on the picture's scale (1 = none)
     pub decode_ms: Option<f64>,
     pub encode_ms: Option<f64>,
-    pub cpu_quality_cap: Option<f64>,
+    pub cpu_scale_cap: Option<f64>,
 }
 
 pub struct Pending {
@@ -181,6 +184,8 @@ pub struct SubShared {
     bandwidth_priority: f64,
     quality_range: (f64, f64),
     tradeoff: f64,
+    /// video codecs: the server's policy with this subscription's overrides
+    pub video_policy: VideoPolicy,
     /// this frontend's shared send gate, and this stream's id in it
     gate: Arc<SendGate>,
     stream_id: usize,
@@ -217,6 +222,7 @@ impl SubShared {
             priority_override: opts.priority,
             codec,
             compress: opts.compress.unwrap_or_default(),
+            video_policy: opts.video_policy(codecs.video_policy),
             codecs,
             max_hz: opts.max_hz,
             bandwidth_priority: opts.bandwidth_priority.unwrap_or(1.0),
@@ -249,11 +255,6 @@ impl SubShared {
         priority != 0 && priority <= STRICT_PRIORITY
     }
 
-    /// The subscription's minQuality.
-    pub fn min_quality(&self) -> f64 {
-        self.quality_range.0
-    }
-
     /// Quality to transcode at now: the allocation's, or the best allowed before the first one.
     pub fn current_quality(&self) -> f64 {
         self.state.lock().unwrap().allocation.quality.unwrap_or(self.quality_range.1)
@@ -264,6 +265,20 @@ impl SubShared {
         let state = self.state.lock().unwrap();
         let rate = state.keys.get(key).map_or(0.0, |queue| queue.rate_hz);
         self.allocated_key_hz(rate, &state.allocation).or(self.max_hz).unwrap_or(if rate > 0.0 { rate } else { 30.0 })
+    }
+
+    /// What a video key is granted: (quality, bits/s, frames/s); before the first allocation, the most it may ask for.
+    pub fn video_grant(&self, key: &str) -> (f64, f64, f64) {
+        let hz = self.key_hz(key);
+        let state = self.state.lock().unwrap();
+        let allocation = &state.allocation;
+        let quality = allocation.quality.unwrap_or(self.quality_range.1);
+        let bitrate = if allocation.hz > 0.0 {
+            allocation.budget_bytes_per_sec * 8.0 * (hz / allocation.hz).min(1.0)
+        } else {
+            self.video_policy.frame_bytes(state.video_source.unwrap_or(DEFAULT_VIDEO_SOURCE), hz, quality) * 8.0 * hz
+        };
+        (quality, bitrate, hz)
     }
 
     /// Per-key Hz cap from the allocation (None = no allocation cap).
@@ -317,8 +332,10 @@ impl SubShared {
                 Box::new(move |_| message_bytes)
             }
             Some(codec) if codec.output() == CodecOutput::Video => {
-                let (width, height) = state.video_source.unwrap_or((640, 480));
-                Box::new(move |quality| crate::codec::video::bytes_per_frame(width, height, quality))
+                let source = state.video_source.unwrap_or(DEFAULT_VIDEO_SOURCE);
+                let keys = state.keys.values().filter(|queue| queue.rate_hz > 0.0).count().max(1);
+                let (policy, frame_hz) = (self.video_policy, max_hz / keys as f64);
+                Box::new(move |quality| policy.frame_bytes(source, frame_hz, quality))
             }
             Some(codec) => {
                 // measured sizes per quality, scaled between qualities by the codec's own estimate
@@ -371,12 +388,12 @@ impl SubShared {
         }
     }
 
-    /// The video pipeline's per-frame costs and the CPU governor's quality ceiling.
-    pub fn record_video_timing(&self, decode_ms: Option<f64>, encode_ms: Option<f64>, cpu_quality_cap: f64) {
+    /// The video pipeline's per-frame costs and the CPU governor's ceiling on the picture's scale.
+    pub fn record_video_timing(&self, decode_ms: Option<f64>, encode_ms: Option<f64>, cpu_scale_cap: f64) {
         let mut state = self.state.lock().unwrap();
         state.stats.decode_ms = decode_ms;
-        state.stats.encode_ms = encode_ms;
-        state.stats.cpu_quality_cap = Some(cpu_quality_cap);
+        state.stats.encode_ms = encode_ms.or(state.stats.encode_ms);
+        state.stats.cpu_scale_cap = Some(cpu_scale_cap);
     }
 
     /// Audio packets went to the track.
@@ -387,7 +404,7 @@ impl SubShared {
     }
 
     /// A video frame went to the track.
-    pub fn record_video_frame(&self, bytes: usize, (width, height): (u32, u32), quality: f64, keyframe: bool, shared_decode: bool, keyframe_requests: u64) {
+    pub fn record_video_frame(&self, bytes: usize, (width, height): (u32, u32), quality: f64, keyframe: bool, shared_encode: bool, keyframe_requests: u64) {
         let mut state = self.state.lock().unwrap();
         state.stats.keyframe_requests = keyframe_requests;
         state.stats.bytes_sent += bytes as u64;
@@ -396,7 +413,7 @@ impl SubShared {
         state.stats.video_height = height;
         state.stats.quality = Some(quality);
         state.stats.keyframes += keyframe as u64;
-        *if shared_decode { &mut state.stats.shared_encodes } else { &mut state.stats.encodes } += 1;
+        *if shared_encode { &mut state.stats.shared_encodes } else { &mut state.stats.encodes } += 1;
     }
 
     fn push(&self, sample: Sample) {
@@ -813,8 +830,8 @@ impl MessageSender {
 }
 
 /// Sends one small frame (e.g. a video frame's metadata) without pacing; returns its size.
-pub async fn send_small_frame(dc: &Arc<dyn DataChannel>, key: &str, item: &Pending, frame_id: u32, payload: &[u8]) -> Result<usize, webrtc::error::Error> {
-    let frame = frame::encode(&frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index: 0, chunk_count: 1, flags: 0 }, payload);
+pub async fn send_small_frame(dc: &Arc<dyn DataChannel>, key: &str, timestamp_ms: f64, seq: u32, frame_id: u32, payload: &[u8]) -> Result<usize, webrtc::error::Error> {
+    let frame = frame::encode(&frame::FrameHeader { key, timestamp_ms, seq, frame_id, chunk_index: 0, chunk_count: 1, flags: 0 }, payload);
     let length = frame.len();
     dc.send(frame).await.map(|_| length)
 }

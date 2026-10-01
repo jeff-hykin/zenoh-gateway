@@ -1,7 +1,7 @@
 //! Data channel labels: `{"type":"sub"|"pub"|"heartbeat", "key":..., "id":..., "opts":{...}}`.
 
 use crate::codec::registry::CodecRegistry;
-use crate::codec::{Codec, CodecOutput, Compress};
+use crate::codec::{Codec, CodecOutput, Compress, VideoPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -46,6 +46,10 @@ pub struct SubOpts {
     pub codec: Option<String>,
     /// data-channel compression; unset = the codec's default (none without a codec)
     pub compress: Option<Compress>,
+    /// video codecs: bits/s the stream asks for at most, and how far its picture may shrink (see `VideoPolicy`)
+    pub max_bitrate: Option<f64>,
+    pub min_resolution_scale: Option<f64>,
+    pub max_resolution: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -96,6 +100,11 @@ impl SubOpts {
         check_priority(parsed.priority)?;
         check_positive("maxAge", parsed.max_age)?;
         check_positive("maxHz", parsed.max_hz)?;
+        check_positive("maxBitrate", parsed.max_bitrate)?;
+        check("minResolutionScale", parsed.min_resolution_scale, |scale| scale > 0.0 && scale <= 1.0, "within (0, 1]")?;
+        if parsed.max_resolution.is_some_and(|(width, height)| width < 16 || height < 16) {
+            return Err("maxResolution must be at least [16, 16]".into());
+        }
         check("bandwidthPriority", parsed.bandwidth_priority, |weight| weight.is_finite() && weight >= 0.0, ">= 0")?;
         for (name, value) in [("minQuality", parsed.min_quality), ("maxQuality", parsed.max_quality), ("qualityToHzTradeoff", parsed.quality_to_hz_tradeoff)] {
             check(name, value, |v| (0.0..=1.0).contains(&v), "within 0..1")?;
@@ -114,6 +123,9 @@ impl SubOpts {
             return Ok(None);
         };
         let codec = registry.get(name)?;
+        if codec.output() != CodecOutput::Video && (self.max_bitrate.is_some() || self.min_resolution_scale.is_some() || self.max_resolution.is_some()) {
+            return Err(format!("maxBitrate, minResolutionScale and maxResolution are for video codecs, and {name} is not one"));
+        }
         if codec.output() == CodecOutput::Video {
             if self.delivery == DeliveryKind::Reliable {
                 return Err(format!("{name} is a video codec: frames go over a lossy video track, use delivery \"latest\""));
@@ -125,6 +137,16 @@ impl SubOpts {
         }
         self.compress.get_or_insert(codec.default_compress());
         Ok(Some(codec))
+    }
+
+    /// The server's video policy with this subscription's overrides.
+    pub fn video_policy(&self, server: VideoPolicy) -> VideoPolicy {
+        VideoPolicy {
+            max_bitrate: self.max_bitrate.or(server.max_bitrate),
+            min_resolution_scale: self.min_resolution_scale.unwrap_or(server.min_resolution_scale),
+            max_resolution: self.max_resolution.or(server.max_resolution),
+            ..server
+        }
     }
 
     pub fn quality_range(&self) -> (f64, f64) {
@@ -154,6 +176,9 @@ impl SubOpts {
             "qualityToHzTradeoff": self.quality_to_hz_tradeoff.unwrap_or(0.5),
             "codec": self.codec,
             "compress": self.compress.unwrap_or_default(),
+            "maxBitrate": self.max_bitrate,
+            "minResolutionScale": self.min_resolution_scale,
+            "maxResolution": self.max_resolution,
         })
     }
 }
@@ -255,6 +280,14 @@ mod tests {
         assert!(sub(r#"{"compress":"gzip"}"#).is_err());
         assert!(sub(r#"{"bandwidthPriority":-1}"#).is_err());
         assert!(sub(r#"{"dangerousMinHz":1}"#).is_err());
+        assert!(sub(r#"{"maxBitrate":0}"#).is_err());
+        assert!(sub(r#"{"minResolutionScale":1.5}"#).is_err());
+        assert!(sub(r#"{"maxResolution":[8,8]}"#).is_err());
+        assert!(resolve(r#"{"codec":"table","maxBitrate":1e6}"#).unwrap_err().contains("for video codecs"));
+        let video = sub(r#"{"codec":"camera","maxBitrate":4e6,"maxResolution":[640,480]}"#).unwrap();
+        assert!(video.clone().resolve_codec(&registry).is_ok());
+        let policy = video.video_policy(VideoPolicy::default());
+        assert_eq!((policy.max_bitrate, policy.max_resolution, policy.min_resolution_scale), (Some(4e6), Some((640, 480)), 0.25));
         let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"minQuality":0.3,"maxQuality":0.9,"qualityToHzTradeoff":0.7}"#).unwrap();
         assert_eq!((full.normalized()["bandwidthPriority"].as_f64(), full.normalized()["qualityToHzTradeoff"].as_f64()), (Some(2.0), Some(0.7)));
         assert_eq!(full.min_interval(), Some(Duration::from_millis(50)));

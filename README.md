@@ -99,6 +99,9 @@ The bridge checks options: an unknown name or a bad value rejects the subscripti
 | `qualityToHzTradeoff` | 0.5 | 0 = keep quality, drop Hz; 1 = keep Hz, drop quality |
 | `codec` | none (raw bytes) | a name from `z.codecs` (see "Codecs"); the bridge rejects unknown names, listing its codecs |
 | `compress` | the codec's (none without one) | `"zstd"` or `"none"`: zstd-compress each data-channel message (raw topics too); the client decompresses, so `msg.bytes` is always plain. Rejected on video codecs |
+| `maxBitrate` | the server's (~0.3 bit/pixel at the source's size and rate) | video codecs: most bits/s the stream asks for; it encodes at what the allocator grants |
+| `minResolutionScale` | 0.25 | video codecs: the picture keeps its full size unless the grant is under 0.05 bit/pixel there, and never shrinks below this share |
+| `maxResolution` | none | video codecs: `[width, height]` box the picture is fitted into |
 
 `Subscription`: `ready()` (resolves when the bridge accepted it and the channel is open, rejects with
 the bridge's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"`), `mediaStream`
@@ -133,9 +136,11 @@ Also exported: `Priority` (`REAL_TIME` 1, `INTERACTIVE_HIGH` 2, `INTERACTIVE_LOW
 
 Picked explicitly per subscription; there is no auto-detection and none is built in, and the core
 knows no message types. No codec = raw bytes, rate is the only degradation. A **video** codec hands
-the bridge frames for its `VideoEncoder`: by default pictures, which the bridge scales to the
-allocated quality and encodes as H.264; a codec can bring its own encoder (H.264, VP8, VP9 or AV1,
-e.g. a hardware one) and the bridge negotiates, packetizes and paces it on a video track
+the bridge frames for its `VideoEncoder`: by default pictures, which the bridge encodes as H.264 at the bitrate the
+allocator grants (full size unless that is under 0.05 bit/pixel); the server can use a hardware encoder for every
+codec (`ServerBuilder::video_encoder`, e.g. from [zenoh-web-encoders](https://github.com/jeff-hykin/zenoh-web-encoders):
+VideoToolbox, or GStreamer on a Jetson / NVENC / VAAPI), a codec can bring its own (H.264, VP8, VP9 or AV1), and the
+bridge negotiates, packetizes and paces it on a video track
 (`sub.mediaStream`, `msg.video`). An **audio** codec hands it PCM, sent as Opus on an audio track
 (`sub.mediaStream`). A **fields** codec sends named numbers and arrays (built with `zenoh_web::Fields`) that the client
 decodes into `msg.decoded` itself; a **data** codec sends its own bytes, which the page decodes with
@@ -177,10 +182,10 @@ is already running on a port before starting its own (`zenoh_web::HEALTH_PATH`).
 ### Custom codecs
 
 Implement `zenoh_web::Codec`: decode a zenoh sample (key, payload, encoding) once, then produce
-**video** (`DecodedFrame::Video(VideoImage::rgb8(..)` or `::i420(..))`: the bridge scales it
-to the allocated quality, encodes H.264 and sends it on a video track, so the page just shows
-`sub.mediaStream`; override `video_encoder()` to return your own `VideoEncoder`, e.g. NVENC or a
-Jetson's encoder, declaring its `VideoFormat`), **audio** (`DecodedFrame::Audio(AudioPcm::new(..))`,
+**video** (`DecodedFrame::Video(VideoImage::rgb8(..)` or `::i420(..)`, BT.601): the bridge encodes it
+at the granted bitrate and sends it on a video track, so the page just shows `sub.mediaStream`; override
+`video_encoder()` to return your own `VideoEncoder`, e.g. one that passes through H.264 a camera already made,
+declaring its `VideoFormat`), **audio** (`DecodedFrame::Audio(AudioPcm::new(..))`,
 Opus on an audio track) or bytes for the data channel from `encode(frame, quality)`: **fields** (built
 with `zenoh_web::Fields`, decoded by the client with no page code) or **data** (any format; the page
 decodes it with `registerCodec`). Decodes are shared across browsers per sample, data encodes per
@@ -307,8 +312,8 @@ deadmen, allocation, latency under load, throughput on a shaped link, video late
 
 - Topic listing sees liveliness tokens (incl. AdvancedPublishers with publisher detection) and keys
   that publish during its probe; plain declarations without a token are invisible.
-- The default video encoder is software H.264 (openh264), one per browser subscription: CPU scales
-  with viewers × streams unless a codec brings a hardware encoder.
+- The default video encoder is software H.264 (openh264). Viewers of one stream at similar grants share one encode,
+  but every stream still costs a core-share unless the server has a hardware encoder (`ServerBuilder::video_encoder`).
 - Audio goes to the browser only; the microphone direction is designed (SPEC "Audio") but not built.
 - Signaling is plain HTTP: a bearer token crosses the network in the clear unless the bridge sits behind
   HTTPS (a reverse proxy).

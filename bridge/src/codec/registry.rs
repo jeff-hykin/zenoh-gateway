@@ -1,6 +1,6 @@
 //! The server's codecs by name, and the caches that share decodes and encodes across frontends.
 
-use super::{Codec, CodecOutput, CodecSample, Compress, DecodedFrame};
+use super::{Codec, CodecOutput, CodecSample, Compress, DecodedFrame, H264Encoder, VideoEncoder, VideoPolicy};
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -62,11 +62,18 @@ pub fn quality_bucket(quality: f64) -> u16 {
     (quality.clamp(0.0, 1.0) * 1000.0).round() as u16
 }
 
-/// Name → codec, plus the decode/encode caches.
+/// Makes the server's video encoders (e.g. hardware ones), for codecs without their own.
+pub type VideoEncoderFactory = Arc<dyn Fn() -> Box<dyn VideoEncoder> + Send + Sync>;
+
+/// Name → codec, plus the decode/encode caches and the video encode sessions.
 pub struct CodecRegistry {
     codecs: BTreeMap<String, Arc<dyn Codec>>,
     decoded: WorkCache<(String, u64), DecodedFrame>,
     encoded: WorkCache<(String, u16, u64, Compress), Encoded>,
+    video_encoder: Option<VideoEncoderFactory>,
+    /// the server's default; subscriptions override parts of it
+    pub video_policy: VideoPolicy,
+    pub video_sessions: crate::media::VideoSessions,
 }
 
 /// A data codec's output as sent: `compressed` when `bytes` are its zstd.
@@ -84,7 +91,24 @@ impl CodecRegistry {
             ensure!(!name.is_empty(), "a codec's name must not be empty");
             ensure!(codecs.insert(name.clone(), codec).is_none(), "codec {name:?} is registered twice");
         }
-        Ok(CodecRegistry { codecs, decoded: WorkCache::new(DECODED_CAPACITY), encoded: WorkCache::new(ENCODED_CAPACITY) })
+        Ok(CodecRegistry {
+            codecs,
+            decoded: WorkCache::new(DECODED_CAPACITY),
+            encoded: WorkCache::new(ENCODED_CAPACITY),
+            video_encoder: None,
+            video_policy: VideoPolicy::default(),
+            video_sessions: Default::default(),
+        })
+    }
+
+    /// The server's video encoder (`None`: software H.264) and default policy.
+    pub fn with_video(self, video_encoder: Option<VideoEncoderFactory>, video_policy: VideoPolicy) -> Self {
+        CodecRegistry { video_encoder, video_policy, ..self }
+    }
+
+    /// A new encoder for a video codec: its own, else the server's, else software H.264.
+    pub fn video_encoder(&self, codec: &dyn Codec) -> Box<dyn VideoEncoder> {
+        codec.video_encoder().or_else(|| self.video_encoder.as_ref().map(|factory| factory())).unwrap_or_else(|| Box::new(H264Encoder::default()))
     }
 
     /// The codec called `name`, or the error a subscription is rejected with.

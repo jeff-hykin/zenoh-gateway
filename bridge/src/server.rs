@@ -1,8 +1,8 @@
 //! The embeddable server: [`Server::builder`] → [`ServerBuilder::build`] → [`Server::bind`] (or [`Server::serve`], or [`Server::router`]).
 
 use crate::auth::{Grant, Leases};
-use crate::codec::Codec;
-use crate::codec::registry::CodecRegistry;
+use crate::codec::registry::{CodecRegistry, VideoEncoderFactory};
+use crate::codec::{Codec, VideoEncoder, VideoPolicy};
 use crate::ice::{self, IceServer};
 use crate::peer::{AllocationConfig, Bridge, ConnectConfig};
 use anyhow::{Context, Result, anyhow, ensure};
@@ -68,6 +68,8 @@ pub struct ServerBuilder {
     authorize: Option<Arc<Authorize>>,
     lease_groups: HashMap<String, Vec<String>>,
     connect_config: ConnectConfig,
+    video_encoder: Option<VideoEncoderFactory>,
+    video_policy: VideoPolicy,
 }
 
 impl Default for ServerBuilder {
@@ -83,6 +85,8 @@ impl Default for ServerBuilder {
             authorize: None,
             lease_groups: HashMap::new(),
             connect_config: ConnectConfig::default(),
+            video_encoder: None,
+            video_policy: VideoPolicy::default(),
         }
     }
 }
@@ -175,6 +179,20 @@ impl ServerBuilder {
         self
     }
 
+    /// Makes the encoder of every video codec that has none of its own ([`Codec::video_encoder`]), e.g. a hardware one
+    /// (zenoh-web-encoders); called once per encode session. Default: software H.264 (openh264).
+    pub fn video_encoder(mut self, factory: impl Fn() -> Box<dyn VideoEncoder> + Send + Sync + 'static) -> Self {
+        self.video_encoder = Some(Arc::new(factory));
+        self
+    }
+
+    /// How video streams spend their bandwidth by default (subscriptions override `maxBitrate`, `minResolutionScale`
+    /// and `maxResolution`). Default: [`VideoPolicy::default`].
+    pub fn video_policy(mut self, policy: VideoPolicy) -> Self {
+        self.video_policy = policy;
+        self
+    }
+
     /// Validates the options, registers the codecs and opens the zenoh session (unless one was given).
     pub async fn build(self) -> Result<Server> {
         let fraction = self.bandwidth_target_fraction;
@@ -182,7 +200,8 @@ impl ServerBuilder {
         if let Some(cap) = self.max_bandwidth_bytes_per_sec {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
-        let codecs = CodecRegistry::new(self.codecs)?;
+        self.video_policy.validate()?;
+        let codecs = CodecRegistry::new(self.codecs)?.with_video(self.video_encoder, self.video_policy);
         let mut config = self.zenoh_config.unwrap_or_default();
         let (session, owns_session) = match self.session {
             Some(session) => {

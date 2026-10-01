@@ -19,7 +19,7 @@
 pub(crate) mod registry;
 pub(crate) mod video;
 
-pub use video::{EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoTarget};
+pub use video::{EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoPolicy, VideoTarget};
 
 use anyhow::{Result, anyhow, ensure};
 use std::any::Any;
@@ -102,8 +102,8 @@ impl<'a> CodecSample<'a> {
 pub enum PixelFormat {
     /// Packed 8-bit RGB, row-major, no padding: `width × height × 3` bytes.
     Rgb8,
-    /// Planar YUV 4:2:0 (BT.601, the layout H.264 encodes): the Y plane (`width × height`), then
-    /// U and V (`width/2 × height/2` each). Width and height must be even.
+    /// Planar YUV 4:2:0 (BT.601 limited range, what the bridge's encoders signal): the Y plane
+    /// (`width × height`), then U and V (`width/2 × height/2` each). Width and height must be even.
     I420,
 }
 
@@ -282,12 +282,12 @@ pub trait Codec: Send + Sync {
     /// Whether the output is a video track, an audio track or bytes on the data channel.
     fn output(&self) -> CodecOutput;
 
-    /// Video codecs: a new encoder for one (frontend, subscription), which also declares the WebRTC
-    /// codec the track negotiates. Default: the bridge's software H.264 (openh264), which takes
-    /// [`DecodedFrame::Video`]. Return a hardware encoder here (NVENC, a Jetson's), or one that
-    /// passes frames through that arrive already encoded.
-    fn video_encoder(&self) -> Box<dyn VideoEncoder> {
-        Box::new(H264Encoder::default())
+    /// Video codecs: a new encoder for one encode session (the viewers of a stream at one target), which also declares
+    /// the WebRTC codec the track negotiates; e.g. one that passes through frames that arrive already encoded. Default
+    /// `None`: the server's ([`ServerBuilder::video_encoder`](crate::ServerBuilder::video_encoder), e.g. a hardware
+    /// one), else the bridge's software H.264 (openh264); both take [`DecodedFrame::Video`].
+    fn video_encoder(&self) -> Option<Box<dyn VideoEncoder>> {
+        None
     }
 
     /// Data-channel codecs: compression used when the subscription doesn't set `compress`
@@ -315,7 +315,7 @@ pub trait Codec: Send + Sync {
     /// any compression) at `quality`, for a sample of `payload_bytes`. Used until sizes are measured, and after
     /// that as the shape between measured qualities (so it should be monotone in `quality`).
     /// The default assumes the output scales linearly from 10% to 100% of the payload. Video is
-    /// priced by the bridge from resolution and bits per pixel instead, audio by what it sends.
+    /// priced by the bridge from its [`VideoPolicy`] instead, audio by what it sends.
     fn estimated_bytes(&self, payload_bytes: usize, quality: f64) -> f64 {
         payload_bytes as f64 * (0.1 + 0.9 * quality.clamp(0.0, 1.0))
     }

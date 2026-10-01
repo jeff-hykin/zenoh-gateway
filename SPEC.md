@@ -39,6 +39,9 @@ const sub = z.subscribe("camera/**", {
     qualityToHzTradeoff: 0.7,    // 0 = keep quality, drop hz; 1 = keep hz, drop quality
     codec: "ros2-image",         // optional transcoder the bridge registered (z.codecs), see "Codecs"
     compress: "zstd",            // or "none"; default: the codec's (none without one), see "Compression"
+    maxBitrate: 8e6,             // video codecs: most bits/s asked for (default: the server's), see "Video"
+    minResolutionScale: 0.5,     // video codecs: the picture never shrinks below this share of the source's size
+    maxResolution: [1280, 720],  // video codecs: box the picture is fitted into
 }, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.decoded, msg.video, msg.mediaStream })
 sub.mediaStream  // video codecs: a MediaStream for a <video> element
 sub.close()
@@ -82,7 +85,8 @@ registerCodec("text-uppercase", (bytes, msg) => new TextDecoder().decode(bytes))
 - Options are checked by the bridge: an unknown name or a bad value rejects the channel (`rejected`
   event with the reason: `state` becomes `"rejected"`, `ready()` rejects).
 - `bandwidthPriority` (default 1), `minQuality` (0), `maxQuality` (1), `qualityToHzTradeoff` (0.5) drive the per-frontend
-  allocator ("Bandwidth allocation"); stats show them with defaults filled in.
+  allocator ("Bandwidth allocation"); stats show them with defaults filled in. `maxBitrate`, `minResolutionScale` and
+  `maxResolution` override the server's video policy ("Video"); on a non-video codec they reject the channel.
 - No `latched` flag: the bridge always subscribes with zenoh-ext AdvancedSubscriber history (max 1 sample per publisher), so publishers with a cache (e.g. rmw_zenoh transient_local like tf_static) replay their last message.
 
 ## Delivery → transport mapping
@@ -119,8 +123,9 @@ dimos codecs' decoders).
 
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
-`bandwidth_target_fraction`, `codec`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret` and
-`udp_ports`; `build().await` validates them and opens the session. Then
+`bandwidth_target_fraction`, `codec`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `udp_ports`,
+`video_encoder` (a factory for every video codec without its own encoder, e.g. a hardware one from
+zenoh-web-encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
 `bind(addr)` serves on a background task (`RunningServer::local_addr`, `shutdown()`), `serve(addr)` /
 `serve_with_shutdown(addr, signal)` serve in place, or `router()` returns the axum routes (`POST
 /offer`, `GET /zenoh-web/health`, `GET /zenoh-web/ice`, static files) for the host's own HTTP server.
@@ -169,31 +174,37 @@ Every codec implements one Rust trait (`zenoh_web::Codec`):
   a fields codec's automatic decoding.
 - `default_compress()`: compression for the codec's messages when the subscription doesn't set
   `compress` (default none; zenoh-dimos-codecs' depth and point clouds use zstd).
-- video codecs: `video_encoder()` → a `VideoEncoder` per (frontend, subscription), default the
-  bridge's software H.264 (see "Video encoders"); its frames go on the subscription's video track
-  (see "Video"); the page needs no codec code. They require `delivery: "latest"`.
+- video codecs: optionally `video_encoder()` → the codec's own `VideoEncoder` per encode session; default the server's
+  (`ServerBuilder::video_encoder`), else the bridge's software H.264 (see "Video encoders"); its frames go on the
+  subscription's video track (see "Video"); the page needs no codec code. They require `delivery: "latest"`.
 - audio codecs: PCM, which the bridge encodes to Opus on an audio track (see "Audio").
 - `estimated_bytes(payloadBytes, quality)`: optional cost model for data codecs (bytes per message),
   the allocator's prior until sizes are measured and its shape between measured qualities (default:
-  10–100 % of the payload, linear in quality). Video is priced by the bridge's own model.
+  10–100 % of the payload, linear in quality). Video is priced by the video policy (see "Video").
 
-Video: scaling is a box filter, RGB → I420 integer BT.601, H.264 openh264.
+Video: scaling is a box filter, RGB → I420 integer BT.601 limited range, tagged in the stream (BT.601 matrix, BT.709
+primaries and transfer). Chrome reads untagged HD video as BT.709, which cost ~2.7 dB of PSNR; tagged BT.601 measured as
+good as BT.709 through openh264 and ~0.5 dB better through VideoToolbox. H.264 openh264 by default.
 - A video subscription decodes its next frame while it encodes the current one (two blocking-pool
   tasks), so the rate is set by the slower stage, not their sum.
-- CPU governor: when scale+encode takes more than 85% of the frame interval at the granted Hz, the
-  stream's quality ceiling drops 0.1 (never below `minQuality`), at most once a second; it rises 0.1
-  when the encode cost predicted at the next step (∝ pixels) fits in 60% of the interval and 5 s
-  have passed since the last step (each resolution change restarts the encoder with a keyframe, so
-  the ceiling must not flap). So a small CPU keeps the frame rate and gives up resolution, as a
-  bandwidth shortfall would. Decode time does not move it (a slow decode caps the rate at any
-  resolution). Stats: `decodeMs`, `encodeMs`, `cpuQualityCap`.
+- CPU governor (per encode session): when scale+encode takes more than 85% of the frame interval, the ceiling on the
+  picture's scale drops 0.1 below the scale in use (never below `minResolutionScale`), at most once a second; it rises
+  0.1 when the encode cost predicted at the next step (∝ pixels) fits in 60% of the interval and 5 s have passed since
+  the last step (each resolution change restarts the encoder with a keyframe, so the ceiling must not flap). It only
+  lowers the size the bitrate policy picked, never the bitrate or the frame rate, so the two never fight; a hardware
+  encoder rarely moves it. Decode time does not move it (a slow decode caps the rate at any resolution). Stats:
+  `decodeMs`, `encodeMs`, `cpuScaleCap`.
 
 Work happens lazily and on send: only messages the pacing/queues let through are transcoded, on
 tokio's blocking pool. Work is shared across frontends through two small caches per bridge: decoded
 frames keyed by (codec, key + payload hash), and data-channel encodes keyed by (codec, quality in
 1/1000 steps, key + payload hash, compression). Identical requests compute once (`encodes` vs `sharedEncodes` in
-stats: data codecs count shared encodes, video codecs shared decodes). Each (frontend, subscription)
-has its own video encoder (and Opus encoder), because rate control and reference frames are per receiver.
+stats). Video encodes are shared through encode sessions: the viewers of one stream (codec, key and video policy)
+whose grants are within 1.25× of each other share one encoder, which runs at the lowest of their grants. Every member
+sends every frame of its session in order (so one reference chain serves them all), starting from a keyframe; a member
+whose grant moves out of range moves to another session (a keyframe), a member that fell behind the session's last 8
+frames waits for a keyframe. A sample is encoded once per session: whichever member picks it first encodes it, the
+others send the result (`sharedEncodes`). Each subscription keeps its own Opus encoder.
 
 ### Fields
 
@@ -227,15 +238,19 @@ on one is rejected, `"none"` accepted, their default ignored.
 `zenoh_web::VideoEncoder` turns a video codec's decoded frames into one WebRTC codec's frames:
 `format()` declares the codec (`VideoFormat::H264`, `Vp8`, `Vp9` or `Av1`) and
 `encode(frame, target)` returns an `EncodedVideo` (bitstream, size, keyframe) or `None` while a
-pipelined encoder has nothing out yet. `target` carries what the allocator and CPU governor
-granted: quality, the even output size for it, bitrate, frame rate, and whether this frame must be a
-keyframe (a viewer joined or sent PLI/FIR). The bridge negotiates the format (it offers all four),
+pipelined encoder has nothing out yet. `target` carries the granted bitrate (encode at it) and frame rate, the even
+output size the video policy and CPU governor picked, the allocator's quality, and whether this frame must be a
+keyframe (a viewer joined or sent PLI/FIR). `VideoTarget::new(width, height, bitrate, fps)` makes one to try an
+encoder. The bridge negotiates the format (it offers all four),
 packetizes (webrtc-rs payloaders), paces (GCC), measures the frames for the allocator and sends the
 per-frame metadata. `H264Encoder` (openh264, constrained baseline) is the default.
 
-A hardware encoder plugs in as a codec's `video_encoder()`: e.g. NVENC through an FFmpeg or
-`nvidia-video-codec-sdk` binding, or a Jetson's encoder through GStreamer (`nvv4l2h264enc`,
-`nvv4l2av1enc`) or the V4L2 M2M API, fed from `VideoImage::to_i420(target.width, target.height)`
+A hardware encoder plugs in for every video codec as `ServerBuilder::video_encoder(factory)`, or for one codec as
+its `video_encoder()` (which wins). [zenoh-web-encoders](https://github.com/jeff-hykin/zenoh-web-encoders) has
+VideoToolbox (macOS) and GStreamer (`nvv4l2h264enc` on a Jetson, `nvh264enc`, `vah264enc` / `vaapih264enc`, loaded at
+runtime) backends, probed by encoding a test frame and wrapped in a fallback to openh264; zenoh-web-cli uses it
+(`--video-encoder auto|software|videotoolbox|gstreamer`). Any encoder is fed from
+`VideoImage::to_i420(target.width, target.height)`
 (or the codec's own frames, e.g. GPU buffers decoded into `DecodedFrame::Data`, which the encoder
 downcasts), returning access units. A camera that already sends H.264 can be passed through the
 same way: the codec's decode keeps the access unit and its encoder returns it (keyframes then
@@ -274,9 +289,18 @@ with the new m-line, then the `sub` channel's label names that `mid` (the bridge
 another format). Renegotiations run one at a time. A closed subscription's transceiver (and the
 bridge's track) is reused by the next one of the same codec instead of renegotiating again.
 Each video frame also sends a 28-byte metadata frame on the `sub` channel (`msg.video`).
-Quality q maps to resolution scale `0.25 + 0.75 q` (even sizes) and a target of `0.03 + 0.12 q`
-bits per pixel; the encoder's bitrate is that size times the allocated Hz. Keyframes: the first
-frame of every subscription, on PLI/FIR from the browser (`keyframeRequests`), and every 3 s.
+Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden per subscription):
+- A stream asks the allocator for at most `maxBitrate` bits/s (default: `max_bits_per_pixel` × the source's pixels ×
+  its rate, 0.3: ~17 Mbit/s for 720p60, ~1.4 Mbit/s for 320x240 at 60 Hz). The encoder runs at what the allocator
+  actually grants.
+- The picture keeps the source's size (fitted into `maxResolution`) unless the grant would leave fewer than
+  `min_bits_per_pixel` (0.05) there; then it shrinks just enough, never below `minResolutionScale` (0.25). Below
+  ~0.03 bit/pixel openh264 overshoots its target even at its coarsest quantizer, while above it a full-size picture
+  beat every smaller one at the same bitrate on the bench scene (after upscaling).
+- Quality, for video, is the share of the most bits per frame: 0 is the smallest picture at the bit-per-pixel floor,
+  1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other codecs.
+- openh264 applies bitrate changes in place (no keyframe); a size change restarts it with one.
+Keyframes: the first frame each viewer gets, on PLI/FIR from the browser (`keyframeRequests`), and every 3 s.
 Send-side congestion control: TWCC feedback into GCC (webrtc-rs interceptors), whose target feeds the
 allocator.
 Every RTP packet carries the playout-delay extension with min = max = 0, so Chrome shows each frame
@@ -326,7 +350,8 @@ Per frontend, every 250 ms:
    delay trigger above: blocked on the network more than 20% of the interval → estimate = 0.9 ×
    measured rate (at most 15% down per step: a long round trip blocks the first intervals before
    the window knows the RTT); otherwise, while streams want more, probe up (start
-   1 MB/s). Video: GCC's target bitrate (TWCC feedback), counted while a video track is in use; video
+   1 MB/s). Video: GCC's target bitrate (TWCC feedback, bounded at 2 Gbit/s: a 50 Mbit/s bound had capped 8 HD cameras on
+   an idle link), counted while a video track is in use; video
    tracks are paced by the GCC pacer (at 2.5 × the GCC target, as libwebrtc paces), not the bulk gate. Budget = min(`--max-bandwidth-bytes-per-sec`
    if set, target fraction × (data estimate + video estimate)).
    GCC starts at 8 Mb/s, the data estimate's starting point. Video streams together get at most
@@ -336,8 +361,8 @@ Per frontend, every 250 ms:
 2. **Demand.** Each subscription wants `price(maxQuality) × Hz`, Hz being each key's measured source
    rate capped by `maxHz`, summed over its keys. Price = bytes per message: measured for raw streams
    and data-channel codecs (per quality, scaled by the codec's `estimated_bytes` between measured
-   qualities, which is also the prior before anything was measured), modeled for video (resolution ×
-   bits per pixel). Strict-priority and reliable streams can't drop messages: they are reserved at
+   qualities, which is also the prior before anything was measured), from the video policy for video
+   (`maxBitrate` / rate at quality 1, the floor picture at 0). Strict-priority and reliable streams can't drop messages: they are reserved at
    their measured rate and never shrunk.
 3. **Shrink.** If the rest want more than the budget left, they shrink like CSS flex items: the deficit
    is split in proportion to `demand / bandwidthPriority` (so 10 / 10 / 0.1 means the 0.1 stream takes
@@ -348,7 +373,7 @@ Per frontend, every 250 ms:
    `t = qualityToHzTradeoff`: 0 keeps quality and drops Hz, 1 keeps Hz and drops quality. When quality
    hits `minQuality`, Hz gives.
 5. **Apply.** Each key's send interval becomes `1 / (its wanted Hz × granted fraction)` (at least
-   0.05 Hz); transcoders encode at the granted quality.
+   0.05 Hz); data transcoders encode at the granted quality, video encoders at the granted bitrate.
 
 Stats: each subscription's `allocation` (`demandBytesPerSec`,
 `budgetBytesPerSec`, `hz`, `hzFraction`, `quality`, `constrained`) and the frontend's `bandwidth`

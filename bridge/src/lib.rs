@@ -53,7 +53,7 @@ mod publisher;
 mod server;
 mod subscription;
 
-pub use codec::{AudioPcm, Codec, CodecOutput, CodecSample, Compress, DecodedFrame, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoTarget};
+pub use codec::{AudioPcm, Codec, CodecOutput, CodecSample, Compress, DecodedFrame, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
 pub use auth::Grant;
 pub use fields::Fields;
 pub use ice::{IceServer, turn_credentials};

@@ -639,7 +639,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
 
 /// A video or audio codec's subscription claims the track the browser renegotiated for it (by mid).
 fn bind_track(state: &PeerState, codec: Option<&dyn Codec>, label: &Label) -> Result<Option<Arc<MediaTrack>>, String> {
-    let Some((codec, mime)) = codec.and_then(|codec| Some((codec, media::track_mime(codec)?))) else { return Ok(None) };
+    let Some((codec, mime)) = codec.and_then(|codec| Some((codec, media::track_mime(&state.codecs, codec)?))) else { return Ok(None) };
     let mid = label.mid.as_deref().ok_or_else(|| format!("{} is a {} codec: the label needs the mid of a renegotiated transceiver", codec.name(), codec.output().as_str()))?;
     let track = state.tracks.lock().unwrap().get(mid).cloned().ok_or_else(|| format!("no track for mid {mid:?} (renegotiate with the codec first)"))?;
     if track.mime != mime {
@@ -843,7 +843,7 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
     let Some(offer) = request.sdp.clone() else { return fail(&request.id, "renegotiate needs sdp") };
     let mime = match request.codec.as_deref().map(|name| state.codecs.get(name)) {
         None => None,
-        Some(Ok(codec)) => match media::track_mime(&*codec) {
+        Some(Ok(codec)) => match media::track_mime(&state.codecs, &*codec) {
             Some(mime) => Some(mime),
             None => return fail(&request.id, format!("{} is not a video or audio codec", codec.name())),
         },

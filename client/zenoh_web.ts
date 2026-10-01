@@ -93,6 +93,12 @@ export interface SubscribeOptions {
     codec?: string
     /** data-channel compression (default: the codec's, none without one); not for video codecs */
     compress?: "zstd" | "none"
+    /** video codecs: most bits/s the stream asks for (default: the server's) */
+    maxBitrate?: number
+    /** video codecs: smallest share of the source's width and height the picture may shrink to (default 0.25) */
+    minResolutionScale?: number
+    /** video codecs: [width, height] box the picture is fitted into */
+    maxResolution?: [number, number]
 }
 
 export interface PublisherOptions {

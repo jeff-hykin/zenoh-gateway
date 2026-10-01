@@ -70,8 +70,8 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         };
         let decoding = start_decode(&shared, &codec, key, item);
         let decoded = match decoding.task.await {
-            Ok((Ok((decoded, _)), _)) => decoded,
-            Ok((Err(error), _)) => {
+            Ok((Ok((decoded, _)), _, _)) => decoded,
+            Ok((Err(error), _, _)) => {
                 shared.record_codec_error(&error);
                 continue;
             }
@@ -88,7 +88,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             Ok(bytes) => shared.record_media_bytes(bytes),
             Err(error) => shared.record_codec_error(&format!("{error:#}")),
         }
-        if subscription::send_small_frame(&dc, &decoding.key, &decoding.item, frame_id, &[]).await.is_err() && shared.is_closed() {
+        if subscription::send_small_frame(&dc, &decoding.key, decoding.item.timestamp_ms, decoding.item.seq, frame_id, &[]).await.is_err() && shared.is_closed() {
             break;
         }
         frame_id = frame_id.wrapping_add(1);
