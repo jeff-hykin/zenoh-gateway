@@ -48,7 +48,7 @@ mod subscription;
 mod video;
 
 pub use codec::{Codec, CodecOutput, CodecSample, DecodedFrame, PixelFormat, VideoImage};
-pub use server::{DEFAULT_PORT, RunningServer, Server, ServerBuilder};
+pub use server::{DEFAULT_PORT, HEALTH_PATH, RunningServer, Server, ServerBuilder};
 /// The zenoh version this crate is built against (for [`ServerBuilder::session`] and
 /// [`ServerBuilder::zenoh_config`]).
 pub use zenoh;

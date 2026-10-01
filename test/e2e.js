@@ -415,6 +415,8 @@ try {
 
         out.topics = await client.listTopics("test/unsubscribed/**", { probeMs: 1500 })
         out.allTopics = (await client.listTopics()).map((topic) => topic.key)
+        out.declaredOnly = await client.listTopics("test/unsubscribed/**", { probeMs: 0 })
+        out.health = await (await fetch(`${bridgeUrl}/zenoh-web/health`)).json()
 
         const outcome = (promise) => promise.then(() => "accepted", (error) => error.message)
         const denied = client.publisher("test/frombrowser/denied", { delivery: "reliable" })
@@ -505,6 +507,9 @@ try {
     check(sourcesOf("test/unsubscribed/declared").includes("sample") && sourcesOf("test/unsubscribed/undeclared").includes("sample"), `listTopics finds keys the page never subscribed to (${topicKeys.join(", ")})`)
     check(sourcesOf("test/unsubscribed/token").includes("token"), "listTopics finds liveliness tokens")
     check(!topicKeys.includes("test/unsubscribed/silent"), "listTopics can't see a declared publisher that never puts (documented)")
+    const declaredOnlySources = extra.declaredOnly.flatMap((topic) => topic.sources)
+    check(declaredOnlySources.includes("token") && !declaredOnlySources.includes("sample"), `listTopics probeMs 0: tokens without a sample probe (${JSON.stringify(extra.declaredOnly)})`)
+    check(extra.health?.service === "zenoh-web" && typeof extra.health?.version === "string", `GET /zenoh-web/health identifies the server (${JSON.stringify(extra.health)})`)
     check(extra.allTopics.includes("test/cached") && extra.allTopics.includes("test/queryable") && extra.allTopics.includes("test/frombrowser/**"), "listTopics(**) sees the AdvancedPublisher, the queryable and the remote subscriber")
 
     check(extra.deniedReady.includes("no-denied-put") && extra.deniedState === "rejected", `denied publisher is rejected with the rule as reason (${extra.deniedReady})`)

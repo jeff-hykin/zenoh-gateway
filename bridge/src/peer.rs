@@ -819,7 +819,8 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
 /// - `subscriber` / `queryable` / `token`: declarations in this bridge's routing tables (admin space)
 /// - `advancedPublisher`: liveliness tokens of zenoh-ext AdvancedPublishers with publisher_detection
 /// - `token`: any liveliness token
-/// - `sample`: data seen on a `filter` subscription during `probe` (catches undeclared publishers)
+/// - `sample`: data seen on a `filter` subscription during `probe` (catches undeclared publishers);
+///   a zero `probe` skips that subscription
 ///
 /// Plain publishers that are declared but silent are invisible: zenoh peers only propagate
 /// publisher declarations to nodes that declared interest, which the public API can't do.
@@ -829,11 +830,18 @@ async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) ->
         found.lock().unwrap().entry(key.to_owned()).or_default().insert(source);
     };
     let sink = found.clone();
-    let probe_subscriber = session
-        .declare_subscriber(filter)
-        .callback(move |sample| note(&sink, sample.key_expr().as_str(), "sample"))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // probe 0 = declarations and tokens only: no subscription, so publishers that only send while
+    // matched (matching listeners) aren't woken by a listing
+    let probe_subscriber = match probe.is_zero() {
+        true => None,
+        false => Some(
+            session
+                .declare_subscriber(filter)
+                .callback(move |sample| note(&sink, sample.key_expr().as_str(), "sample"))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ),
+    };
     for (segment, source) in [("subscriber", "subscriber"), ("queryable", "queryable"), ("token", "token")] {
         let selector = format!("@/*/*/{segment}/{filter}");
         let Ok(replies) = session.get(selector.as_str()).timeout(ADMIN_QUERY_TIMEOUT).await else { continue };

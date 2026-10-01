@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use log::{error, info};
 use std::future::Future;
@@ -26,6 +26,10 @@ use webrtc::peer_connection::RTCSessionDescription;
 
 /// Default HTTP port of the `zenoh-web` command.
 pub const DEFAULT_PORT: u16 = 7448;
+
+/// `GET` this path for `{"service": "zenoh-web", "version": "<crate version>"}`: how a program
+/// checks whether a zenoh-web server is already listening somewhere before starting its own.
+pub const HEALTH_PATH: &str = "/zenoh-web/health";
 
 /// Configures a [`Server`]. Start with [`Server::builder`].
 ///
@@ -214,11 +218,17 @@ impl Server {
         &self.inner.session
     }
 
-    /// The HTTP routes: `POST /offer` (WebRTC signaling, CORS-permissive) and, with
-    /// [`ServerBuilder::serve_dir`], static files for everything else. Mount it in a host
-    /// application's axum server; call [`shutdown`](Self::shutdown) when the host stops.
+    /// The HTTP routes: `POST /offer` (WebRTC signaling, CORS-permissive), `GET /zenoh-web/health`
+    /// (`{"service": "zenoh-web", "version": ...}`, so another program can tell a zenoh-web server is
+    /// already listening on a port) and, with [`ServerBuilder::serve_dir`], static files for
+    /// everything else. Mount it in a host application's axum server; call
+    /// [`shutdown`](Self::shutdown) when the host stops.
     pub fn router(&self) -> Router {
-        let mut router = Router::new().route("/offer", post(offer)).with_state(self.inner.bridge.clone()).layer(CorsLayer::permissive());
+        let mut router = Router::new()
+            .route("/offer", post(offer))
+            .route(HEALTH_PATH, get(health))
+            .with_state(self.inner.bridge.clone())
+            .layer(CorsLayer::permissive());
         if let Some(dir) = &self.inner.serve_dir {
             router = router.fallback_service(ServeDir::new(dir));
         }
@@ -319,6 +329,10 @@ impl RunningServer {
             Err(error) => Err(anyhow!("HTTP server task: {error}")),
         }
     }
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"service": "zenoh-web", "version": env!("CARGO_PKG_VERSION")}))
 }
 
 async fn offer(State(bridge): State<Arc<Bridge>>, Json(offer): Json<RTCSessionDescription>) -> Response {

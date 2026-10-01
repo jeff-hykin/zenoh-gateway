@@ -296,6 +296,9 @@ Stats: each subscription's `allocation` (`demandBytesPerSec`, `floorBytesPerSec`
 | `advancedPublisher` | zenoh-ext AdvancedPublishers with publisher_detection (their `@adv/pub` token) |
 | `sample` | keys that published during a `probeMs` subscription on `filter`, declared or not |
 
+`probeMs: 0` skips the `sample` probe entirely (no subscription on `filter`), so a publisher that
+only sends while it has a matching subscriber (a zenoh matching listener) isn't woken by a listing.
+
 It can't see a plain publisher that is declared but silent during the probe: zenoh peers only forward
 publisher declarations to nodes that declared interest in them, which zenoh's public API doesn't expose.
 rmw_zenoh liveliness tokens (`@ros2_lv/...`) only appear when the filter names them; they're returned raw.
@@ -341,6 +344,7 @@ resolving so the bridge has an offset before the first put.
 ## Wire format
 
 - Signaling: `POST /offer` with the browser's SDP offer (non-trickle), returns the answer.
+- `GET /zenoh-web/health` returns `{"service": "zenoh-web", "version": "<crate version>"}` (detecting a running server).
 - The bridge can also serve a static directory (`--serve <dir>`, `ServerBuilder::serve_dir`) so the UI is live-editable on disk.
 - Each subscribe/publisher is its own data channel. Its label is JSON: `{"type":"sub"|"pub", "key":..., "id":n, "opts":{...}}`.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.

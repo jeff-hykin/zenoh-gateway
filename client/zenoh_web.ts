@@ -1374,6 +1374,7 @@ export class ZenohWeb {
     /**
      * Keys currently live on the zenoh network under `filter`, including ones never subscribed to.
      * See SPEC.md "Topic enumeration" for which kinds of keys can and can't be seen.
+     * `probeMs: 0` lists declarations and tokens only, without subscribing to `filter`.
      */
     async listTopics(filter = "**", { probeMs = 600 }: { probeMs?: number } = {}): Promise<Topic[]> {
         const response = await this._request({ op: "listTopics", key: filter, probeMs }, probeMs + 5000)

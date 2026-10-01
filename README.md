@@ -128,7 +128,7 @@ Options are validated in the client (unknown names and out-of-range values throw
 | `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, bytes, timestamp, seq, depth?, points?, decoded?, video?, mediaStream? }` |
 | `publisher(key, options)` → `Publisher` | |
 | `get(key, { timeoutMs = 5000 })` → `[{ key, bytes, error? }]` | zenoh query |
-| `listTopics(filter = "**", { probeMs = 600 })` → `[{ key, sources }]` | live keys; `sources` ⊂ `subscriber`, `queryable`, `token`, `advancedPublisher`, `sample` (SPEC "Topic enumeration") |
+| `listTopics(filter = "**", { probeMs = 600 })` → `[{ key, sources }]` | live keys; `sources` ⊂ `subscriber`, `queryable`, `token`, `advancedPublisher`, `sample` (SPEC "Topic enumeration"); `probeMs: 0` skips the `sample` probe, so publishers that only send while matched stay asleep |
 | `codecs` | `[{ name, output }]`: every codec the bridge runs (`output` `"video"` or `"data"`), fetched on connect |
 | `stats` | per key: `received`, `dropped`, `backlogBytes`, `rttMs`, `bridge` (normalized options, bridge counters, `allocation`) |
 | `bridgeStats` | `clock`, `heartbeat`, `access` (`enabled`, `denied`), `bandwidth` (estimate, cap, budget, demand, queue delay, …) |
@@ -228,8 +228,10 @@ running.shutdown().await?;
 ```
 
 Also `server.serve(addr)`, `server.serve_with_shutdown(addr, signal)`, and `server.router()` (an axum
-`Router` with `POST /offer` and the static files, to mount in your own HTTP server; then call
-`server.shutdown()` yourself). The `zenoh-web` command is a thin wrapper over this builder. API docs:
+`Router` with `POST /offer`, `GET /zenoh-web/health` and the static files, to mount in your own HTTP
+server; then call `server.shutdown()` yourself). `GET /zenoh-web/health` answers
+`{"service": "zenoh-web", "version": "..."}`, so an application can check whether a zenoh-web server
+is already running on a port before starting its own (`zenoh_web::HEALTH_PATH`). The `zenoh-web` command is a thin wrapper over this builder. API docs:
 `cargo doc --open` in `bridge/`.
 
 ### Custom codecs
