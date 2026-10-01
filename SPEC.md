@@ -30,7 +30,7 @@ const sub = z.subscribe("camera/**", {
     priority: Priority.DATA_LOW, // optional; defaults to the priority the message was published with
     maxAge: 500,                 // ms; drop anything older
     maxHz: 20,                   // bridge never sends a key faster than this
-    bandwidthPriority: 1,        // flex-shrink weight when bandwidth is short (higher shrinks more)
+    bandwidthPriority: 1,        // when bandwidth is short, higher keeps more (0 gives up everything first)
     minQuality: 0.3,             // 0-1, transcoded streams only
     maxQuality: 1.0,
     qualityToHzTradeoff: 0.7,    // 0 = keep quality, drop hz; 1 = keep hz, drop quality
@@ -249,8 +249,9 @@ Per frontend, every 250 ms:
    bits per pixel). Strict-priority and reliable streams can't drop messages: they are reserved at
    their measured rate and never shrunk.
 3. **Shrink.** If the rest want more than the budget left, they shrink like CSS flex items: the deficit
-   is split in proportion to `bandwidthPriority × demand`; a stream that reaches 0 stops there and the
-   rest shrink further. Weight-0 streams shrink only once nothing else can.
+   is split in proportion to `demand / bandwidthPriority` (so 10 / 10 / 0.1 means the 0.1 stream takes
+   ~100x the cut); a stream that reaches 0 stops there and the rest shrink further. Priority-0 streams
+   give up everything before any other stream gives up anything.
 4. **Quality vs Hz.** A transcoded stream granted fraction r of its demand shrinks its message size by
    `r^t` (choosing the best quality among the bounds and 0.1 steps that fits) and its Hz by the rest,
    `t = qualityToHzTradeoff`: 0 keeps quality and drops Hz, 1 keeps Hz and drops quality. When quality

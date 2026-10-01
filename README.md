@@ -31,7 +31,7 @@ zenoh peers / routers (publishers you don't control: ROS 2 over rmw_zenoh, dimos
   `"reliable"` ones are ordered and lossless.
 - The bridge never parses payloads unless a subscription picks a codec. Codecs run lazily inside the
   bridge, only for frames that will actually be sent.
-- Every browser gets a bandwidth estimate and a budget; streams shrink by `bandwidthPriority`, trading
+- Every browser gets a bandwidth estimate and a budget; streams with a higher `bandwidthPriority` keep more, trading
   quality against rate per `qualityToHzTradeoff`. Strict-priority streams skip the queue.
 - Heartbeat + deadman: a publisher can leave a "stop" message on the bridge that is published once if
   the page goes silent.
@@ -89,7 +89,7 @@ The bridge checks options: an unknown name or a bad value rejects the subscripti
 | `priority` | as published | zenoh priority 1–7 (`Priority.*`); ≤ INTERACTIVE_HIGH (2) makes it strict |
 | `maxAge` | none | ms; drop anything older (also the SCTP packet lifetime on `"latest"`) |
 | `maxHz` | none | never send a key faster |
-| `bandwidthPriority` | 1 | flex-shrink weight when bandwidth is short (higher shrinks more; 0 shrinks last) |
+| `bandwidthPriority` | 1 | when bandwidth is short, a higher number keeps more bandwidth and quality (each stream gives up in proportion to demand / priority); 0 gives up everything first |
 | `minQuality`, `maxQuality` | 0, 1 | quality bounds for codec streams |
 | `qualityToHzTradeoff` | 0.5 | 0 = keep quality, drop Hz; 1 = keep Hz, drop quality |
 | `codec` | none (raw bytes) | a name from `z.codecs` (see "Codecs"); the bridge rejects unknown names, listing its codecs |
@@ -228,7 +228,7 @@ new publisher is needed. Background tabs throttle timers to ≥ 1 s, so keep `mi
 Per browser, every 250 ms: estimate the path (delivery rate + a delay trigger from RTT samples for data
 channels, GCC for video), take `bandwidth_target_fraction` of it (capped by
 `max_bandwidth_bytes_per_sec`), reserve strict-priority and reliable streams, and shrink the rest like
-CSS flex items by `bandwidthPriority × demand` (weight-0 streams shrink last). A codec stream granted a fraction r of its demand shrinks its message size by
+CSS flex items by `demand / bandwidthPriority` (higher priority keeps more; priority-0 streams shrink first). A codec stream granted a fraction r of its demand shrinks its message size by
 `r^qualityToHzTradeoff` and its rate by the rest. Bulk sends are paced so queues stay short and strict
 streams don't wait behind them. Each subscription's `allocation` (demand, budget, hz, quality,
 constrained) is in `z.stats`. Full algorithm and measurements: SPEC.md "Bandwidth allocation".

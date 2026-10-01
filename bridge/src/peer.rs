@@ -908,7 +908,7 @@ mod tests {
     use super::*;
 
     fn stream(bytes_per_message: f64, hz: f64) -> allocator::Demand {
-        allocator::Demand { weight: 1.0, max_hz: hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None }
+        allocator::Demand { priority: 1.0, max_hz: hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None }
     }
 
     #[test]

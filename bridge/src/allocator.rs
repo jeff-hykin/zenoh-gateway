@@ -3,8 +3,8 @@
 //! Every stream (subscription) wants `price(maxQuality) * maxHz` bytes/s, where maxHz is its
 //! source rate capped by its `maxHz` option. Reliable and strict streams can't drop messages: their
 //! measured rate is reserved. When the rest want more than the budget left, they shrink like CSS flex
-//! items with `flex-shrink = bandwidthPriority` (scaled by what they want); zero-weight streams shrink
-//! only once nothing else can. A transcoded stream then splits its grant between quality and Hz along
+//! items with `flex-shrink = demand / bandwidthPriority`: a higher priority keeps more. Priority-0
+//! streams give up everything before any other stream gives up anything. A transcoded stream then splits its grant between quality and Hz along
 //! `qualityToHzTradeoff`.
 
 use serde::Serialize;
@@ -13,8 +13,8 @@ use serde::Serialize;
 pub type Price = Box<dyn Fn(f64) -> f64 + Send>;
 
 pub struct Demand {
-    /// bandwidthPriority: flex-shrink weight (0 = shrink last)
-    pub weight: f64,
+    /// bandwidthPriority: higher keeps more (shrink weight = demand / priority); 0 shrinks first
+    pub priority: f64,
     /// messages/s wanted: source rate capped by maxHz, summed over keys
     pub max_hz: f64,
     /// `None` for streams without a transcoder (quality doesn't apply)
@@ -75,12 +75,12 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
     let wants: Vec<f64> = demands.iter().map(Demand::wants).collect();
     let mut grants = wants.clone();
     let mut over = wants.iter().sum::<f64>() - budget;
-    // weighted shrink, a stream stopping at 0 while the others take the rest; then zero-weight streams
-    for zero_weight_phase in [false, true] {
+    // priority-0 streams first, then the rest by demand / priority; a stream stopping at 0 leaves the rest to the others
+    for zero_priority_phase in [true, false] {
         let mut active: Vec<usize> = (0..demands.len())
-            .filter(|&i| demands[i].fixed_bytes_per_sec.is_none() && grants[i] > 0.0 && (demands[i].weight == 0.0) == zero_weight_phase)
+            .filter(|&i| demands[i].fixed_bytes_per_sec.is_none() && grants[i] > 0.0 && (demands[i].priority == 0.0) == zero_priority_phase)
             .collect();
-        let weight = |i: usize| if zero_weight_phase { wants[i] } else { demands[i].weight * wants[i] };
+        let weight = |i: usize| if zero_priority_phase { wants[i] } else { wants[i] / demands[i].priority };
         while over > 1e-9 && !active.is_empty() {
             let total: f64 = active.iter().map(|&i| weight(i)).sum();
             let step = active.iter().map(|&i| grants[i] * total / weight(i)).fold(over, f64::min);
@@ -270,13 +270,13 @@ impl Estimator {
 mod tests {
     use super::*;
 
-    fn raw(weight: f64, max_hz: f64, bytes: f64) -> Demand {
-        Demand { weight, max_hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes), fixed_bytes_per_sec: None }
+    fn raw(priority: f64, max_hz: f64, bytes: f64) -> Demand {
+        Demand { priority, max_hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes), fixed_bytes_per_sec: None }
     }
 
     fn transcoded(tradeoff: f64, max_hz: f64) -> Demand {
         // price grows with quality: 100 bytes at q=0 .. 1100 at q=1
-        Demand { weight: 1.0, max_hz, quality_range: Some((0.0, 1.0)), tradeoff, price: Box::new(|q| 100.0 + 1000.0 * q), fixed_bytes_per_sec: None }
+        Demand { priority: 1.0, max_hz, quality_range: Some((0.0, 1.0)), tradeoff, price: Box::new(|q| 100.0 + 1000.0 * q), fixed_bytes_per_sec: None }
     }
 
     #[test]
@@ -287,32 +287,32 @@ mod tests {
     }
 
     #[test]
-    fn equal_weights_shrink_by_the_same_fraction() {
+    fn equal_priorities_shrink_by_the_same_fraction() {
         let allocations = allocate(600.0, &[raw(1.0, 10.0, 100.0), raw(1.0, 10.0, 20.0)]);
         assert!((allocations[0].hz_fraction - 0.5).abs() < 1e-9 && (allocations[1].hz_fraction - 0.5).abs() < 1e-9);
         assert!(allocations.iter().all(|a| a.constrained));
     }
 
     #[test]
-    fn higher_weight_shrinks_more_and_stops_at_zero() {
-        // three 400 KB/s streams, budget 480 KB/s: the weight-10 ones give 100x as much as the weight-0.1 one
-        let demands = [raw(0.1, 20.0, 20_000.0), raw(10.0, 20.0, 20_000.0), raw(10.0, 20.0, 20_000.0)];
+    fn higher_priority_keeps_more() {
+        // three 400 KB/s streams, budget 480 KB/s: the priority-0.1 ones take 100x the cut of the priority-10 one
+        let demands = [raw(10.0, 20.0, 20_000.0), raw(0.1, 20.0, 20_000.0), raw(0.1, 20.0, 20_000.0)];
         let allocations = allocate(480_000.0, &demands);
         let total: f64 = allocations.iter().map(|a| a.budget_bytes_per_sec).sum();
         assert!((total - 480_000.0).abs() < 1.0, "{total}");
         assert!(allocations[0].hz > 19.5 && allocations[1].hz < 2.2, "{allocations:?}");
-        // tighter: the weight-10 streams reach 0, the rest comes from the weight-0.1 one
+        // tighter: the priority-0.1 streams reach 0, the rest comes from the priority-10 one
         let allocations = allocate(300_000.0, &demands);
         assert_eq!((allocations[1].hz, allocations[2].hz), (0.0, 0.0));
         assert!((allocations[0].hz - 15.0).abs() < 1e-6, "{:?}", allocations[0]);
     }
 
     #[test]
-    fn zero_weight_shrinks_last() {
+    fn zero_priority_shrinks_first() {
         let allocations = allocate(1000.0, &[raw(0.0, 10.0, 100.0), raw(1.0, 10.0, 100.0)]);
-        assert_eq!((allocations[0].hz, allocations[1].hz), (10.0, 0.0));
+        assert_eq!((allocations[0].hz, allocations[1].hz), (0.0, 10.0));
         let allocations = allocate(500.0, &[raw(0.0, 10.0, 100.0), raw(1.0, 10.0, 100.0)]);
-        assert_eq!((allocations[0].hz, allocations[1].hz), (5.0, 0.0));
+        assert_eq!((allocations[0].hz, allocations[1].hz), (0.0, 5.0));
     }
 
     #[test]

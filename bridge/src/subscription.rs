@@ -176,8 +176,8 @@ pub struct SubShared {
     /// the server's codecs, with the caches that share work across frontends
     pub codecs: Arc<CodecRegistry>,
     max_hz: Option<f64>,
-    /// bandwidthPriority: flex-shrink weight
-    weight: f64,
+    /// bandwidthPriority: higher keeps more when bandwidth is short
+    bandwidth_priority: f64,
     quality_range: (f64, f64),
     tradeoff: f64,
     /// this frontend's shared send gate, and this stream's id in it
@@ -220,7 +220,7 @@ impl SubShared {
             codec,
             codecs,
             max_hz: opts.max_hz,
-            weight: opts.bandwidth_priority.unwrap_or(1.0),
+            bandwidth_priority: opts.bandwidth_priority.unwrap_or(1.0),
             quality_range: opts.quality_range(),
             tradeoff: opts.quality_to_hz_tradeoff.unwrap_or(0.5),
             state: Mutex::new(SubState::default()),
@@ -331,7 +331,7 @@ impl SubShared {
             }
         };
         let demand = Demand {
-            weight: self.weight,
+            priority: self.bandwidth_priority,
             max_hz,
             quality_range: self.codec.as_ref().map(|_| self.quality_range),
             tradeoff: self.tradeoff,

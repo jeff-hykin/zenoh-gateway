@@ -80,7 +80,7 @@ export interface Message {
 export interface SubscribeOptions {
     delivery?: Delivery
     priority?: number
-    /** flex-shrink weight when bandwidth is short (default 1; higher shrinks more, 0 shrinks last) */
+    /** when bandwidth is short, higher keeps more bandwidth and quality (default 1; 0 gives up everything first) */
     bandwidthPriority?: number
     maxAge?: number
     maxHz?: number
