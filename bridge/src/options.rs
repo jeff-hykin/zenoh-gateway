@@ -31,18 +31,7 @@ pub enum DeliveryKind {
     Reliable,
 }
 
-/// How a video codec's pictures reach the browser.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ImageTransport {
-    /// H.264 on a WebRTC video track
-    #[default]
-    Video,
-    /// one JPEG file per frame on the subscription's data channel
-    Jpeg,
-}
-
-/// Subscribe options. The quality range and the tradeoff feed the per-frontend allocator; `codec`
+/// Subscribe options. bandwidthPriority, the quality range and the tradeoff feed the per-frontend allocator; `codec`
 /// picks a transcoder (none = raw passthrough).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -50,14 +39,13 @@ pub struct SubOpts {
     #[serde(default)]
     pub delivery: DeliveryKind,
     pub priority: Option<u8>,
+    pub bandwidth_priority: Option<f64>,
     pub max_age: Option<f64>,
     pub max_hz: Option<f64>,
     pub min_quality: Option<f64>,
     pub max_quality: Option<f64>,
     pub quality_to_hz_tradeoff: Option<f64>,
     pub codec: Option<String>,
-    /// video codecs only: H.264 track (default) or JPEG files on the data channel
-    pub image_transport: Option<ImageTransport>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -118,6 +106,10 @@ impl SubOpts {
         check_priority(self.priority)?;
         check_positive("maxAge", self.max_age)?;
         check_positive("maxHz", self.max_hz)?;
+        match self.bandwidth_priority {
+            Some(weight) if !(weight.is_finite() && weight >= 0.0) => return Err(format!("bandwidthPriority must be >= 0, got {weight}")),
+            _ => {}
+        }
         check_unit("minQuality", self.min_quality)?;
         check_unit("maxQuality", self.max_quality)?;
         check_unit("qualityToHzTradeoff", self.quality_to_hz_tradeoff)?;
@@ -127,28 +119,15 @@ impl SubOpts {
         Ok(())
     }
 
-    /// The subscription's codec from `registry` (None = raw); unknown names, video codecs on
-    /// reliable delivery over H.264, and `imageTransport` without a video codec are refused.
+    /// The subscription's codec from `registry` (None = raw); unknown names and video codecs on
+    /// reliable delivery are refused.
     pub fn resolve_codec(&self, registry: &CodecRegistry) -> Result<Option<Arc<dyn Codec>>, String> {
-        let Some(name) = self.codec.as_deref() else {
-            if self.image_transport.is_some() {
-                return Err("imageTransport needs a video codec".into());
-            }
-            return Ok(None);
-        };
+        let Some(name) = self.codec.as_deref() else { return Ok(None) };
         let codec = registry.get(name)?;
-        if codec.output() != CodecOutput::Video && self.image_transport.is_some() {
-            return Err(format!("imageTransport applies to video codecs; {name} sends data"));
-        }
-        if codec.output() == CodecOutput::Video && !self.jpeg() && self.delivery == DeliveryKind::Reliable {
-            return Err(format!("{name} is a video codec: frames go over a lossy video track, use delivery \"latest\" (or imageTransport \"jpeg\")"));
+        if codec.output() == CodecOutput::Video && self.delivery == DeliveryKind::Reliable {
+            return Err(format!("{name} is a video codec: frames go over a lossy video track, use delivery \"latest\""));
         }
         Ok(Some(codec))
-    }
-
-    /// Video codecs' pictures go out as JPEG files on the data channel.
-    pub fn jpeg(&self) -> bool {
-        self.image_transport == Some(ImageTransport::Jpeg)
     }
 
     pub fn quality_range(&self) -> (f64, f64) {
@@ -170,13 +149,13 @@ impl SubOpts {
         json!({
             "delivery": self.delivery,
             "priority": self.priority,
+            "bandwidthPriority": self.bandwidth_priority.unwrap_or(1.0),
             "maxAge": self.max_age,
             "maxHz": self.max_hz,
             "minQuality": self.min_quality.unwrap_or(0.0),
             "maxQuality": self.max_quality.unwrap_or(1.0),
             "qualityToHzTradeoff": self.quality_to_hz_tradeoff.unwrap_or(0.5),
             "codec": self.codec,
-            "imageTransport": self.image_transport,
         })
     }
 }
@@ -259,14 +238,11 @@ mod tests {
         assert!(resolve(r#"{"codec":"image","delivery":"reliable"}"#).unwrap_err().contains("video codec"), "video is lossy");
         assert_eq!(resolve(r#"{"codec":"depth","delivery":"reliable"}"#).unwrap().as_deref(), Some("depth"));
         assert_eq!(resolve(r#"{}"#).unwrap(), None);
-        assert!(sub(r#"{"imageTransport":"png"}"#).is_err());
-        assert_eq!(resolve(r#"{"codec":"image","delivery":"reliable","imageTransport":"jpeg"}"#).unwrap().as_deref(), Some("image"), "jpeg files can be reliable");
-        assert!(resolve(r#"{"codec":"depth","imageTransport":"jpeg"}"#).unwrap_err().contains("video codecs"));
-        assert!(resolve(r#"{"imageTransport":"jpeg"}"#).unwrap_err().contains("video codec"));
-        assert!(sub(r#"{"codec":"image","imageTransport":"jpeg"}"#).unwrap().jpeg());
-        assert!(!sub(r#"{"codec":"image","imageTransport":"video"}"#).unwrap().jpeg());
-        let full = sub(r#"{"maxHz":20,"minQuality":0.3,"maxQuality":0.9,"qualityToHzTradeoff":0.7}"#).unwrap();
-        assert_eq!(full.normalized()["qualityToHzTradeoff"], 0.7);
+        assert!(sub(r#"{"codec":"image","imageTransport":"jpeg"}"#).is_err(), "JPEG files are gone");
+        assert!(sub(r#"{"bandwidthPriority":-1}"#).is_err());
+        assert!(sub(r#"{"dangerousMinHz":1}"#).is_err());
+        let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"minQuality":0.3,"maxQuality":0.9,"qualityToHzTradeoff":0.7}"#).unwrap();
+        assert_eq!((full.normalized()["bandwidthPriority"].as_f64(), full.normalized()["qualityToHzTradeoff"].as_f64()), (Some(2.0), Some(0.7)));
         assert_eq!(full.min_interval(), Some(Duration::from_millis(50)));
     }
 

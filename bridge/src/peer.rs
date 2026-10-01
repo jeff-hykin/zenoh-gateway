@@ -513,8 +513,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     let rejected = match label.kind.as_str() {
         "sub" => match SubOpts::parse(&label.opts).and_then(|opts| {
             let codec = opts.resolve_codec(&state.codecs)?;
-            // JPEG files ride the subscription's own data channel; only H.264 needs a track
-            let video = if opts.jpeg() { None } else { bind_video(&state, codec.as_deref(), &label)? };
+            let video = bind_video(&state, codec.as_deref(), &label)?;
             Ok((opts, codec, video))
         }) {
             Ok((opts, codec, video)) => {
@@ -909,7 +908,7 @@ mod tests {
     use super::*;
 
     fn stream(bytes_per_message: f64, hz: f64) -> allocator::Demand {
-        allocator::Demand { max_hz: hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None }
+        allocator::Demand { weight: 1.0, max_hz: hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None }
     }
 
     #[test]

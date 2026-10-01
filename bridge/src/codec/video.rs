@@ -217,11 +217,11 @@ impl VideoEncoder {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
     /// Four solid quadrants: red, green / blue, white.
-    pub(crate) fn quadrants(width: u32, height: u32) -> VideoImage {
+    fn quadrants(width: u32, height: u32) -> VideoImage {
         let mut pixels = Vec::with_capacity((width * height * 3) as usize);
         for y in 0..height {
             for x in 0..width {
@@ -307,7 +307,10 @@ pub(crate) mod tests {
             println!("{name:<40} {:7.2} ms", start.elapsed().as_secs_f64() * 1000.0 / runs as f64);
         };
         let decode = || {
-            let (width, height, pixels) = crate::codec::jpeg::tests::decode(&jpeg);
+            use zune_jpeg::zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+            let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(&jpeg), DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB));
+            let pixels = decoder.decode().unwrap();
+            let (width, height) = decoder.dimensions().unwrap();
             VideoImage::rgb8(width as u32, height as u32, pixels).unwrap()
         };
         time("jpeg -> rgb (zune)", 10, Box::new(|| drop(decode())));
@@ -319,7 +322,6 @@ pub(crate) mod tests {
         for quality in [0.8, 0.6, 0.3, 0.1] {
             let (width, height) = scaled_size(image.width(), image.height(), quality);
             time(&format!("to_yuv q{quality} {width}x{height}"), 10, Box::new(|| drop(to_yuv(&image, width, height))));
-            time(&format!("jpeg (scale + encode) q{quality}"), 10, Box::new(|| drop(crate::codec::jpeg::encode(&image, quality).unwrap())));
             let mut encoder = VideoEncoder::default();
             let mut flip = false;
             time(&format!("encode (to_yuv + h264) q{quality}"), 20, Box::new(|| {

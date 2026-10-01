@@ -2,7 +2,7 @@
 
 View and drive a [zenoh](https://zenoh.io) system from a browser over a squeezed network (a phone on
 weak wifi), without a heavy bridge: a Rust library that serves browsers over WebRTC, and a
-dependency-free TypeScript client. Pictures arrive as H.264 video (or JPEG files), other data as
+dependency-free TypeScript client. Pictures arrive as H.264 video, other data as
 bytes on per-stream data channels, and a per-browser bandwidth allocator decides who gets what when
 the link is short. Codecs are plugged in by the application:
 
@@ -31,8 +31,8 @@ zenoh peers / routers (publishers you don't control: ROS 2 over rmw_zenoh, dimos
   `"reliable"` ones are ordered and lossless.
 - The bridge never parses payloads unless a subscription picks a codec. Codecs run lazily inside the
   bridge, only for frames that will actually be sent.
-- Every browser gets a bandwidth estimate and a budget; streams shrink together, trading quality
-  against rate per `qualityToHzTradeoff`. Strict-priority streams skip the queue.
+- Every browser gets a bandwidth estimate and a budget; streams shrink by `bandwidthPriority`, trading
+  quality against rate per `qualityToHzTradeoff`. Strict-priority streams skip the queue.
 - Heartbeat + deadman: a publisher can leave a "stop" message on the bridge that is published once if
   the page goes silent.
 
@@ -67,7 +67,7 @@ The bridge checks options: an unknown name or a bad value rejects the subscripti
 
 | member | |
 |---|---|
-| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, bytes, timestamp, seq, decoded?, video?, mediaStream?, image? }` |
+| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, bytes, timestamp, seq, decoded?, video?, mediaStream? }` |
 | `publisher(key, options)` → `Publisher` | |
 | `get(key, { timeoutMs = 5000 })` → `[{ key, bytes, error? }]` | zenoh query |
 | `listTopics(filter = "**", { probeMs = 600 })` → `[{ key, sources }]` | live keys; `sources` ⊂ `token`, `advancedPublisher`, `sample` (SPEC "Topic enumeration"); `probeMs: 0` skips the `sample` probe, so publishers that only send while matched stay asleep |
@@ -89,10 +89,10 @@ The bridge checks options: an unknown name or a bad value rejects the subscripti
 | `priority` | as published | zenoh priority 1–7 (`Priority.*`); ≤ INTERACTIVE_HIGH (2) makes it strict |
 | `maxAge` | none | ms; drop anything older (also the SCTP packet lifetime on `"latest"`) |
 | `maxHz` | none | never send a key faster |
+| `bandwidthPriority` | 1 | flex-shrink weight when bandwidth is short (higher shrinks more; 0 shrinks last) |
 | `minQuality`, `maxQuality` | 0, 1 | quality bounds for codec streams |
 | `qualityToHzTradeoff` | 0.5 | 0 = keep quality, drop Hz; 1 = keep Hz, drop quality |
 | `codec` | none (raw bytes) | a name from `z.codecs` (see "Codecs"); the bridge rejects unknown names, listing its codecs |
-| `imageTransport` | `"video"` | video codecs: `"video"` = H.264 on a video track (`sub.mediaStream`); `"jpeg"` = one JPEG file per picture on the data channel, decoded for you into `msg.image` (an `ImageBitmap`; draw it, then `close()` it) |
 
 `Subscription`: `ready()` (resolves when the bridge accepted it and the channel is open, rejects with
 the bridge's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"`), `mediaStream`
@@ -127,15 +127,6 @@ Picked explicitly per subscription; there is no auto-detection and none is built
 bytes, rate is the only degradation. A **video** codec hands the bridge pictures, which it scales to
 the allocated quality and sends as H.264 on a video track (`sub.mediaStream`, `msg.video`); a **data**
 codec sends its own bytes, which the page decodes with `registerCodec`.
-
-Every video codec can instead send JPEG files: `imageTransport: "jpeg"`. Each picture the pacing lets
-through is scaled for the allocated quality (the same resolution scale as H.264) and encoded at JPEG
-quality `35 + 55 q`; a source that already is a JPEG goes out byte for byte, without a decode, while the
-whole picture may be sent (quality 1). Delivery, drops, maxHz and the backlog window are the data
-channel's, and the allocator prices the stream by the JPEG sizes it measures. On the page, `msg.bytes`
-is the file and `msg.image` the decoded `ImageBitmap` (one decode at a time; a picture that arrives
-meanwhile replaces the one waiting). Choose it where the browser's video pipeline (jitter buffer,
-decoder) costs too much latency; H.264 sends fewer bytes for the same picture.
 
 ## Use as a Rust library
 
@@ -174,8 +165,7 @@ is already running on a port before starting its own (`zenoh_web::HEALTH_PATH`).
 Implement `zenoh_web::Codec`: decode a zenoh sample (key, payload, encoding) once, then produce
 either **video** (`DecodedFrame::Video(VideoImage::rgb8(..)` or `::i420(..))`: the bridge scales it
 to the allocated quality, encodes H.264 and sends it on a video track, so the page just shows
-`sub.mediaStream`, or JPEG files with `imageTransport: "jpeg"`; implement `jpeg(sample)` to let a
-sample that already is a JPEG pass through untouched) or **data** (`encode(frame, quality)` returns bytes for the data channel; the
+`sub.mediaStream`) or **data** (`encode(frame, quality)` returns bytes for the data channel; the
 page decodes them with `registerCodec`). Decodes are shared across browsers per sample, data encodes
 per (sample, quality). `estimated_bytes(payload_bytes, quality)` is an optional cost model for the
 allocator.
@@ -237,8 +227,8 @@ new publisher is needed. Background tabs throttle timers to ≥ 1 s, so keep `mi
 
 Per browser, every 250 ms: estimate the path (delivery rate + a delay trigger from RTT samples for data
 channels, GCC for video), take `bandwidth_target_fraction` of it (capped by
-`max_bandwidth_bytes_per_sec`), reserve strict-priority and reliable streams, and shrink the rest by
-the same fraction. A codec stream granted a fraction r of its demand shrinks its message size by
+`max_bandwidth_bytes_per_sec`), reserve strict-priority and reliable streams, and shrink the rest like
+CSS flex items by `bandwidthPriority × demand` (weight-0 streams shrink last). A codec stream granted a fraction r of its demand shrinks its message size by
 `r^qualityToHzTradeoff` and its rate by the rest. Bulk sends are paced so queues stay short and strict
 streams don't wait behind them. Each subscription's `allocation` (demand, budget, hz, quality,
 constrained) is in `z.stats`. Full algorithm and measurements: SPEC.md "Bandwidth allocation".

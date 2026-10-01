@@ -30,12 +30,12 @@ const sub = z.subscribe("camera/**", {
     priority: Priority.DATA_LOW, // optional; defaults to the priority the message was published with
     maxAge: 500,                 // ms; drop anything older
     maxHz: 20,                   // bridge never sends a key faster than this
+    bandwidthPriority: 1,        // flex-shrink weight when bandwidth is short (higher shrinks more)
     minQuality: 0.3,             // 0-1, transcoded streams only
     maxQuality: 1.0,
     qualityToHzTradeoff: 0.7,    // 0 = keep quality, drop hz; 1 = keep hz, drop quality
     codec: "ros2-image",         // optional transcoder the bridge registered (z.codecs), see "Codecs"
-    imageTransport: "video",     // video codecs: "video" (H.264 track) or "jpeg" (JPEG files on the data channel)
-}, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.decoded, msg.video, msg.mediaStream, msg.image })
+}, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.decoded, msg.video, msg.mediaStream })
 sub.mediaStream  // video codecs: a MediaStream for a <video> element
 sub.close()
 
@@ -71,7 +71,7 @@ registerCodec("text-uppercase", (bytes, msg) => new TextDecoder().decode(bytes))
 - `Priority` mirrors zenoh / zenoh-ts: REAL_TIME=1, INTERACTIVE_HIGH=2, INTERACTIVE_LOW=3, DATA_HIGH=4, DATA=5, DATA_LOW=6, BACKGROUND=7 (lower = more important).
 - Options are checked by the bridge: an unknown name or a bad value rejects the channel (`rejected`
   event with the reason: `state` becomes `"rejected"`, `ready()` rejects).
-- `minQuality` (default 0), `maxQuality` (1), `qualityToHzTradeoff` (0.5) drive the per-frontend
+- `bandwidthPriority` (default 1), `minQuality` (0), `maxQuality` (1), `qualityToHzTradeoff` (0.5) drive the per-frontend
   allocator ("Bandwidth allocation"); stats show them with defaults filled in.
 - No `latched` flag: the bridge always subscribes with zenoh-ext AdvancedSubscriber history (max 1 sample per publisher), so publishers with a cache (e.g. rmw_zenoh transient_local like tf_static) replay their last message.
 
@@ -156,7 +156,6 @@ Every codec implements one Rust trait (`zenoh_web::Codec`):
 - `estimated_bytes(payloadBytes, quality)`: optional cost model for data codecs (bytes per message),
   the allocator's prior until sizes are measured and its shape between measured qualities (default:
   10–100 % of the payload, linear in quality). Video is priced by the bridge's own model.
-- `jpeg(sample)`: optional, video codecs whose sample already is a JPEG file (see "JPEG files").
 
 Video: scaling is a box filter, RGB → I420 integer BT.601, H.264 openh264.
 - A video subscription decodes its next frame while it encodes the current one (two blocking-pool
@@ -193,21 +192,6 @@ Every RTP packet carries the playout-delay extension with min = max = 0, so Chro
 as soon as it is decoded instead of holding it in its jitter buffer for smooth pacing (the client
 also sets `jitterBufferTarget = 0`). Locally that took receive -> shown from ~22 ms to ~1 ms
 (`test/video_latency.js`); on a jittery link, bursts of frames are shown as they come.
-
-### JPEG files (`imageTransport: "jpeg"`)
-
-Any video codec's subscription may ask for JPEG files instead of a track. It runs the same pipeline
-(pick, shared decode overlapping the encode, CPU governor) but encodes each picture as a baseline
-4:2:0 JPEG (`jpeg-encoder`, pure Rust) at the resolution scale `0.25 + 0.75 q` and JPEG quality
-`35 + 55 q`, and sends it as one message on the `sub` channel, with the data path's chunking,
-pacing, backlog window, `maxAge` abandonment and delivery mode (so `"reliable"` is allowed here). No
-transceiver is renegotiated and no metadata frame is sent. Pass-through: when the next picture would
-go at full size (quality 1 after the governor) and the codec's `jpeg(sample)` returns the sample's
-picture as a JPEG file, those bytes are sent without decoding. Price: measured bytes per quality
-bucket (as for data codecs), shaped between buckets by `pixels(q) × (0.25 + q) / 8`; JPEG streams
-count as data streams for the estimators and the video cap. The client decodes each message with
-`createImageBitmap` into `msg.image`, one at a time, a newer picture replacing one still waiting
-(`imagesSkipped`).
 
 ## Bandwidth allocation
 
@@ -264,7 +248,9 @@ Per frontend, every 250 ms:
    qualities, which is also the prior before anything was measured), modeled for video (resolution ×
    bits per pixel). Strict-priority and reliable streams can't drop messages: they are reserved at
    their measured rate and never shrunk.
-3. **Shrink.** If the rest want more than the budget left, each gets the same fraction of what it wants.
+3. **Shrink.** If the rest want more than the budget left, they shrink like CSS flex items: the deficit
+   is split in proportion to `bandwidthPriority × demand`; a stream that reaches 0 stops there and the
+   rest shrink further. Weight-0 streams shrink only once nothing else can.
 4. **Quality vs Hz.** A transcoded stream granted fraction r of its demand shrinks its message size by
    `r^t` (choosing the best quality among the bounds and 0.1 steps that fits) and its Hz by the rest,
    `t = qualityToHzTradeoff`: 0 keeps quality and drops Hz, 1 keeps Hz and drops quality. When quality

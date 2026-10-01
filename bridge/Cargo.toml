@@ -30,8 +30,10 @@ async-trait = "0.1"
 anyhow = "1"
 log = "0.4"
 futures = "0.3"
-# video transport: H.264 (openh264 builds its C sources) and JPEG files
+# H.264 video (openh264 builds its C sources)
 openh264 = "0.9"
-jpeg-encoder = "0.6"
+
+[dev-dependencies]
+# decodes a real camera frame for the ignored bench_stages
 zune-jpeg = "0.5"
 

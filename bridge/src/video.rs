@@ -232,38 +232,26 @@ fn metadata(frame: &EncodedFrame, source: (u32, u32), quality: f64) -> [u8; META
     out
 }
 
-/// What the blocking pool made of a picked sample.
-enum Decoded {
-    /// pixels for the encoder (and whether another frontend's decode was reused)
-    Picture(Arc<DecodedFrame>, bool),
-    /// a JPEG source sent as it is (`imageTransport: "jpeg"` at full size), and its size
-    Passthrough(Vec<u8>, (u32, u32)),
-}
+/// A decoded picture and whether another frontend's decode was reused, or the decode error.
+type DecodeOutcome = std::result::Result<(Arc<DecodedFrame>, bool), String>;
 
 /// A picked frame and its decode, running on the blocking pool.
 struct Decoding {
     key: String,
     item: subscription::Pending,
     /// (what came of the sample, milliseconds it took)
-    task: tokio::task::JoinHandle<(std::result::Result<Decoded, String>, f64)>,
+    task: tokio::task::JoinHandle<(DecodeOutcome, f64)>,
 }
 
-/// Starts decoding a picked sample. With `passthrough`, a sample the codec says already is a JPEG
-/// is not decoded at all.
-fn start_decode(shared: &SubShared, codec: &Arc<dyn Codec>, key: String, item: subscription::Pending, passthrough: bool) -> Decoding {
+/// Starts decoding a picked sample.
+fn start_decode(shared: &SubShared, codec: &Arc<dyn Codec>, key: String, item: subscription::Pending) -> Decoding {
     let payload = item.payload.to_bytes().into_owned();
     let (hash_key, encoding, codecs, codec) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone());
     let task = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let sample = CodecSample::new(&hash_key, &payload, &encoding);
-        if passthrough
-            && let Some(jpeg) = codec.jpeg(&sample)
-            && let Some(size) = crate::codec::jpeg::jpeg_size(jpeg)
-        {
-            return (Ok(Decoded::Passthrough(jpeg.to_vec(), size)), started.elapsed().as_secs_f64() * 1000.0);
-        }
         let (decoded, reused) = codecs.decode_shared(&*codec, &sample, registry::sample_hash(&sample));
-        (decoded.map(|decoded| Decoded::Picture(decoded, reused)), started.elapsed().as_secs_f64() * 1000.0)
+        (decoded.map(|decoded| (decoded, reused)), started.elapsed().as_secs_f64() * 1000.0)
     });
     Decoding { key, item, task }
 }
@@ -313,11 +301,6 @@ impl CpuGovernor {
         self.encode_ms = Some(self.encode_ms.map_or(ms, |average| average + CPU_EWMA_GAIN * (ms - average)));
     }
 
-    /// The quality the next frame would be encoded at, without moving the ceiling.
-    fn ceiling(&self, allocated: f64, min_quality: f64) -> f64 {
-        allocated.min(self.cap).max(min_quality.min(allocated))
-    }
-
     /// The quality to encode at: `allocated`, lowered to the governor's ceiling.
     fn quality(&mut self, allocated: f64, min_quality: f64, hz: f64, now: Instant) -> f64 {
         let floor = min_quality.min(allocated);
@@ -345,45 +328,21 @@ impl CpuGovernor {
     }
 }
 
-/// Where a video subscription's pictures go.
-pub enum Output {
-    /// H.264 on this WebRTC video track (plus a small metadata frame per picture on the channel)
-    Track(Arc<VideoTrack>),
-    /// one JPEG file per picture on the subscription's data channel
-    Jpeg,
-}
-
-/// One picture encoded for its output.
-enum Encoded {
-    H264(EncodedFrame),
-    Jpeg(crate::codec::jpeg::EncodedJpeg),
-}
-
 /// Sends a video subscription's frames: pick (paced by maxHz and the allocation), decode (shared
-/// across frontends), encode at the allocated quality and Hz (off the runtime), and write to the
-/// track, or send as a JPEG file on the data channel. The next frame's decode overlaps this
-/// frame's encode: in series, a big camera frame (a 1920x1536 jpeg is ~16 ms to decode and ~20 ms
-/// to scale and encode on a Jetson Orin core) could not keep up with 30 Hz; overlapped, the slower
-/// of the two sets the rate.
-pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, output: Output) {
+/// across frontends), encode H.264 at the allocated quality and Hz (off the runtime), and write to
+/// the track. The next frame's decode overlaps this frame's encode: in series, a big camera frame (a
+/// 1920x1536 jpeg is ~16 ms to decode and ~20 ms to scale and encode on a Jetson Orin core) could
+/// not keep up with 30 Hz; overlapped, the slower of the two sets the rate.
+pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: Arc<VideoTrack>) {
     let Some(codec) = shared.codec.clone() else { return };
-    let track = match &output {
-        Output::Track(track) => Some(track.clone()),
-        Output::Jpeg => None,
-    };
-    let mut encoder = track.as_ref().map(|_| VideoEncoder::default());
-    let mut sender = subscription::MessageSender::new();
+    let mut encoder = Some(VideoEncoder::default());
     let mut next_frame_id: u32 = 0;
     let mut last_write: Option<Instant> = None;
     let mut warned_write = false;
     let mut next: Option<Decoding> = None;
     let mut governor = CpuGovernor::new();
-    // JPEG sources go out untouched when the whole picture may be sent
-    let passthrough = |governor: &CpuGovernor| track.is_none() && crate::codec::jpeg::is_full_size(governor.ceiling(shared.current_quality(), shared.min_quality()));
     // a new subscriber starts from a keyframe (the new encoder's first frame is one anyway)
-    if let Some(track) = &track {
-        track.keyframe_requested.store(true, Ordering::Release);
-    }
+    track.keyframe_requested.store(true, Ordering::Release);
     while !shared.is_closed() {
         let decoding = match next.take() {
             Some(decoding) => decoding,
@@ -393,23 +352,14 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, output:
                     shared.wait_for_data(wake_at).await;
                     continue;
                 };
-                start_decode(&shared, &codec, key, item, passthrough(&governor))
+                start_decode(&shared, &codec, key, item)
             }
         };
         let Decoding { key, item, task } = decoding;
         let (decoded, reused) = match task.await {
-            Ok((Ok(Decoded::Picture(decoded, reused)), decode_ms)) => {
+            Ok((Ok((decoded, reused)), decode_ms)) => {
                 governor.observe_decode(decode_ms, reused);
                 (decoded, reused)
-            }
-            Ok((Ok(Decoded::Passthrough(jpeg, size)), _)) => {
-                shared.note_video_source(size.0, size.1);
-                shared.record_picture_size(size.0, size.1);
-                shared.record_encode(registry::quality_bucket(1.0), 1.0, jpeg.len(), false);
-                if sender.send(&dc, &shared, &key, &item, &jpeg).await == subscription::Sent::Closed {
-                    break;
-                }
-                continue;
             }
             Ok((Err(error), _)) => {
                 shared.record_codec_error(&error);
@@ -422,7 +372,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, output:
         };
         let hz = shared.key_hz(&key);
         let quality = governor.quality(shared.current_quality(), shared.min_quality(), hz, Instant::now());
-        let keyframe = track.as_ref().is_some_and(|track| track.keyframe_requested.swap(false, Ordering::AcqRel));
+        let keyframe = track.keyframe_requested.swap(false, Ordering::AcqRel);
         let mut working = encoder.take();
         let codec_name = codec.name().to_owned();
         let mut encoding = tokio::task::spawn_blocking(move || {
@@ -430,16 +380,11 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, output:
                 return (working, Err(format!("video codec {codec_name:?} decoded to a data frame")));
             };
             let started = Instant::now();
-            let encoded = match working.as_mut() {
-                Some(h264) => {
-                    if keyframe {
-                        h264.request_keyframe();
-                    }
-                    h264.encode(image, quality, hz).map(Encoded::H264)
-                }
-                None => crate::codec::jpeg::encode(image, quality).map(Encoded::Jpeg),
-            };
-            let result = encoded.map(|frame| (frame, (image.width(), image.height()), started.elapsed().as_secs_f64() * 1000.0)).map_err(|error| format!("{error:#}"));
+            let h264 = working.as_mut().expect("the encoder comes back with every frame");
+            if keyframe {
+                h264.request_keyframe();
+            }
+            let result = h264.encode(image, quality, hz).map(|frame| (frame, (image.width(), image.height()), started.elapsed().as_secs_f64() * 1000.0)).map_err(|error| format!("{error:#}"));
             (working, result)
         });
         // while it encodes, pick the next frame and start decoding it as soon as one may go
@@ -449,7 +394,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, output:
             }
             let (picked, wake_at) = shared.pick(Instant::now());
             if let Some((key, item)) = picked {
-                next = Some(start_decode(&shared, &codec, key, item, passthrough(&governor)));
+                next = Some(start_decode(&shared, &codec, key, item));
                 continue;
             }
             tokio::select! {
@@ -470,23 +415,12 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, output:
                 continue;
             }
             Err(error) => {
+                encoder = Some(VideoEncoder::default());
                 shared.record_codec_error(&format!("encoder task failed: {error}"));
                 continue;
             }
         };
         shared.note_video_source(source.0, source.1);
-        let frame = match frame {
-            Encoded::Jpeg(jpeg) => {
-                shared.record_picture_size(jpeg.width, jpeg.height);
-                shared.record_encode(registry::quality_bucket(quality), quality, jpeg.data.len(), reused);
-                if sender.send(&dc, &shared, &key, &item, &jpeg.data).await == subscription::Sent::Closed {
-                    break;
-                }
-                continue;
-            }
-            Encoded::H264(frame) => frame,
-        };
-        let Some(track) = &track else { continue };
         let now = Instant::now();
         let duration = last_write.map_or(Duration::from_secs_f64(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
         last_write = Some(now);
@@ -506,9 +440,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, output:
         }
         next_frame_id = next_frame_id.wrapping_add(1);
     }
-    if let Some(track) = &track {
-        track.release();
-    }
+    track.release();
 }
 
 #[cfg(test)]

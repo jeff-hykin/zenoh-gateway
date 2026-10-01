@@ -11,7 +11,6 @@
 //! pool. Decodes are shared across frontends by (codec, key, payload), data encodes by (codec,
 //! quality, key, payload), so identical requests from several browsers compute once.
 
-pub(crate) mod jpeg;
 pub(crate) mod registry;
 pub(crate) mod video;
 
@@ -23,10 +22,8 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CodecOutput {
     /// [`DecodedFrame::Video`] frames, which the bridge scales to the allocated quality, encodes
-    /// to H.264 and sends on a WebRTC video track (the page gets `sub.mediaStream`), or, with the
-    /// subscribe option `imageTransport: "jpeg"`, encodes as JPEG files on the data channel (the
-    /// page gets `msg.image`). An H.264 subscription must use `delivery: "latest"`. No browser
-    /// code is needed.
+    /// to H.264 and sends on a WebRTC video track (the page gets `sub.mediaStream`). The
+    /// subscription must use `delivery: "latest"`. No browser code is needed.
     Video,
     /// Bytes from [`Codec::encode`], sent on the subscription's data channel. In the browser,
     /// `msg.bytes` holds them and `msg.decoded` what the decoder registered for this codec's name
@@ -222,13 +219,5 @@ pub trait Codec: Send + Sync {
     /// codecs are priced by the bridge from resolution and bits per pixel instead.
     fn estimated_bytes(&self, payload_bytes: usize, quality: f64) -> f64 {
         payload_bytes as f64 * (0.1 + 0.9 * quality.clamp(0.0, 1.0))
-    }
-
-    /// [`CodecOutput::Video`] codecs: the sample's picture as a JPEG file, if it already is one.
-    /// A subscription with `imageTransport: "jpeg"` that may send full size then forwards these
-    /// bytes as they are, without decoding or re-encoding. The default (`None`) always transcodes.
-    fn jpeg<'a>(&self, sample: &CodecSample<'a>) -> Option<&'a [u8]> {
-        let _ = sample;
-        None
     }
 }

@@ -1511,12 +1511,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jpeg-encoder"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f"
-
-[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4862,7 +4856,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
- "jpeg-encoder",
  "log",
  "openh264",
  "serde",

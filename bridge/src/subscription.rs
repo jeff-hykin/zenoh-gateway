@@ -176,6 +176,8 @@ pub struct SubShared {
     /// the server's codecs, with the caches that share work across frontends
     pub codecs: Arc<CodecRegistry>,
     max_hz: Option<f64>,
+    /// bandwidthPriority: flex-shrink weight
+    weight: f64,
     quality_range: (f64, f64),
     tradeoff: f64,
     /// this frontend's shared send gate, and this stream's id in it
@@ -190,8 +192,6 @@ pub struct SubShared {
     closed: AtomicBool,
     /// flips to true on close, so `run` also stops when the channel never reports its own close
     closed_signal: tokio::sync::watch::Sender<bool>,
-    /// a video codec's pictures go out as JPEG files on the data channel (`imageTransport: "jpeg"`)
-    pub jpeg: bool,
 }
 
 pub fn now_unix_ms() -> f64 {
@@ -220,6 +220,7 @@ impl SubShared {
             codec,
             codecs,
             max_hz: opts.max_hz,
+            weight: opts.bandwidth_priority.unwrap_or(1.0),
             quality_range: opts.quality_range(),
             tradeoff: opts.quality_to_hz_tradeoff.unwrap_or(0.5),
             state: Mutex::new(SubState::default()),
@@ -227,7 +228,6 @@ impl SubShared {
             drained: Notify::new(),
             closed: AtomicBool::new(false),
             closed_signal: tokio::sync::watch::Sender::new(false),
-            jpeg: opts.jpeg(),
         }
     }
 
@@ -284,14 +284,9 @@ impl SubShared {
         }
     }
 
-    /// A video codec's subscription, by either transport.
-    pub fn is_image(&self) -> bool {
-        self.codec.as_ref().is_some_and(|codec| codec.output() == CodecOutput::Video)
-    }
-
-    /// A video codec's subscription on an H.264 track (not the data channel).
+    /// A video codec's subscription (H.264 on a track).
     pub fn is_video(&self) -> bool {
-        self.is_image() && !self.jpeg
+        self.codec.as_ref().is_some_and(|codec| codec.output() == CodecOutput::Video)
     }
 
     pub fn note_video_source(&self, width: u32, height: u32) {
@@ -317,23 +312,14 @@ impl SubShared {
                 let message_bytes = if state.message_bytes > 0.0 { state.message_bytes } else { payload_bytes + FRAME_OVERHEAD_BYTES };
                 Box::new(move |_| message_bytes)
             }
-            Some(codec) if codec.output() == CodecOutput::Video && !self.jpeg => {
+            Some(codec) if codec.output() == CodecOutput::Video => {
                 let (width, height) = state.video_source.unwrap_or((640, 480));
                 Box::new(move |quality| crate::codec::video::bytes_per_frame(width, height, quality))
             }
             Some(codec) => {
-                // measured sizes per quality, scaled between qualities by a model: the JPEG one for
-                // pictures sent as files, else the codec's own estimate
-                let model: crate::allocator::Price = match self.jpeg {
-                    true => {
-                        let (width, height) = state.video_source.unwrap_or((640, 480));
-                        Box::new(move |quality| crate::codec::jpeg::bytes_per_frame(width, height, quality))
-                    }
-                    false => {
-                        let (codec, payload_len) = (codec.clone(), payload_bytes.round() as usize);
-                        Box::new(move |quality| codec.estimated_bytes(payload_len, quality).max(0.0))
-                    }
-                };
+                // measured sizes per quality, scaled between qualities by the codec's own estimate
+                let (codec, payload_len) = (codec.clone(), payload_bytes.round() as usize);
+                let model = move |quality: f64| codec.estimated_bytes(payload_len, quality).max(0.0);
                 let measured: Vec<(f64, f64)> = state.encoded_bytes.iter().map(|(&bucket, &bytes)| (bucket as f64 / 1000.0, bytes)).collect();
                 Box::new(move |quality| {
                     let nearest = measured.iter().min_by(|a, b| (a.0 - quality).abs().total_cmp(&(b.0 - quality).abs()));
@@ -345,6 +331,7 @@ impl SubShared {
             }
         };
         let demand = Demand {
+            weight: self.weight,
             max_hz,
             quality_range: self.codec.as_ref().map(|_| self.quality_range),
             tradeoff: self.tradeoff,
@@ -382,13 +369,6 @@ impl SubShared {
             warn!("codec {}: {error}", self.codec.as_ref().map_or("?", |codec| codec.name()));
             state.stats.last_codec_error = Some(error.to_owned());
         }
-    }
-
-    /// The size of the last picture sent as a JPEG file.
-    pub fn record_picture_size(&self, width: u32, height: u32) {
-        let mut state = self.state.lock().unwrap();
-        state.stats.video_width = width;
-        state.stats.video_height = height;
     }
 
     /// The video pipeline's per-frame costs and the CPU governor's quality ceiling.
@@ -575,8 +555,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
 
     shared.gate.register(shared.stream_id, dc.clone());
     let sender = match video {
-        Some(track) => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), crate::video::Output::Track(track))),
-        None if shared.is_image() => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), crate::video::Output::Jpeg)),
+        Some(track) => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), track)),
         None => tokio::spawn(send_loop(dc.clone(), shared.clone())),
     };
     // A browser that vanishes (killed, crashed, lid closed) never closes its channels; the peer is
