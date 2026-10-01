@@ -324,9 +324,14 @@ impl RunningServer {
         }
         // deadmen first: a browser that is still connected keeps its HTTP side idle anyway
         self.server.shutdown().await?;
-        match (&mut self.task).await {
-            Ok(result) => result.context("HTTP server"),
-            Err(error) => Err(anyhow!("HTTP server task: {error}")),
+        // graceful HTTP shutdown waits for open requests; a stuck one must not keep the process alive
+        match tokio::time::timeout(std::time::Duration::from_secs(3), &mut self.task).await {
+            Ok(Ok(result)) => result.context("HTTP server"),
+            Ok(Err(error)) => Err(anyhow!("HTTP server task: {error}")),
+            Err(_) => {
+                self.task.abort();
+                Ok(())
+            }
         }
     }
 }

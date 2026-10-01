@@ -261,13 +261,17 @@ bridge keeps the path's queues short and lets urgent streams skip what queue rem
   runs below the path's capacity and its queue stays near empty.
 - **Pacing.** Bulk streams send through a per-stream token bucket at their granted rate × 1.25, in
   chunks of 4 ms of the frontend's budget (4–64 KiB). A per-frontend gate admits a bulk chunk only
-  while the bulk bytes outstanding in SCTP are under `budget × (min RTT + 5 ms)` (at least two chunks,
+  while the bulk bytes outstanding in SCTP are under `budget × (min RTT + 5 ms)`, when the frontend has a strict stream
+  to protect (none: no in-flight limit, `bulkInflightLimit: null` in stats; at least two chunks,
   about one bandwidth-delay product), counting a chunk the moment it is admitted so senders woken
   together can't burst. A strict message waits behind at most the bulk already handed to SCTP, and
   bulk never bursts whole messages into the link.
 - **Delay trigger.** The browser reports its RTT with every clock-sync sample (each heartbeat, else
-  the 1 s control ping: configure `heartbeatHz` for a fast trigger). When the smallest RTT of a 250 ms
-  interval is more than 5 ms above the 30 s minimum, a queue is standing on the path: the data
+  the 1 s control ping: configure `heartbeatHz` for a fast trigger). The queue delay of a 250 ms
+  interval is its smallest RTT minus the 30 s minimum. When it exceeds `5 ms + 2 × median` of the queue delays of the
+  last 30 s (`delayThresholdMs` in stats) for two intervals in a row, a queue is
+  standing on the path (a Wi-Fi or VPN path whose RTT swings by tens of ms with no load raises its
+  own threshold; a lone spike is ignored): the data
   estimate drops 15% at once and probing pauses 1 s; then it probes up 10% per interval below 90% of
   the level that caused the queue and 2% above it (before any congestion: 50% per interval, a slow
   start). No loss is needed to react.

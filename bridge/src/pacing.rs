@@ -17,8 +17,6 @@ use tokio::sync::Notify;
 pub const MIN_CHUNK_BYTES: usize = 4 * 1024;
 pub const MAX_CHUNK_BYTES: usize = crate::frame::CHUNK_BYTES;
 const CHUNK_MS: f64 = 4.0;
-/// Bulk in-flight window beyond one minimum RTT of the budget.
-const INFLIGHT_SLACK_MS: f64 = 5.0;
 /// Re-check while waiting, in case a wakeup is missed (outstanding bytes drain without an event).
 const GATE_BACKSTOP: Duration = Duration::from_millis(5);
 /// Token-bucket rate = granted rate x this, so a message finishes a little before the next is due.
@@ -60,14 +58,23 @@ impl Drop for StrictTurn<'_> {
 }
 
 impl SendGate {
-    /// From the allocator: the budget sets bulk chunk size and in-flight limit (budget x (rtt + 5 ms)):
-    /// about one bandwidth-delay product, so bulk can use its budget without standing in a queue.
-    pub fn configure(&self, budget_bytes_per_sec: f64, min_rtt_ms: Option<f64>) {
+    /// From the allocator: the budget sets bulk chunk size and in-flight limit, budget x (min RTT +
+    /// `slack_ms`): about one bandwidth-delay product, so bulk can use its budget without standing
+    /// in a queue.
+    /// The limit exists so a strict stream waits behind little bulk; `limit_inflight` is false when the
+    /// frontend has no strict stream, and then bulk is limited only by its pacing and SCTP.
+    pub fn configure(&self, budget_bytes_per_sec: f64, min_rtt_ms: Option<f64>, slack_ms: f64, limit_inflight: bool) {
         let chunk = ((budget_bytes_per_sec * CHUNK_MS / 1000.0) as usize).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES);
-        let window = budget_bytes_per_sec * (min_rtt_ms.unwrap_or(50.0) + INFLIGHT_SLACK_MS) / 1000.0;
+        let window = budget_bytes_per_sec * (min_rtt_ms.unwrap_or(50.0) + slack_ms) / 1000.0;
         self.chunk_bytes.store(chunk, Ordering::Relaxed);
-        self.inflight_limit.store((window as usize).max(2 * chunk), Ordering::Relaxed);
+        let limit = if limit_inflight { (window as usize).max(2 * chunk) } else { usize::MAX };
+        self.inflight_limit.store(limit, Ordering::Relaxed);
         self.changed.notify_waiters();
+    }
+
+    /// The bulk in-flight limit, if any.
+    pub fn inflight_limit(&self) -> Option<usize> {
+        Some(self.inflight_limit.load(Ordering::Relaxed)).filter(|limit| *limit != usize::MAX)
     }
 
     pub fn chunk_bytes(&self) -> usize {
@@ -210,7 +217,7 @@ mod tests {
     #[test]
     fn gate_sizes_chunks_and_blocks_bulk_during_strict_turns() {
         let gate = SendGate::default();
-        gate.configure(1_000_000.0, Some(10.0));
+        gate.configure(1_000_000.0, Some(10.0), 5.0, true);
         assert_eq!(gate.chunk_bytes(), MIN_CHUNK_BYTES);
         assert_eq!(gate.inflight_limit.load(Ordering::Relaxed), 15_000);
         assert!(gate.try_admit(1, 10_000));
@@ -222,7 +229,14 @@ mod tests {
         assert!(!gate.try_admit(1, 1000));
         drop(turn);
         assert!(gate.try_admit(1, 1000));
-        gate.configure(1e9, Some(1.0));
+        gate.configure(1e9, Some(1.0), 5.0, true);
         assert_eq!(gate.chunk_bytes(), MAX_CHUNK_BYTES);
+        // a jittery path widens the window by its jitter allowance
+        gate.configure(1_000_000.0, Some(10.0), 50.0, true);
+        assert_eq!(gate.inflight_limit(), Some(60_000));
+        // no strict stream to protect: no limit
+        gate.configure(1_000_000.0, Some(10.0), 50.0, false);
+        assert_eq!(gate.inflight_limit(), None);
+        assert!(gate.try_admit(1, 10_000_000));
     }
 }

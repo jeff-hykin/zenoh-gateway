@@ -167,9 +167,13 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
 
 /// Data-channel capacity estimate (bytes/s). webrtc-rs doesn't expose the SCTP congestion window,
 /// so this combines what the `sub` channels actually pushed into SCTP with two congestion signals:
-/// - delay: the connection's RTT (the smallest browser clock-sync sample of the interval) rose
-///   `DELAY_THRESHOLD_MS` above its recent minimum, i.e. a queue is building somewhere on the path.
-///   The estimate drops at once by 15% and probing pauses 1 s while the queue drains;
+/// - delay: the connection's RTT (the smallest browser clock-sync sample of the interval) stayed
+///   above its recent minimum by more than the path's usual jitter for `DELAY_PERSISTENCE`
+///   intervals in a row, i.e. a queue is building somewhere on the path. The threshold is
+///   `DELAY_THRESHOLD_MS` plus twice the median of the last `JITTER_WINDOW` of these delays: a
+///   Wi-Fi or VPN path whose RTT swings by tens of ms with no load must not read as congested (on
+///   one, a fixed 5 ms threshold held the estimate at its floor while the link idled). The estimate
+///   drops at once by 15% and probing pauses 1 s while the queue drains;
 /// - loss/backpressure: senders blocked on SCTP more than 20% of the interval: 0.9 x measured rate.
 ///
 /// Otherwise, while streams want more, it probes up: 50% per interval until the first congestion
@@ -184,8 +188,14 @@ pub struct Estimator {
     /// estimate at the last congestion event
     pub congested_at_bytes_per_sec: f64,
     pub delay_events: u64,
+    /// queue delay that counts as congestion now (base threshold + 2 x the path's median jitter)
+    pub delay_threshold_ms: f64,
     #[serde(skip)]
     hold_probing_until: Option<std::time::Instant>,
+    #[serde(skip)]
+    delay_samples: std::collections::VecDeque<(std::time::Instant, f64)>,
+    #[serde(skip)]
+    over_threshold: u32,
 }
 
 pub const INITIAL_ESTIMATE: f64 = 1_000_000.0;
@@ -197,6 +207,10 @@ const FAST_PROBE_GAIN: f64 = 1.10;
 const SLOW_PROBE_GAIN: f64 = 1.02;
 /// RTT above its recent minimum by this much means a queue is building.
 pub const DELAY_THRESHOLD_MS: f64 = 5.0;
+/// Intervals in a row above the threshold before the delay counts as a queue (a lone spike doesn't).
+const DELAY_PERSISTENCE: u32 = 2;
+/// How far back the path's usual queue-delay jitter is measured.
+const JITTER_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 const DELAY_DECREASE: f64 = 0.85;
 const HOLD_AFTER_CONGESTION: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -208,7 +222,10 @@ impl Default for Estimator {
             network_blocked_fraction: 0.0,
             congested_at_bytes_per_sec: f64::INFINITY,
             delay_events: 0,
+            delay_threshold_ms: DELAY_THRESHOLD_MS,
             hold_probing_until: None,
+            delay_samples: std::collections::VecDeque::new(),
+            over_threshold: 0,
         }
     }
 }
@@ -236,7 +253,8 @@ impl Estimator {
         self.sent_bytes_per_sec = sent_bytes / interval_secs;
         self.network_blocked_fraction = (blocked_secs / (interval_secs * active_senders.max(1) as f64)).min(1.0);
         let holding = self.hold_probing_until.is_some_and(|until| now < until);
-        if queue_delay_ms.is_some_and(|delay| delay > DELAY_THRESHOLD_MS) && !holding {
+        let queued = self.queue_building(now, queue_delay_ms);
+        if queued && !holding {
             self.congested_at_bytes_per_sec = self.data_bytes_per_sec;
             self.data_bytes_per_sec *= DELAY_DECREASE;
             self.delay_events += 1;
@@ -255,6 +273,31 @@ impl Estimator {
             self.data_bytes_per_sec *= gain;
         }
         self.data_bytes_per_sec = self.data_bytes_per_sec.clamp(MIN_ESTIMATE, MAX_ESTIMATE);
+    }
+
+    /// Whether this interval's queue delay, and enough before it, stood above the path's jitter.
+    fn queue_building(&mut self, now: std::time::Instant, queue_delay_ms: Option<f64>) -> bool {
+        let Some(delay) = queue_delay_ms else { return false };
+        while self.delay_samples.front().is_some_and(|(at, _)| now.duration_since(*at) > JITTER_WINDOW) {
+            self.delay_samples.pop_front();
+        }
+        let mut recent: Vec<f64> = self.delay_samples.iter().map(|(_, delay)| *delay).collect();
+        // the path's own swing: twice its median queue delay (a median, so a queue that stands for
+        // less than half the window can't raise the bar it is measured against)
+        let jitter = if recent.is_empty() {
+            0.0
+        } else {
+            recent.sort_by(f64::total_cmp);
+            2.0 * recent[recent.len() / 2]
+        };
+        self.delay_threshold_ms = DELAY_THRESHOLD_MS + jitter;
+        self.delay_samples.push_back((now, delay));
+        if delay > self.delay_threshold_ms {
+            self.over_threshold += 1;
+        } else {
+            self.over_threshold = 0;
+        }
+        self.over_threshold >= DELAY_PERSISTENCE
     }
 }
 
@@ -363,15 +406,35 @@ mod tests {
     #[test]
     fn delay_cuts_and_holds() {
         let now = std::time::Instant::now();
+        let at = |interval: u64| now + std::time::Duration::from_millis(250 * interval);
         let mut estimator = Estimator::default();
-        estimator.update(sample(now, 0.25, 200_000.0, 0.0, 1, 5e6, Some(3.0)));
-        assert!((estimator.data_bytes_per_sec - 1_500_000.0).abs() < 1.0, "small RTT noise: keeps slow-starting");
-        estimator.update(sample(now, 0.25, 200_000.0, 0.0, 1, 5e6, Some(25.0)));
-        assert!((estimator.data_bytes_per_sec - 1_275_000.0).abs() < 1.0, "cut by 15%: {estimator:?}");
+        // a quiet path (1-2 ms of queue delay), demand capped so the estimate settles
+        for interval in 0..40 {
+            estimator.update(sample(at(interval), 0.25, 200_000.0, 0.0, 1, 1000.0, Some(1.0 + (interval % 2) as f64)));
+        }
+        let settled = estimator.data_bytes_per_sec;
+        estimator.update(sample(at(41), 0.25, 200_000.0, 0.0, 1, 1000.0, Some(25.0)));
+        assert_eq!(estimator.data_bytes_per_sec, settled, "one spike is not a queue: {estimator:?}");
+        estimator.update(sample(at(42), 0.25, 200_000.0, 0.0, 1, 1000.0, Some(40.0)));
+        assert!((estimator.data_bytes_per_sec - settled * 0.85).abs() < 1.0, "a second in a row is: cut by 15%: {estimator:?}");
         assert_eq!(estimator.delay_events, 1);
-        estimator.update(sample(now + std::time::Duration::from_millis(250), 0.25, 200_000.0, 0.0, 1, 5e6, Some(25.0)));
-        assert!((estimator.data_bytes_per_sec - 1_275_000.0).abs() < 1.0, "holds while the queue drains");
-        estimator.update(sample(now + std::time::Duration::from_millis(1100), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0)));
-        assert!((estimator.data_bytes_per_sec - 1_402_500.0).abs() < 1.0, "then probes again, 10% below 90% of the congestion level: {estimator:?}");
+        estimator.update(sample(at(43), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0)));
+        assert!((estimator.data_bytes_per_sec - settled * 0.85).abs() < 1.0, "holds while the queue drains");
+        estimator.update(sample(at(47), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0)));
+        assert!((estimator.data_bytes_per_sec - settled * 0.85 * 1.1).abs() < 1.0, "then probes again, 10% below 90% of the congestion level: {estimator:?}");
+    }
+
+    #[test]
+    fn a_jittery_idle_path_is_not_congestion() {
+        // RTT excess swinging between 5 and 90 ms with nothing queued (seen on Wi-Fi + VPN)
+        let now = std::time::Instant::now();
+        let mut estimator = Estimator::default();
+        let swings = [10.0, 74.0, 18.0, 5.0, 27.0, 32.0, 9.0, 56.0, 10.0, 28.0, 10.0, 45.0, 22.0, 2.0, 73.0, 22.0, 17.0, 11.0, 15.0, 68.0, 7.0, 23.0];
+        for (index, delay) in swings.iter().cycle().take(120).enumerate() {
+            estimator.update(sample(now + std::time::Duration::from_millis(250 * index as u64), 0.25, 20_000.0, 0.0, 1, 2e6, Some(*delay)));
+        }
+        assert!(estimator.delay_events <= 3, "{} delay events", estimator.delay_events);
+        assert!(estimator.data_bytes_per_sec >= 1_000_000.0, "the estimate stays up: {estimator:?}");
+        assert!(estimator.delay_threshold_ms > 30.0, "{estimator:?}");
     }
 }

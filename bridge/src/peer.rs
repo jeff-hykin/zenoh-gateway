@@ -34,6 +34,8 @@ const DEFAULT_LIST_PROBE_MS: u64 = 600;
 const ADMIN_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// A connection that stays `disconnected` this long is treated as gone.
 const DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
+/// Longest a shutdown waits for one browser connection to close.
+const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often each frontend's bandwidth is re-estimated and re-allocated.
 const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
 /// The RTT baseline is the minimum over this window.
@@ -67,6 +69,10 @@ struct BandwidthStats {
     queue_delay_ms: Option<f64>,
     min_rtt_ms: Option<f64>,
     delay_events: u64,
+    /// queue delay that counts as congestion (5 ms + 2 x the path's median jitter)
+    delay_threshold_ms: f64,
+    /// bulk bytes allowed in flight (`null`: no strict stream to protect, so no limit)
+    bulk_inflight_limit: Option<usize>,
     /// bytes/s reserved for strict-priority and reliable streams
     reserved_bytes_per_sec: f64,
     bulk_chunk_bytes: usize,
@@ -221,7 +227,9 @@ impl PeerState {
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.is_video).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
-        self.gate.configure((budget - reserved).max(0.0), min_rtt_ms);
+        // the in-flight limit only protects strict streams' latency; without one it only costs throughput
+        let strict_present = subscriptions.iter().any(|shared| shared.is_strict());
+        self.gate.configure((budget - reserved).max(0.0), min_rtt_ms, allocator::DELAY_THRESHOLD_MS, strict_present);
         let video_cap = video_estimate.min(budget);
         let allocations = allocate_within_video_cap(budget, video_cap, demands, &is_video);
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
@@ -236,6 +244,8 @@ impl PeerState {
             queue_delay_ms,
             min_rtt_ms,
             delay_events: estimator.delay_events,
+            delay_threshold_ms: estimator.delay_threshold_ms,
+            bulk_inflight_limit: self.gate.inflight_limit(),
             reserved_bytes_per_sec: reserved,
             bulk_chunk_bytes: self.gate.chunk_bytes(),
             demand_bytes_per_sec: total_demand,
@@ -418,8 +428,9 @@ impl Bridge {
         for entry in &peers {
             entry.state.fire_deadmen("shutdown").await;
         }
+        // a peer whose transport is already broken can take forever to close; never hold up exit
         for entry in peers {
-            let _ = entry.connection.close().await;
+            let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()).await;
         }
     }
 }
