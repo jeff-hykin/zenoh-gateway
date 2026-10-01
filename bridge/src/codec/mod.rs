@@ -4,8 +4,10 @@
 //! under its [`name`](Codec::name). A codec decodes a zenoh sample into a [`DecodedFrame`], then
 //! either hands the bridge raw video ([`CodecOutput::Video`]: the bridge scales it, encodes H.264
 //! and sends it on a WebRTC video track) or encodes bytes for the subscription's data channel at
-//! the quality the bandwidth allocator picked ([`CodecOutput::Data`]: the browser decodes them
-//! with a decoder registered through the client's `registerCodec`).
+//! the quality the bandwidth allocator picked: [`Fields`](crate::Fields), which the browser client
+//! decodes by itself ([`CodecOutput::Fields`]), or the codec's own format, decoded by a decoder
+//! registered through the client's `registerCodec` ([`CodecOutput::Data`]). Data-channel bytes may
+//! be zstd-compressed on the way ([`Compress`], [`Codec::default_compress`]).
 //!
 //! Work is lazy (only messages the pacing and queues let through) and runs on tokio's blocking
 //! pool. Decodes are shared across frontends by (codec, key, payload), data encodes by (codec,
@@ -29,6 +31,10 @@ pub enum CodecOutput {
     /// `msg.bytes` holds them and `msg.decoded` what the decoder registered for this codec's name
     /// (client `registerCodec(name, decoder)`) returned.
     Data,
+    /// A [`Fields`](crate::Fields) message from [`Codec::encode`], sent on the data channel; the
+    /// browser client decodes it into `msg.decoded` (an object of numbers, strings and typed arrays)
+    /// with no codec code in the page.
+    Fields,
 }
 
 impl CodecOutput {
@@ -37,6 +43,28 @@ impl CodecOutput {
         match self {
             CodecOutput::Video => "video",
             CodecOutput::Data => "data",
+            CodecOutput::Fields => "fields",
+        }
+    }
+}
+
+/// Compression of a subscription's data-channel messages (subscribe option `compress`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compress {
+    /// As encoded.
+    #[default]
+    None,
+    /// zstd level 3; a message that doesn't shrink is sent as is (each frame flags which it is).
+    Zstd,
+}
+
+impl Compress {
+    /// Blocking: the compressed bytes, or `None` when uncompressed or when that would not shrink them.
+    pub(crate) fn apply(self, bytes: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Compress::None => None,
+            Compress::Zstd => zstd::bulk::compress(bytes, 3).ok().filter(|compressed| compressed.len() < bytes.len()),
         }
     }
 }
@@ -127,7 +155,7 @@ impl VideoImage {
 pub enum DecodedFrame {
     /// A picture for the bridge's H.264 path ([`CodecOutput::Video`] codecs).
     Video(VideoImage),
-    /// Anything the codec's own [`encode`](Codec::encode) understands ([`CodecOutput::Data`]
+    /// Anything the codec's own [`encode`](Codec::encode) understands (data-channel
     /// codecs); build it with [`DecodedFrame::data`], read it back with [`DecodedFrame::downcast`].
     Data(Box<dyn Any + Send + Sync>),
 }
@@ -197,13 +225,19 @@ pub trait Codec: Send + Sync {
     /// Whether the output is video (the bridge's H.264 track) or bytes on the data channel.
     fn output(&self) -> CodecOutput;
 
+    /// Data-channel codecs: compression used when the subscription doesn't set `compress`
+    /// (e.g. [`Compress::Zstd`] for output that compresses well). Ignored for video.
+    fn default_compress(&self) -> Compress {
+        Compress::None
+    }
+
     /// Parses and decodes one sample. The result is shared by every frontend that receives this
     /// sample through this codec, at any quality. [`CodecOutput::Video`] codecs must return
     /// [`DecodedFrame::Video`] (any size: the bridge scales it per quality and keeps it even).
     /// An error skips the message and is counted in the subscription's `codecErrors` stats.
     fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame>;
 
-    /// [`CodecOutput::Data`] codecs: the bytes to send for `frame` at `quality` (0 = smallest,
+    /// Data-channel codecs: the bytes to send for `frame` at `quality` (0 = smallest,
     /// 1 = best, picked by the bandwidth allocator within the subscription's
     /// `minQuality..maxQuality`). Results are shared across frontends asking for the same
     /// quality (in 1/1000 steps). Video codecs never get this call.
@@ -212,8 +246,8 @@ pub trait Codec: Send + Sync {
         Err(anyhow!("codec {:?} has no data-channel encoder", self.name()))
     }
 
-    /// The allocator's prior for [`CodecOutput::Data`] codecs: expected bytes per encoded message
-    /// at `quality`, for a sample of `payload_bytes`. Used until sizes are measured, and after
+    /// The allocator's prior for data-channel codecs: expected bytes per message as sent (after
+    /// any compression) at `quality`, for a sample of `payload_bytes`. Used until sizes are measured, and after
     /// that as the shape between measured qualities (so it should be monotone in `quality`).
     /// The default assumes the output scales linearly from 10% to 100% of the payload. Video
     /// codecs are priced by the bridge from resolution and bits per pixel instead.

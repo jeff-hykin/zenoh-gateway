@@ -1,17 +1,5 @@
 {
     "tasks": {
-        "build": "deno run --allow-all tools/build_web.js build",
-        "check": "deno check client/zenoh_web.ts",
-        "e2e": "deno run --allow-all --unstable-net test/all.js",
-        "e2e:core": "deno run --allow-all test/e2e.js",
-        "e2e:codecs": "deno run --allow-all test/codecs.js",
-        "e2e:custom-codec": "deno run --allow-all test/custom_codec.js",
-        "e2e:allocation": "deno run --allow-all test/allocation.js",
-        "e2e:latency": "deno run --allow-all --unstable-net test/latency.js",
-        "e2e:abandoned": "deno run --allow-all test/abandoned.js",
-        "e2e:example": "deno run --allow-all test/example.js",
-        "e2e:throughput": "deno run --allow-all --unstable-net test/throughput.js",
-        "e2e:video-latency": "deno run --allow-all --unstable-net test/video_latency.js",
-        "sctp-baseline": "deno run --allow-all --unstable-net test/sctp_baseline.js"
+        "check": "deno check client/zenoh_web.ts"
     }
 }

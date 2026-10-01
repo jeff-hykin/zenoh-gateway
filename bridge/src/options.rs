@@ -1,7 +1,7 @@
 //! Data channel labels: `{"type":"sub"|"pub"|"heartbeat", "key":..., "id":..., "opts":{...}}`.
 
 use crate::codec::registry::CodecRegistry;
-use crate::codec::{Codec, CodecOutput};
+use crate::codec::{Codec, CodecOutput, Compress};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -46,6 +46,8 @@ pub struct SubOpts {
     pub max_quality: Option<f64>,
     pub quality_to_hz_tradeoff: Option<f64>,
     pub codec: Option<String>,
+    /// data-channel compression; unset = the codec's default (none without a codec)
+    pub compress: Option<Compress>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -119,14 +121,24 @@ impl SubOpts {
         Ok(())
     }
 
-    /// The subscription's codec from `registry` (None = raw); unknown names and video codecs on
-    /// reliable delivery are refused.
-    pub fn resolve_codec(&self, registry: &CodecRegistry) -> Result<Option<Arc<dyn Codec>>, String> {
-        let Some(name) = self.codec.as_deref() else { return Ok(None) };
+    /// The subscription's codec from `registry` (None = raw), filling `compress` in with the codec's
+    /// default; unknown names, and video codecs on reliable delivery or with zstd, are refused.
+    pub fn resolve_codec(&mut self, registry: &CodecRegistry) -> Result<Option<Arc<dyn Codec>>, String> {
+        let Some(name) = self.codec.as_deref() else {
+            self.compress.get_or_insert_default();
+            return Ok(None);
+        };
         let codec = registry.get(name)?;
-        if codec.output() == CodecOutput::Video && self.delivery == DeliveryKind::Reliable {
-            return Err(format!("{name} is a video codec: frames go over a lossy video track, use delivery \"latest\""));
+        if codec.output() == CodecOutput::Video {
+            if self.delivery == DeliveryKind::Reliable {
+                return Err(format!("{name} is a video codec: frames go over a lossy video track, use delivery \"latest\""));
+            }
+            if self.compress == Some(Compress::Zstd) {
+                return Err(format!("{name} is a video codec: H.264 is already compressed, compress must be \"none\""));
+            }
+            self.compress = Some(Compress::None);
         }
+        self.compress.get_or_insert(codec.default_compress());
         Ok(Some(codec))
     }
 
@@ -156,6 +168,7 @@ impl SubOpts {
             "maxQuality": self.max_quality.unwrap_or(1.0),
             "qualityToHzTradeoff": self.quality_to_hz_tradeoff.unwrap_or(0.5),
             "codec": self.codec,
+            "compress": self.compress.unwrap_or_default(),
         })
     }
 }
@@ -209,6 +222,10 @@ mod tests {
             self.1
         }
 
+        fn default_compress(&self) -> Compress {
+            Compress::Zstd
+        }
+
         fn decode(&self, _: &CodecSample<'_>) -> anyhow::Result<DecodedFrame> {
             anyhow::bail!("not decoded in these tests")
         }
@@ -232,13 +249,25 @@ mod tests {
         assert!(sub(r#"{"priority":9}"#).is_err());
         assert!(sub(r#"{"minQuality":0.8,"maxQuality":0.2}"#).is_err());
         assert!(sub(r#"{"qualityToHzTradeoff":2}"#).is_err());
-        let registry = CodecRegistry::new([Arc::new(Named("image", CodecOutput::Video)) as Arc<dyn Codec>, Arc::new(Named("depth", CodecOutput::Data))]).unwrap();
+        let registry = CodecRegistry::new([Arc::new(Named("camera", CodecOutput::Video)) as Arc<dyn Codec>, Arc::new(Named("table", CodecOutput::Data))]).unwrap();
         let resolve = |opts: &str| sub(opts).unwrap().resolve_codec(&registry).map(|codec| codec.map(|codec| codec.name().to_owned()));
+        let compress = |opts: &str| {
+            let mut parsed = sub(opts)?;
+            parsed.resolve_codec(&registry)?;
+            Ok::<_, String>(parsed.normalized()["compress"].as_str().unwrap().to_owned())
+        };
         assert!(resolve(r#"{"codec":"jpeg"}"#).unwrap_err().contains("unknown codec"));
-        assert!(resolve(r#"{"codec":"image","delivery":"reliable"}"#).unwrap_err().contains("video codec"), "video is lossy");
-        assert_eq!(resolve(r#"{"codec":"depth","delivery":"reliable"}"#).unwrap().as_deref(), Some("depth"));
+        assert!(resolve(r#"{"codec":"camera","delivery":"reliable"}"#).unwrap_err().contains("video codec"), "video is lossy");
+        assert_eq!(resolve(r#"{"codec":"table","delivery":"reliable"}"#).unwrap().as_deref(), Some("table"));
         assert_eq!(resolve(r#"{}"#).unwrap(), None);
-        assert!(sub(r#"{"codec":"image","imageTransport":"jpeg"}"#).is_err(), "JPEG files are gone");
+        assert!(sub(r#"{"codec":"camera","imageTransport":"jpeg"}"#).is_err(), "JPEG files are gone");
+        assert_eq!(compress(r#"{}"#).unwrap(), "none");
+        assert_eq!(compress(r#"{"compress":"zstd"}"#).unwrap(), "zstd", "raw topics compress too");
+        assert_eq!(compress(r#"{"codec":"table"}"#).unwrap(), "zstd", "the codec's default");
+        assert_eq!(compress(r#"{"codec":"table","compress":"none"}"#).unwrap(), "none", "an explicit option overrides it");
+        assert_eq!(compress(r#"{"codec":"camera"}"#).unwrap(), "none");
+        assert!(compress(r#"{"codec":"camera","compress":"zstd"}"#).unwrap_err().contains("already compressed"));
+        assert!(sub(r#"{"compress":"gzip"}"#).is_err());
         assert!(sub(r#"{"bandwidthPriority":-1}"#).is_err());
         assert!(sub(r#"{"dangerousMinHz":1}"#).is_err());
         let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"minQuality":0.3,"maxQuality":0.9,"qualityToHzTradeoff":0.7}"#).unwrap();

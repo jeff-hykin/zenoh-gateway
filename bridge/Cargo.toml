@@ -30,6 +30,8 @@ async-trait = "0.1"
 anyhow = "1"
 log = "0.4"
 futures = "0.3"
+# subscribe option compress: "zstd" (builds its C sources)
+zstd = "0.13"
 # H.264 video (openh264 builds its C sources)
 openh264 = "0.9"
 

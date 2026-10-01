@@ -4,6 +4,8 @@
 /// <reference lib="esnext" />
 // zenoh-web browser client: one WebRTC data channel per subscription/publisher, see SPEC.md
 
+import { decompress as zstdDecompress } from "./vendor/fzstd.ts"
+
 /** zenoh priorities (lower = more important). */
 export const Priority = Object.freeze({
     REAL_TIME: 1,
@@ -20,8 +22,8 @@ export type ConnectionState = "connecting" | "connected" | "degraded" | "lost"
 export type PublisherState = "connecting" | "open" | "tripped" | "rejected" | "closed"
 export type SubscriptionState = "connecting" | "open" | "rejected" | "closed"
 
-/** Where any codec's output goes: the bridge's H.264 video track, or bytes on the data channel. */
-export type CodecKind = "video" | "data"
+/** Where any codec's output goes: the bridge's H.264 video track, or bytes on the data channel (`fields`: decoded by this client). */
+export type CodecKind = "video" | "data" | "fields"
 
 /** A codec the bridge has registered. */
 export interface CodecInfo {
@@ -36,7 +38,7 @@ const codecDecoders = new Map<string, CodecDecoder>()
 
 /**
  * Registers the browser decoder for a data codec the bridge runs (a Rust codec the host
- * application added with `ServerBuilder::codec`, e.g. zenoh-dimos-codecs). Messages of subscriptions using that codec get
+ * application added with `ServerBuilder::codec`). Messages of subscriptions using that codec get
  * `msg.decoded = decoder(msg.bytes, msg)`. Video codecs need no decoder. Registering a different
  * decoder under a name that already has one throws.
  */
@@ -67,11 +69,11 @@ export interface VideoFrameInfo {
 
 export interface Message {
     key: string
-    /** the payload as sent: raw sample bytes, or the codec's wire format */
+    /** the payload (decompressed): raw sample bytes, or the codec's output */
     bytes: Uint8Array
     timestamp: number
     seq: number
-    /** data codecs: what the codec's registered decoder returned (see `registerCodec`) */
+    /** fields codecs: the decoded fields (see `decodeFields`); data codecs: what the codec's registered decoder returned (see `registerCodec`) */
     decoded?: unknown
     video?: VideoFrameInfo
     mediaStream?: MediaStream
@@ -89,6 +91,8 @@ export interface SubscribeOptions {
     qualityToHzTradeoff?: number
     /** a name the bridge registered (`ZenohWeb.codecs`) */
     codec?: string
+    /** data-channel compression (default: the codec's, none without one); not for video codecs */
+    compress?: "zstd" | "none"
 }
 
 export interface PublisherOptions {
@@ -167,6 +171,7 @@ interface ClockSample {
 interface PartialMessage {
     key: string
     timestamp: number
+    flags: number
     chunks: (Uint8Array | undefined)[]
     receivedChunks: number
     receivedBytes: number
@@ -238,12 +243,16 @@ export interface Frame {
     frameId: number
     chunkIndex: number
     chunkCount: number
+    /** bit0: the whole message is zstd-compressed */
+    flags: number
     chunk: Uint8Array
 }
 
+const zstdFlag = 1
+
 /**
  * Bridge frame (little endian):
- * u16 keyLen | key | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | chunk
+ * u16 keyLen | key | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk
  */
 export function decodeFrame(buffer: ArrayBuffer): Frame {
     const view = new DataView(buffer)
@@ -257,8 +266,59 @@ export function decodeFrame(buffer: ArrayBuffer): Frame {
         frameId: view.getUint32(offset + 12, true),
         chunkIndex: view.getUint32(offset + 16, true),
         chunkCount: view.getUint32(offset + 20, true),
-        chunk: new Uint8Array(buffer, offset + 24),
+        flags: view.getUint8(offset + 24),
+        chunk: new Uint8Array(buffer, offset + 25),
     }
+}
+
+/** A decoded fields value: one number, text, or the elements' values (scaled fields: Float32Array). */
+export type FieldValue = number | string | Uint8Array | Int8Array | Uint16Array | Int16Array | Uint32Array | Int32Array | Float32Array | Float64Array
+
+const fieldArrays = [Uint8Array, Int8Array, Uint16Array, Int16Array, Uint32Array, Int32Array, Float32Array, Float64Array]
+
+/**
+ * A fields message (SPEC "Fields") as an object of named values: scalar fields are numbers, text
+ * fields strings, others typed arrays viewing the message (copied once if misaligned).
+ */
+export function decodeFields(message: Uint8Array): Record<string, FieldValue> {
+    const bytes = message.byteOffset % 8 === 0 ? message : message.slice()
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    if (bytes[0] !== 1) {
+        throw new Error(`zenoh-web: unknown fields format version ${bytes[0]}`)
+    }
+    const fields: Record<string, FieldValue> = {}
+    let offset = 2
+    for (let field = 0; field < bytes[1]; field++) {
+        const name = keyDecoder.decode(bytes.subarray(offset + 1, offset + 1 + bytes[offset]))
+        offset += 1 + bytes[offset]
+        const [dtype, components, flags] = [bytes[offset], bytes[offset + 1], bytes[offset + 2]]
+        const length = view.getUint32(offset + 3, true) * components
+        offset += 7
+        if (dtype === 8) {
+            fields[name] = keyDecoder.decode(bytes.subarray(offset, offset + length))
+            offset += length
+            continue
+        }
+        const TypedArray = fieldArrays[dtype]
+        if (TypedArray === undefined) {
+            throw new Error(`zenoh-web: field ${name} has unknown dtype ${dtype}`)
+        }
+        const scaling = (flags & 1) === 1 ? Array.from({ length: 2 * components }, (_, index) => view.getFloat64(offset + 8 * index, true)) : null
+        offset += scaling === null ? 0 : 16 * components
+        offset = Math.ceil(offset / TypedArray.BYTES_PER_ELEMENT) * TypedArray.BYTES_PER_ELEMENT
+        let values: FieldValue = new TypedArray(bytes.buffer as ArrayBuffer, bytes.byteOffset + offset, length)
+        offset += length * TypedArray.BYTES_PER_ELEMENT
+        if (scaling !== null) {
+            const quantized = values
+            values = new Float32Array(length)
+            for (let index = 0; index < length; index++) {
+                const component = index % components
+                values[index] = scaling[component] + quantized[index] * scaling[components + component]
+            }
+        }
+        fields[name] = (flags & 2) === 2 ? values[0] : values
+    }
+    return fields
 }
 
 /** Video metadata frame (28 bytes) sent on a video subscription's channel per frame. */
@@ -512,7 +572,7 @@ export class Subscription extends Endpoint {
 
     #onFrame(channel: RTCDataChannel, frame: Frame, frameBytes: number): void {
         if (frame.chunkCount <= 1) {
-            this.#deliver({ key: frame.key, bytes: frame.chunk, timestamp: frame.timestamp, seq: frame.seq })
+            this.#deliver({ key: frame.key, bytes: frame.chunk, timestamp: frame.timestamp, seq: frame.seq }, frame.flags)
         } else {
             this.#addChunk(frame)
         }
@@ -522,7 +582,7 @@ export class Subscription extends Endpoint {
     #addChunk(frame: Frame): void {
         let partial = this.#partials.get(frame.seq)
         if (!partial) {
-            partial = { key: frame.key, timestamp: frame.timestamp, chunks: new Array(frame.chunkCount), receivedChunks: 0, receivedBytes: 0 }
+            partial = { key: frame.key, timestamp: frame.timestamp, flags: frame.flags, chunks: new Array(frame.chunkCount), receivedChunks: 0, receivedBytes: 0 }
             this.#partials.set(frame.seq, partial)
             this.#evictPartials(maxPartialMessages)
         }
@@ -550,7 +610,7 @@ export class Subscription extends Endpoint {
                 this.partialDropped++
             }
         }
-        this.#deliver({ key: partial.key, bytes, timestamp: partial.timestamp, seq: frame.seq })
+        this.#deliver({ key: partial.key, bytes, timestamp: partial.timestamp, seq: frame.seq }, partial.flags)
     }
 
     #evictPartials(limit: number): void {
@@ -570,7 +630,7 @@ export class Subscription extends Endpoint {
                 return true
             }
             const name = String(this.options.codec)
-            const decoder = codecDecoders.get(name)
+            const decoder = codecDecoders.get(name) ?? (this.codecKind === "fields" ? decodeFields : undefined)
             if (decoder !== undefined) {
                 message.decoded = decoder(message.bytes, message)
             } else if (!this.#warnedNoDecoder) {
@@ -585,7 +645,16 @@ export class Subscription extends Endpoint {
         }
     }
 
-    #deliver(message: Message): void {
+    #deliver(message: Message, flags: number): void {
+        if ((flags & zstdFlag) !== 0) {
+            try {
+                message.bytes = zstdDecompress(message.bytes) as Uint8Array
+            } catch (error) {
+                this.decodeErrors++
+                console.error(`zenoh-web: zstd message on ${message.key} did not decompress`, error)
+                return
+            }
+        }
         if (this.codecKind !== null && !this.#decode(message)) {
             return
         }

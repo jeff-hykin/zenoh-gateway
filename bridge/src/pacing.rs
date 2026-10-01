@@ -188,27 +188,27 @@ impl SendGate {
 pub struct TokenBucket {
     rate: Option<f64>,
     tokens: f64,
-    depth: f64,
+    capacity: f64,
     refilled: Instant,
 }
 
 impl Default for TokenBucket {
     fn default() -> Self {
-        TokenBucket { rate: None, tokens: 0.0, depth: MAX_CHUNK_BYTES as f64, refilled: Instant::now() }
+        TokenBucket { rate: None, tokens: 0.0, capacity: MAX_CHUNK_BYTES as f64, refilled: Instant::now() }
     }
 }
 
 impl TokenBucket {
-    pub fn set_rate(&mut self, rate: Option<f64>, depth: usize) {
+    pub fn set_rate(&mut self, rate: Option<f64>, capacity: usize) {
         self.refill(Instant::now());
         self.rate = rate.map(|rate| rate.max(1000.0));
-        self.depth = depth as f64;
-        self.tokens = self.tokens.min(self.depth);
+        self.capacity = capacity as f64;
+        self.tokens = self.tokens.min(self.capacity);
     }
 
     fn refill(&mut self, now: Instant) {
         if let Some(rate) = self.rate {
-            self.tokens = (self.tokens + rate * now.duration_since(self.refilled).as_secs_f64()).min(self.depth);
+            self.tokens = (self.tokens + rate * now.duration_since(self.refilled).as_secs_f64()).min(self.capacity);
         }
         self.refilled = now;
     }

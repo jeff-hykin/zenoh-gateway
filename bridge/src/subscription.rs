@@ -3,7 +3,7 @@
 
 use crate::allocator::{Allocation, Demand};
 use crate::codec::registry::{self, CodecRegistry};
-use crate::codec::{Codec, CodecOutput, CodecSample};
+use crate::codec::{Codec, CodecOutput, CodecSample, Compress};
 use crate::frame;
 use crate::options::{Delivery, Label, SubOpts};
 use crate::pacing::{PACING_SLACK, SendGate, TokenBucket};
@@ -173,6 +173,7 @@ pub struct SubShared {
     min_interval: Option<Duration>,
     priority_override: Option<u8>,
     pub codec: Option<Arc<dyn Codec>>,
+    compress: Compress,
     /// the server's codecs, with the caches that share work across frontends
     pub codecs: Arc<CodecRegistry>,
     max_hz: Option<f64>,
@@ -218,6 +219,7 @@ impl SubShared {
             min_interval: opts.min_interval(),
             priority_override: opts.priority,
             codec,
+            compress: opts.compress.unwrap_or_default(),
             codecs,
             max_hz: opts.max_hz,
             bandwidth_priority: opts.bandwidth_priority.unwrap_or(1.0),
@@ -652,34 +654,57 @@ impl Pacer {
     }
 }
 
-/// A message's bytes as sent: the sample payload, or a transcoder's output.
+/// A message's bytes as sent: the sample payload (maybe compressed), or a transcoder's output.
 enum Body<'a> {
     Raw(std::borrow::Cow<'a, [u8]>),
-    Encoded(Arc<Vec<u8>>),
+    Compressed(Vec<u8>),
+    Encoded(Arc<registry::Encoded>),
 }
 
 impl Body<'_> {
     fn bytes(&self) -> &[u8] {
         match self {
             Body::Raw(bytes) => bytes,
-            Body::Encoded(bytes) => bytes,
+            Body::Compressed(bytes) => bytes,
+            Body::Encoded(encoded) => &encoded.bytes,
+        }
+    }
+
+    /// The frame header's flags.
+    fn flags(&self) -> u8 {
+        match self {
+            Body::Compressed(_) => frame::ZSTD,
+            Body::Encoded(encoded) if encoded.compressed => frame::ZSTD,
+            _ => 0,
         }
     }
 }
 
+/// A raw payload, zstd-compressed off the async runtime when the subscription asks for it.
+async fn raw_body(compress: Compress, item: &Pending) -> Body<'_> {
+    if compress != Compress::None {
+        let payload = item.payload.clone();
+        if let Ok(Some(compressed)) = tokio::task::spawn_blocking(move || compress.apply(&payload.to_bytes())).await {
+            return Body::Compressed(compressed);
+        }
+    }
+    Body::Raw(item.payload.to_bytes())
+}
+
 /// Transcodes off the async runtime (shared with other frontends asking for the same encode).
-async fn encode(shared: &SubShared, codec: Arc<dyn Codec>, key: &str, item: &Pending) -> Option<Arc<Vec<u8>>> {
+async fn encode(shared: &SubShared, codec: Arc<dyn Codec>, key: &str, item: &Pending) -> Option<Arc<registry::Encoded>> {
     let quality = shared.current_quality();
     let payload = item.payload.to_bytes().into_owned();
-    let (key, encoding, codecs) = (key.to_owned(), item.encoding.clone(), shared.codecs.clone());
+    let (key, encoding, codecs, compress) = (key.to_owned(), item.encoding.clone(), shared.codecs.clone(), shared.compress);
     let outcome = tokio::task::spawn_blocking(move || {
         let sample = CodecSample::new(&key, &payload, &encoding);
-        codecs.encode_shared(&*codec, &sample, registry::sample_hash(&sample), quality)
+        codecs.encode_shared(&*codec, &sample, registry::sample_hash(&sample), quality, compress)
     })
     .await;
     match outcome {
         Ok((Ok(encoded), reused)) => {
-            shared.record_encode(registry::quality_bucket(quality), quality, encoded.len(), reused);
+            // the price model learns the bytes actually sent, after compression
+            shared.record_encode(registry::quality_bucket(quality), quality, encoded.bytes.len(), reused);
             Some(encoded)
         }
         Ok((Err(error), _)) => {
@@ -707,9 +732,9 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
                 Some(encoded) => Body::Encoded(encoded),
                 None => continue,
             },
-            None => Body::Raw(item.payload.to_bytes()),
+            None => raw_body(shared.compress, &item).await,
         };
-        if sender.send(&dc, &shared, &key, &item, body.bytes()).await == Sent::Closed {
+        if sender.send(&dc, &shared, &key, &item, body.bytes(), body.flags()).await == Sent::Closed {
             return;
         }
     }
@@ -738,7 +763,7 @@ impl MessageSender {
         MessageSender { pacer: Pacer { probe_interval: FIRST_PROBE_AFTER, acks_seen: 0, resume_bytes: BACKED_UP_BYTES / 2 }, next_frame_id: 0, warned_send_error: false }
     }
 
-    pub async fn send(&mut self, dc: &Arc<dyn DataChannel>, shared: &SubShared, key: &str, item: &Pending, payload: &[u8]) -> Sent {
+    pub async fn send(&mut self, dc: &Arc<dyn DataChannel>, shared: &SubShared, key: &str, item: &Pending, payload: &[u8], flags: u8) -> Sent {
         // strict: whole message at once, bulk held off meanwhile; bulk: small paced chunks
         let strict_turn = shared.is_strict().then(|| shared.gate.strict_turn());
         let chunk_bytes = if strict_turn.is_some() { frame::CHUNK_BYTES } else { shared.gate.chunk_bytes() };
@@ -753,7 +778,7 @@ impl MessageSender {
             }
             let frame_id = self.next_frame_id;
             self.next_frame_id = self.next_frame_id.wrapping_add(1);
-            let header = frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index, chunk_count };
+            let header = frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index, chunk_count, flags };
             let frame = frame::encode(&header, frame::chunk(payload, chunk_index, chunk_bytes));
             let frame_len = frame.len();
             if strict_turn.is_none() {
@@ -805,7 +830,7 @@ impl MessageSender {
 
 /// Sends one small frame (e.g. a video frame's metadata) without pacing; returns its size.
 pub async fn send_small_frame(dc: &Arc<dyn DataChannel>, key: &str, item: &Pending, frame_id: u32, payload: &[u8]) -> Result<usize, webrtc::error::Error> {
-    let header = frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index: 0, chunk_count: 1 };
+    let header = frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index: 0, chunk_count: 1, flags: 0 };
     let frame = frame::encode(&header, payload);
     let length = frame.len();
     dc.send(frame).await.map(|_| length)
@@ -886,6 +911,26 @@ mod tests {
         let (next, _) = shared.pick(t0 + Duration::from_millis(500));
         assert!(next.is_none());
         assert_eq!(shared.stats().dropped_age, 1);
+    }
+
+    #[tokio::test]
+    async fn raw_payloads_compress_when_asked_and_when_it_shrinks() {
+        let item = |payload: Vec<u8>| Pending { payload: ZBytes::from(payload), ..pending(0, 5, Instant::now()) };
+        let text = item(b"zenoh ".repeat(1000));
+        let body = raw_body(Compress::Zstd, &text).await;
+        assert_eq!(body.flags(), frame::ZSTD);
+        assert_eq!(zstd::bulk::decompress(body.bytes(), 6000).unwrap(), b"zenoh ".repeat(1000));
+        assert_eq!(raw_body(Compress::None, &text).await.flags(), 0);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let noise: Vec<u8> = (0..4096).map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        }).collect();
+        let noisy = item(noise.clone());
+        let body = raw_body(Compress::Zstd, &noisy).await;
+        assert_eq!((body.flags(), body.bytes()), (0, &noise[..]), "incompressible bytes go as they are");
     }
 
     #[test]

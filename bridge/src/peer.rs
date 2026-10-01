@@ -511,7 +511,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
         state.channels.lock().unwrap().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
     let rejected = match label.kind.as_str() {
-        "sub" => match SubOpts::parse(&label.opts).and_then(|opts| {
+        "sub" => match SubOpts::parse(&label.opts).and_then(|mut opts| {
             let codec = opts.resolve_codec(&state.codecs)?;
             let video = bind_video(&state, codec.as_deref(), &label)?;
             Ok((opts, codec, video))

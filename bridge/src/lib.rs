@@ -5,7 +5,7 @@
 //! deadmen. The browser side is `client/zenoh_web.ts` in the repository.
 //!
 //! This crate is the library for embedding the server in an application; the `zenoh-web` command
-//! (with the ROS 2 / dimos codecs) is [zenoh-web-cli](https://github.com/jeff-hykin/zenoh-web-cli):
+//! (with a set of robotics codecs) is [zenoh-web-cli](https://github.com/jeff-hykin/zenoh-web-cli):
 //!
 //! ```no_run
 //! # async fn run() -> anyhow::Result<()> {
@@ -28,15 +28,19 @@
 //! # Codecs
 //!
 //! A subscription may pick a transcoder by name (`codec: "<name>"`). The server has none built in:
-//! implement [`Codec`] and pass it to [`ServerBuilder::codec`] (the ROS 2 / dimos ones are
+//! implement [`Codec`] and pass it to [`ServerBuilder::codec`] (e.g. the robotics ones of
 //! [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)). A codec either produces [`VideoImage`]s, which the bridge turns
-//! into H.264 on a video track (no browser code needed), or bytes for the data channel, which the
-//! page decodes with a decoder registered through the client's `registerCodec(name, decoder)`.
+//! into H.264 on a video track (no browser code needed), or bytes for the data channel: a
+//! [`Fields`] message the client decodes by itself, or the codec's own format, which the page
+//! decodes with a decoder registered through the client's `registerCodec(name, decoder)`. Data
+//! channel messages can be zstd-compressed per subscription (`compress: "zstd"`, or the codec's
+//! [`Codec::default_compress`]).
 
 #![warn(missing_docs)]
 
 mod allocator;
 mod codec;
+pub mod fields;
 mod frame;
 mod options;
 mod pacing;
@@ -46,7 +50,8 @@ mod server;
 mod subscription;
 mod video;
 
-pub use codec::{Codec, CodecOutput, CodecSample, DecodedFrame, PixelFormat, VideoImage};
+pub use codec::{Codec, CodecOutput, CodecSample, Compress, DecodedFrame, PixelFormat, VideoImage};
+pub use fields::Fields;
 pub use server::{DEFAULT_PORT, HEALTH_PATH, RunningServer, Server, ServerBuilder};
 /// The zenoh version this crate is built against (for [`ServerBuilder::session`] and
 /// [`ServerBuilder::zenoh_config`]).

@@ -93,10 +93,11 @@ The bridge checks options: an unknown name or a bad value rejects the subscripti
 | `minQuality`, `maxQuality` | 0, 1 | quality bounds for codec streams |
 | `qualityToHzTradeoff` | 0.5 | 0 = keep quality, drop Hz; 1 = keep Hz, drop quality |
 | `codec` | none (raw bytes) | a name from `z.codecs` (see "Codecs"); the bridge rejects unknown names, listing its codecs |
+| `compress` | the codec's (none without one) | `"zstd"` or `"none"`: zstd-compress each data-channel message (raw topics too); the client decompresses, so `msg.bytes` is always plain. Rejected on video codecs |
 
 `Subscription`: `ready()` (resolves when the bridge accepted it and the channel is open, rejects with
 the bridge's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"`), `mediaStream`
-(video codecs), `codecKind` (`"video"`, `"data"` or `null`), `received`, `dropped`, `partialDropped`,
+(video codecs), `codecKind` (`"video"`, `"fields"`, `"data"` or `null`), `received`, `dropped`, `partialDropped`,
 `decodeErrors`, `bridgeStats`, `close()`.
 
 ### Publisher options and methods
@@ -112,21 +113,25 @@ the bridge's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"
 `clearDeadman()`, `state` (`"connecting"`, `"open"`, `"tripped"`, `"rejected"`, `"closed"`),
 `onTripped(fn)`, `tripReason`, `sent`, `dropped`, `ready()`, `close()`.
 
-`registerCodec(name, decoder)` supplies the browser decoder of a data codec the bridge's host
+A **fields** codec's messages arrive decoded as `msg.decoded`, an object of numbers, strings and
+typed arrays (`decodeFields`, SPEC "Fields"). `registerCodec(name, decoder)` supplies the browser decoder of a data codec the bridge's host
 application added (see [Custom codecs](#custom-codecs)): each message then gets
 `msg.decoded = decoder(msg.bytes, msg)`. Without a decoder, `msg.bytes` still carries the codec's
 bytes (and the page warns once). Video codecs need no decoder.
 
 Also exported: `Priority` (`REAL_TIME` 1, `INTERACTIVE_HIGH` 2, `INTERACTIVE_LOW` 3, `DATA_HIGH` 4,
-`DATA` 5, `DATA_LOW` 6, `BACKGROUND` 7) and the wire helpers `decodeFrame`, `decodeVideoFrameInfo`,
+`DATA` 5, `DATA_LOW` 6, `BACKGROUND` 7) and the wire helpers `decodeFrame`, `decodeFields`, `decodeVideoFrameInfo`,
 `encodePut`.
 
 ## Codecs
 
 Picked explicitly per subscription; there is no auto-detection and none is built in. No codec = raw
 bytes, rate is the only degradation. A **video** codec hands the bridge pictures, which it scales to
-the allocated quality and sends as H.264 on a video track (`sub.mediaStream`, `msg.video`); a **data**
-codec sends its own bytes, which the page decodes with `registerCodec`.
+the allocated quality and sends as H.264 on a video track (`sub.mediaStream`, `msg.video`); a
+**fields** codec sends named numbers and arrays (built with `zenoh_web::Fields`) that the client
+decodes into `msg.decoded` itself; a **data** codec sends its own bytes, which the page decodes with
+`registerCodec`. A codec can ask for zstd by default (`Codec::default_compress`, e.g. depth and point
+clouds); the `compress` option overrides it.
 
 ## Use as a Rust library
 
@@ -165,10 +170,11 @@ is already running on a port before starting its own (`zenoh_web::HEALTH_PATH`).
 Implement `zenoh_web::Codec`: decode a zenoh sample (key, payload, encoding) once, then produce
 either **video** (`DecodedFrame::Video(VideoImage::rgb8(..)` or `::i420(..))`: the bridge scales it
 to the allocated quality, encodes H.264 and sends it on a video track, so the page just shows
-`sub.mediaStream`) or **data** (`encode(frame, quality)` returns bytes for the data channel; the
-page decodes them with `registerCodec`). Decodes are shared across browsers per sample, data encodes
-per (sample, quality). `estimated_bytes(payload_bytes, quality)` is an optional cost model for the
-allocator.
+`sub.mediaStream`) or bytes for the data channel from `encode(frame, quality)`: **fields** (built
+with `zenoh_web::Fields`, decoded by the client with no page code) or **data** (any format; the page
+decodes it with `registerCodec`). Decodes are shared across browsers per sample, data encodes per
+(sample, quality, compression). `estimated_bytes(payload_bytes, quality)` is an optional cost model
+for the allocator, `default_compress()` the compression used when a subscription sets none.
 
 ```rust
 use zenoh_web::{Codec, CodecOutput, CodecSample, DecodedFrame};

@@ -1,11 +1,14 @@
 //! Bridge -> browser frame, little endian:
-//! `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | chunk bytes`.
+//! `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk bytes`.
 //! `seq` numbers messages per channel; a message larger than one chunk is split across frames
 //! that share its `seq` (chunk size is per message, at most `CHUNK_BYTES`). `frameId` numbers frames per channel; the page acks frameIds.
+//! `flags` bit0 ([`ZSTD`]): the whole message (all its chunks joined) is zstd-compressed.
 
 use bytes::{BufMut, BytesMut};
 
-pub const HEADER_FIXED_LEN: usize = 2 + 8 + 4 + 4 + 4 + 4;
+pub const HEADER_FIXED_LEN: usize = 2 + 8 + 4 + 4 + 4 + 4 + 1;
+/// `flags` bit: the message is zstd-compressed.
+pub const ZSTD: u8 = 1;
 /// Payload bytes per frame; well under the 256 KiB SCTP message limit, small enough to interleave.
 pub const CHUNK_BYTES: usize = 64 * 1024;
 
@@ -16,6 +19,7 @@ pub struct FrameHeader<'a> {
     pub frame_id: u32,
     pub chunk_index: u32,
     pub chunk_count: u32,
+    pub flags: u8,
 }
 
 pub fn chunk_count(payload_len: usize, chunk_bytes: usize) -> u32 {
@@ -32,6 +36,7 @@ pub fn encode(header: &FrameHeader, chunk: &[u8]) -> BytesMut {
     frame.put_u32_le(header.frame_id);
     frame.put_u32_le(header.chunk_index);
     frame.put_u32_le(header.chunk_count);
+    frame.put_u8(header.flags);
     frame.put_slice(chunk);
     frame
 }
@@ -48,7 +53,7 @@ mod tests {
 
     #[test]
     fn layout() {
-        let header = FrameHeader { key: "a/b", timestamp_ms: 1.5, seq: 7, frame_id: 9, chunk_index: 1, chunk_count: 3 };
+        let header = FrameHeader { key: "a/b", timestamp_ms: 1.5, seq: 7, frame_id: 9, chunk_index: 1, chunk_count: 3, flags: ZSTD };
         let frame = encode(&header, &[9, 9]);
         assert_eq!(&frame[0..2], &3u16.to_le_bytes());
         assert_eq!(&frame[2..5], b"a/b");
@@ -57,7 +62,8 @@ mod tests {
         assert_eq!(&frame[17..21], &9u32.to_le_bytes());
         assert_eq!(&frame[21..25], &1u32.to_le_bytes());
         assert_eq!(&frame[25..29], &3u32.to_le_bytes());
-        assert_eq!(&frame[29..], &[9, 9]);
+        assert_eq!(frame[29], ZSTD);
+        assert_eq!(&frame[30..], &[9, 9]);
     }
 
     #[test]

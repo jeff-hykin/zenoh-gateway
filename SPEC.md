@@ -35,6 +35,7 @@ const sub = z.subscribe("camera/**", {
     maxQuality: 1.0,
     qualityToHzTradeoff: 0.7,    // 0 = keep quality, drop hz; 1 = keep hz, drop quality
     codec: "ros2-image",         // optional transcoder the bridge registered (z.codecs), see "Codecs"
+    compress: "zstd",            // or "none"; default: the codec's (none without one), see "Compression"
 }, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.decoded, msg.video, msg.mediaStream })
 sub.mediaStream  // video codecs: a MediaStream for a <video> element
 sub.close()
@@ -139,17 +140,22 @@ degradation). There is no auto-detection and none is built in: the application e
 registers codecs by name (`ServerBuilder::codec`; a name registered twice fails the build), e.g. the
 ROS 2 / dimos image, depth and point cloud codecs of
 [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs). The client fetches the
-registry on connect (`control` op `codecs` → `{codecs: [{name, output}]}`, as `z.codecs`); the bridge
+registry on connect (`control` op `codecs` → `{codecs: [{name, output}]}`, output `"video"`, `"fields"` or `"data"`, as `z.codecs`); the bridge
 refuses an unknown name (`rejected` event, listing the known names).
 
 Every codec implements one Rust trait (`zenoh_web::Codec`):
 
-- `name()`, and `output()`: **video** or **data**.
+- `name()`, and `output()`: **video**, **fields** or **data**.
 - `decode(sample)`: the sample's key, payload and zenoh encoding → a decoded frame. A video codec's
   frame is a picture (packed RGB8 or planar I420, any size).
-- data codecs: `encode(frame, quality)` → the bytes sent on the data channel (quality 0..1, from the
-  allocator). The page decodes them with the decoder registered for that name
-  (`registerCodec(name, decoder)` → `msg.decoded`); without one it gets `msg.bytes` (and a warning).
+- fields and data codecs: `encode(frame, quality)` → the bytes sent on the data channel (quality
+  0..1, from the allocator). A **fields** codec builds them with `zenoh_web::Fields` (see "Fields") and
+  the client decodes them into `msg.decoded` by itself. A **data** codec uses its own format, which the
+  page decodes with the decoder registered for that name (`registerCodec(name, decoder)` →
+  `msg.decoded`); without one it gets `msg.bytes` (and a warning). A registered decoder also overrides
+  a fields codec's automatic decoding.
+- `default_compress()`: compression for the codec's messages when the subscription doesn't set
+  `compress` (default none; zenoh-dimos-codecs' depth and point clouds use zstd).
 - video codecs: the bridge scales the picture to the allocated quality, encodes H.264 and sends it on
   the subscription's video track (see "Video"); the page needs no codec code. They require
   `delivery: "latest"`.
@@ -171,9 +177,36 @@ Video: scaling is a box filter, RGB → I420 integer BT.601, H.264 openh264.
 Work happens lazily and on send: only messages the pacing/queues let through are transcoded, on
 tokio's blocking pool. Work is shared across frontends through two small caches per bridge: decoded
 frames keyed by (codec, key + payload hash), and data-channel encodes keyed by (codec, quality in
-1/1000 steps, key + payload hash). Identical requests compute once (`encodes` vs `sharedEncodes` in
+1/1000 steps, key + payload hash, compression). Identical requests compute once (`encodes` vs `sharedEncodes` in
 stats: data codecs count shared encodes, video codecs shared decodes). Each (frontend, subscription)
 has its own H.264 encoder, because rate control and reference frames are per receiver.
+
+### Fields
+
+The format of **fields** codecs: named numbers, text and arrays the client turns into a plain object.
+Little endian: `u8 version=1 | u8 fieldCount`, then per field `u8 nameLen | name utf8 | u8 dtype |
+u8 components (1..4) | u8 flags | u32 count | [scaled: f64 offset[components] | f64 scale[components]] |
+zero padding | count × components values`.
+- dtype: 0 u8, 1 i8, 2 u16, 3 i16, 4 u32, 5 i32, 6 f32, 7 f64, 8 utf8 (text; `count` bytes).
+- flags: bit0 **scaled** (integer dtypes only), bit1 **scalar** (one value).
+- The padding puts the values at a multiple of the dtype's size from the message start, so the client
+  views them in place (it copies a message once if its buffer is misaligned).
+- Decoded: a scalar is a `number`, text a `string`, a scaled field a `Float32Array` of
+  `offset[c] + value × scale[c]` (c = index mod components), anything else the dtype's typed array
+  (`Uint8Array` … `Float64Array`), components interleaved.
+- Rust: `Fields::new().scalar("width", w).array("data", &values).vectors("origin", 3, &xyz)
+  .scaled("positions", &origin, &scale, &quantized).text("encoding", "16UC1").build()`;
+  `zenoh_web::fields::parse` reads one back.
+
+### Compression
+
+Subscribe option `compress`: `"zstd"` or `"none"`; unset, the codec's `default_compress()` (none
+without a codec). It applies to raw topics and to fields and data codecs: the bridge compresses each
+message (zstd level 3, on tokio's blocking pool, shared across frontends with the encode) and the
+client decompresses it before decoding or handing it on, so `msg.bytes` is always uncompressed. A
+message zstd would not shrink is sent as is; each frame's `flags` says which. The price model learns
+the compressed sizes from what is sent. Video codecs are already compressed (H.264): `compress: "zstd"`
+on one is rejected, `"none"` accepted, their default ignored.
 
 ### Video
 
@@ -325,13 +358,14 @@ resolving so the bridge has an offset before the first put.
 - One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
   `codecs`, `renegotiate`, `setDeadman`, `clearDeadman`) and events: `accepted` / `rejected`
   (per sub/pub channel, by label id) and `tripped`.
-- Bridge → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | chunk`,
+- Bridge → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk`,
   little endian. `seq` numbers messages per channel, `frameId` numbers frames; the page acks the highest
-  `frameId` it has processed with a 4-byte `u32` message on the same channel.
+  `frameId` it has processed with a 4-byte `u32` message on the same channel. `flags` bit0: the
+  message (its chunks joined) is zstd-compressed.
 - All chunks of one message have the same size, at most 64 KiB (bulk streams use smaller ones, see
   "Bandwidth allocation").
 - Browser → bridge put: `f64 sentAtMs (browser clock) | payload`, little endian.
 - Heartbeat: browser sends `{"t0", "offsetMs", "rttMs"}` (JSON), bridge answers `{"t0", "t1", "t2"}`.
 - Video `sub` label: adds `"mid"`. Video metadata frame (little endian): `u8 version=1 | u8 flags
   (bit0 keyframe) | u16 0 | u32 width | u32 height | u32 sourceWidth | u32 sourceHeight | f32 quality |
-  u32 encodedBytes`. A data codec's payload is the codec's own format.
+  u32 encodedBytes`. A fields codec's payload is "Fields", a data codec's its own format.

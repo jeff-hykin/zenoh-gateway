@@ -1,6 +1,6 @@
 //! The server's codecs by name, and the caches that share decodes and encodes across frontends.
 
-use super::{Codec, CodecOutput, CodecSample, DecodedFrame};
+use super::{Codec, CodecOutput, CodecSample, Compress, DecodedFrame};
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -67,7 +67,13 @@ pub fn quality_bucket(quality: f64) -> u16 {
 pub struct CodecRegistry {
     codecs: BTreeMap<String, Arc<dyn Codec>>,
     decoded: WorkCache<(String, u64), DecodedFrame>,
-    encoded: WorkCache<(String, u16, u64), Vec<u8>>,
+    encoded: WorkCache<(String, u16, u64, Compress), Encoded>,
+}
+
+/// A data codec's output as sent: `compressed` when `bytes` are its zstd.
+pub struct Encoded {
+    pub bytes: Vec<u8>,
+    pub compressed: bool,
 }
 
 impl CodecRegistry {
@@ -107,12 +113,16 @@ impl CodecRegistry {
         })
     }
 
-    /// Blocking: a data codec's bytes for `sample` at `quality` (or another frontend's identical
-    /// encode). `true` = reused.
-    pub fn encode_shared(&self, codec: &dyn Codec, sample: &CodecSample<'_>, hash: u64, quality: f64) -> (Result<Arc<Vec<u8>>, String>, bool) {
-        self.encoded.get_or_compute((codec.name().to_owned(), quality_bucket(quality), hash), || {
+    /// Blocking: a data codec's bytes for `sample` at `quality`, compressed as asked (or another
+    /// frontend's identical encode). `true` = reused.
+    pub fn encode_shared(&self, codec: &dyn Codec, sample: &CodecSample<'_>, hash: u64, quality: f64, compress: Compress) -> (Result<Arc<Encoded>, String>, bool) {
+        self.encoded.get_or_compute((codec.name().to_owned(), quality_bucket(quality), hash, compress), || {
             let (frame, _) = self.decode_shared(codec, sample, hash);
-            codec.encode(&*frame?, quality).map_err(|error| format!("{error:#}"))
+            let bytes = codec.encode(&*frame?, quality).map_err(|error| format!("{error:#}"))?;
+            Ok(match compress.apply(&bytes) {
+                Some(compressed) => Encoded { bytes: compressed, compressed: true },
+                None => Encoded { bytes, compressed: false },
+            })
         })
     }
 }
@@ -143,7 +153,7 @@ mod tests {
         for name in ["other", "custom"] {
             assert_eq!(registry.get(name).unwrap().name(), name);
         }
-        let error = registry.get("ros2-jpeg").err().unwrap();
+        let error = registry.get("missing").err().unwrap();
         assert!(error.contains("unknown codec") && error.contains("other") && error.contains("custom"), "{error}");
         let duplicate = CodecRegistry::new([Arc::new(Named("custom")) as Arc<dyn Codec>, Arc::new(Named("custom"))]).err().unwrap();
         assert!(duplicate.to_string().contains("registered twice"), "{duplicate}");
@@ -170,9 +180,46 @@ mod tests {
         let encoding = zenoh::bytes::Encoding::default();
         let sample = CodecSample::new("a/b", b"xyz", &encoding);
         let hash = sample_hash(&sample);
-        let (encoded, _) = registry.encode_shared(&*codec, &sample, hash, 1.0);
-        assert!(encoded.unwrap_err().contains("no data-channel encoder"));
+        let (encoded, _) = registry.encode_shared(&*codec, &sample, hash, 1.0, Compress::Zstd);
+        assert!(encoded.err().unwrap().contains("no data-channel encoder"));
         let (_, reused) = registry.decode_shared(&*codec, &sample, hash);
         assert!(reused, "the encode attempt's decode is cached");
+    }
+
+    struct Repeat;
+
+    impl Codec for Repeat {
+        fn name(&self) -> &str {
+            "repeat"
+        }
+
+        fn output(&self) -> CodecOutput {
+            CodecOutput::Data
+        }
+
+        fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame> {
+            Ok(DecodedFrame::data(sample.payload.repeat(1000)))
+        }
+
+        fn encode(&self, frame: &DecodedFrame, _: f64) -> Result<Vec<u8>> {
+            Ok(frame.downcast::<Vec<u8>>()?.clone())
+        }
+    }
+
+    #[test]
+    fn encodes_compress_and_share_per_compression() {
+        let registry = CodecRegistry::new([Arc::new(Repeat) as Arc<dyn Codec>]).unwrap();
+        let encoding = zenoh::bytes::Encoding::default();
+        let sample = CodecSample::new("a/b", b"xyz", &encoding);
+        let hash = sample_hash(&sample);
+        let (plain, _) = registry.encode_shared(&Repeat, &sample, hash, 1.0, Compress::None);
+        let (zstd, reused) = registry.encode_shared(&Repeat, &sample, hash, 1.0, Compress::Zstd);
+        let (plain, zstd) = (plain.unwrap(), zstd.unwrap());
+        assert!(!reused && !plain.compressed && zstd.compressed && zstd.bytes.len() < plain.bytes.len() / 10);
+        assert_eq!(zstd::bulk::decompress(&zstd.bytes, 3000).unwrap(), plain.bytes);
+        assert!(registry.encode_shared(&Repeat, &sample, hash, 1.0, Compress::Zstd).1, "same compression is shared");
+        let tiny = CodecSample::new("a/b", b"", &encoding);
+        let (tiny, _) = registry.encode_shared(&Repeat, &tiny, sample_hash(&tiny), 1.0, Compress::Zstd);
+        assert!(!tiny.unwrap().compressed, "a message zstd would grow is sent as is");
     }
 }
