@@ -40,6 +40,9 @@ export function lineCollector(stream, name) {
     const lines = []
     /** @type {{ test: (line: string) => boolean, resolve: (line: string) => void }[]} */
     let waiters = []
+    const logFile = name === "bridge" ? Deno.env.get("BRIDGE_LOG_FILE") : undefined
+    const log = logFile ? Deno.openSync(logFile, { create: true, append: true }) : null
+    const encoder = new TextEncoder()
     ;(async () => {
         let buffered = ""
         for await (const chunk of stream.pipeThrough(new TextDecoderStream())) {
@@ -47,6 +50,13 @@ export function lineCollector(stream, name) {
             const parts = buffered.split("\n")
             buffered = parts.pop() ?? ""
             for (const line of parts) {
+                if (log) {
+                    log.writeSync(encoder.encode(`${line}\n`))
+                    // keep memory bounded when tracing: only waiters see the line
+                    if (!line.includes("listening on") && !line.includes("rejected")) {
+                        continue
+                    }
+                }
                 lines.push(line)
                 if (Deno.env.get("E2E_VERBOSE")) {
                     console.log(`[${name}] ${line}`)

@@ -5,6 +5,7 @@ mod allocator;
 mod codec;
 mod frame;
 mod options;
+mod pacing;
 mod peer;
 mod publisher;
 mod subscription;
@@ -43,6 +44,15 @@ struct Cli {
     /// link or to test allocation on localhost.
     #[arg(long)]
     max_bandwidth_bytes_per_sec: Option<f64>,
+    /// Fraction of the estimated bandwidth the allocator hands out; the rest keeps the path's
+    /// queues short for strict-priority streams. A connection may override it (connect option
+    /// `bandwidthTargetFraction`).
+    #[arg(long, default_value_t = 0.75)]
+    bandwidth_target_fraction: f64,
+    /// Subscriptions at this zenoh priority or more urgent (1 REAL_TIME .. 7 BACKGROUND) bypass
+    /// allocation and pacing and preempt everything else; 0 disables. Default 2 (INTERACTIVE_HIGH).
+    #[arg(long, default_value_t = 2)]
+    strict_priority: u8,
 }
 
 async fn offer(State(bridge): State<Arc<Bridge>>, Json(offer): Json<RTCSessionDescription>) -> Response {
@@ -80,7 +90,9 @@ async fn main() -> anyhow::Result<()> {
     config.insert_json5("adminspace/enabled", "true").map_err(|e| anyhow::anyhow!("{e}"))?;
     config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).map_err(|e| anyhow::anyhow!("{e}"))?;
     let session = zenoh::open(config).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    let bridge = Bridge::new(session.clone(), access_control, cli.max_bandwidth_bytes_per_sec);
+    anyhow::ensure!(cli.bandwidth_target_fraction > 0.0 && cli.bandwidth_target_fraction <= 1.0, "--bandwidth-target-fraction must be within (0, 1]");
+    let allocation = peer::AllocationConfig { max_bandwidth: cli.max_bandwidth_bytes_per_sec, target_fraction: cli.bandwidth_target_fraction, strict_priority: cli.strict_priority };
+    let bridge = Bridge::new(session.clone(), access_control, allocation);
 
     let mut app = Router::new().route("/offer", post(offer)).with_state(bridge.clone()).layer(CorsLayer::permissive());
     if let Some(dir) = &cli.serve {

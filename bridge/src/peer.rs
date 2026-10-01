@@ -4,6 +4,7 @@ use crate::acl::{AccessControl, AclMessage};
 use crate::allocator::{self, Estimator};
 use crate::codec::Output;
 use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
+use crate::pacing::SendGate;
 use crate::publisher::{self, PubShared};
 use crate::subscription::{self, SubShared, now_unix_ms};
 use crate::video::{self, VideoTrack};
@@ -11,7 +12,7 @@ use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -34,6 +35,19 @@ const ADMIN_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 /// How often each frontend's bandwidth is re-estimated and re-allocated.
 const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
+/// The RTT baseline is the minimum over this window.
+const RTT_BASELINE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Bridge-wide allocation settings (command-line flags).
+#[derive(Debug, Clone, Copy)]
+pub struct AllocationConfig {
+    /// cap on each frontend's budget, bytes/s
+    pub max_bandwidth: Option<f64>,
+    /// fraction of the estimate the allocator hands out (`--bandwidth-target-fraction`)
+    pub target_fraction: f64,
+    /// zenoh priority at or above which (numerically <=) streams are strict; 0 = none
+    pub strict_priority: u8,
+}
 
 /// The frontend-level side of allocation, reported in stats as `bandwidth`.
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -45,8 +59,16 @@ struct BandwidthStats {
     video_estimate_bytes_per_sec: f64,
     /// `--max-bandwidth-bytes-per-sec`
     cap_bytes_per_sec: Option<f64>,
-    /// min(cap, data + video estimate): what the allocator divides
+    /// min(cap, target fraction x (data + video estimate)): what the allocator divides
     budget_bytes_per_sec: f64,
+    target_fraction: f64,
+    /// latest RTT minus its 30 s minimum (the delay trigger's input)
+    queue_delay_ms: Option<f64>,
+    min_rtt_ms: Option<f64>,
+    delay_events: u64,
+    /// bytes/s reserved for strict-priority and reliable streams
+    reserved_bytes_per_sec: f64,
+    bulk_chunk_bytes: usize,
     demand_bytes_per_sec: f64,
     sent_bytes_per_sec: f64,
     network_blocked_fraction: f64,
@@ -105,14 +127,20 @@ struct PeerState {
     negotiation: tokio::sync::Mutex<()>,
     video_tracks: Mutex<HashMap<String, Arc<VideoTrack>>>,
     video_target_bps: Arc<AtomicU64>,
-    max_bandwidth: Option<f64>,
+    config: AllocationConfig,
+    gate: Arc<SendGate>,
+    /// (when, rtt ms) reported by the browser's clock sync
+    rtt_samples: Mutex<VecDeque<(Instant, f64)>>,
+    last_allocation: Mutex<Instant>,
+    /// this connection's `bandwidthTargetFraction`, if it set one
+    target_fraction_override: Mutex<Option<f64>>,
     estimator: Mutex<Estimator>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
 }
 
 impl PeerState {
-    fn new(peer_id: u64, session: zenoh::Session, access_control: Arc<AccessControl>, video_target_bps: Arc<AtomicU64>, max_bandwidth: Option<f64>) -> Self {
+    fn new(peer_id: u64, session: zenoh::Session, access_control: Arc<AccessControl>, video_target_bps: Arc<AtomicU64>, config: AllocationConfig) -> Self {
         PeerState {
             peer_id,
             session,
@@ -130,9 +158,13 @@ impl PeerState {
             negotiation: tokio::sync::Mutex::new(()),
             video_tracks: Mutex::new(HashMap::new()),
             video_target_bps,
-            max_bandwidth,
+            config,
+            gate: Arc::default(),
+            rtt_samples: Mutex::new(VecDeque::new()),
+            last_allocation: Mutex::new(Instant::now()),
             estimator: Mutex::new(Estimator::default()),
-            bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: max_bandwidth, ..Default::default() }),
+            bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, target_fraction: config.target_fraction, ..Default::default() }),
+            target_fraction_override: Mutex::new(None),
             gone: AtomicBool::new(false),
         }
     }
@@ -148,8 +180,20 @@ impl PeerState {
             .collect()
     }
 
+    /// (queue delay, minimum RTT): the smallest RTT since `since` minus the window's minimum. A
+    /// standing queue raises every sample; scheduling noise in the browser only some of them.
+    fn queue_delay(&self, since: Instant) -> (Option<f64>, Option<f64>) {
+        let samples = self.rtt_samples.lock().unwrap();
+        let minimum = samples.iter().map(|(_, rtt)| *rtt).reduce(f64::min);
+        let newest = samples.iter().filter(|(at, _)| *at >= since).map(|(_, rtt)| *rtt).reduce(f64::min);
+        (newest.zip(minimum).map(|(newest, minimum)| newest - minimum), minimum)
+    }
+
     /// One allocation round: measure, update the estimate, divide the budget among streams.
     fn allocate(&self, interval_secs: f64) {
+        let now = Instant::now();
+        let since = std::mem::replace(&mut *self.last_allocation.lock().unwrap(), now);
+        let (queue_delay_ms, min_rtt_ms) = self.queue_delay(since);
         let subscriptions = self.subscriptions();
         let usages: Vec<subscription::Usage> = subscriptions.iter().map(|shared| shared.usage(interval_secs)).collect();
         let wants = |demand: &allocator::Demand| demand.fixed_bytes_per_sec.unwrap_or_else(|| (demand.price)(demand.quality_range.map_or(1.0, |(_, max)| max)) * demand.max_hz);
@@ -161,14 +205,18 @@ impl PeerState {
         let total_demand: f64 = usages.iter().map(|usage| wants(&usage.demand)).sum();
         let estimator = {
             let mut estimator = self.estimator.lock().unwrap();
-            estimator.update(interval_secs, sent as f64, blocked_ms / 1000.0, active, data_demand);
+            estimator.update(now, interval_secs, sent as f64, blocked_ms / 1000.0, active, data_demand, queue_delay_ms);
             estimator.clone()
         };
         let has_video = usages.iter().any(|usage| usage.is_video);
         let video_estimate = if has_video { video::gcc_target_bytes_per_sec(&self.video_target_bps) } else { 0.0 };
         let estimate = estimator.data_bytes_per_sec + video_estimate;
-        let budget = self.max_bandwidth.map_or(estimate, |cap| cap.min(estimate));
+        let target_fraction = self.target_fraction_override.lock().unwrap().unwrap_or(self.config.target_fraction);
+        let usable = estimate * target_fraction;
+        let budget = self.config.max_bandwidth.map_or(usable, |cap| cap.min(usable));
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
+        let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
+        self.gate.configure((budget - reserved).max(0.0), min_rtt_ms);
         let allocations = allocator::allocate(budget, &demands);
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
             shared.apply(allocation);
@@ -176,8 +224,14 @@ impl PeerState {
         *self.bandwidth.lock().unwrap() = BandwidthStats {
             data_estimate_bytes_per_sec: estimator.data_bytes_per_sec,
             video_estimate_bytes_per_sec: video_estimate,
-            cap_bytes_per_sec: self.max_bandwidth,
+            cap_bytes_per_sec: self.config.max_bandwidth,
             budget_bytes_per_sec: budget,
+            target_fraction,
+            queue_delay_ms,
+            min_rtt_ms,
+            delay_events: estimator.delay_events,
+            reserved_bytes_per_sec: reserved,
+            bulk_chunk_bytes: self.gate.chunk_bytes(),
             demand_bytes_per_sec: total_demand,
             sent_bytes_per_sec: estimator.sent_bytes_per_sec,
             network_blocked_fraction: estimator.network_blocked_fraction,
@@ -190,8 +244,14 @@ impl PeerState {
         if let Some(offset) = offset_ms.filter(|v| v.is_finite()) {
             *self.clock_offset_ms.lock().unwrap() = Some(offset);
         }
-        if let Some(rtt) = rtt_ms.filter(|v| v.is_finite()) {
+        if let Some(rtt) = rtt_ms.filter(|v| v.is_finite() && *v >= 0.0) {
             *self.rtt_ms.lock().unwrap() = Some(rtt);
+            let now = Instant::now();
+            let mut samples = self.rtt_samples.lock().unwrap();
+            samples.push_back((now, rtt));
+            while samples.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_BASELINE_WINDOW) {
+                samples.pop_front();
+            }
         }
     }
 
@@ -271,18 +331,17 @@ struct PeerEntry {
 pub struct Bridge {
     pub session: zenoh::Session,
     access_control: Arc<AccessControl>,
-    /// test/ops cap on each frontend's budget (bytes/s)
-    max_bandwidth: Option<f64>,
+    allocation: AllocationConfig,
     peers: Mutex<HashMap<u64, PeerEntry>>,
     next_peer: AtomicU64,
 }
 
 impl Bridge {
-    pub fn new(session: zenoh::Session, access_control: AccessControl, max_bandwidth: Option<f64>) -> Arc<Self> {
+    pub fn new(session: zenoh::Session, access_control: AccessControl, allocation: AllocationConfig) -> Arc<Self> {
         Arc::new(Bridge {
             session,
             access_control: Arc::new(access_control),
-            max_bandwidth,
+            allocation,
             peers: Mutex::new(HashMap::new()),
             next_peer: AtomicU64::new(1),
         })
@@ -293,7 +352,7 @@ impl Bridge {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
         let (media_engine, interceptors, video_target_bps) = video::media_setup()?;
-        let state = Arc::new(PeerState::new(peer_id, self.session.clone(), self.access_control.clone(), video_target_bps, self.max_bandwidth));
+        let state = Arc::new(PeerState::new(peer_id, self.session.clone(), self.access_control.clone(), video_target_bps, self.allocation));
         let handler = Arc::new(Handler { bridge: Arc::downgrade(self), peer_id, gathered_tx, state: state.clone() });
         let setting_engine = SettingEngineBuilder::new()
             .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
@@ -452,7 +511,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     let rejected = match label.kind.as_str() {
         "sub" => match SubOpts::parse(&label.opts).and_then(|opts| bind_video(&state, &opts, &label).map(|video| (opts, video))) {
             Ok((opts, video)) => {
-                let shared = Arc::new(SubShared::new(&opts));
+                let shared = Arc::new(SubShared::new(&opts, state.gate.clone(), state.config.strict_priority));
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
                 state.send_accepted(label.id).await;
                 subscription::run(dc.clone(), label.clone(), session, shared, video).await;
@@ -589,6 +648,8 @@ struct ControlRequest {
     sdp: Option<RTCSessionDescription>,
     #[serde(default)]
     add_video: bool,
+    #[serde(default)]
+    bandwidth_target_fraction: Option<f64>,
 }
 
 fn ok(id: &Value, extra: Value) -> Value {
@@ -662,6 +723,14 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "access": access, "bandwidth": bandwidth}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
+            "configure" => match request.bandwidth_target_fraction {
+                Some(fraction) if fraction > 0.0 && fraction <= 1.0 => {
+                    *state.target_fraction_override.lock().unwrap() = Some(fraction);
+                    ok(&request.id, json!({}))
+                }
+                Some(fraction) => fail(&request.id, format!("bandwidthTargetFraction must be within (0, 1], got {fraction}")),
+                None => ok(&request.id, json!({})),
+            },
             // can wait on the peer connection's driver; keep stats and pings flowing meanwhile
             "renegotiate" => {
                 let dc = dc.clone();

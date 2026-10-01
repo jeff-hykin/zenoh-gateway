@@ -128,6 +128,8 @@ export interface ConnectOptions {
     heartbeatHz?: number
     heartbeatMisses?: number
     clock?: () => number
+    /** fraction of the estimated bandwidth the bridge allocates to this connection (default: the bridge's, 0.75) */
+    bandwidthTargetFraction?: number
 }
 
 export interface KeyStats {
@@ -164,6 +166,13 @@ export interface BandwidthStats {
     videoEstimateBytesPerSec: number
     capBytesPerSec: number | null
     budgetBytesPerSec: number
+    targetFraction: number
+    /** latest RTT minus its 30 s minimum: the delay trigger's input */
+    queueDelayMs: number | null
+    minRttMs: number | null
+    delayEvents: number
+    reservedBytesPerSec: number
+    bulkChunkBytes: number
     demandBytesPerSec: number
     sentBytesPerSec: number
     networkBlockedFraction: number
@@ -942,7 +951,7 @@ export class Publisher extends Endpoint {
     }
 }
 
-type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock">> & Pick<ConnectOptions, "clock">
+type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "bandwidthTargetFraction">> & Pick<ConnectOptions, "clock" | "bandwidthTargetFraction">
 
 export class ZenohWeb {
     state: ConnectionState = "connecting"
@@ -986,6 +995,7 @@ export class ZenohWeb {
         this.options = { iceServers: [], reconnect: true, statsIntervalMs: 1000, heartbeatHz: 0, heartbeatMisses: 3, ...options }
         checkNumber("heartbeatHz", this.options.heartbeatHz, (v) => Number.isFinite(v) && v >= 0, ">= 0 (0 = no heartbeat)")
         checkNumber("heartbeatMisses", this.options.heartbeatMisses, (v) => Number.isInteger(v) && v >= 1, "an integer >= 1")
+        checkNumber("bandwidthTargetFraction", this.options.bandwidthTargetFraction, (v) => v > 0 && v <= 1, "within (0, 1]")
         this.now = this.options.clock ?? (() => performance.timeOrigin + performance.now())
     }
 
@@ -1123,6 +1133,9 @@ export class ZenohWeb {
             }
             await peer.setRemoteDescription(await response.json())
             await waitOpen(control, openTimeoutMs)
+            if (this.options.bandwidthTargetFraction !== undefined) {
+                await this._request({ op: "configure", bandwidthTargetFraction: this.options.bandwidthTargetFraction }, pingTimeoutMs)
+            }
             // a few quick samples so the bridge knows the clock offset before the first put
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()

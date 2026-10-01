@@ -1,7 +1,7 @@
 //! Bridge -> browser frame, little endian:
 //! `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | chunk bytes`.
-//! `seq` numbers messages per channel; a message larger than `CHUNK_BYTES` is split across frames
-//! that share its `seq`. `frameId` numbers frames per channel; the page acks frameIds.
+//! `seq` numbers messages per channel; a message larger than one chunk is split across frames
+//! that share its `seq` (chunk size is per message, at most `CHUNK_BYTES`). `frameId` numbers frames per channel; the page acks frameIds.
 
 use bytes::{BufMut, BytesMut};
 
@@ -18,8 +18,8 @@ pub struct FrameHeader<'a> {
     pub chunk_count: u32,
 }
 
-pub fn chunk_count(payload_len: usize) -> u32 {
-    payload_len.div_ceil(CHUNK_BYTES).max(1) as u32
+pub fn chunk_count(payload_len: usize, chunk_bytes: usize) -> u32 {
+    payload_len.div_ceil(chunk_bytes).max(1) as u32
 }
 
 pub fn encode(header: &FrameHeader, chunk: &[u8]) -> BytesMut {
@@ -37,9 +37,9 @@ pub fn encode(header: &FrameHeader, chunk: &[u8]) -> BytesMut {
 }
 
 /// The `index`-th chunk of `payload`.
-pub fn chunk(payload: &[u8], index: u32) -> &[u8] {
-    let start = index as usize * CHUNK_BYTES;
-    &payload[start.min(payload.len())..(start + CHUNK_BYTES).min(payload.len())]
+pub fn chunk(payload: &[u8], index: u32, chunk_bytes: usize) -> &[u8] {
+    let start = index as usize * chunk_bytes;
+    &payload[start.min(payload.len())..(start + chunk_bytes).min(payload.len())]
 }
 
 #[cfg(test)]
@@ -63,10 +63,12 @@ mod tests {
     #[test]
     fn chunking_covers_payload_exactly() {
         let payload: Vec<u8> = (0..(CHUNK_BYTES * 2 + 5)).map(|i| i as u8).collect();
-        assert_eq!(chunk_count(payload.len()), 3);
-        assert_eq!(chunk_count(0), 1, "an empty payload is still one frame");
-        let joined: Vec<u8> = (0..3).flat_map(|i| chunk(&payload, i).to_vec()).collect();
+        assert_eq!(chunk_count(payload.len(), CHUNK_BYTES), 3);
+        assert_eq!(chunk_count(0, CHUNK_BYTES), 1, "an empty payload is still one frame");
+        let joined: Vec<u8> = (0..3).flat_map(|i| chunk(&payload, i, CHUNK_BYTES).to_vec()).collect();
         assert_eq!(joined, payload);
-        assert_eq!(chunk(&payload, 2).len(), 5);
+        assert_eq!(chunk(&payload, 2, CHUNK_BYTES).len(), 5);
+        let small: Vec<u8> = (0..chunk_count(payload.len(), 1000)).flat_map(|i| chunk(&payload, i, 1000).to_vec()).collect();
+        assert_eq!(small, payload);
     }
 }

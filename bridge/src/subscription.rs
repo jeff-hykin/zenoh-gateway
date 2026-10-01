@@ -5,10 +5,11 @@ use crate::allocator::{Allocation, Demand};
 use crate::codec::{self, Codec, Output};
 use crate::frame;
 use crate::options::{Delivery, Label, SubOpts};
+use crate::pacing::{PACING_SLACK, SendGate, TokenBucket};
 use log::{debug, warn};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -63,8 +64,13 @@ pub struct SubStats {
     pub blocked_on_network_ms: f64,
     /// time the sender waited only for the page to consume what it already has
     pub blocked_on_page_ms: f64,
+    /// time a bulk sender waited on its token bucket and the frontend's send gate
+    pub paced_ms: f64,
     /// Bridge receive time minus sample timestamp (upstream lag), largest seen.
     pub max_receive_lag_ms: f64,
+    /// Time a message's last frame was handed to SCTP minus its sample timestamp, largest seen
+    /// (upstream lag + queueing, pacing and encoding in the bridge).
+    pub max_send_lag_ms: f64,
     /// frame bytes handed to SCTP (data channel) or video bytes handed to the track
     pub bytes_sent: u64,
     /// transcodes this subscription ran / reused from another frontend's identical request
@@ -159,6 +165,14 @@ pub struct SubShared {
     weight: f64,
     quality_range: (f64, f64),
     tradeoff: f64,
+    /// this frontend's shared send gate, and this stream's id in it
+    gate: Arc<SendGate>,
+    stream_id: usize,
+    /// streams at this zenoh priority or more urgent bypass allocation and pacing (0 = none)
+    strict_threshold: u8,
+    /// published priority of the latest sample (used when the subscription sets none)
+    sample_priority: AtomicU8,
+    bucket: Mutex<TokenBucket>,
     state: Mutex<SubState>,
     data_ready: Notify,
     drained: Notify,
@@ -178,8 +192,14 @@ fn sample_timestamp_ms(sample: &Sample) -> f64 {
 }
 
 impl SubShared {
-    pub fn new(opts: &SubOpts) -> Self {
+    pub fn new(opts: &SubOpts, gate: Arc<SendGate>, strict_threshold: u8) -> Self {
+        static NEXT_STREAM: AtomicUsize = AtomicUsize::new(0);
         SubShared {
+            gate,
+            stream_id: NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
+            strict_threshold,
+            sample_priority: AtomicU8::new(0),
+            bucket: Mutex::new(TokenBucket::default()),
             delivery: opts.delivery(),
             min_interval: opts.min_interval(),
             priority_override: opts.zenoh_priority().map(|p| p as u8),
@@ -208,6 +228,13 @@ impl SubShared {
         self.closed.load(Ordering::Relaxed)
     }
 
+    /// Strict-priority tier: its priority (subscribe option, else as published) is at or above the
+    /// bridge's threshold. Strict streams bypass allocation and pacing and preempt bulk streams.
+    pub fn is_strict(&self) -> bool {
+        let priority = self.priority_override.unwrap_or_else(|| self.sample_priority.load(Ordering::Relaxed));
+        priority != 0 && priority <= self.strict_threshold
+    }
+
     /// Quality to transcode at now: the allocation's, or the best allowed before the first one.
     pub fn current_quality(&self) -> f64 {
         self.state.lock().unwrap().allocation.quality.unwrap_or(self.quality_range.1)
@@ -222,7 +249,7 @@ impl SubShared {
 
     /// Per-key Hz cap from the allocation (None = no allocation cap).
     fn allocated_key_hz(&self, rate_hz: f64, allocation: &Allocation) -> Option<f64> {
-        if self.delivery.reliable || !allocation.constrained || rate_hz <= 0.0 {
+        if self.delivery.reliable || self.is_strict() || !allocation.constrained || rate_hz <= 0.0 {
             return None;
         }
         let wanted = self.max_hz.map_or(rate_hz, |max| max.min(rate_hz));
@@ -285,12 +312,16 @@ impl SubShared {
             quality_range: self.codec.map(|_| self.quality_range),
             tradeoff: self.tradeoff,
             price,
-            fixed_bytes_per_sec: self.delivery.reliable.then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
+            fixed_bytes_per_sec: (self.delivery.reliable || self.is_strict()).then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
         };
         Usage { demand, bytes_sent, network_blocked_ms, is_video: self.codec.is_some_and(|codec| codec.output() == Output::Video) }
     }
 
     pub fn apply(&self, allocation: Allocation) {
+        // bulk streams trickle at their grant; strict and reliable ones aren't paced
+        let paced = !self.delivery.reliable && !self.is_strict() && allocation.demand_bytes_per_sec > 0.0;
+        let rate = paced.then(|| allocation.budget_bytes_per_sec * PACING_SLACK);
+        self.bucket.lock().unwrap().set_rate(rate, 2 * self.gate.chunk_bytes());
         self.state.lock().unwrap().allocation = allocation;
         self.data_ready.notify_one();
     }
@@ -338,6 +369,7 @@ impl SubShared {
             return;
         }
         let payload_len = sample.payload().len();
+        self.sample_priority.store(sample.priority() as u8, Ordering::Relaxed);
         {
             let mut state = self.state.lock().unwrap();
             let seq = state.next_seq;
@@ -502,6 +534,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     }
     shared.close();
     let _ = sender.await;
+    shared.gate.forget(shared.stream_id);
     drop(subscriber);
     debug!("unsubscribed {:?}", label.key);
 }
@@ -625,7 +658,10 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             None => Body::Raw(item.payload.to_bytes()),
         };
         let payload = body.bytes();
-        let chunk_count = frame::chunk_count(payload.len());
+        // strict: whole message at once, bulk held off meanwhile; bulk: small paced chunks
+        let strict_turn = shared.is_strict().then(|| shared.gate.strict_turn());
+        let chunk_bytes = if strict_turn.is_some() { frame::CHUNK_BYTES } else { shared.gate.chunk_bytes() };
+        let chunk_count = frame::chunk_count(payload.len(), chunk_bytes);
         let mut completed = true;
         let mut message_bytes = 0usize;
         for chunk_index in 0..chunk_count {
@@ -639,8 +675,16 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             let frame_id = next_frame_id;
             next_frame_id = next_frame_id.wrapping_add(1);
             let header = frame::FrameHeader { key: &key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index, chunk_count };
-            let frame = frame::encode(&header, frame::chunk(payload, chunk_index));
+            let frame = frame::encode(&header, frame::chunk(payload, chunk_index, chunk_bytes));
             let frame_len = frame.len();
+            if strict_turn.is_none() {
+                let wait = shared.bucket.lock().unwrap().take(frame_len, Instant::now());
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                let gated = shared.gate.wait_bulk_turn(shared.stream_id, frame_len, || async { dc.outstanding_bytes().await.unwrap_or(0) }).await;
+                shared.state.lock().unwrap().stats.paced_ms += (wait + gated).as_secs_f64() * 1000.0;
+            }
             if let Err(error) = dc.send(frame).await {
                 if shared.closed.load(Ordering::Relaxed) {
                     return;
@@ -665,13 +709,18 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
                 state.stats.bytes_sent += frame_len as u64;
             }
             pacer.wait_writable(&dc, &shared).await;
+            if strict_turn.is_none() {
+                shared.gate.report_outstanding(shared.stream_id, shared.state.lock().unwrap().stats.outstanding_bytes);
+            }
             if shared.closed.load(Ordering::Relaxed) {
                 return;
             }
         }
+        drop(strict_turn);
         if completed {
             let mut state = shared.state.lock().unwrap();
             state.stats.sent += 1;
+            state.stats.max_send_lag_ms = state.stats.max_send_lag_ms.max(now_unix_ms() - item.timestamp_ms);
             state.message_bytes = ewma(state.message_bytes, message_bytes as f64);
         }
     }
@@ -690,7 +739,17 @@ mod tests {
     use super::*;
 
     fn shared(opts: &str) -> SubShared {
-        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap())
+        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Arc::default(), 2)
+    }
+
+    #[test]
+    fn strict_tier_by_option_or_published_priority() {
+        assert!(shared(r#"{"priority":2}"#).is_strict());
+        assert!(!shared(r#"{"priority":3}"#).is_strict());
+        let unset = shared(r#"{}"#);
+        assert!(!unset.is_strict(), "no sample yet");
+        unset.sample_priority.store(1, Ordering::Relaxed);
+        assert!(unset.is_strict());
     }
 
     fn pending(seq: u32, priority: u8, arrived: Instant) -> Pending {

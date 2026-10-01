@@ -23,6 +23,7 @@ import { connect, Priority } from "./zenoh_web.ts"   // via esm.sh, or bundled: 
 const z = await connect("http://robot.local:7448", {
     heartbeatHz: 5,         // 0 (default) = no heartbeat; needed for deadmen
     heartbeatMisses: 3,     // silence of misses/heartbeatHz seconds = frontend gone
+    bandwidthTargetFraction: 0.75,  // optional: overrides the bridge's --bandwidth-target-fraction here
 })
 
 const sub = z.subscribe("camera/**", {
@@ -172,23 +173,48 @@ without voxels, where `scale = (largest bounding-box extent / 2) / 32767` (e.g. 
 
 ## Bandwidth allocation
 
+All of a frontend's streams share one path (wifi queue, UDP, one SCTP association), so throttling
+"on average" isn't enough: a burst or an overshoot builds a queue that every stream waits in. The
+bridge keeps the path's queues short and lets urgent streams skip what queue remains:
+
+- **Strict-priority tier.** A subscription whose priority (its `priority` option, else the published
+  priority of its samples) is `--strict-priority` (default 2, INTERACTIVE_HIGH) or more urgent
+  bypasses allocation and pacing: its measured rate is reserved off the top, and while it sends a
+  message no bulk chunk starts. Everything else shares the remainder by `bandwidthPriority`.
+- **Target fraction (headroom).** The allocator hands out `--bandwidth-target-fraction` (default
+  0.75; per connection: connect option `bandwidthTargetFraction`) of the estimate, so bulk traffic
+  runs below the path's capacity and its queue stays near empty.
+- **Pacing.** Bulk streams send through a per-stream token bucket at their granted rate × 1.25, in
+  chunks of 4 ms of the frontend's budget (4–64 KiB). A per-frontend gate admits a bulk chunk only
+  while the bulk bytes outstanding in SCTP are under `budget × (min RTT + 5 ms)` (at least two chunks,
+  about one bandwidth-delay product), counting a chunk the moment it is admitted so senders woken
+  together can't burst. A strict message waits behind at most the bulk already handed to SCTP, and
+  bulk never bursts whole messages into the link.
+- **Delay trigger.** The browser reports its RTT with every clock-sync sample (each heartbeat, else
+  the 1 s control ping: configure `heartbeatHz` for a fast trigger). When the smallest RTT of a 250 ms
+  interval is more than 10 ms above the 30 s minimum, a queue is standing on the path: the data
+  estimate drops 15% at once and probing pauses 1 s; then it probes up 10% per interval below 90% of
+  the level that caused the queue and 2% above it. No loss is needed to react.
+
 Per frontend, every 250 ms:
 1. **Estimate.** Data channels: a delivery-rate estimator over what the `sub` channels pushed into SCTP
-   and how long their senders waited on SCTP (webrtc-rs doesn't expose the congestion window): blocked
-   on the network more than 20% of the interval → estimate = 0.9 × measured rate (at most halving per
-   step); otherwise, if streams want more, probe up 25% per interval (start 1 MB/s). Video: GCC's
-   target bitrate, counted while a video track is in use. Budget = min(`--max-bandwidth-bytes-per-sec`
-   if set, data estimate + video estimate).
+   and how long their senders waited on SCTP (webrtc-rs doesn't expose the congestion window), plus the
+   delay trigger above: blocked on the network more than 20% of the interval → estimate = 0.9 ×
+   measured rate (at most halving per step); otherwise, while streams want more, probe up (start
+   1 MB/s). Video: GCC's target bitrate (TWCC feedback), counted while a video track is in use; video
+   tracks are paced by the GCC pacer, not the bulk gate. Budget = min(`--max-bandwidth-bytes-per-sec`
+   if set, target fraction × (data estimate + video estimate)).
 2. **Demand.** Each subscription wants `price(maxQuality) × Hz`, Hz being each key's measured source
    rate capped by `maxHz`, summed over its keys. Price = bytes per message: measured for raw streams
    and data-channel codecs (per quality, scaled by a size prior between measured qualities), modeled
    for video (resolution × bits per pixel). Floor = `price(minQuality) × dangerousMinHz` (per key,
-   never above the key's rate).
+   never above the key's rate). Strict-priority and reliable streams are reserved at their measured
+   rate instead.
 3. **Shrink.** If demand exceeds the budget, streams shrink like CSS flex items: the deficit is split in
    proportion to `bandwidthPriority × demand`; a stream that would go below its floor freezes there and
    the rest shrink further. Weight-0 streams shrink only once nothing else can. Floors are kept even
    when they add up to more than the budget ("dangerous"). Reliable subscriptions can't drop messages,
-   so their measured rate is reserved and never shrunk.
+   so their measured rate is reserved and never shrunk (they still yield to strict streams).
 4. **Quality vs Hz.** A transcoded stream granted fraction r of its demand shrinks its message size by
    `r^t` (choosing the best quality among the bounds and 0.1 steps that fits) and its Hz by the rest,
    `t = qualityToHzTradeoff`: 0 keeps quality and drops Hz, 1 keeps Hz and drops quality. When one
@@ -199,7 +225,9 @@ Per frontend, every 250 ms:
 Stats: each subscription's `allocation` (`demandBytesPerSec`, `floorBytesPerSec`,
 `budgetBytesPerSec`, `hz`, `hzFraction`, `quality`, `constrained`) and the frontend's `bandwidth`
 (`dataEstimateBytesPerSec`, `videoEstimateBytesPerSec`, `capBytesPerSec`, `budgetBytesPerSec`,
-`demandBytesPerSec`, `sentBytesPerSec`, `networkBlockedFraction`, `constrained`).
+`targetFraction`, `reservedBytesPerSec`, `bulkChunkBytes`, `queueDelayMs`, `minRttMs`, `delayEvents`,
+`demandBytesPerSec`, `sentBytesPerSec`, `networkBlockedFraction`, `constrained`). Per stream,
+`pacedMs` is time spent waiting on the token bucket and the gate.
 
 ## Topic enumeration
 
@@ -264,6 +292,8 @@ resolving so the bridge has an offset before the first put.
 - Bridge → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | chunk`,
   little endian. `seq` numbers messages per channel, `frameId` numbers frames; the page acks the highest
   `frameId` it has processed with a 4-byte `u32` message on the same channel.
+- All chunks of one message have the same size, at most 64 KiB (bulk streams use smaller ones, see
+  "Bandwidth allocation").
 - Browser → bridge put: `f64 sentAtMs (browser clock) | payload`, little endian.
 - Heartbeat: browser sends `{"t0", "offsetMs", "rttMs"}` (JSON), bridge answers `{"t0", "t1", "t2"}`.
 - Video `sub` label: adds `"mid"`. The payload of a codec message (little endian):
