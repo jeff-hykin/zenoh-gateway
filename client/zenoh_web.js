@@ -33,6 +33,9 @@ const gatherTimeoutMs = 3000
 const openTimeoutMs = 10000
 const pingTimeoutMs = 3000
 const reconnectDelayMs = 1000
+// consumption acks let the bridge stop sending while this page's JS is behind
+const ackEveryBytes = 16 * 1024
+const ackDelayMs = 5
 
 /**
  * @param {Delivery | undefined} delivery
@@ -165,6 +168,17 @@ export class Subscription {
     closed = false
     /** @type {object | null} latest bridge-side stats for this channel */
     bridgeStats = null
+    /** @type {Promise<void>} */
+    #ready = Promise.resolve()
+    #highestConsumedSeq = -1
+    #bytesSinceAck = 0
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    #ackTimer = null
+
+    /** Resolves once the current data channel is open (rejects if it fails to open). */
+    ready() {
+        return this.#ready
+    }
 
     /**
      * @param {ZenohWeb} owner
@@ -194,6 +208,8 @@ export class Subscription {
         this.#firstSeq = -1
         this.#maxSeq = -1
         this.#receivedOnChannel = 0
+        this.#highestConsumedSeq = -1
+        this.#bytesSinceAck = 0
         const { delivery, priority, hz, quality, tradeoff } = this.options
         const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts: { delivery, priority, hz, quality, tradeoff } })
         const channel = peer.createDataChannel(label, channelInit(this.delivery))
@@ -216,8 +232,42 @@ export class Subscription {
             } catch (error) {
                 console.error(`zenoh-web: subscriber callback for ${this.key} threw`, error)
             }
+            this.#consumed(channel, message.seq, event.data.byteLength)
         }
         this.channel = channel
+        this.#ready = waitOpen(channel, openTimeoutMs)
+        this.#ready.catch(() => {})
+    }
+
+    /**
+     * Tells the bridge we processed everything up to seq: 4 bytes, little endian.
+     * @param {RTCDataChannel} channel
+     * @param {number} seq
+     * @param {number} byteLength
+     */
+    #consumed(channel, seq, byteLength) {
+        if (seq > this.#highestConsumedSeq) {
+            this.#highestConsumedSeq = seq
+        }
+        this.#bytesSinceAck += byteLength
+        const sendAck = () => {
+            this.#ackTimer = null
+            if (channel.readyState !== "open" || channel !== this.channel) {
+                return
+            }
+            this.#bytesSinceAck = 0
+            const ack = new Uint8Array(4)
+            new DataView(ack.buffer).setUint32(0, this.#highestConsumedSeq, true)
+            channel.send(ack)
+        }
+        if (this.#bytesSinceAck >= ackEveryBytes) {
+            if (this.#ackTimer) {
+                clearTimeout(this.#ackTimer)
+            }
+            sendAck()
+        } else if (!this.#ackTimer) {
+            this.#ackTimer = setTimeout(sendAck, ackDelayMs)
+        }
     }
 
     close() {
@@ -242,6 +292,13 @@ export class Publisher {
     sent = 0
     dropped = 0
     closed = false
+    /** @type {Promise<void>} */
+    #ready = Promise.resolve()
+
+    /** Resolves once the current data channel is open (rejects if it fails to open). */
+    ready() {
+        return this.#ready
+    }
 
     /**
      * @param {ZenohWeb} owner
@@ -274,6 +331,8 @@ export class Publisher {
         channel.onopen = () => this.#flush()
         channel.onbufferedamountlow = () => this.#flush()
         this.channel = channel
+        this.#ready = waitOpen(channel, openTimeoutMs)
+        this.#ready.catch(() => {})
     }
 
     /** @param {Uint8Array | ArrayBuffer | ArrayBufferView | string} value */

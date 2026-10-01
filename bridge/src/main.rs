@@ -61,7 +61,7 @@ fn zenoh_config(cli: &Cli) -> anyhow::Result<zenoh::Config> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zenoh=warn,rtc=warn,webrtc=warn")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zenoh=warn,zenoh_ext=warn,zenoh_web=info,rtc=warn,webrtc=warn")).init();
     let cli = Cli::parse();
     let session = zenoh::open(zenoh_config(&cli)?).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let bridge = Bridge::new(session);

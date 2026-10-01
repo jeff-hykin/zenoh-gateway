@@ -21,6 +21,12 @@ pub const BACKED_UP_BYTES: usize = 64 * 1024;
 pub const RESUME_BYTES: usize = 32 * 1024;
 /// Backstop re-check while backed up, in case a low-water event is missed.
 const BACKSTOP: Duration = Duration::from_millis(20);
+/// Max bytes sent but not yet acknowledged as consumed by the page's JS (see `ack`).
+/// SCTP's buffered amount only covers the network: a busy browser main thread acks SCTP
+/// on its network thread and then queues messages internally without limit.
+pub const UNCONSUMED_WINDOW: usize = 256 * 1024;
+/// A sent frame never acked for this long is assumed lost (lossy channels), not unconsumed.
+const ASSUME_LOST_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +40,9 @@ pub struct SubStats {
     pub queued_bytes: usize,
     pub outstanding_bytes: usize,
     pub backed_up: bool,
+    pub unconsumed_bytes: usize,
+    /// Bridge receive time minus sample timestamp (upstream lag), largest seen.
+    pub max_receive_lag_ms: f64,
 }
 
 struct Pending {
@@ -55,6 +64,25 @@ struct SubState {
     keys: HashMap<String, KeyQueue>,
     next_seq: u32,
     stats: SubStats,
+    /// (seq, frame bytes, sent at) in send order, until the page acks a seq at or past it
+    unconsumed: VecDeque<(u32, usize, Instant)>,
+}
+
+impl SubState {
+    fn forget_lost(&mut self, now: Instant) {
+        while let Some(&(_, len, sent_at)) = self.unconsumed.front() {
+            if now.duration_since(sent_at) < ASSUME_LOST_AFTER {
+                break;
+            }
+            self.unconsumed.pop_front();
+            self.stats.unconsumed_bytes -= len;
+        }
+    }
+}
+
+/// `a <= b` for wrapping u32 sequence numbers.
+fn seq_at_or_before(a: u32, b: u32) -> bool {
+    b.wrapping_sub(a) < u32::MAX / 2
 }
 
 pub struct SubShared {
@@ -108,8 +136,10 @@ impl SubShared {
             state.stats.received += 1;
             state.stats.queued += 1;
             state.stats.queued_bytes += payload_len;
+            let timestamp_ms = sample_timestamp_ms(&sample);
+            state.stats.max_receive_lag_ms = state.stats.max_receive_lag_ms.max(now_unix_ms() - timestamp_ms);
             let pending = Pending {
-                timestamp_ms: sample_timestamp_ms(&sample),
+                timestamp_ms,
                 seq,
                 arrived: Instant::now(),
                 priority: self.priority_override.unwrap_or(sample.priority() as u8),
@@ -175,6 +205,26 @@ impl SubShared {
         (Some((key, item)), wake_at)
     }
 
+    /// Page consumed everything up to `seq` (4-byte little endian message on the sub channel).
+    fn ack(&self, seq: u32) {
+        let mut state = self.state.lock().unwrap();
+        while let Some(&(sent_seq, len, _)) = state.unconsumed.front() {
+            if !seq_at_or_before(sent_seq, seq) {
+                break;
+            }
+            state.unconsumed.pop_front();
+            state.stats.unconsumed_bytes -= len;
+        }
+        drop(state);
+        self.drained.notify_one();
+    }
+
+    fn unconsumed_bytes(&self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        state.forget_lost(Instant::now());
+        state.stats.unconsumed_bytes
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         self.data_ready.notify_one();
@@ -206,6 +256,9 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     while let Some(event) = dc.poll().await {
         match event {
             DataChannelEvent::OnBufferedAmountLow => shared.drained.notify_one(),
+            DataChannelEvent::OnMessage(message) if message.data.len() == 4 => {
+                shared.ack(u32::from_le_bytes([message.data[0], message.data[1], message.data[2], message.data[3]]));
+            }
             DataChannelEvent::OnClose => break,
             _ => {}
         }
@@ -249,17 +302,21 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             continue;
         }
         let mut outstanding = dc.outstanding_bytes().await.unwrap_or(0);
-        let backed_up = outstanding >= BACKED_UP_BYTES;
-        {
+        let unconsumed = {
             let mut state = shared.state.lock().unwrap();
+            state.unconsumed.push_back((item.seq, frame_len, Instant::now()));
+            state.stats.unconsumed_bytes += frame_len;
             state.stats.sent += 1;
             state.stats.outstanding_bytes = outstanding;
-            state.stats.backed_up = backed_up;
-        }
-        if !backed_up {
+            state.stats.unconsumed_bytes
+        };
+        if outstanding < BACKED_UP_BYTES && unconsumed < UNCONSUMED_WINDOW {
             continue;
         }
-        while outstanding > RESUME_BYTES && !shared.closed.load(Ordering::Relaxed) {
+        shared.state.lock().unwrap().stats.backed_up = true;
+        while (outstanding > RESUME_BYTES || shared.unconsumed_bytes() >= UNCONSUMED_WINDOW)
+            && !shared.closed.load(Ordering::Relaxed)
+        {
             tokio::select! {
                 _ = shared.drained.notified() => {}
                 _ = tokio::time::sleep(BACKSTOP) => {}
@@ -308,6 +365,25 @@ mod tests {
         assert_eq!(first.unwrap().0, "a/high");
         let (second, _) = shared.pick(t0 + Duration::from_millis(2));
         assert_eq!(second.unwrap().0, "a/low");
+    }
+
+    #[test]
+    fn ack_releases_window() {
+        let shared = shared(r#"{}"#);
+        let now = Instant::now();
+        {
+            let mut state = shared.state.lock().unwrap();
+            for seq in [5u32, 6, 9] {
+                state.unconsumed.push_back((seq, 100, now));
+                state.stats.unconsumed_bytes += 100;
+            }
+        }
+        shared.ack(6);
+        assert_eq!(shared.unconsumed_bytes(), 100);
+        shared.ack(u32::MAX);
+        assert_eq!(shared.unconsumed_bytes(), 100, "a seq far behind is not an ack");
+        shared.ack(9);
+        assert_eq!(shared.unconsumed_bytes(), 0);
     }
 
     #[test]

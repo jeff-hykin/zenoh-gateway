@@ -23,6 +23,8 @@ use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 const MAX_MESSAGE_SIZE: u32 = 256 * 1024;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GET_TIMEOUT_MS: u64 = 5000;
+/// A connection that stays `disconnected` this long is treated as gone.
+const DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 
 enum ChannelStats {
     Sub(Arc<SubShared>),
@@ -39,6 +41,7 @@ struct ChannelEntry {
 struct PeerState {
     channels: Mutex<HashMap<u64, ChannelEntry>>,
     next_channel: AtomicU64,
+    connection_state: Mutex<Option<RTCPeerConnectionState>>,
 }
 
 pub struct Bridge {
@@ -114,10 +117,25 @@ impl PeerConnectionEventHandler for Handler {
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         debug!("peer {}: {state}", self.peer_id);
-        if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed)
-            && let Some(bridge) = self.bridge.upgrade()
-        {
-            bridge.drop_peer(self.peer_id);
+        *self.state.connection_state.lock().unwrap() = Some(state);
+        match state {
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                if let Some(bridge) = self.bridge.upgrade() {
+                    bridge.drop_peer(self.peer_id);
+                }
+            }
+            // ICE may sit in `disconnected` without ever reaching `failed`
+            RTCPeerConnectionState::Disconnected => {
+                let (bridge, state, peer_id) = (self.bridge.clone(), self.state.clone(), self.peer_id);
+                tokio::spawn(async move {
+                    tokio::time::sleep(DISCONNECTED_GRACE).await;
+                    let still_down = *state.connection_state.lock().unwrap() != Some(RTCPeerConnectionState::Connected);
+                    if still_down && let Some(bridge) = bridge.upgrade() {
+                        bridge.drop_peer(peer_id);
+                    }
+                });
+            }
+            _ => {}
         }
     }
 
@@ -129,7 +147,12 @@ impl PeerConnectionEventHandler for Handler {
         tokio::spawn(async move {
             let raw_label = dc.label().await.unwrap_or_default();
             if raw_label == "control" {
+                let weak_bridge = Arc::downgrade(&bridge);
                 run_control(dc, bridge, state).await;
+                // the client keeps `control` open for its whole life, so its close means the browser left
+                if let Some(bridge) = weak_bridge.upgrade() {
+                    bridge.drop_peer(peer_id);
+                }
                 return;
             }
             let label: Label = match serde_json::from_str(&raw_label) {
