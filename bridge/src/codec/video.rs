@@ -55,7 +55,7 @@ pub fn resize(rgb: &Rgb8, width: u32, height: u32) -> Vec<u8> {
             let mut sum = [0u32; 3];
             for source_y in y0..y1 {
                 let row = &rgb.pixels[(source_y as usize * rgb.width as usize + x0 as usize) * 3..(source_y as usize * rgb.width as usize + x1 as usize) * 3];
-                for pixel in row.chunks_exact(3) {
+                for pixel in row.as_chunks::<3>().0 {
                     for channel in 0..3 {
                         sum[channel] += pixel[channel] as u32;
                     }

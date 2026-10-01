@@ -4,6 +4,8 @@
 /// <reference lib="esnext" />
 // zenoh-web browser client: one WebRTC data channel per subscription/publisher, see SPEC.md
 
+import { decompress as zstdDecompress } from "./vendor/fzstd.ts"
+
 /** zenoh priorities (lower = more important). */
 export const Priority = Object.freeze({
     REAL_TIME: 1,
@@ -20,11 +22,82 @@ export type ConnectionState = "connecting" | "connected" | "degraded" | "lost"
 export type PublisherState = "connecting" | "open" | "tripped" | "rejected" | "closed"
 export type SubscriptionState = "connecting" | "open" | "rejected" | "closed"
 
+/** Transcoders the bridge runs, picked with the subscribe option `codec` (SPEC "Codecs"). */
+export const CODECS = Object.freeze([
+    "ros2-image",
+    "ros2-compressed-image",
+    "ros2-depth",
+    "ros2-compressed-depth",
+    "ros2-pointcloud2",
+    "dimos-image",
+    "dimos-compressed-image",
+    "dimos-depth",
+    "dimos-compressed-depth",
+    "dimos-pointcloud2",
+] as const)
+
+export type CodecName = typeof CODECS[number]
+export type CodecOutput = "video" | "depth" | "pointcloud"
+
+export function codecOutput(codec: CodecName): CodecOutput {
+    if (codec.endsWith("pointcloud2")) {
+        return "pointcloud"
+    }
+    return codec.endsWith("depth") ? "depth" : "video"
+}
+
+/** Lossless depth, downscaled by `stride` (nearest neighbor) at lower quality. */
+export interface DepthImage {
+    width: number
+    height: number
+    sourceWidth: number
+    sourceHeight: number
+    stride: number
+    encoding: "16UC1" | "32FC1" | "mono16"
+    /** row-major; Uint16Array for 16UC1/mono16, Float32Array for 32FC1 */
+    data: Uint16Array | Float32Array
+}
+
+export interface PointCloud {
+    count: number
+    /** finite points in the source message, before voxel downsampling */
+    sourceCount: number
+    /** x, y, z per point */
+    positions: Float32Array
+    /** 0..255 per point; the source value is intensityMin + value * intensityScale */
+    intensity: Uint8Array | null
+    intensityMin: number
+    intensityScale: number
+    origin: [number, number, number]
+    /** meters per quantization step */
+    scale: number
+    /** 0 = no downsampling */
+    voxelSize: number
+    /** largest per-axis error against a source point: voxelSize / 2, or scale / 2 without voxels */
+    maxError: number
+}
+
+/** Per-frame details of a video subscription; the pixels are on `mediaStream`. */
+export interface VideoFrameInfo {
+    width: number
+    height: number
+    sourceWidth: number
+    sourceHeight: number
+    quality: number
+    keyframe: boolean
+    encodedBytes: number
+}
+
 export interface Message {
     key: string
+    /** the payload as sent: raw sample bytes, or the codec's wire format */
     bytes: Uint8Array
     timestamp: number
     seq: number
+    depth?: DepthImage
+    points?: PointCloud
+    video?: VideoFrameInfo
+    mediaStream?: MediaStream
 }
 
 export interface SubscribeOptions {
@@ -38,6 +111,7 @@ export interface SubscribeOptions {
     minQuality?: number
     maxQuality?: number
     qualityToHzTradeoff?: number
+    codec?: CodecName
 }
 
 export interface PublisherOptions {
@@ -70,13 +144,37 @@ export interface BridgeChannelStats {
     type: string
     key: string
     opts: Record<string, unknown>
-    stats: Record<string, number | boolean | null>
+    stats: Record<string, number | boolean | string | null>
+    /** subscriptions: this stream's share of the frontend's bandwidth (SPEC "Bandwidth allocation") */
+    allocation: Allocation | null
+}
+
+export interface Allocation {
+    demandBytesPerSec: number
+    floorBytesPerSec: number
+    budgetBytesPerSec: number
+    hz: number
+    hzFraction: number
+    quality: number | null
+    constrained: boolean
+}
+
+export interface BandwidthStats {
+    dataEstimateBytesPerSec: number
+    videoEstimateBytesPerSec: number
+    capBytesPerSec: number | null
+    budgetBytesPerSec: number
+    demandBytesPerSec: number
+    sentBytesPerSec: number
+    networkBlockedFraction: number
+    constrained: boolean
 }
 
 export interface BridgeStats {
     clock: { offsetMs: number | null, rttMs: number | null }
     heartbeat: Record<string, unknown>
     access: { enabled: boolean, denied: number }
+    bandwidth: BandwidthStats | null
 }
 
 export interface GetReply {
@@ -138,7 +236,7 @@ const putHeaderBytes = 8
 // incomplete chunked messages kept per subscription before the oldest is dropped
 const maxPartialMessages = 8
 
-const subscribeOptionNames = new Set(["delivery", "priority", "bandwidthPriority", "queueSize", "maxAge", "maxHz", "dangerousMinHz", "minQuality", "maxQuality", "qualityToHzTradeoff"])
+const subscribeOptionNames = new Set(["delivery", "priority", "bandwidthPriority", "queueSize", "maxAge", "maxHz", "dangerousMinHz", "minQuality", "maxQuality", "qualityToHzTradeoff", "codec"])
 const publisherOptionNames = new Set(["delivery", "priority", "repeatMs", "latencyLimit"])
 
 function checkNumber(name: string, value: unknown, isValid: (value: number) => boolean, expected: string): void {
@@ -176,6 +274,14 @@ export function validateSubscribeOptions(options: SubscribeOptions): void {
     checkNumber("qualityToHzTradeoff", options.qualityToHzTradeoff, isUnit, "within 0..1")
     if ((options.minQuality ?? 0) > (options.maxQuality ?? 1)) {
         throw new RangeError("zenoh-web: minQuality must be <= maxQuality")
+    }
+    if (options.codec !== undefined) {
+        if (!(CODECS as readonly string[]).includes(options.codec)) {
+            throw new TypeError(`zenoh-web: unknown codec "${String(options.codec)}" (known: ${CODECS.join(", ")})`)
+        }
+        if (codecOutput(options.codec) === "video" && options.delivery === "reliable") {
+            throw new TypeError(`zenoh-web: ${options.codec} is a video codec (a lossy video track); use delivery "latest"`)
+        }
     }
 }
 
@@ -255,6 +361,73 @@ export function decodeFrame(buffer: ArrayBuffer): Frame {
         chunkIndex: view.getUint32(offset + 16, true),
         chunkCount: view.getUint32(offset + 20, true),
         chunk: new Uint8Array(buffer, offset + 24),
+    }
+}
+
+// browsers are little endian, so typed arrays can view the decoded little-endian values directly
+const depthEncodings = { 1: "16UC1", 2: "32FC1", 3: "mono16" } as const
+
+/** Depth codec payload: 20-byte header + zstd(values), see SPEC "Wire formats". */
+export function decodeDepth(bytes: Uint8Array): DepthImage {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    if (bytes[0] !== 1) {
+        throw new Error(`zenoh-web: unknown depth format version ${bytes[0]}`)
+    }
+    const encoding = depthEncodings[bytes[1] as 1 | 2 | 3]
+    if (!encoding) {
+        throw new Error(`zenoh-web: unknown depth encoding ${bytes[1]}`)
+    }
+    const width = view.getUint32(4, true)
+    const height = view.getUint32(8, true)
+    const values = zstdDecompress(bytes.subarray(20)) as Uint8Array
+    const aligned = values.byteOffset % 4 === 0 ? values : values.slice()
+    const count = width * height
+    const data = encoding === "32FC1" ? new Float32Array(aligned.buffer, aligned.byteOffset, count) : new Uint16Array(aligned.buffer, aligned.byteOffset, count)
+    return { width, height, sourceWidth: view.getUint32(12, true), sourceHeight: view.getUint32(16, true), stride: view.getUint16(2, true), encoding, data }
+}
+
+/** Point cloud codec payload: 40-byte header + zstd(int16 xyz, u8 intensity), see SPEC "Wire formats". */
+export function decodePointCloud(bytes: Uint8Array): PointCloud {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    if (bytes[0] !== 1) {
+        throw new Error(`zenoh-web: unknown point cloud format version ${bytes[0]}`)
+    }
+    const hasIntensity = (bytes[1] & 1) === 1
+    const count = view.getUint32(4, true)
+    const origin: [number, number, number] = [view.getFloat32(12, true), view.getFloat32(16, true), view.getFloat32(20, true)]
+    const scale = view.getFloat32(24, true)
+    const voxelSize = view.getFloat32(28, true)
+    const body = zstdDecompress(bytes.subarray(40)) as Uint8Array
+    const quantized = new DataView(body.buffer, body.byteOffset, body.byteLength)
+    const positions = new Float32Array(count * 3)
+    for (let index = 0; index < count * 3; index++) {
+        positions[index] = origin[index % 3] + quantized.getInt16(index * 2, true) * scale
+    }
+    return {
+        count,
+        sourceCount: view.getUint32(8, true),
+        positions,
+        intensity: hasIntensity ? body.slice(count * 6, count * 7) : null,
+        intensityMin: view.getFloat32(32, true),
+        intensityScale: view.getFloat32(36, true),
+        origin,
+        scale,
+        voxelSize,
+        maxError: voxelSize > 0 ? voxelSize / 2 : scale / 2,
+    }
+}
+
+/** Video metadata frame (28 bytes) sent on a video subscription's channel per frame. */
+export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    return {
+        keyframe: (bytes[1] & 1) === 1,
+        width: view.getUint32(4, true),
+        height: view.getUint32(8, true),
+        sourceWidth: view.getUint32(12, true),
+        sourceHeight: view.getUint32(16, true),
+        quality: view.getFloat32(20, true),
+        encodedBytes: view.getUint32(24, true),
     }
 }
 
@@ -369,9 +542,13 @@ abstract class Endpoint {
         return this.acceptance.promise
     }
 
-    protected watchChannel(channel: RTCDataChannel): void {
+    /** Starts a new attempt to get accepted (each attach, including reconnects). */
+    protected beginAttempt(): Acceptance {
         this.acceptance = new Acceptance()
-        const acceptance = this.acceptance
+        return this.acceptance
+    }
+
+    protected watchChannel(channel: RTCDataChannel, acceptance: Acceptance): void {
         waitOpen(channel, openTimeoutMs).then(() => acceptance.channelOpened(), (error: Error) => acceptance.reject(error))
     }
 
@@ -399,6 +576,12 @@ export class Subscription extends Endpoint {
     received = 0
     /** chunked messages dropped incomplete (lost chunk or abandoned for a newer message) */
     partialDropped = 0
+    /** codec payloads that failed to decode in this page */
+    decodeErrors = 0
+    /** video codecs: the decoded video (also on each message as `mediaStream`) */
+    mediaStream: MediaStream | null = null
+    readonly codecOutput: CodecOutput | null
+    #videoTransceiver: RTCRtpTransceiver | null = null
     /** drops before the current channel (each new channel restarts seq at 0) */
     #droppedBefore = 0
     #firstSeq = -1
@@ -411,6 +594,7 @@ export class Subscription extends Endpoint {
 
     constructor(owner: ZenohWeb, id: number, key: string, readonly options: SubscribeOptions, readonly callback: (message: Message) => void) {
         super(owner, id, key)
+        this.codecOutput = options.codec ? codecOutput(options.codec) : null
     }
 
     get state(): SubscriptionState {
@@ -437,8 +621,27 @@ export class Subscription extends Endpoint {
         this.#highestConsumedFrame = -1
         this.#bytesSinceAck = 0
         this.#partials.clear()
+        const acceptance = this.beginAttempt()
+        if (this.codecOutput !== "video") {
+            this.#openChannel(peer, acceptance, null)
+            return
+        }
+        // video: a recvonly transceiver (renegotiated with the bridge) carries the frames
+        this.#videoTransceiver = null
+        this.owner._acquireVideoTransceiver(peer).then((transceiver) => {
+            if (this.closed || acceptance !== this.acceptance) {
+                this.owner._releaseVideoTransceiver(peer, transceiver)
+                return
+            }
+            this.#videoTransceiver = transceiver
+            this.mediaStream = new MediaStream([transceiver.receiver.track])
+            this.#openChannel(peer, acceptance, transceiver.mid)
+        }, (error: Error) => acceptance.reject(new Error(`zenoh-web: video renegotiation for ${this.key} failed: ${error.message}`)))
+    }
+
+    #openChannel(peer: RTCPeerConnection, acceptance: Acceptance, mid: string | null): void {
         // JSON turns queueSize Infinity into null, which the bridge reads as unbounded
-        const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts: this.options })
+        const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts: this.options, ...(mid === null ? {} : { mid }) })
         const channel = peer.createDataChannel(label, channelInit(this.options.delivery, this.options.maxAge))
         channel.binaryType = "arraybuffer"
         channel.onmessage = (event: MessageEvent) => {
@@ -447,7 +650,19 @@ export class Subscription extends Endpoint {
             }
         }
         this.channel = channel
-        this.watchChannel(channel)
+        this.watchChannel(channel, acceptance)
+    }
+
+    override close(): void {
+        if (this.closed) {
+            return
+        }
+        super.close()
+        const peer = this.owner._peer
+        if (this.#videoTransceiver && peer) {
+            this.owner._releaseVideoTransceiver(peer, this.#videoTransceiver)
+        }
+        this.#videoTransceiver = null
     }
 
     #onFrame(channel: RTCDataChannel, frame: Frame, frameBytes: number): void {
@@ -501,7 +716,29 @@ export class Subscription extends Endpoint {
         }
     }
 
+    /** Adds the codec's decoded form; false if it can't be decoded. */
+    #decode(message: Message): boolean {
+        try {
+            if (this.codecOutput === "depth") {
+                message.depth = decodeDepth(message.bytes)
+            } else if (this.codecOutput === "pointcloud") {
+                message.points = decodePointCloud(message.bytes)
+            } else if (this.codecOutput === "video") {
+                message.video = decodeVideoFrameInfo(message.bytes)
+                message.mediaStream = this.mediaStream ?? undefined
+            }
+            return true
+        } catch (error) {
+            this.decodeErrors++
+            console.error(`zenoh-web: ${this.options.codec} payload on ${message.key} did not decode`, error)
+            return false
+        }
+    }
+
     #deliver(message: Message): void {
+        if (this.codecOutput !== null && !this.#decode(message)) {
+            return
+        }
         this.received++
         this.#receivedOnChannel++
         if (this.#firstSeq < 0 || message.seq < this.#firstSeq) {
@@ -591,12 +828,13 @@ export class Publisher extends Endpoint {
     attach(peer: RTCPeerConnection): void {
         const { delivery, priority, latencyLimit } = this.options
         const label = JSON.stringify({ type: "pub", key: this.key, id: this.id, opts: { delivery, priority, latencyLimit } })
+        const acceptance = this.beginAttempt()
         const channel = peer.createDataChannel(label, channelInit(delivery, undefined))
         channel.binaryType = "arraybuffer"
         channel.bufferedAmountLowThreshold = resumeBytes
         channel.onbufferedamountlow = () => this.#flush()
         this.channel = channel
-        this.watchChannel(channel)
+        this.watchChannel(channel, acceptance)
         // puts made before the bridge accepted the channel wait for it
         this.acceptance.promise.then(() => this.#flush(), () => {})
     }
@@ -735,6 +973,13 @@ export class ZenohWeb {
     #closed = false
     #generation = 0
     #statsTimer: ReturnType<typeof setInterval> | null = null
+    /** renegotiations run one at a time */
+    #negotiation: Promise<unknown> = Promise.resolve()
+    /** resolves once the current peer connection is up (renegotiation needs `control`) */
+    #connected: Promise<void> = new Promise(() => {})
+    #markConnected: () => void = () => {}
+    /** video transceivers of closed subscriptions, reused before adding new ones */
+    #freeVideoTransceivers = new Map<RTCPeerConnection, RTCRtpTransceiver[]>()
 
     constructor(url: string, options: ConnectOptions = {}) {
         this.url = url.replace(/\/+$/, "")
@@ -789,10 +1034,57 @@ export class ZenohWeb {
     }
 
     /** Opens (or re-opens) the peer connection and every channel on it. */
+    get _peer(): RTCPeerConnection | null {
+        return this.#peer
+    }
+
+    /**
+     * A recvonly video transceiver bound to a bridge track: a free one, or a new one added through
+     * a renegotiation over `control` (the bridge answers with a track for the new m-line).
+     */
+    _acquireVideoTransceiver(peer: RTCPeerConnection): Promise<RTCRtpTransceiver> {
+        const free = this.#freeVideoTransceivers.get(peer)?.pop()
+        if (free) {
+            return Promise.resolve(free)
+        }
+        const run = async () => {
+            await this.#connected
+            if (peer !== this.#peer) {
+                throw new Error("connection replaced")
+            }
+            const transceiver = peer.addTransceiver("video", { direction: "recvonly" })
+            await peer.setLocalDescription(await peer.createOffer())
+            const offer = peer.localDescription
+            const response = await this._request({ op: "renegotiate", addVideo: true, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
+            await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
+            if (response.mid !== transceiver.mid) {
+                throw new Error(`bridge bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
+            }
+            return transceiver
+        }
+        const result = this.#negotiation.then(run, run)
+        this.#negotiation = result.catch(() => {})
+        return result
+    }
+
+    _releaseVideoTransceiver(peer: RTCPeerConnection, transceiver: RTCRtpTransceiver): void {
+        if (peer === this.#peer && peer.connectionState !== "closed") {
+            const free = this.#freeVideoTransceivers.get(peer) ?? []
+            free.push(transceiver)
+            this.#freeVideoTransceivers.set(peer, free)
+        }
+    }
+
     async _open(): Promise<void> {
         const generation = ++this.#generation
         this.#setState("connecting")
         this.#clockSamples = []
+        this.#connected = new Promise((resolve) => {
+            this.#markConnected = resolve
+        })
+        if (this.#peer) {
+            this.#freeVideoTransceivers.delete(this.#peer)
+        }
         const peer = new RTCPeerConnection({ iceServers: this.options.iceServers })
         const control = peer.createDataChannel("control", { ordered: true })
         this.#peer = peer
@@ -840,6 +1132,7 @@ export class ZenohWeb {
             throw error
         }
         this.#setState("connected")
+        this.#markConnected()
     }
 
     #attachHeartbeat(peer: RTCPeerConnection): void {
@@ -1024,7 +1317,7 @@ export class ZenohWeb {
         }
         const response = await this._request({ op: "stats" }, pingTimeoutMs).catch(() => null)
         if (response) {
-            this.bridgeStats = { clock: response.clock, heartbeat: response.heartbeat, access: response.access } as BridgeStats
+            this.bridgeStats = { clock: response.clock, heartbeat: response.heartbeat, access: response.access, bandwidth: response.bandwidth ?? null } as BridgeStats
         }
         this.#refreshStats((response?.channels as BridgeChannelStats[] | undefined) ?? null)
     }

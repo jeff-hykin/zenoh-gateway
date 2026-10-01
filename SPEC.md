@@ -13,7 +13,7 @@ zenoh peers (publishers we don't control)
 ```
 
 The bridge is a dumb pipe: one data channel ↔ one zenoh key expression. It never parses payloads,
-except for the hardcoded transcoders (point clouds, video) described in phase 2.
+except when a subscription explicitly picks one of the hardcoded codecs (see "Codecs").
 
 ## JS API
 
@@ -31,12 +31,14 @@ const sub = z.subscribe("camera/**", {
     queueSize: 1,                // pending samples per key; default 1 for latest, Infinity for reliable
     maxAge: 500,                 // ms; drop anything older
     maxHz: 20,                   // bridge never sends a key faster than this
-    bandwidthPriority: 1,        // phase 2: flex-shrink weight when bandwidth is short
-    dangerousMinHz: 1,           // phase 2: allocation floor (may starve others)
-    minQuality: 0.3,             // phase 2: 0-1, transcoded types only
-    maxQuality: 1.0,             // phase 2
-    qualityToHzTradeoff: 0.7,    // phase 2: 0 = keep quality, drop hz; 1 = keep hz, drop quality
-}, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq })
+    bandwidthPriority: 1,        // flex-shrink weight when bandwidth is short (higher shrinks more)
+    dangerousMinHz: 1,           // allocation floor (may starve others)
+    minQuality: 0.3,             // 0-1, transcoded streams only
+    maxQuality: 1.0,
+    qualityToHzTradeoff: 0.7,    // 0 = keep quality, drop hz; 1 = keep hz, drop quality
+    codec: "ros2-image",         // optional transcoder, see "Codecs"; unknown names throw
+}, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.depth, msg.points, msg.video, msg.mediaStream })
+sub.mediaStream  // video codecs: a MediaStream for a <video> element
 sub.close()
 
 const cmd = z.publisher("cmd_vel", {
@@ -58,7 +60,8 @@ const topics = await z.listTopics("robot/**")  // [{ key, sources }], see "Topic
 await sub.ready()      // resolves when the bridge accepted the channel, rejects with its reason
 sub.state              // "connecting" | "open" | "rejected" | "closed" (publishers add "tripped")
 
-z.stats          // per-key: received, dropped, backlogBytes, rttMs, bridge (incl. normalized options)
+z.stats          // per-key: received, dropped, backlogBytes, rttMs, bridge (normalized options, stats, allocation)
+z.bridgeStats.bandwidth  // this frontend's estimate, cap, budget, demand (see "Bandwidth allocation")
 z.clockOffsetMs  // bridge clock - browser clock
 z.rttMs
 z.onState(fn)    // "connecting" | "connected" | "degraded" | "lost"
@@ -66,9 +69,9 @@ z.onState(fn)    // "connecting" | "connected" | "degraded" | "lost"
 
 - `Priority` mirrors zenoh / zenoh-ts: REAL_TIME=1, INTERACTIVE_HIGH=2, INTERACTIVE_LOW=3, DATA_HIGH=4, DATA=5, DATA_LOW=6, BACKGROUND=7 (lower = more important).
 - Options are validated in the client (unknown names and out-of-range values throw) and again in the bridge.
-- `bandwidthPriority`, `dangerousMinHz`, `minQuality`, `maxQuality`, `qualityToHzTradeoff` are accepted,
-  validated, carried to the bridge and shown (with defaults filled in) in stats, but have **no effect
-  until phase 2** (bandwidth allocation and transcoding).
+- `bandwidthPriority` (default 1), `dangerousMinHz` (0), `minQuality` (0), `maxQuality` (1),
+  `qualityToHzTradeoff` (0.5) drive the per-frontend allocator ("Bandwidth allocation"); stats show
+  them with defaults filled in.
 - No `latched` flag: the bridge always subscribes with zenoh-ext AdvancedSubscriber history (max 1 sample per publisher), so publishers with a cache (e.g. rmw_zenoh transient_local like tf_static) replay their last message.
 
 ## Delivery → transport mapping
@@ -106,6 +109,97 @@ partially: the bridge finishes a chunked message it started (so big messages mak
 newer ones keep arriving) unless it outlives `maxAge` (`abandonedPartial`); SCTP drops lost chunks
 (`maxRetransmits: 0` / `maxPacketLifeTime`); and the client discards incomplete messages once a newer
 one completes or more than 8 are pending (`partialDropped`).
+
+## Codecs
+
+Picked explicitly per subscription with `codec`. The name is `<protocol>-<input type>`; the input
+type decides the output. No `codec` = raw passthrough (Hz is the only degradation). An unknown name
+throws in the client and is refused by the bridge (`rejected` event). There is no auto-detection.
+
+| codec | input message | output |
+|---|---|---|
+| `ros2-image`, `dimos-image` | `sensor_msgs/Image`: rgb8, bgr8, rgba8, bgra8, mono8, mono16/16UC1 (top 8 bits), or `jpeg`/`png` data in an Image (dimos `lcm_jpeg_encode`) | H.264 video track |
+| `ros2-compressed-image`, `dimos-compressed-image` | `sensor_msgs/CompressedImage`: jpeg, png, webp, jxl (magic bytes first, `format` string second) | H.264 video track |
+| `ros2-depth`, `dimos-depth` | `sensor_msgs/Image`: 16UC1, 32FC1, mono16 | lossless depth, data channel |
+| `ros2-compressed-depth`, `dimos-compressed-depth` | `sensor_msgs/CompressedImage`: 16-bit gray png or jxl, ROS `compressedDepth` png (12-byte header skipped; its quantized 32FC1 form is refused) | lossless depth, data channel |
+| `ros2-pointcloud2`, `dimos-pointcloud2` | `sensor_msgs/PointCloud2`, any field layout | quantized points, data channel |
+
+Inputs:
+- ROS 2 over rmw_zenoh: key `<domain>/<topic>/<pkg>::msg::dds_::<Type>_/RIHS01_<hash>`, payload CDR with
+  the 4-byte encapsulation header (little or big endian honored).
+- dimos over zenoh: key `<topic>/<msg_name>` (e.g. `dimos/camera/color/sensor_msgs.Image`), payload LCM
+  (big endian) with the 8-byte type fingerprint, which the bridge checks (a wrong type is an error, counted
+  in `codecErrors` / `lastCodecError` stats).
+- mono16 is ambiguous (IR intensity or depth-like); the subscriber decides: `*-image` shows its top
+  8 bits as gray video, `*-depth` delivers it losslessly with encoding `mono16`.
+- Decoders are pure Rust (zune-jpeg, png, image-webp, jxl-oxide); H.264 is openh264, compression zstd.
+
+Work happens lazily and on send: only messages the pacing/queues let through are transcoded, on
+tokio's blocking pool. Data-channel encodes are shared across frontends through a small cache keyed by
+(codec, quality, payload hash): identical requests compute once (`encodes` vs `sharedEncodes` in
+stats). For video only the decode to RGB is shared; each (frontend, subscription) has its own H.264
+encoder, because rate control and reference frames are per receiver.
+
+### Video
+
+The client adds a recvonly video transceiver and renegotiates over `control`
+(`{op: "renegotiate", addVideo: true, sdp}` → `{sdp, mid}`); the bridge adds an H.264 track
+(constrained baseline, `profile-level-id=42e01f`) that pairs with the new m-line, then the `sub`
+channel's label names that `mid`. Renegotiations run one at a time. A closed video subscription's
+transceiver (and the bridge's track) is reused by the next one instead of renegotiating again.
+Each video frame also sends a 28-byte metadata frame on the `sub` channel (`msg.video`).
+Quality q maps to resolution scale `0.25 + 0.75 q` (even sizes) and a target of `0.03 + 0.12 q`
+bits per pixel; the encoder's bitrate is that size times the allocated Hz. Keyframes: the first
+frame of every subscription, on PLI/FIR from the browser (`keyframeRequests`), and every 3 s.
+Send-side congestion control: TWCC feedback into GCC (webrtc-rs interceptors), whose target feeds the
+allocator.
+
+### Depth and point clouds
+
+Depth stays lossless: quality only lowers resolution, by an integer stride `round(1 / (1/8 + 7/8 q))`
+(1 at q = 1, 2 at 0.5, 8 at 0), nearest neighbor (every value is a source value, never a blend).
+`msg.depth.data` is a `Uint16Array` (16UC1, mono16) or `Float32Array` (32FC1).
+
+Point clouds: points with a non-finite x, y or z are skipped; fields are read by name (`x`, `y`, `z`,
+optional `intensity`) at their offsets with any PointField datatype, honoring `point_step`, `row_step`
+and `is_bigendian`. Quality q < 1 voxel-downsamples with voxel edge `0.2 m × (1 − q)`: each occupied
+voxel becomes one point at its center (mean intensity). Coordinates are int16 around a per-message
+origin: `x = originX + qx × scale`. Error per axis against the source point is at most `scale / 2`
+without voxels, where `scale = (largest bounding-box extent / 2) / 32767` (e.g. 0.76 mm for a
+100 m wide cloud), plus f32 rounding (~1e-7 relative); with voxels, at most `voxelSize / 2`
+(`msg.points.maxError`). Intensity is scaled to u8 over the message's min..max (`intensityMin`,
+`intensityScale`). `msg.points.positions` is a `Float32Array` (x, y, z per point).
+
+## Bandwidth allocation
+
+Per frontend, every 250 ms:
+1. **Estimate.** Data channels: a delivery-rate estimator over what the `sub` channels pushed into SCTP
+   and how long their senders waited on SCTP (webrtc-rs doesn't expose the congestion window): blocked
+   on the network more than 20% of the interval → estimate = 0.9 × measured rate (at most halving per
+   step); otherwise, if streams want more, probe up 25% per interval (start 1 MB/s). Video: GCC's
+   target bitrate, counted while a video track is in use. Budget = min(`--max-bandwidth-bytes-per-sec`
+   if set, data estimate + video estimate).
+2. **Demand.** Each subscription wants `price(maxQuality) × Hz`, Hz being each key's measured source
+   rate capped by `maxHz`, summed over its keys. Price = bytes per message: measured for raw streams
+   and data-channel codecs (per quality, scaled by a size prior between measured qualities), modeled
+   for video (resolution × bits per pixel). Floor = `price(minQuality) × dangerousMinHz` (per key,
+   never above the key's rate).
+3. **Shrink.** If demand exceeds the budget, streams shrink like CSS flex items: the deficit is split in
+   proportion to `bandwidthPriority × demand`; a stream that would go below its floor freezes there and
+   the rest shrink further. Weight-0 streams shrink only once nothing else can. Floors are kept even
+   when they add up to more than the budget ("dangerous"). Reliable subscriptions can't drop messages,
+   so their measured rate is reserved and never shrunk.
+4. **Quality vs Hz.** A transcoded stream granted fraction r of its demand shrinks its message size by
+   `r^t` (choosing the best quality among the bounds and 0.1 steps that fits) and its Hz by the rest,
+   `t = qualityToHzTradeoff`: 0 keeps quality and drops Hz, 1 keeps Hz and drops quality. When one
+   hits its bound (`minQuality`, or `dangerousMinHz`), the other gives.
+5. **Apply.** Each key's send interval becomes `1 / (its wanted Hz × granted fraction)` (never below
+   its floor or 0.05 Hz); transcoders encode at the granted quality.
+
+Stats: each subscription's `allocation` (`demandBytesPerSec`, `floorBytesPerSec`,
+`budgetBytesPerSec`, `hz`, `hzFraction`, `quality`, `constrained`) and the frontend's `bandwidth`
+(`dataEstimateBytesPerSec`, `videoEstimateBytesPerSec`, `capBytesPerSec`, `budgetBytesPerSec`,
+`demandBytesPerSec`, `sentBytesPerSec`, `networkBlockedFraction`, `constrained`).
 
 ## Topic enumeration
 
@@ -172,14 +266,22 @@ resolving so the bridge has an offset before the first put.
   `frameId` it has processed with a 4-byte `u32` message on the same channel.
 - Browser → bridge put: `f64 sentAtMs (browser clock) | payload`, little endian.
 - Heartbeat: browser sends `{"t0", "offsetMs", "rttMs"}` (JSON), bridge answers `{"t0", "t1", "t2"}`.
+- Video `sub` label: adds `"mid"`. The payload of a codec message (little endian):
+  - depth: `u8 version=1 | u8 encoding (1 16UC1, 2 32FC1, 3 mono16) | u16 stride | u32 width |
+    u32 height | u32 sourceWidth | u32 sourceHeight | zstd(width × height values)`
+  - point cloud: `u8 version=1 | u8 flags (bit0 intensity) | u16 0 | u32 pointCount | u32 sourcePointCount |
+    f32 originX | f32 originY | f32 originZ | f32 scale | f32 voxelSize | f32 intensityMin |
+    f32 intensityScale | zstd(i16 x, y, z per point, then u8 intensity per point if flagged)`
+  - video metadata: `u8 version=1 | u8 flags (bit0 keyframe) | u16 0 | u32 width | u32 height |
+    u32 sourceWidth | u32 sourceHeight | f32 quality | u32 encodedBytes`
+- The client decodes zstd with vendored fzstd (`client/vendor/`), since `DecompressionStream("zstd")`
+  isn't in every browser yet.
 
 ## Phases
 
 1. Bridge pipe + JS client: subscribe (with history), publisher, get, delivery queues (queueSize, maxAge),
    maxHz cap, stats, clock sync, latencyLimit, heartbeat + deadman.
-2. Bandwidth allocation (`bandwidthPriority` as flex-shrink weight, `dangerousMinHz` floor, shrink by
-   priority) + hardcoded transcoders for point clouds and video (`minQuality`/`maxQuality` +
-   `qualityToHzTradeoff`). Lazy: a transcoder only runs while a web subscriber wants it
-   (zenoh matching listener). Transcoded variants publish on quality-rounded keys so clients share encodes.
-   Unknown types are hz-only.
+2. Done: bandwidth allocation and the hardcoded codecs above. Transcoding runs inside the bridge's
+   subscription (so only while a browser subscribes), not on separate zenoh keys; encodes are shared
+   through an in-process cache instead.
 3. Later: WASM degrade functions shipped from the frontend.

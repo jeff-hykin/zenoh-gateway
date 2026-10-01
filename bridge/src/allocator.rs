@@ -93,48 +93,50 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
     let mut grants = wants.clone();
     let mut frozen: Vec<bool> = floors.iter().zip(&wants).map(|(floor, want)| floor >= want).collect();
     let constrained = wants.iter().sum::<f64>() > budget;
-    while constrained {
-        let over = grants.iter().sum::<f64>() - budget;
-        if over <= 1e-9 {
-            break;
-        }
-        let shrink_weights = |zero_weight_phase: bool| -> Vec<f64> {
-            demands
-                .iter()
-                .enumerate()
-                .map(|(i, d)| {
-                    if frozen[i] {
-                        0.0
-                    } else if zero_weight_phase {
-                        if d.weight == 0.0 { wants[i] } else { 0.0 }
-                    } else {
-                        d.weight * wants[i]
-                    }
-                })
-                .collect()
-        };
-        let mut weights = shrink_weights(false);
-        if weights.iter().sum::<f64>() <= 0.0 {
-            weights = shrink_weights(true);
-        }
-        let total_weight: f64 = weights.iter().sum();
-        if total_weight <= 0.0 {
-            // everyone is at a floor: floors exceed the budget
-            break;
-        }
-        let mut froze_any = false;
-        for i in 0..demands.len() {
-            if weights[i] > 0.0 && grants[i] - over * weights[i] / total_weight <= floors[i] {
-                grants[i] = floors[i];
-                frozen[i] = true;
-                froze_any = true;
+    if constrained {
+        loop {
+            let over = grants.iter().sum::<f64>() - budget;
+            if over <= 1e-9 {
+                break;
             }
-        }
-        if !froze_any {
+            let shrink_weights = |zero_weight_phase: bool| -> Vec<f64> {
+                demands
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        if frozen[i] {
+                            0.0
+                        } else if zero_weight_phase {
+                            if d.weight == 0.0 { wants[i] } else { 0.0 }
+                        } else {
+                            d.weight * wants[i]
+                        }
+                    })
+                    .collect()
+            };
+            let mut weights = shrink_weights(false);
+            if weights.iter().sum::<f64>() <= 0.0 {
+                weights = shrink_weights(true);
+            }
+            let total_weight: f64 = weights.iter().sum();
+            if total_weight <= 0.0 {
+                // everyone is at a floor: floors exceed the budget
+                break;
+            }
+            let mut froze_any = false;
             for i in 0..demands.len() {
-                grants[i] -= over * weights[i] / total_weight;
+                if weights[i] > 0.0 && grants[i] - over * weights[i] / total_weight <= floors[i] {
+                    grants[i] = floors[i];
+                    frozen[i] = true;
+                    froze_any = true;
+                }
             }
-            break;
+            if !froze_any {
+                for i in 0..demands.len() {
+                    grants[i] -= over * weights[i] / total_weight;
+                }
+                break;
+            }
         }
     }
     demands

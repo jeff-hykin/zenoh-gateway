@@ -12,6 +12,11 @@
 //! - `test/big`: `--big-bytes` at `--big-hz`, only while someone subscribes; byte i (i >= 8) is
 //!   `(counter * 31 + i * 7) & 0xff`, bytes 0..4 the counter, 4..8 the length (u32 little endian)
 //!
+//! - `--publish <key>=<file>@<hz>` (repeatable): the file's exact bytes, e.g. a codec fixture
+//! - `--synthetic <key>=<bytes>@<hz>` (repeatable): f64 send time (unix ms) + u32 counter + zeros
+//!
+//! `test/big`, `--publish` and `--synthetic` keys only put while someone subscribes.
+//!
 //! Prints `READY` once everything is declared.
 
 use clap::Parser;
@@ -35,6 +40,35 @@ struct Cli {
     big_hz: f64,
     #[arg(long, default_value_t = 2_500_000)]
     big_bytes: usize,
+    #[arg(long)]
+    publish: Vec<String>,
+    #[arg(long)]
+    synthetic: Vec<String>,
+}
+
+/// `<key>=<value>@<hz>`
+fn split_spec(spec: &str) -> anyhow::Result<(String, String, f64)> {
+    let (key, rest) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("{spec}: expected <key>=<value>@<hz>"))?;
+    let (value, hz) = rest.rsplit_once('@').ok_or_else(|| anyhow::anyhow!("{spec}: expected <key>=<value>@<hz>"))?;
+    Ok((key.to_owned(), value.to_owned(), hz.parse()?))
+}
+
+/// Puts `make(counter)` on `key` at `hz` while the key has a matching subscriber.
+async fn publish_while_matched(session: &zenoh::Session, key: String, hz: f64, make: impl Fn(u32) -> Vec<u8> + Send + 'static) -> anyhow::Result<()> {
+    let publisher = session.declare_publisher(key).congestion_control(CongestionControl::Drop).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs_f64(1.0 / hz));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut counter: u32 = 0;
+        loop {
+            ticker.tick().await;
+            if publisher.matching_status().await.is_ok_and(|status| status.matching()) {
+                let _ = publisher.put(make(counter)).await;
+                counter = counter.wrapping_add(1);
+            }
+        }
+    });
+    Ok(())
 }
 
 /// The `test/big` payload for `counter`; checkable byte by byte in the browser.
@@ -119,6 +153,23 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    for spec in &cli.publish {
+        let (key, path, hz) = split_spec(spec)?;
+        let bytes = std::fs::read(&path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        publish_while_matched(&session, key, hz, move |_| bytes.clone()).await?;
+    }
+    for spec in &cli.synthetic {
+        let (key, size, hz) = split_spec(spec)?;
+        let size: usize = size.parse::<usize>()?.max(12);
+        publish_while_matched(&session, key, hz, move |counter| {
+            let mut payload = vec![0u8; size];
+            payload[0..8].copy_from_slice(&unix_ms().to_le_bytes());
+            payload[8..12].copy_from_slice(&counter.to_le_bytes());
+            payload
+        })
+        .await?;
+    }
 
     let jpeg_publisher = session.declare_publisher("test/jpeg").await.map_err(|e| anyhow::anyhow!("{e}"))?;
     tokio::spawn(async move {

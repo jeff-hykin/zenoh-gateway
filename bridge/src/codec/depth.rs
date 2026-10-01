@@ -73,13 +73,13 @@ mod tests {
         let full = encode(&depth, 1.0).unwrap();
         assert_eq!(&full[..4], &[1, 1, 1, 0]);
         let decoded = zstd::bulk::decompress(&full[HEADER_LEN..], 1 << 20).unwrap();
-        let decoded: Vec<u16> = decoded.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        let decoded: Vec<u16> = decoded.as_chunks::<2>().0.iter().map(|&b| u16::from_le_bytes(b)).collect();
         assert_eq!(decoded, values);
         let half = encode(&depth, 0.5).unwrap();
         assert_eq!(u32::from_le_bytes(half[4..8].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(half[8..12].try_into().unwrap()), 2);
         let decoded = zstd::bulk::decompress(&half[HEADER_LEN..], 1 << 20).unwrap();
-        let decoded: Vec<u16> = decoded.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        let decoded: Vec<u16> = decoded.as_chunks::<2>().0.iter().map(|&b| u16::from_le_bytes(b)).collect();
         assert_eq!(decoded, vec![0, 2, 8, 10], "every value is a source value, never a blend");
     }
 }

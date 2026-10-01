@@ -2,6 +2,9 @@
     "tasks": {
         "build": "deno run --allow-all tools/build_web.js build",
         "check": "deno check client/zenoh_web.ts",
-        "e2e": "deno run --allow-all test/e2e.js"
+        "e2e": "deno run --allow-all test/all.js",
+        "e2e:core": "deno run --allow-all test/e2e.js",
+        "e2e:codecs": "deno run --allow-all test/codecs.js",
+        "e2e:allocation": "deno run --allow-all test/allocation.js"
     }
 }

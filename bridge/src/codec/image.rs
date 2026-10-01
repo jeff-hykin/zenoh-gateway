@@ -78,6 +78,9 @@ fn read_u16(bytes: &[u8], big_endian: bool) -> u16 {
     if big_endian { u16::from_be_bytes([bytes[0], bytes[1]]) } else { u16::from_le_bytes([bytes[0], bytes[1]]) }
 }
 
+/// Writes one pixel's RGB from its source bytes (and the message's big-endian flag).
+type PixelConverter = fn(&[u8], bool, &mut [u8]);
+
 /// A raw image (or a dimos Image carrying a jpeg/png file) as RGB8. 16-bit gray keeps its top 8 bits.
 pub fn raw_to_rgb(image: &RawImage) -> Result<Rgb8> {
     let encoding = image.encoding.to_ascii_lowercase();
@@ -85,7 +88,7 @@ pub fn raw_to_rgb(image: &RawImage) -> Result<Rgb8> {
         return compressed_to_rgb(image.data, &encoding);
     }
     // (bytes per pixel, writes one pixel's RGB from its source bytes)
-    let (bytes_per_pixel, convert): (usize, fn(&[u8], bool, &mut [u8])) = match encoding.as_str() {
+    let (bytes_per_pixel, convert): (usize, PixelConverter) = match encoding.as_str() {
         "rgb8" => (3, |s, _, d| d.copy_from_slice(&s[..3])),
         "bgr8" | "8uc3" => (3, |s, _, d| d.copy_from_slice(&[s[2], s[1], s[0]])),
         "rgba8" => (4, |s, _, d| d.copy_from_slice(&s[..3])),
@@ -99,7 +102,7 @@ pub fn raw_to_rgb(image: &RawImage) -> Result<Rgb8> {
     for y in 0..image.height {
         let source = row(image, y, bytes_per_pixel)?;
         let destination = &mut pixels[y as usize * image.width as usize * 3..][..image.width as usize * 3];
-        for (source_pixel, destination_pixel) in source.chunks_exact(bytes_per_pixel).zip(destination.chunks_exact_mut(3)) {
+        for (source_pixel, destination_pixel) in source.chunks_exact(bytes_per_pixel).zip(destination.as_chunks_mut::<3>().0.iter_mut()) {
             convert(source_pixel, image.big_endian, destination_pixel);
         }
     }
@@ -112,7 +115,7 @@ fn to_rgb(samples: &[u8], channels: usize, width: u32, height: u32) -> Result<Rg
     let pixels = match channels {
         3 => samples[..width as usize * height as usize * 3].to_vec(),
         1 | 2 => samples.chunks_exact(channels).flat_map(|p| [p[0], p[0], p[0]]).collect(),
-        4 => samples.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(),
+        4 => samples.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect(),
         other => bail!("{other} channels per pixel"),
     };
     Ok(Rgb8 { width, height, pixels })
@@ -172,7 +175,7 @@ pub fn raw_to_depth(image: &RawImage) -> Result<Depth> {
         "16UC1" | "mono16" => {
             let mut values = Vec::with_capacity(pixel_count);
             for y in 0..height {
-                values.extend(row(image, y, 2)?.chunks_exact(2).map(|s| read_u16(s, image.big_endian)));
+                values.extend(row(image, y, 2)?.as_chunks::<2>().0.iter().map(|s| read_u16(s, image.big_endian)));
             }
             let encoding = if image.encoding == "mono16" { DepthEncoding::Mono16 } else { DepthEncoding::U16 };
             Ok(Depth { width, height, encoding, values: DepthValues::U16(values) })
@@ -180,8 +183,7 @@ pub fn raw_to_depth(image: &RawImage) -> Result<Depth> {
         "32FC1" => {
             let mut values = Vec::with_capacity(pixel_count);
             for y in 0..height {
-                values.extend(row(image, y, 4)?.chunks_exact(4).map(|s| {
-                    let bytes = [s[0], s[1], s[2], s[3]];
+                values.extend(row(image, y, 4)?.as_chunks::<4>().0.iter().map(|&bytes| {
                     if image.big_endian { f32::from_be_bytes(bytes) } else { f32::from_le_bytes(bytes) }
                 }));
             }
@@ -205,7 +207,7 @@ pub fn compressed_to_depth(data: &[u8], format: &str) -> Result<Depth> {
             let (info, samples) = decode_png(data, png::Transformations::IDENTITY)?;
             ensure!(info.color_type == png::ColorType::Grayscale && info.bit_depth == png::BitDepth::Sixteen,
                 "png depth must be 16-bit grayscale, got {:?} {:?}", info.color_type, info.bit_depth);
-            let values = samples.chunks_exact(2).map(|s| u16::from_be_bytes([s[0], s[1]])).collect();
+            let values = samples.as_chunks::<2>().0.iter().map(|&s| u16::from_be_bytes(s)).collect();
             Ok(Depth { width: info.width, height: info.height, encoding: DepthEncoding::U16, values: DepthValues::U16(values) })
         }
         FileFormat::Jxl => {

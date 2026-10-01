@@ -210,8 +210,8 @@ mod tests {
         assert_eq!((*first.unwrap(), shared), (10, false));
         let (again, shared) = cache.get_or_compute(1, || panic!("must not recompute"));
         assert_eq!((*again.unwrap(), shared), (10, true));
-        cache.get_or_compute(2, || Ok(20));
-        cache.get_or_compute(3, || Ok(30));
+        let _ = cache.get_or_compute(2, || Ok(20));
+        let _ = cache.get_or_compute(3, || Ok(30));
         let (evicted, shared) = cache.get_or_compute(1, || Ok(11));
         assert_eq!((*evicted.unwrap(), shared), (11, false), "oldest entry evicted at capacity");
     }

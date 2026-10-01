@@ -164,8 +164,8 @@ pub fn encode(cloud: &PointCloud, quality: f64) -> Result<Vec<u8>> {
 
     let mut body = Vec::with_capacity(points.len() * if has_intensity { 7 } else { 6 });
     for point in &points {
-        for axis in 0..3 {
-            let quantized = ((point.xyz[axis] - origin[axis] as f64) / scale as f64).round().clamp(-QUANT_MAX, QUANT_MAX) as i16;
+        for (value, axis_origin) in point.xyz.iter().zip(origin) {
+            let quantized = ((value - axis_origin as f64) / scale as f64).round().clamp(-QUANT_MAX, QUANT_MAX) as i16;
             body.extend_from_slice(&quantized.to_le_bytes());
         }
     }
