@@ -35,6 +35,9 @@ futures = "0.3"
 zstd = "0.13"
 # audio tracks: libopus transpiled to Rust (no C toolchain, so it cross-compiles like the rest)
 unsafe-libopus = "0.2"
+# coturn time-limited TURN credentials (HMAC-SHA1; already in the tree through webrtc)
+hmac = "0.12"
+sha1 = "0.10"
 # H.264 video (openh264 builds its C sources)
 openh264 = "0.9"
 

@@ -40,9 +40,11 @@
 
 mod allocator;
 mod audio;
+mod auth;
 mod codec;
 pub mod fields;
 mod frame;
+mod ice;
 mod media;
 mod options;
 mod pacing;
@@ -52,8 +54,10 @@ mod server;
 mod subscription;
 
 pub use codec::{AudioPcm, Codec, CodecOutput, CodecSample, Compress, DecodedFrame, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoTarget};
+pub use auth::Grant;
 pub use fields::Fields;
-pub use server::{DEFAULT_PORT, HEALTH_PATH, RunningServer, Server, ServerBuilder};
+pub use ice::{IceServer, turn_credentials};
+pub use server::{Authorize, DEFAULT_PORT, HEALTH_PATH, ICE_PATH, RunningServer, Server, ServerBuilder};
 /// The zenoh version this crate is built against (for [`ServerBuilder::session`] and
 /// [`ServerBuilder::zenoh_config`]).
 pub use zenoh;

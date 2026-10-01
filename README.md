@@ -56,9 +56,11 @@ The bridge checks options: an unknown name or a bad value rejects the subscripti
 
 | option | default | |
 |---|---|---|
-| `heartbeatHz` | 0 (off) | heartbeats per second on their own channel; required for deadmen |
+| `heartbeatHz` | 0 (off) | heartbeats per second on their own channel; required for deadmen and leases |
 | `heartbeatMisses` | 3 | silence of `misses / hz` seconds = this page is gone |
-| `iceServers` | `[]` | `RTCIceServer[]` (LAN needs none) |
+| `token` | none | sent as `Authorization: Bearer <token>` (see [Auth](#auth)); a refused token rejects `connect` and stops reconnecting |
+| `iceServers` | the bridge's | `RTCIceServer[]`; by default fetched from the bridge (`GET /zenoh-web/ice`, TURN credentials minted per client), `[]` on a bridge without any |
+| `iceTransportPolicy` | `"all"` | `"relay"` sends everything through TURN |
 | `reconnect` | `true` | re-open the connection and every live channel after a loss |
 | `statsIntervalMs` | 1000 | how often `z.stats` / `z.bridgeStats` refresh |
 | `clock` | `performance.timeOrigin + performance.now()` | the page's clock in ms (put timestamps, clock sync) |
@@ -78,6 +80,9 @@ The bridge checks options: an unknown name or a bad value rejects the subscripti
 | `state`, `onState(fn)` | `"connecting"` / `"connected"` / `"degraded"` / `"lost"`; `onState` returns an unsubscribe function |
 | `now()` | the page clock used for timestamps |
 | `pollStats()` | refresh stats now |
+| `lease(group, { keys?, maxSeconds? })` → `Lease` | exclusive publish rights on a group's keys among this bridge's clients ([Leases](#leases)) |
+| `expireLease(group)` | end another client's lease (needs the grant's `forceExpire`) |
+| `iceServers` | the ICE servers in use |
 | `pauseHeartbeat()`, `resumeHeartbeat()` | stop/resume beats (to test deadman wiring) |
 | `close()` | close everything |
 
@@ -111,7 +116,8 @@ the bridge's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"
 
 `Publisher`: `put(bytes | string | ArrayBufferView, { timestamp })`, `setDeadman(bytes)`,
 `clearDeadman()`, `state` (`"connecting"`, `"open"`, `"tripped"`, `"rejected"`, `"closed"`),
-`onTripped(fn)`, `tripReason`, `sent`, `dropped`, `ready()`, `close()`.
+`onTripped(fn)`, `tripReason`, `blocked` (why the bridge drops its puts now: another client's lease;
+else `null`), `sent`, `dropped`, `ready()`, `close()`.
 
 A **fields** codec's messages arrive decoded as `msg.decoded`, an object of numbers, strings and
 typed arrays (`decodeFields`, SPEC "Fields"). `registerCodec(name, decoder)` supplies the browser decoder of a data codec the bridge's host
@@ -162,7 +168,7 @@ running.shutdown().await?;
 ```
 
 Also `server.serve(addr)`, `server.serve_with_shutdown(addr, signal)`, and `server.router()` (an axum
-`Router` with `POST /offer`, `GET /zenoh-web/health` and the static files, to mount in your own HTTP
+`Router` with `POST /offer`, `GET /zenoh-web/health`, `GET /zenoh-web/ice` and the static files, to mount in your own HTTP
 server; then call `server.shutdown()` yourself). `GET /zenoh-web/health` answers
 `{"service": "zenoh-web", "version": "..."}`, so an application can check whether a zenoh-web server
 is already running on a port before starting its own (`zenoh_web::HEALTH_PATH`). API docs:
@@ -225,6 +231,48 @@ so a dependent crate gets the fixed code without any `[patch]` section.
 zenoh's own `access_control` (in the zenoh config) applies to the browsers' puts, subscriptions and
 queries like to any other traffic of the server's session: what it denies is dropped silently.
 
+## Auth
+
+```rust
+use zenoh_web::Grant;
+let server = zenoh_web::Server::builder()
+    .authorize(|token, _headers| match token {
+        Some("viewer-token") => Ok(Grant { subscribe: vec!["robot/**".into()], list_topics: vec!["robot/**".into()], ..Default::default() }),
+        Some("driver-token") => Ok(Grant { publish: vec!["robot/cmd/**".into()], lease_groups: vec!["drive".into()], max_lease_secs: Some(300.0), ..Grant::all() }),
+        _ => Err("unknown token".into()),   // HTTP 401 with this reason
+    })
+    .lease_group("drive", ["robot/cmd/**"])
+    .build()
+    .await?;
+server.revoke("driver-token");   // closes its live connections; the hook decides if it may come back
+```
+
+The page connects with `connect(url, { token })`. A `Grant` lists key expressions per action (`subscribe`,
+`publish`, `query`, `listTopics`) plus lease rights (`leaseGroups`, `maxLeaseSecs`, `forceExpire`); a
+request is allowed when one of them includes its key, otherwise the channel is rejected with
+`not authorized to <action> "<key>"`. No hook = `Grant::all()` for everyone. Issuing tokens is up to
+the host; zenoh-web-cli's `--auth-file` is a small file-based example. SPEC "Auth".
+
+## Leases
+
+`const lease = await z.lease("drive", { maxSeconds: 60 })` gives this page the exclusive right to
+publish on the group's keys among the bridge's clients: everyone else's puts there are dropped
+(`publisher.blocked` says why) until the lease ends: the holder's heartbeat stops, `maxSeconds`
+passes, it disconnects, calls `lease.release()`, or a client with `forceExpire` calls
+`z.expireLease("drive")`. `lease.onLost(reason)` reports which. Groups come from the server
+(`lease_group`) or, for names it doesn't define, from the client (`{ keys: [...] }`), within the grant.
+**Leases bind only this bridge's clients**, not native zenoh publishers; use zenoh's
+`access_control` for those. SPEC "Leases".
+
+## ICE and TURN
+
+`.ice_servers([IceServer { urls: vec!["turn:relay.example.org:3478".into()], ..Default::default() }])`
+configures the bridge's side, and browsers get the same list from `GET /zenoh-web/ice` (the client
+fetches it by itself). With coturn's `use-auth-secret`, `.turn_secret(secret, ttl)` mints
+time-limited credentials per connection (username `"<expiry>:<user>"`, HMAC-SHA1 credential).
+`.udp_ports(50000..=50100)` binds each connection's WebRTC sockets to a port from that range, to
+firewall a relay or robot easily. SPEC "ICE and TURN".
+
 ## Heartbeat and deadman
 
 `connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })` sends beats on an unreliable channel (they are
@@ -252,7 +300,7 @@ deno task check                            # type-check the client
 ```
 
 The end-to-end suites (a real zenoh peer, the server and headless Chrome; delivery, clock sync,
-deadmen, allocation, latency under load, throughput on a shaped link, video latency, codecs) are in
+deadmen, allocation, latency under load, throughput on a shaped link, video latency, codecs, auth and leases) are in
 [zenoh-web-cli](https://github.com/jeff-hykin/zenoh-web-cli), which builds them against this crate.
 
 ## Known limitations
@@ -262,7 +310,8 @@ deadmen, allocation, latency under load, throughput on a shaped link, video late
 - The default video encoder is software H.264 (openh264), one per browser subscription: CPU scales
   with viewers × streams unless a codec brings a hardware encoder.
 - Audio goes to the browser only; the microphone direction is designed (SPEC "Audio") but not built.
-- No per-user identity or auth on `/offer`. Run it on a trusted network.
-- No TURN/relay configuration on the bridge side: the browser must reach the bridge's UDP ports (LAN, VPN).
+- Signaling is plain HTTP: a bearer token crosses the network in the clear unless the bridge sits behind
+  HTTPS (a reverse proxy).
+- Leases bind only this bridge's clients, and aren't re-taken after a reconnect.
 - Codecs are compiled into the application (codecs shipped from the browser as WASM are a later phase).
 - Changing a subscription's options means closing it and subscribing again.

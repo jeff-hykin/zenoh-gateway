@@ -1,6 +1,8 @@
 //! One browser = one PeerConnection; each data channel it opens is dispatched by its label.
 
 use crate::allocator::{self, Estimator};
+use crate::auth::{Grant, Leases};
+use crate::ice::{self, IceServer};
 use crate::codec::registry::CodecRegistry;
 use crate::codec::Codec;
 use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
@@ -12,7 +14,8 @@ use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -22,6 +25,7 @@ use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
     RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, SettingEngineBuilder,
 };
+use rtc::peer_connection::configuration::RTCIceServer;
 use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use zenoh::qos::{CongestionControl, Priority, Reliability};
 
@@ -49,6 +53,15 @@ pub struct AllocationConfig {
     pub max_bandwidth: Option<f64>,
     /// fraction of the estimate the allocator hands out (`--bandwidth-target-fraction`)
     pub target_fraction: f64,
+}
+
+/// How the bridge's side of each connection reaches browsers (builder options / command-line flags).
+#[derive(Debug, Clone, Default)]
+pub struct ConnectConfig {
+    pub ice_servers: Vec<IceServer>,
+    /// coturn's static-auth-secret and the minted credentials' lifetime
+    pub turn_secret: Option<(String, Duration)>,
+    pub udp_ports: Option<RangeInclusive<u16>>,
 }
 
 /// The frontend-level side of allocation, reported in stats as `bandwidth`.
@@ -139,12 +152,21 @@ struct PeerState {
     estimator: Mutex<Estimator>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
+    bridge: Weak<Bridge>,
+    /// the bearer token it connected with, and what it may do
+    token: Option<String>,
+    grant: Grant,
+    leases: Arc<Leases>,
 }
 
 impl PeerState {
-    fn new(peer_id: u64, bridge: &Bridge, video_target_bps: Arc<AtomicU64>) -> Self {
+    fn new(peer_id: u64, bridge: &Arc<Bridge>, video_target_bps: Arc<AtomicU64>, token: Option<String>, grant: Grant) -> Self {
         let config = bridge.allocation;
         PeerState {
+            bridge: Arc::downgrade(bridge),
+            token,
+            grant,
+            leases: bridge.leases.clone(),
             peer_id,
             session: bridge.session.clone(),
             codecs: bridge.codecs.clone(),
@@ -290,6 +312,10 @@ impl PeerState {
     async fn fire_deadmen(&self, reason: &str) {
         let armed: Vec<(u64, Deadman)> = self.deadmen.lock().unwrap().drain().collect();
         for (pub_id, deadman) in armed {
+            if let Some(blocked) = self.leases.blocker(self.peer_id, &deadman.key) {
+                warn!("peer {}: deadman on {:?} not fired: {blocked}", self.peer_id, deadman.key);
+                continue;
+            }
             // trip first, so a put racing in behind the deadman can't undo it
             deadman.shared.tripped.store(true, Ordering::Release);
             deadman.shared.stats.lock().unwrap().deadman_armed = false;
@@ -312,6 +338,11 @@ impl PeerState {
             }
         }
     }
+
+    async fn lease_lost(&self, group: &str, reason: &str) {
+        info!("peer {}: lease {group:?} lost ({reason})", self.peer_id);
+        self.send_event(json!({"event": "leaseLost", "group": group, "reason": reason})).await;
+    }
 }
 
 struct PeerEntry {
@@ -326,36 +357,83 @@ pub struct Bridge {
     allocation: AllocationConfig,
     peers: Mutex<HashMap<u64, PeerEntry>>,
     next_peer: AtomicU64,
+    leases: Arc<Leases>,
+    pub connect_config: ConnectConfig,
+    /// with `udp_ports`: peer id -> its port
+    udp_ports_in_use: Mutex<HashMap<u64, u16>>,
 }
 
 impl Bridge {
-    pub fn new(session: zenoh::Session, codecs: CodecRegistry, allocation: AllocationConfig) -> Arc<Self> {
+    pub fn new(session: zenoh::Session, codecs: CodecRegistry, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
         Arc::new(Bridge {
             session,
             codecs: Arc::new(codecs),
             allocation,
             peers: Mutex::new(HashMap::new()),
             next_peer: AtomicU64::new(1),
+            leases: Arc::new(leases),
+            connect_config,
+            udp_ports_in_use: Mutex::new(HashMap::new()),
         })
     }
 
+    /// A port of `udp_ports` no other connection uses and nothing else has bound, reserved for `peer_id`.
+    fn reserve_udp_port(&self, peer_id: u64) -> anyhow::Result<Option<u16>> {
+        let Some(range) = self.connect_config.udp_ports.clone() else { return Ok(None) };
+        let mut in_use = self.udp_ports_in_use.lock().unwrap();
+        let used: HashSet<u16> = in_use.values().copied().collect();
+        let port = range.clone().find(|port| !used.contains(port) && std::net::UdpSocket::bind(("0.0.0.0", *port)).is_ok());
+        let port = port.ok_or_else(|| anyhow::anyhow!("no free UDP port in {range:?} for another connection"))?;
+        in_use.insert(peer_id, port);
+        Ok(Some(port))
+    }
+
+    async fn lease_lost(&self, holder: u64, group: &str, reason: &str) {
+        let state = self.peers.lock().unwrap().get(&holder).map(|entry| entry.state.clone());
+        if let Some(state) = state {
+            state.lease_lost(group, reason).await;
+        }
+    }
+
+    /// Closes every connection made with `token`.
+    pub fn revoke(&self, token: &str) -> usize {
+        let revoked: Vec<u64> = self.peers.lock().unwrap().iter().filter(|(_, entry)| entry.state.token.as_deref() == Some(token)).map(|(id, _)| *id).collect();
+        for peer_id in &revoked {
+            self.drop_peer(*peer_id, "revoked");
+        }
+        revoked.len()
+    }
+
     /// Non-trickle signaling: take an offer, return an answer with all our candidates in it.
-    pub async fn answer(self: &Arc<Self>, offer: RTCSessionDescription) -> anyhow::Result<RTCSessionDescription> {
+    pub async fn answer(self: &Arc<Self>, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
+        let result = self.answer_as(peer_id, offer, token, grant).await;
+        if result.is_err() {
+            self.udp_ports_in_use.lock().unwrap().remove(&peer_id);
+        }
+        result
+    }
+
+    async fn answer_as(self: &Arc<Self>, peer_id: u64, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
         let (media_engine, interceptors, video_target_bps) = media::media_setup()?;
-        let state = Arc::new(PeerState::new(peer_id, self, video_target_bps));
+        let state = Arc::new(PeerState::new(peer_id, self, video_target_bps, token, grant));
+        let port = self.reserve_udp_port(peer_id)?.unwrap_or(0);
+        let ice_servers = ice::mint(&self.connect_config.ice_servers, self.connect_config.turn_secret.as_ref(), "bridge")
+            .into_iter()
+            .map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential })
+            .collect();
         let handler = Arc::new(Handler { bridge: Arc::downgrade(self), peer_id, gathered_tx, state: state.clone() });
         let setting_engine = SettingEngineBuilder::new()
             .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
             .build();
         let peer_connection = PeerConnectionBuilder::new()
-            .with_configuration(RTCConfigurationBuilder::new().build())
+            .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).build())
             .with_setting_engine(setting_engine)
             .with_media_engine(media_engine)
             .with_interceptor_registry(interceptors)
             .with_handler(handler)
-            .with_udp_addrs(vec!["0.0.0.0:0".to_string(), "127.0.0.1:0".to_string()])
+            .with_udp_addrs(vec![format!("0.0.0.0:{port}"), format!("127.0.0.1:{port}")])
             .build()
             .await?;
         peer_connection.set_remote_description(offer).await?;
@@ -376,9 +454,11 @@ impl Bridge {
         Ok(local)
     }
 
-    fn drop_peer(&self, peer_id: u64) {
+    fn drop_peer(&self, peer_id: u64, reason: &'static str) {
+        self.udp_ports_in_use.lock().unwrap().remove(&peer_id);
+        self.leases.release_all(peer_id);
         if let Some(entry) = self.peers.lock().unwrap().remove(&peer_id) {
-            info!("peer {peer_id}: gone");
+            info!("peer {peer_id}: gone ({reason})");
             entry.state.gone.store(true, Ordering::Relaxed);
             entry.state.connection.lock().unwrap().take();
             entry.state.tracks.lock().unwrap().clear();
@@ -389,7 +469,19 @@ impl Bridge {
                 }
             }
             tokio::spawn(async move {
-                entry.state.fire_deadmen("disconnected").await;
+                entry.state.fire_deadmen(reason).await;
+                // a browser can take ~30 s to notice a closed connection by itself
+                let control = entry.state.control.lock().unwrap().clone();
+                if let Some(control) = control {
+                    let _ = control.send_text(&json!({"event": "closed", "reason": reason}).to_string()).await;
+                    // closing right away would drop it unsent
+                    for _ in 0..50 {
+                        if control.outstanding_bytes().await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
                 let _ = entry.connection.close().await;
             });
         }
@@ -445,7 +537,7 @@ impl PeerConnectionEventHandler for Handler {
         match state {
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                 if let Some(bridge) = self.bridge.upgrade() {
-                    bridge.drop_peer(self.peer_id);
+                    bridge.drop_peer(self.peer_id, "disconnected");
                 }
             }
             // ICE may sit in `disconnected` without ever reaching `failed`
@@ -455,7 +547,7 @@ impl PeerConnectionEventHandler for Handler {
                     tokio::time::sleep(DISCONNECTED_GRACE).await;
                     let still_down = *state.connection_state.lock().unwrap() != Some(RTCPeerConnectionState::Connected);
                     if still_down && let Some(bridge) = bridge.upgrade() {
-                        bridge.drop_peer(peer_id);
+                        bridge.drop_peer(peer_id, "disconnected");
                     }
                 });
             }
@@ -478,7 +570,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
         *state.control.lock().unwrap() = None;
         // the client keeps `control` open for its whole life, so its close means the browser left
         if let Some(bridge) = bridge.upgrade() {
-            bridge.drop_peer(peer_id);
+            bridge.drop_peer(peer_id, "disconnected");
         }
         return;
     }
@@ -496,7 +588,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
         state.channels.lock().unwrap().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
     let rejected = match label.kind.as_str() {
-        "sub" => match SubOpts::parse(&label.opts).and_then(|mut opts| {
+        "sub" => match Grant::check(&state.grant.subscribe, "subscribe", &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
             let codec = opts.resolve_codec(&state.codecs)?;
             let track = bind_track(&state, codec.as_deref(), &label)?;
             Ok((opts, codec, track))
@@ -510,12 +602,14 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
             }
             Err(error) => Some(error),
         },
-        "pub" => match PubOpts::parse(&label.opts) {
+        "pub" => match Grant::check(&state.grant.publish, "publish", &label.key).and_then(|()| PubOpts::parse(&label.opts)) {
             Ok(opts) => {
                 let shared = Arc::new(PubShared::default());
                 register(json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit}), ChannelStats::Pub(shared.clone()));
                 state.send_accepted(label.id).await;
-                publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone()).await;
+                let (leases, key) = (state.leases.clone(), label.key.clone());
+                let blocker = move || leases.blocker(peer_id, &key);
+                publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker).await;
                 None
             }
             Err(error) => Some(error),
@@ -630,6 +724,9 @@ async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc
                 state.heartbeat.lock().unwrap().deadlines_missed += 1;
                 warn!("peer {}: heartbeat missed for {deadline:?}", state.peer_id);
                 state.fire_deadmen("heartbeat").await;
+                for group in state.leases.release_all(state.peer_id) {
+                    state.lease_lost(&group, "heartbeat").await;
+                }
             }
         }
     }
@@ -653,6 +750,10 @@ struct ControlRequest {
     sdp: Option<RTCSessionDescription>,
     /// renegotiate: add a track for this codec's format
     codec: Option<String>,
+    /// lease ops: the group, its keys (a group the server doesn't define) and maxSeconds
+    group: Option<String>,
+    keys: Option<Vec<String>>,
+    max_seconds: Option<f64>,
 }
 
 fn ok(id: &Value, extra: Value) -> Value {
@@ -687,12 +788,16 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
         };
         let response = match request.op.as_str() {
             // these can take seconds or wait on the peer connection's driver; keep stats and pings flowing meanwhile
-            "get" | "listTopics" | "renegotiate" => {
+            "get" | "listTopics" | "renegotiate" | "expireLease" => {
                 let (dc, state) = (dc.clone(), state.clone());
                 tokio::spawn(async move {
                     let response = match request.op.as_str() {
-                        "get" => handle_get(&state.session, &request).await,
-                        "listTopics" => handle_list_topics(&state.session, &request).await,
+                        "get" => match Grant::check(&state.grant.query, "query", request.key.split('?').next().unwrap_or_default()) {
+                            Ok(()) => handle_get(&state.session, &request).await,
+                            Err(error) => fail(&request.id, error),
+                        },
+                        "listTopics" => handle_list_topics(&state.session, &request, &state.grant).await,
+                        "expireLease" => expire_lease(&state, &request).await,
                         _ => handle_renegotiate(&state, &request).await,
                     };
                     let _ = dc.send_text(&response.to_string()).await;
@@ -713,6 +818,11 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             "codecs" => {
                 let codecs: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
                 ok(&request.id, json!({"codecs": codecs}))
+            }
+            "lease" => take_lease(&state, &request),
+            "releaseLease" => {
+                state.leases.end(request.group.as_deref().unwrap_or_default(), |holder, _| holder == state.peer_id);
+                ok(&request.id, json!({}))
             }
             "clearDeadman" => {
                 let pub_id = request.pub_id.unwrap_or_default();
@@ -754,6 +864,48 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
             warn!("peer {}: renegotiation failed: {error:#}", state.peer_id);
             fail(&request.id, format!("{error:#}"))
         }
+    }
+}
+
+/// Takes (or renews) a lease; it ends at maxSeconds, when the heartbeat stops, or on disconnect.
+fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
+    if !state.heartbeat.lock().unwrap().configured {
+        return fail(&request.id, "a lease needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })");
+    }
+    let group = request.group.clone().unwrap_or_default();
+    match state.leases.take(state.peer_id, &state.grant, &group, request.keys.clone(), request.max_seconds) {
+        Ok((keys, expires_in, serial)) => {
+            if let Some(after) = expires_in {
+                let (bridge, group) = (state.bridge.clone(), group.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    if let Some(bridge) = bridge.upgrade()
+                        && let Some(holder) = bridge.leases.end(&group, |_, lease_serial| lease_serial == serial)
+                    {
+                        bridge.lease_lost(holder, &group, "maxSeconds").await;
+                    }
+                });
+            }
+            info!("peer {}: leased {group:?} {keys:?}", state.peer_id);
+            ok(&request.id, json!({"group": group, "keys": keys, "expiresInMs": expires_in.map(|after| after.as_millis() as u64)}))
+        }
+        Err(error) => fail(&request.id, error),
+    }
+}
+
+/// Ends another client's lease, with the grant's forceExpire right.
+async fn expire_lease(state: &PeerState, request: &ControlRequest) -> Value {
+    let group = request.group.as_deref().unwrap_or_default();
+    if !state.grant.force_expire {
+        return fail(&request.id, format!("not authorized to force-expire lease {group:?}"));
+    }
+    let Some(bridge) = state.bridge.upgrade() else { return fail(&request.id, "shutting down") };
+    match bridge.leases.end(group, |_, _| true) {
+        Some(holder) => {
+            bridge.lease_lost(holder, group, &format!("force-expired by peer {}", state.peer_id)).await;
+            ok(&request.id, json!({}))
+        }
+        None => fail(&request.id, format!("no lease {group:?} is held")),
     }
 }
 
@@ -827,10 +979,13 @@ async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) ->
     Ok(found.iter().map(|(key, sources)| json!({"key": key, "sources": sources})).collect())
 }
 
-async fn handle_list_topics(session: &zenoh::Session, request: &ControlRequest) -> Value {
+async fn handle_list_topics(session: &zenoh::Session, request: &ControlRequest, grant: &Grant) -> Value {
     let filter = if request.key.is_empty() { "**" } else { &request.key };
     match list_topics(session, filter, Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS))).await {
-        Ok(topics) => ok(&request.id, json!({"topics": topics})),
+        Ok(mut topics) => {
+            topics.retain(|topic| Grant::check(&grant.list_topics, "list", topic["key"].as_str().unwrap_or_default()).is_ok());
+            ok(&request.id, json!({"topics": topics}))
+        }
         Err(error) => fail(&request.id, error),
     }
 }

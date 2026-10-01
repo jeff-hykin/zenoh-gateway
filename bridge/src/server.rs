@@ -1,20 +1,25 @@
 //! The embeddable server: [`Server::builder`] → [`ServerBuilder::build`] → [`Server::bind`] (or [`Server::serve`], or [`Server::router`]).
 
+use crate::auth::{Grant, Leases};
 use crate::codec::Codec;
 use crate::codec::registry::CodecRegistry;
-use crate::peer::{AllocationConfig, Bridge};
+use crate::ice::{self, IceServer};
+use crate::peer::{AllocationConfig, Bridge, ConnectConfig};
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use log::{error, info};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::net::ToSocketAddrs;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -27,6 +32,13 @@ pub const DEFAULT_PORT: u16 = 7448;
 
 /// `GET` this path for `{"service": "zenoh-web", "version": "<crate version>"}`, to check a zenoh-web server is listening.
 pub const HEALTH_PATH: &str = "/zenoh-web/health";
+
+/// `GET` this path for `{"iceServers": [...]}`: the STUN/TURN servers the bridge uses, with TURN credentials minted for the caller.
+pub const ICE_PATH: &str = "/zenoh-web/ice";
+
+/// The authorize hook: the bearer token of `POST /offer` (and `GET` [`ICE_PATH`]) and the request headers in,
+/// a [`Grant`] or the reason for refusing (HTTP 401) out.
+pub type Authorize = dyn Fn(Option<&str>, &HeaderMap) -> Result<Grant, String> + Send + Sync;
 
 /// Configures a [`Server`]. Start with [`Server::builder`].
 ///
@@ -53,6 +65,9 @@ pub struct ServerBuilder {
     max_bandwidth_bytes_per_sec: Option<f64>,
     bandwidth_target_fraction: f64,
     codecs: Vec<Arc<dyn Codec>>,
+    authorize: Option<Arc<Authorize>>,
+    lease_groups: HashMap<String, Vec<String>>,
+    connect_config: ConnectConfig,
 }
 
 impl Default for ServerBuilder {
@@ -65,6 +80,9 @@ impl Default for ServerBuilder {
             max_bandwidth_bytes_per_sec: None,
             bandwidth_target_fraction: 0.75,
             codecs: Vec::new(),
+            authorize: None,
+            lease_groups: HashMap::new(),
+            connect_config: ConnectConfig::default(),
         }
     }
 }
@@ -126,6 +144,37 @@ impl ServerBuilder {
         self
     }
 
+    /// Decides what each connection may do, from its bearer token (`connect(url, { token })`) and headers; it runs on
+    /// every offer, so a reconnect is authorized afresh. Without a hook everyone gets [`Grant::all`].
+    pub fn authorize(mut self, hook: impl Fn(Option<&str>, &HeaderMap) -> Result<Grant, String> + Send + Sync + 'static) -> Self {
+        self.authorize = Some(Arc::new(hook));
+        self
+    }
+
+    /// Defines a lease group: while a client holds it, other clients of this bridge can't publish on these keys.
+    pub fn lease_group(mut self, name: impl Into<String>, keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.lease_groups.insert(name.into(), keys.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// STUN/TURN servers for the bridge's side of every connection, also handed to browsers at [`ICE_PATH`].
+    pub fn ice_servers(mut self, servers: impl IntoIterator<Item = IceServer>) -> Self {
+        self.connect_config.ice_servers = servers.into_iter().collect();
+        self
+    }
+
+    /// coturn's `static-auth-secret`: TURN servers without a username get credentials minted per connection, valid for `ttl`.
+    pub fn turn_secret(mut self, secret: impl Into<String>, ttl: Duration) -> Self {
+        self.connect_config.turn_secret = Some((secret.into(), ttl));
+        self
+    }
+
+    /// Binds each connection's WebRTC UDP sockets to a port from this range (one port per connection), to firewall a relay easily.
+    pub fn udp_ports(mut self, ports: RangeInclusive<u16>) -> Self {
+        self.connect_config.udp_ports = Some(ports);
+        self
+    }
+
     /// Validates the options, registers the codecs and opens the zenoh session (unless one was given).
     pub async fn build(self) -> Result<Server> {
         let fraction = self.bandwidth_target_fraction;
@@ -147,8 +196,10 @@ impl ServerBuilder {
                 (zenoh::open(config).await.map_err(|error| anyhow!("opening the zenoh session: {error}"))?, true)
             }
         };
-        let bridge = Bridge::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction });
-        Ok(Server { inner: Arc::new(Inner { bridge, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false) }) })
+        ensure!(self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0), "the UDP port range must be non-empty and above 0");
+        let leases = Leases::new(self.lease_groups);
+        let bridge = Bridge::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction }, leases, self.connect_config);
+        Ok(Server { inner: Arc::new(Inner { bridge, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false), authorize: self.authorize }) })
     }
 }
 
@@ -158,6 +209,16 @@ struct Inner {
     owns_session: bool,
     serve_dir: Option<PathBuf>,
     shut_down: AtomicBool,
+    authorize: Option<Arc<Authorize>>,
+}
+
+impl Inner {
+    /// The request's bearer token and what the hook grants it.
+    fn authorize(&self, headers: &HeaderMap) -> Result<(Option<String>, Grant), String> {
+        let token = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()).and_then(|value| value.strip_prefix("Bearer ")).map(str::to_owned);
+        let grant = self.authorize.as_ref().map_or_else(|| Ok(Grant::all()), |hook| hook(token.as_deref(), headers))?;
+        Ok((token, grant))
+    }
 }
 
 /// A configured zenoh-web server: the zenoh side is live, browsers connect once it is bound ([`bind`](Self::bind),
@@ -178,13 +239,20 @@ impl Server {
         &self.inner.session
     }
 
-    /// The HTTP routes: `POST /offer` (WebRTC signaling, CORS-permissive), `GET` [`HEALTH_PATH`] and, with
+    /// Closes every live connection made with `token` (deadmen fire with reason `"revoked"`) and returns how many;
+    /// the authorize hook decides whether the token may connect again.
+    pub fn revoke(&self, token: &str) -> usize {
+        self.inner.bridge.revoke(token)
+    }
+
+    /// The HTTP routes: `POST /offer` (WebRTC signaling, CORS-permissive), `GET` [`HEALTH_PATH`] and [`ICE_PATH`] and, with
     /// [`ServerBuilder::serve_dir`], static files. Mount it in a host's axum server; call [`shutdown`](Self::shutdown) when it stops.
     pub fn router(&self) -> Router {
         let mut router = Router::new()
             .route("/offer", post(offer))
             .route(HEALTH_PATH, get(health))
-            .with_state(self.inner.bridge.clone())
+            .route(ICE_PATH, get(ice_servers))
+            .with_state(self.inner.clone())
             .layer(CorsLayer::permissive());
         if let Some(dir) = &self.inner.serve_dir {
             router = router.fallback_service(ServeDir::new(dir));
@@ -292,8 +360,22 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"service": "zenoh-web", "version": env!("CARGO_PKG_VERSION")}))
 }
 
-async fn offer(State(bridge): State<Arc<Bridge>>, Json(offer): Json<RTCSessionDescription>) -> Response {
-    match bridge.answer(offer).await {
+async fn ice_servers(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> Response {
+    match inner.authorize(&headers) {
+        Ok(_) => Json(serde_json::json!({"iceServers": ice::mint(&inner.bridge.connect_config.ice_servers, inner.bridge.connect_config.turn_secret.as_ref(), "browser")})).into_response(),
+        Err(reason) => (StatusCode::UNAUTHORIZED, reason).into_response(),
+    }
+}
+
+async fn offer(State(inner): State<Arc<Inner>>, headers: HeaderMap, Json(offer): Json<RTCSessionDescription>) -> Response {
+    let (token, grant) = match inner.authorize(&headers) {
+        Ok(authorized) => authorized,
+        Err(reason) => {
+            info!("offer refused: {reason}");
+            return (StatusCode::UNAUTHORIZED, reason).into_response();
+        }
+    };
+    match inner.bridge.answer(offer, token, grant).await {
         Ok(answer) => Json(answer).into_response(),
         Err(error) => {
             error!("offer failed: {error:#}");

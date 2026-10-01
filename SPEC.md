@@ -21,8 +21,11 @@ except when a subscription explicitly picks one of its codecs (see "Codecs").
 import { connect, Priority, registerCodec } from "./zenoh_web.ts"   // via esm.sh, or bundled: see "Client"
 
 const z = await connect("http://robot.local:7448", {
-    heartbeatHz: 5,         // 0 (default) = no heartbeat; needed for deadmen
+    heartbeatHz: 5,         // 0 (default) = no heartbeat; needed for deadmen and leases
     heartbeatMisses: 3,     // silence of misses/heartbeatHz seconds = frontend gone
+    token: "s3cret",        // optional: `Authorization: Bearer`, see "Auth"
+    iceServers: [],         // optional: default the bridge's (GET /zenoh-web/ice), see "ICE and TURN"
+    iceTransportPolicy: "relay", // optional: everything through TURN
 })
 
 const sub = z.subscribe("camera/**", {
@@ -50,8 +53,14 @@ cmd.put(bytes)                    // or cmd.put(bytes, { timestamp: z.now() - de
 await cmd.setDeadman(stopBytes)   // throws if connect() had no heartbeat
 await cmd.clearDeadman()
 cmd.state                         // "connecting" | "open" | "tripped" | "rejected" | "closed"
-cmd.onTripped((reason) => {})     // "heartbeat" | "disconnected" | "shutdown"
+cmd.onTripped((reason) => {})     // "heartbeat" | "disconnected" | "shutdown" | "revoked"
+cmd.blocked                       // why the bridge drops this publisher's puts now (another client's lease), else null
 cmd.close()
+
+const lease = await z.lease("arm", { maxSeconds: 60 })  // or { keys: ["robot/arm/**"] } for a group the server doesn't define; see "Leases"
+lease.onLost((reason) => {})      // "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" | "renewed"
+await lease.release()
+await z.expireLease("arm")        // end another client's lease (needs the grant's forceExpire)
 
 const replies = await z.get("some/key/**")   // zenoh query, returns [{ key, bytes }]
 const topics = await z.listTopics("robot/**")  // [{ key, sources }], see "Topic enumeration"
@@ -110,10 +119,12 @@ dimos codecs' decoders).
 
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
-`bandwidth_target_fraction` and `codec`s; `build().await` validates them and opens the session. Then
+`bandwidth_target_fraction`, `codec`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret` and
+`udp_ports`; `build().await` validates them and opens the session. Then
 `bind(addr)` serves on a background task (`RunningServer::local_addr`, `shutdown()`), `serve(addr)` /
 `serve_with_shutdown(addr, signal)` serve in place, or `router()` returns the axum routes (`POST
-/offer`, static files) for the host's own HTTP server. Shutdown fires every frontend's deadmen
+/offer`, `GET /zenoh-web/health`, `GET /zenoh-web/ice`, static files) for the host's own HTTP server.
+`Server::revoke(token)` closes that token's connections (see "Auth"). Shutdown fires every frontend's deadmen
 (reason `"shutdown"`), closes the browser connections, then the session if the server opened it.
 
 zenoh is pinned to 1.6.2: 1.7.0 through 1.10.1 deadlock when the admin space answers a query while a
@@ -368,7 +379,66 @@ they're returned raw.
 ## Access control
 
 The `access_control` section of the bridge's zenoh config applies to browsers' puts, subscriptions and
-queries like to any other traffic of its session: zenoh drops what it denies, silently.
+queries like to any other traffic of its session: zenoh drops what it denies, silently. "Auth" is the
+per-browser layer on top, with reasons.
+
+## Auth
+
+- `ServerBuilder::authorize(|token: Option<&str>, headers| -> Result<Grant, String>)` runs on every
+  `POST /offer` and `GET /zenoh-web/ice`, with the `Authorization: Bearer <token>` the client sends
+  (`connect(url, { token })`). `Err(reason)` answers HTTP 401 with the reason; the client then stops
+  reconnecting (`connect` rejects with `bridge refused the token: <reason>`, state `"lost"`). Without a
+  hook every connection gets `Grant::all()`, the behaviour before auth existed.
+- A `Grant` (serde, camelCase) holds key-expression lists: `subscribe`, `publish` (and deadmen), `query`
+  (`get`), `listTopics` (which keys a listing shows), and the lease rights `leaseGroups` (names, `"*"` =
+  any), `maxLeaseSecs` and `forceExpire`. A request is allowed when one of the list's expressions
+  includes its key (zenoh's `includes`: `robot/**` includes `robot/arm/cmd` and `robot/arm/**`, not
+  `**`). A refused sub or pub channel is `rejected` with `not authorized to subscribe "<key>"`; a
+  refused `get` fails the same way; `listTopics` leaves the keys out.
+- `Server::revoke(token)` closes every live connection made with that token (deadmen fire with reason
+  `"revoked"`, leases end); whether it can come back is the hook's call, since it runs on every offer.
+- Token issuance is the host's business (no store, no JWT in core). zenoh-web-cli's `--auth-file` is a
+  small example: a json5 map of token → `read` / `write` / `lease` / a grant object, re-read when it
+  changes, revoking tokens removed or changed there.
+
+## Leases
+
+- A lease is one client's exclusive right to publish on a group of key expressions, among the clients
+  of this bridge. Groups are defined on the server (`ServerBuilder::lease_group(name, keys)`, or the
+  cli's auth file), or by the client (`z.lease(group, { keys })`) when the server doesn't define that
+  name. The grant must allow the group name, and `publish` must include every key of the group.
+- `z.lease(group, { maxSeconds })` needs a heartbeat (`connect(url, { heartbeatHz })`) and returns a
+  `Lease` (`keys`, `expiresInMs`, `release()`, `onLost`). Leasing a group you hold renews it (the old
+  handle is lost with `"renewed"`). A group whose keys intersect another client's lease is refused
+  (`conflicts with "<group>", held by another client`). `maxSeconds` is capped by `maxLeaseSecs`.
+- While held, every other client's puts on keys intersecting the lease are dropped by the bridge
+  (`rejectedLeased` in that publisher's stats). The publisher is told why on its own channel: the bridge
+  sends `{"blocked": "<key> is leased by another client (group \"<group>\")"}` when its first put is
+  dropped and `{"blocked": null}` when puts go through again; the client keeps it in `publisher.blocked`.
+  Other clients' deadmen on those keys don't fire either.
+- It ends when the holder's heartbeat misses (`"heartbeat"`, the same deadline as deadmen), at
+  `maxSeconds`, when the holder disconnects or is revoked, on `release()`, or when a client whose grant
+  has `forceExpire` calls `z.expireLease(group)`. The bridge tells the holder with
+  `{event: "leaseLost", group, reason}` on `control`, and the client calls `onLost`. Leases are not
+  re-taken after a reconnect.
+- **It binds only clients of this bridge.** Native zenoh publishers, and other bridges, publish
+  regardless; zenoh's `access_control` is the tool for those.
+
+## ICE and TURN
+
+- `ServerBuilder::ice_servers([IceServer { urls, username, credential }])` configures the bridge's own
+  side of every connection, and `GET /zenoh-web/ice` (authorized like an offer) hands the same list to
+  browsers as `{"iceServers": [...]}`. The client fetches it on every (re)connect unless `connect` was
+  given `iceServers` (an older bridge's 404 means none), and exposes it as `z.iceServers`.
+- `turn_secret(secret, ttl)`: coturn's TURN REST API (`use-auth-secret`, `static-auth-secret`). Every
+  TURN entry without a username gets credentials minted per connection and per caller: username
+  `"<unix expiry>:<user>"` (`bridge` for its own side, `browser` for `/zenoh-web/ice`), credential
+  `base64(HMAC-SHA1(secret, username))`. The ttl must outlast a connection (TURN refreshes use them).
+  `zenoh_web::turn_credentials` computes them.
+- `udp_ports(low..=high)`: each connection's WebRTC UDP sockets bind a port from this range (one port
+  per connection, on every interface), so a firewall only opens that range; the range bounds the
+  number of simultaneous browsers. webrtc-rs binds sockets per connection, so there is no single
+  shared mux port.
 
 ## Clock sync
 
@@ -397,14 +467,17 @@ resolving so the bridge has an offset before the first put.
 
 ## Wire format
 
-- Signaling: `POST /offer` with the browser's SDP offer (non-trickle), returns the answer.
+- Signaling: `POST /offer` with the browser's SDP offer (non-trickle), returns the answer (401 with a reason when the authorize hook refuses).
+- `GET /zenoh-web/ice` returns `{"iceServers": [{urls, username?, credential?}]}`, see "ICE and TURN".
 - `GET /zenoh-web/health` returns `{"service": "zenoh-web", "version": "<crate version>"}` (detecting a running server).
 - The bridge can also serve a static directory (`--serve <dir>`, `ServerBuilder::serve_dir`) so the UI is live-editable on disk.
 - Each subscribe/publisher is its own data channel. Its label is JSON: `{"type":"sub"|"pub", "key":..., "id":n, "opts":{...}}`.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.
 - One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
-  `codecs`, `renegotiate`, `setDeadman`, `clearDeadman`) and events: `accepted` / `rejected`
-  (per sub/pub channel, by label id) and `tripped`.
+  `codecs`, `renegotiate`, `setDeadman`, `clearDeadman`, `lease {group, keys?, maxSeconds?}`,
+  `releaseLease {group}`, `expireLease {group}`) and events: `accepted` / `rejected` (per sub/pub
+  channel, by label id), `tripped` and `leaseLost {group, reason}`.
+- Bridge → browser on a `pub` channel: `{"blocked": reason | null}` (JSON text), see "Leases".
 - Bridge → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk`,
   little endian. `seq` numbers messages per channel, `frameId` numbers frames; the page acks the highest
   `frameId` it has processed with a 4-byte `u32` message on the same channel. `flags` bit0: the

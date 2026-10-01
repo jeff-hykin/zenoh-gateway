@@ -103,7 +103,12 @@ export interface PublisherOptions {
 }
 
 export interface ConnectOptions {
+    /** default: the bridge's (`GET /zenoh-web/ice`, TURN credentials minted for this client) */
     iceServers?: RTCIceServer[]
+    /** "relay" forces every byte through TURN */
+    iceTransportPolicy?: RTCIceTransportPolicy
+    /** sent as `Authorization: Bearer <token>`; the bridge's authorize hook turns it into a grant */
+    token?: string
     reconnect?: boolean
     statsIntervalMs?: number
     heartbeatHz?: number
@@ -152,7 +157,7 @@ interface ControlResponse {
     id?: number
     ok?: boolean
     error?: string
-    event?: "tripped" | "rejected" | "accepted"
+    event?: "tripped" | "rejected" | "accepted" | "leaseLost" | "closed"
     reason?: string
     [field: string]: unknown
 }
@@ -708,6 +713,8 @@ export class Publisher extends Endpoint {
     /** why the deadman fired: "heartbeat" | "disconnected" | "shutdown" */
     tripReason: string | null = null
     deadmanArmed = false
+    /** why the bridge is dropping this publisher's puts right now (another client's lease), else null */
+    blocked: string | null = null
     #last: Uint8Array | null = null
     /** stamped frames waiting for the channel (reliable: all, latest: only the newest) */
     #pending: Uint8Array<ArrayBuffer>[] = []
@@ -753,6 +760,9 @@ export class Publisher extends Endpoint {
         channel.binaryType = "arraybuffer"
         channel.bufferedAmountLowThreshold = resumeBytes
         channel.onbufferedamountlow = () => this.#flush()
+        channel.onmessage = (event: MessageEvent) => {
+            this.blocked = JSON.parse(String(event.data)).blocked ?? null
+        }
         this.channel = channel
         this.watchChannel(channel, acceptance)
         // puts made before the bridge accepted the channel wait for it
@@ -862,7 +872,45 @@ export class Publisher extends Endpoint {
     }
 }
 
-type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock">> & Pick<ConnectOptions, "clock">
+/** An exclusive right to publish on a group of keys among this bridge's clients (SPEC "Leases"). */
+export class Lease {
+    /** why it ended: "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" */
+    lost: string | null = null
+    #listeners = new Set<(reason: string) => void>()
+
+    constructor(readonly owner: ZenohWeb, readonly group: string, readonly keys: string[], readonly expiresInMs: number | null) {}
+
+    onLost(listener: (reason: string) => void): () => void {
+        this.#listeners.add(listener)
+        return () => {
+            this.#listeners.delete(listener)
+        }
+    }
+
+    async release(): Promise<void> {
+        if (this.lost === null) {
+            this._lose("released")
+            await this.owner._request({ op: "releaseLease", group: this.group }, pingTimeoutMs)
+        }
+    }
+
+    _lose(reason: string): void {
+        if (this.lost !== null) {
+            return
+        }
+        this.lost = reason
+        this.owner._leases.delete(this.group)
+        for (const listener of this.#listeners) {
+            try {
+                listener(reason)
+            } catch (error) {
+                console.error("zenoh-web: onLost listener threw", error)
+            }
+        }
+    }
+}
+
+type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token">
 
 export class ZenohWeb {
     state: ConnectionState = "connecting"
@@ -876,6 +924,10 @@ export class ZenohWeb {
     bridgeStats: BridgeStats | null = null
     /** the codecs the bridge runs, fetched on connect */
     codecs: readonly CodecInfo[] = []
+    /** the ICE servers in use (the bridge's unless given) */
+    iceServers: RTCIceServer[] = []
+    /** leases held, by group */
+    readonly _leases = new Map<string, Lease>()
     readonly url: string
     readonly options: ResolvedConnectOptions
     /** this client's clock in ms; put timestamps and clock sync use it */
@@ -906,7 +958,7 @@ export class ZenohWeb {
 
     constructor(url: string, options: ConnectOptions = {}) {
         this.url = url.replace(/\/+$/, "")
-        this.options = { iceServers: [], reconnect: true, statsIntervalMs: 1000, heartbeatHz: 0, heartbeatMisses: 3, ...options }
+        this.options = { reconnect: true, statsIntervalMs: 1000, heartbeatHz: 0, heartbeatMisses: 3, ...options }
         this.now = this.options.clock ?? (() => performance.timeOrigin + performance.now())
     }
 
@@ -1013,7 +1065,15 @@ export class ZenohWeb {
         if (this.#peer) {
             this.#freeTransceivers.delete(this.#peer)
         }
-        const peer = new RTCPeerConnection({ iceServers: this.options.iceServers })
+        const auth: Record<string, string> = this.options.token === undefined ? {} : { authorization: `Bearer ${this.options.token}` }
+        let iceServers = this.options.iceServers
+        if (iceServers === undefined) {
+            const response = await fetch(`${this.url}/zenoh-web/ice`, { headers: auth }).catch(() => null)
+            await this.#refuseIfUnauthorized(response)
+            iceServers = response?.ok ? (await response.json()).iceServers as RTCIceServer[] : []
+        }
+        this.iceServers = iceServers
+        const peer = new RTCPeerConnection({ iceServers, iceTransportPolicy: this.options.iceTransportPolicy ?? "all" })
         const control = peer.createDataChannel("control", { ordered: true })
         this.#peer = peer
         this.#control = control
@@ -1043,9 +1103,10 @@ export class ZenohWeb {
             await waitIceGathering(peer)
             const response = await fetch(`${this.url}/offer`, {
                 method: "POST",
-                headers: { "content-type": "application/json" },
+                headers: { "content-type": "application/json", ...auth },
                 body: JSON.stringify({ type: peer.localDescription?.type, sdp: peer.localDescription?.sdp }),
             })
+            await this.#refuseIfUnauthorized(response, peer)
             if (!response.ok) {
                 throw new Error(`bridge refused offer: ${response.status} ${await response.text()}`)
             }
@@ -1062,6 +1123,15 @@ export class ZenohWeb {
         }
         this.#setState("connected")
         this.#markConnected()
+    }
+
+    /** A 401 is final: no reconnecting with a token the bridge refuses (or revoked). */
+    async #refuseIfUnauthorized(response: Response | null, peer?: RTCPeerConnection): Promise<void> {
+        if (response?.status === 401) {
+            peer?.close()
+            this.close()
+            throw new Error(`zenoh-web: bridge refused the token: ${await response.text()}`)
+        }
     }
 
     #attachHeartbeat(peer: RTCPeerConnection): void {
@@ -1111,6 +1181,9 @@ export class ZenohWeb {
         this.#setState("lost")
         // the bridge fires this frontend's deadmen when it loses us
         this.#tripArmedPublishers("disconnected")
+        for (const lease of [...this._leases.values()]) {
+            lease._lose("disconnected")
+        }
         for (const request of this.#requests.values()) {
             clearTimeout(request.timer)
             request.reject(new Error("connection lost"))
@@ -1147,6 +1220,10 @@ export class ZenohWeb {
                 endpoint?._rejected(String(response.reason))
             } else if (response.event === "accepted") {
                 endpoint?._accepted()
+            } else if (response.event === "closed") {
+                this.#onLost(this.#generation)
+            } else if (response.event === "leaseLost") {
+                this._leases.get(String(response.group))?._lose(String(response.reason))
             }
             return
         }
@@ -1229,6 +1306,27 @@ export class ZenohWeb {
     async listTopics(filter = "**", { probeMs = 600 }: { probeMs?: number } = {}): Promise<Topic[]> {
         const response = await this._request({ op: "listTopics", key: filter, probeMs }, probeMs + 5000)
         return response.topics as Topic[]
+    }
+
+    /**
+     * Takes (or renews) the exclusive right to publish on `group`'s keys among this bridge's clients: the
+     * server's group, or `keys` for one it doesn't define. Needs a heartbeat; it ends when the heartbeat
+     * stops, at `maxSeconds`, on disconnect, by `release()` or by force-expiry (`onLost` says which).
+     */
+    async lease(group: string, { keys, maxSeconds }: { keys?: string[], maxSeconds?: number } = {}): Promise<Lease> {
+        if (!this.options.heartbeatHz) {
+            throw new Error("zenoh-web: a lease needs a heartbeat; connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })")
+        }
+        const response = await this._request({ op: "lease", group, keys, maxSeconds }, pingTimeoutMs)
+        const lease = new Lease(this, group, response.keys as string[], (response.expiresInMs as number | null) ?? null)
+        this._leases.get(group)?._lose("renewed")
+        this._leases.set(group, lease)
+        return lease
+    }
+
+    /** Ends another client's lease on `group` (needs the grant's forceExpire right). */
+    async expireLease(group: string): Promise<void> {
+        await this._request({ op: "expireLease", group }, pingTimeoutMs)
     }
 
     /** Polls bridge stats (and, without a heartbeat, clock sync) once; also runs on a timer while connected. */

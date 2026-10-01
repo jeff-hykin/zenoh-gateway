@@ -24,6 +24,8 @@ pub struct PubStats {
     /// accepted without an age check because no clock offset was known yet
     pub unsynced: u64,
     pub rejected_tripped: u64,
+    /// dropped because another client leases the key
+    pub rejected_leased: u64,
     pub last_age_ms: Option<f64>,
     pub deadman_armed: bool,
     pub tripped: bool,
@@ -54,7 +56,9 @@ fn age_ms(sent_at_ms: f64, offset_ms: f64, bridge_now_ms: f64) -> f64 {
     bridge_now_ms - (sent_at_ms + offset_ms)
 }
 
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session: zenoh::Session, shared: Arc<PubShared>, clock_offset_ms: Arc<Mutex<Option<f64>>>) {
+/// `blocker` says why a put may not go out now (another client's lease); the browser hears
+/// `{"blocked": reason | null}` on this channel whenever that changes.
+pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session: zenoh::Session, shared: Arc<PubShared>, clock_offset_ms: Arc<Mutex<Option<f64>>>, blocker: impl Fn() -> Option<String>) {
     let priority = opts.zenoh_priority().unwrap_or_default();
     let congestion_control = if opts.delivery == DeliveryKind::Reliable { CongestionControl::Block } else { CongestionControl::Drop };
     let publisher = session
@@ -72,14 +76,24 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
         }
     };
     debug!("publisher {:?} priority={priority:?} congestion={congestion_control:?} latencyLimit={:?}", label.key, opts.latency_limit);
+    let mut blocked: Option<String> = None;
     while let Some(event) = dc.poll().await {
         match event {
             DataChannelEvent::OnMessage(message) => {
+                let now_blocked = blocker();
+                if now_blocked != blocked {
+                    blocked = now_blocked;
+                    let _ = dc.send_text(&serde_json::json!({"blocked": blocked}).to_string()).await;
+                }
                 {
                     let mut stats = shared.stats.lock().unwrap();
                     stats.received += 1;
                     if shared.tripped.load(Ordering::Acquire) {
                         stats.rejected_tripped += 1;
+                        continue;
+                    }
+                    if blocked.is_some() {
+                        stats.rejected_leased += 1;
                         continue;
                     }
                     if message.data.len() < PUT_HEADER_LEN {
