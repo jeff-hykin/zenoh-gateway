@@ -291,6 +291,18 @@ The webrtc-rs fixes zenoh-web needs live in renamed forks (`zenoh-web-webrtc`, `
 that zenoh-web depends on directly, so a dependent crate gets the fixed code without any
 `[patch]` section. `cargo tree -i rtc-sctp` in a dependent finds nothing; `cargo tree -i zenoh-web-rtc-sctp` finds the fork.
 
+zenoh itself is the exception: zenoh-web takes and returns zenoh types, so its fix (zenoh 1.10.1's
+admin space deadlocked against concurrent declarations, which a page polling `listTopics` while
+another subscribed hit; upstream PR eclipse-zenoh/zenoh#2619) is `bridge/forks/zenoh`, applied by
+`[patch.crates-io]`. A crate that depends on zenoh-web must add the same entry:
+
+```toml
+[patch.crates-io]
+zenoh = { git = "https://github.com/jeff-hykin/zenoh-web", rev = "<the zenoh-web rev you use>" }
+```
+
+Without it the build fails on `zenoh::ZENOH_WEB_PATCHES` rather than shipping the deadlock.
+
 ## Access control
 
 Bridge-wide, from zenoh's own `access_control` in `--zenoh-config`. The bridge applies it before a
@@ -418,3 +430,5 @@ their own headless Chrome (never the one on port 9222):
   upstream has them: browser-opened channels honor their reliability, a reset stream's unsent chunks are
   dropped, fragmented partially-reliable messages are abandoned whole, a repeated stream reset isn't re-run,
   and the retransmission timeout floor/cap are 200 ms / 3 s.
+- `bridge/forks/zenoh` is zenoh 1.10.1 whose admin space replies after releasing its routing-table lock
+  (eclipse-zenoh/zenoh#2619); dependents need the `[patch.crates-io]` entry above until a zenoh release has it.

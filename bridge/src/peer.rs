@@ -976,4 +976,49 @@ mod tests {
         let allocations = allocate_within_video_cap(1_000_000.0, 600_000.0, vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)], &[true, false]);
         assert_eq!((allocations[0].budget_bytes_per_sec, allocations[1].budget_bytes_per_sec), (500_000.0, 500_000.0));
     }
+
+    /// zenoh 1.10.1's admin space replied while holding its routing tables' read lock, and the
+    /// reply takes that lock again; a declaration waiting for the write lock in between wedged
+    /// every zenoh and tokio thread (a page polling listTopics while another subscribed hung web_ctrl).
+    #[test]
+    fn list_topics_survives_concurrent_declarations() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+            runtime.block_on(async {
+                let mut config = zenoh::Config::default();
+                config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+                config.insert_json5("listen/endpoints", "[]").unwrap();
+                config.insert_json5("adminspace/enabled", "true").unwrap();
+                config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).unwrap();
+                let session = zenoh::open(config).await.unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut tasks = Vec::new();
+                for worker in 0..3 {
+                    let session = session.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let mut round = 0;
+                        while Instant::now() < deadline {
+                            let subscriber = session.declare_subscriber(format!("deadlock/{worker}/{round}")).await.unwrap();
+                            subscriber.undeclare().await.unwrap();
+                            round += 1;
+                        }
+                    }));
+                }
+                for _ in 0..3 {
+                    let session = session.clone();
+                    tasks.push(tokio::spawn(async move {
+                        while Instant::now() < deadline {
+                            list_topics(&session, "**", Duration::ZERO).await.unwrap();
+                        }
+                    }));
+                }
+                for task in tasks {
+                    task.await.unwrap();
+                }
+            });
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(30)).is_ok(), "listTopics and declarations deadlocked");
+    }
 }

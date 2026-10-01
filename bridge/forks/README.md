@@ -17,3 +17,17 @@ fork fixes). zenoh-web depends on them by exact version and path: inside this re
 git dependency on it) the path is used, and the published zenoh-web uses the crates.io copies.
 Publish order (each needs the previous ones on crates.io): rtc-sctp, rtc-datachannel, rtc, webrtc;
 run `cargo package --list` and `cargo publish --dry-run` in each directory first.
+
+## zenoh (a patch, not a renamed fork)
+
+`zenoh/` is zenoh 1.10.1 with the admin-space deadlock fixed (`zenoh/PATCHES.md`; upstream PR
+eclipse-zenoh/zenoh#2619). zenoh-web passes zenoh types across its API (`Server::session`), so a
+renamed package would be a different, incompatible crate; it is applied with `[patch.crates-io]`
+instead, which only the top-level workspace honours. Every crate that depends on zenoh-web needs:
+
+```toml
+[patch.crates-io]
+zenoh = { git = "https://github.com/jeff-hykin/zenoh-web", rev = "<the zenoh-web rev you use>" }
+```
+
+zenoh-web reads `zenoh::ZENOH_WEB_PATCHES`, so forgetting it is a compile error, not a hang.

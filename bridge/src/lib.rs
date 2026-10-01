@@ -35,6 +35,11 @@
 
 #![warn(missing_docs)]
 
+// zenoh's admin space deadlocked against concurrent declarations (eclipse-zenoh/zenoh#2619, unmerged);
+// zenoh-web needs its fork, `bridge/forks/zenoh`. A crate depending on zenoh-web must add
+// `[patch.crates-io] zenoh = { git = "https://github.com/jeff-hykin/zenoh-web", rev = "<same rev>" }`.
+const _: u32 = zenoh::ZENOH_WEB_PATCHES;
+
 mod acl;
 mod allocator;
 mod codec;
