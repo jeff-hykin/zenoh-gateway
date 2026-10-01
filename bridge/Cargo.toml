@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "View and drive a zenoh system from a browser over WebRTC (data channels, H.264 video, bandwidth allocation, deadmen): an embeddable server with pluggable codecs"
 repository = "https://github.com/jeff-hykin/zenoh-web"
+license-file = "../LICENSE"
 readme = "../README.md"
 keywords = ["zenoh", "webrtc", "robotics", "browser", "bridge"]
 categories = ["network-programming", "web-programming", "science::robotics"]
