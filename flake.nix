@@ -12,11 +12,14 @@
     outputs = { self, nixpkgs, rust-overlay }:
         let
             lib = nixpkgs.lib;
+            # no x86_64-darwin: nixpkgs 26.11 dropped it (Intel Macs use the release binary)
             systems = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
             forAllSystems = lib.genAttrs systems;
             pname = "zenoh-web";
             version = "0.1.0";
             linuxTarget = "aarch64-unknown-linux-gnu";
+            linuxX86Target = "x86_64-unknown-linux-gnu";
+            darwinX86Target = "x86_64-apple-darwin";
             # glibc floor 2.35: Ubuntu 22.04 / Jetson L4T 36 (Pi OS bookworm is 2.36)
             glibcVersion = "2.35";
 
@@ -29,7 +32,7 @@
             perSystem = system:
                 let
                     pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
-                    rustToolchain = pkgs.rust-bin.stable.latest.minimal.override { targets = [ linuxTarget ]; };
+                    rustToolchain = pkgs.rust-bin.stable.latest.minimal.override { targets = [ linuxTarget linuxX86Target darwinX86Target ]; };
                     rustPlatform = pkgs.makeRustPlatform { cargo = rustToolchain; rustc = rustToolchain; };
                     # registry crates only; the [patch.crates-io] path crates (vendor/rtc, vendor/rtc-sctp) come with src
                     cargoDeps = rustPlatform.importCargoLock { lockFile = ./bridge/Cargo.lock; };
@@ -57,25 +60,46 @@
                         };
                     };
 
-                    # aarch64 Linux from a Mac: cargo-zigbuild with zig as the C/C++ cross toolchain
-                    crossAarch64Linux = pkgs.stdenv.mkDerivation {
-                        pname = "${pname}-aarch64-linux";
+                    # Linux from a Mac: cargo-zigbuild with zig as the C/C++ cross toolchain
+                    crossLinux = target: pkgs.stdenv.mkDerivation {
+                        pname = "${pname}-${lib.head (lib.splitString "-" target)}-linux";
                         inherit version src cargoDeps;
-                        nativeBuildInputs = [ rustToolchain rustPlatform.cargoSetupHook pkgs.cargo-zigbuild pkgs.zig ];
+                        nativeBuildInputs = [ rustToolchain rustPlatform.cargoSetupHook pkgs.cargo-zigbuild pkgs.zig ]
+                            ++ lib.optionals (lib.hasPrefix "x86_64" target) [ pkgs.nasm ];
                         # the darwin stdenv's fixup would try to otool/strip an ELF
                         dontFixup = true;
                         buildPhase = ''
                             runHook preBuild
                             export HOME=$TMPDIR
                             export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local-cache
-                            cargo zigbuild --release --offline --bin ${pname} --target ${linuxTarget}.${glibcVersion}
+                            cargo zigbuild --release --offline --bin ${pname} --target ${target}.${glibcVersion}
                             runHook postBuild
                         '';
                         installPhase = ''
                             runHook preInstall
-                            install -Dm755 target/${linuxTarget}/release/${pname} $out/bin/${pname}
+                            install -Dm755 target/${target}/release/${pname} $out/bin/${pname}
                             runHook postInstall
                         '';
+                        meta.mainProgram = pname;
+                    };
+
+                    # Intel macOS from Apple Silicon: the same clang/SDK (universal), rustc told the other arch
+                    crossX86Darwin = pkgs.stdenv.mkDerivation {
+                        pname = "${pname}-x86_64-darwin";
+                        inherit version src cargoDeps;
+                        nativeBuildInputs = [ rustToolchain rustPlatform.cargoSetupHook pkgs.nasm pkgs.darwin.autoSignDarwinBinariesHook ];
+                        buildPhase = ''
+                            runHook preBuild
+                            export HOME=$TMPDIR
+                            cargo build --release --offline --bin ${pname} --target ${darwinX86Target}
+                            runHook postBuild
+                        '';
+                        installPhase = ''
+                            runHook preInstall
+                            install -Dm755 target/${darwinX86Target}/release/${pname} $out/bin/${pname}
+                            runHook postInstall
+                        '';
+                        preFixup = native.preFixup;
                         meta.mainProgram = pname;
                     };
                 in {
@@ -83,8 +107,21 @@
                         ${pname} = native;
                         default = native;
                     } // lib.optionalAttrs isDarwin {
-                        "${pname}-aarch64-linux" = crossAarch64Linux;
+                        "${pname}-aarch64-linux" = crossLinux linuxTarget;
+                        "${pname}-x86_64-linux" = crossLinux linuxX86Target;
+                        "${pname}-x86_64-darwin" = crossX86Darwin;
+                        # all four release binaries as result/<target-triple>/zenoh-web
+                        release = pkgs.runCommand "${pname}-release-${version}" { } (lib.concatMapStrings (entry: ''
+                            install -Dm755 ${entry.package}/bin/${pname} $out/${entry.target}/${pname}
+                        '') [
+                            { target = "aarch64-apple-darwin"; package = native; }
+                            { target = darwinX86Target; package = crossX86Darwin; }
+                            { target = linuxTarget; package = crossLinux linuxTarget; }
+                            { target = linuxX86Target; package = crossLinux linuxX86Target; }
+                        ]);
                     };
+
+                    apps.default = { type = "app"; program = "${native}/bin/${pname}"; };
 
                     devShells.default = pkgs.mkShell {
                         packages = [
@@ -100,5 +137,6 @@
         in {
             packages = lib.mapAttrs (system: outputs: outputs.packages) outputsBySystem;
             devShells = lib.mapAttrs (system: outputs: outputs.devShells) outputsBySystem;
+            apps = lib.mapAttrs (system: outputs: outputs.apps) outputsBySystem;
         };
 }

@@ -29,6 +29,25 @@ zenoh peers / routers (publishers you don't control: ROS 2 over rmw_zenoh, dimos
 - Heartbeat + deadman: a publisher can leave a "stop" message on the bridge that is published once if
   the page goes silent.
 
+## Install
+
+Prebuilt binaries (Linux x86_64/aarch64 with glibc ≥ 2.35, macOS Apple Silicon/Intel; no Windows):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jeff-hykin/zenoh-web/main/install.sh | sh
+```
+
+It picks the [release](https://github.com/jeff-hykin/zenoh-web/releases) tarball for your OS/CPU, checks it
+against `SHA256SUMS`, and installs `zenoh-web` into `~/.local/bin`. Env overrides: `ZENOH_WEB_VERSION=v0.1.0`,
+`ZENOH_WEB_INSTALL_DIR=/somewhere/bin`.
+
+With nix (builds from source; aarch64-darwin, aarch64-linux, x86_64-linux):
+
+```sh
+nix profile install github:jeff-hykin/zenoh-web   # puts zenoh-web on your PATH
+nix run github:jeff-hykin/zenoh-web -- --help     # or run it without installing
+```
+
 ## Quick start
 
 With nix (builds the bridge from this repo's flake):
@@ -40,7 +59,7 @@ nix run . -- --serve examples --connect tcp/127.0.0.1:7447   # your zenoh router
 ```
 
 No robot handy? Start the test peer first; it publishes the repo's fixtures (a 320×240 image, a
-20000-point cloud and a 16-bit depth image, as dimos LCM messages) while someone subscribes:
+20000-point cloud and a 16-bit depth image, in the dimos message format) while someone subscribes:
 
 ```sh
 cargo run --release --manifest-path bridge/Cargo.toml --example test_peer -- --listen tcp/127.0.0.1:7447 \
@@ -223,17 +242,33 @@ algorithm and measurements: SPEC.md "Bandwidth allocation".
 ```sh
 nix build .#zenoh-web                  # native (default package); result/bin/zenoh-web
 nix build .#zenoh-web-aarch64-linux    # on an Apple Silicon Mac: aarch64 Linux binary (Jetson, Pi 5)
+nix build .#zenoh-web-x86_64-linux     # on an Apple Silicon Mac: x86_64 Linux binary
+nix build .#zenoh-web-x86_64-darwin    # on an Apple Silicon Mac: Intel macOS binary
 nix develop                            # Rust (+ aarch64-linux target), clippy, deno, zig, cargo-zigbuild
 ```
 
-- Packages: `packages.{aarch64-darwin,aarch64-linux,x86_64-linux}.zenoh-web` (native) and
-  `packages.aarch64-darwin.zenoh-web-aarch64-linux` (cross). The flake builds only `bridge/`.
-- The cross build uses cargo-zigbuild with zig as the C/C++ toolchain (openh264, zstd) against glibc
+- Packages: `packages.{aarch64-darwin,aarch64-linux,x86_64-linux}.zenoh-web` (native, also `apps.default`) and
+  `packages.aarch64-darwin.zenoh-web-{aarch64-linux,x86_64-linux,x86_64-darwin}` (cross). The flake builds only `bridge/`.
+- The Linux cross builds use cargo-zigbuild with zig as the C/C++ toolchain (openh264, zstd) against glibc
   2.35 (Ubuntu 22.04, Jetson L4T 36, Pi OS bookworm). The binary needs only `libc.so.6`, `libm.so.6`
   and the loader (C++ runtime linked statically), and its newest symbol is `GLIBC_2.34`.
 - The macOS binary links `/usr/lib/libiconv.2.dylib` (rewritten from nix's copy), so it runs on Macs without nix.
+  The Intel one is built by the same clang/SDK with `--target x86_64-apple-darwin` (macOS ≥ 14).
 - Cargo dependencies come from `bridge/Cargo.lock` (`importCargoLock`); the patched crates in
   `bridge/vendor/` are path dependencies and travel with the source.
+
+## Releases
+
+All four release binaries are built on an Apple Silicon Mac, with no remote builders:
+
+```sh
+nix build .#release --builders ''   # result/<target-triple>/zenoh-web for
+                                    # aarch64-apple-darwin, x86_64-apple-darwin,
+                                    # aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu
+```
+
+Each is packaged as `zenoh-web-<version>-<target-triple>.tar.gz` (binary + README.md) with a
+`SHA256SUMS`, and uploaded with `gh release create v<version>`; `install.sh` reads those names.
 
 ## Tests
 
