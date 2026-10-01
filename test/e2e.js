@@ -152,25 +152,33 @@ try {
 
     $.logStep("launching headless Chrome (own instance, random debugging port)")
     browser = await launch({ headless: true, args: ["--no-sandbox"] })
-    const page = await browser.newPage(`${bridgeUrl}/examples/viewer.html`)
+    const page = await browser.newPage(`${bridgeUrl}/test/blank.html`)
 
-    $.logStep("viewer page")
-    await $.sleep(3000)
-    const viewer = await page.evaluate(() => ({
-        state: document.getElementById("state")?.textContent,
-        keys: [...document.querySelectorAll("td.key")].map((cell) => cell.textContent),
-        images: [...document.querySelectorAll("#images img")].filter((image) => image.naturalWidth > 0).length,
-    }))
-    console.log("viewer:", JSON.stringify(viewer))
-    check(viewer.state === "connected", "viewer connects")
-    check(viewer.keys.includes("test/jpeg") && viewer.keys.includes("test/fast"), "viewer lists keys from a ** subscription")
-    check(viewer.images >= 1, "viewer decodes the JPEG payload into an image")
-    await page.screenshot().then((png) => scratch.join("viewer.png").writeSync(png))
+    $.logStep("wildcard subscription (raw, all keys)")
+    const wildcard = await page.evaluate(async (bridgeUrl) => {
+        const { connect } = await import("/client/zenoh_web.js")
+        const client = await connect(bridgeUrl)
+        const keys = new Set()
+        let jpeg = null
+        client.subscribe("**", {}, (message) => {
+            keys.add(message.key)
+            if (message.key === "test/jpeg") {
+                jpeg = message.bytes
+            }
+        })
+        await new Promise((resolve) => setTimeout(resolve, 3000))
+        const bitmap = jpeg ? await createImageBitmap(new Blob([jpeg], { type: "image/jpeg" })).catch(() => null) : null
+        return { state: client.state, keys: [...keys], jpegWidth: bitmap?.width ?? 0 }
+    }, { args: [bridgeUrl] })
+    console.log("wildcard:", JSON.stringify(wildcard))
+    check(wildcard.state === "connected", "client connects")
+    check(wildcard.keys.includes("test/jpeg") && wildcard.keys.includes("test/fast"), "a ** subscription receives every publishing key")
+    check(wildcard.jpegWidth > 0, "the raw JPEG payload decodes in the browser")
 
-    // fresh page so the viewer's ** subscription doesn't compete with the measurements below
-    await page.goto(`${bridgeUrl}/test/blank.html`)
+    // fresh page so the ** subscription doesn't compete with the measurements below
+    await page.goto(`${bridgeUrl}/test/blank.html?fresh`)
     const viewerGone = await bridgeOutput.waitFor((line) => line.includes("peer 1: gone"), 5000).then(() => true, () => false)
-    check(viewerGone, "bridge drops the viewer's peer connection after the page navigates away")
+    check(viewerGone, "bridge drops a page's peer connection after it navigates away")
     const results = await page.evaluate(async (bridgeUrl) => {
         const { connect, Priority, encodePut } = await import("/client/zenoh_web.js")
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))

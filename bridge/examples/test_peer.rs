@@ -1,4 +1,4 @@
-//! A zenoh peer for the e2e test and the viewer demo.
+//! A zenoh peer for the e2e tests and for trying the example page without a robot.
 //!
 //! - `test/cached`: AdvancedPublisher with a 1-sample cache, put once at startup ("cached-hello")
 //! - `test/fast`: `--fast-hz` puts of `--fast-bytes` bytes; payload starts with f64 send time (unix ms) + u32 counter
