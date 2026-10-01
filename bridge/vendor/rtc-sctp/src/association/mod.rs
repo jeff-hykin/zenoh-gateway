@@ -160,6 +160,8 @@ pub struct Association {
     my_next_rsn: u32,
     reconfigs: HashMap<u32, ChunkReconfig>,
     reconfig_requests: HashMap<u32, ParamOutgoingResetRequest>,
+    /// zenoh-web patch: sequence number of the last peer reset request we performed
+    last_performed_peer_reconfig_request: Option<u32>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -262,6 +264,7 @@ impl Default for Association {
             my_next_rsn: 0,
             reconfigs: HashMap::default(),
             reconfig_requests: HashMap::default(),
+            last_performed_peer_reconfig_request: None,
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -1715,6 +1718,27 @@ impl Association {
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+            // zenoh-web patch, RFC 6525 Sec 5.2.2: a request we already performed is a
+            // retransmission (its response crossed it on the wire). Answer it again but never
+            // re-run it: by now the peer may have reused those stream ids for new channels,
+            // and resetting them again silently kills the new channel and drops its data.
+            if self
+                .last_performed_peer_reconfig_request
+                .is_some_and(|last| sna32lte(p.reconfig_request_sequence_number, last))
+            {
+                debug!(
+                    "[{}] duplicate reset request {} for streams {:?} already performed; re-answering only",
+                    self.side, p.reconfig_request_sequence_number, p.stream_identifiers
+                );
+                reply.push(self.create_packet(vec![Box::new(ChunkReconfig {
+                    param_a: Some(Box::new(ParamReconfigResponse {
+                        reconfig_response_sequence_number: p.reconfig_request_sequence_number,
+                        result: ReconfigResult::SuccessPerformed,
+                    })),
+                    param_b: None,
+                })]));
+                return Ok(());
+            }
             self.reconfig_requests
                 .insert(p.reconfig_request_sequence_number, p.clone());
             self.reset_streams_if_any(p, true, reply)?;
@@ -2086,6 +2110,11 @@ impl Association {
             if draining.is_empty() {
                 self.reconfig_requests
                     .remove(&p.reconfig_request_sequence_number);
+                // zenoh-web patch: remember it, see handle_reconfig_param
+                let seq = p.reconfig_request_sequence_number;
+                if self.last_performed_peer_reconfig_request.is_none_or(|last| sna32gt(seq, last)) {
+                    self.last_performed_peer_reconfig_request = Some(seq);
+                }
             } else {
                 debug!(
                     "[{}] resetStream(): deferring reset of {:?}, application has not drained",

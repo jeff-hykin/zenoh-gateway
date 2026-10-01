@@ -305,10 +305,17 @@ function waitIceGathering(peer: RTCPeerConnection): Promise<void> {
     })
 }
 
-/** Settles when the bridge accepts or rejects a channel (or it fails to open). */
+/**
+ * Settles once the channel is usable: the bridge accepted it AND it is open in this browser.
+ * Both are needed because the bridge's `accepted` (control channel) can arrive before this
+ * channel's own open (its DCEP ack travels on a different SCTP stream). Rejects if the bridge
+ * rejects it or it fails to open.
+ */
 class Acceptance {
     promise: Promise<void>
     settled = false
+    #bridgeAccepted = false
+    #channelOpen = false
     #resolve: () => void = () => {}
     #reject: (error: Error) => void = () => {}
 
@@ -320,8 +327,18 @@ class Acceptance {
         this.promise.catch(() => {})
     }
 
-    accept(): void {
-        if (!this.settled) {
+    bridgeAccepted(): void {
+        this.#bridgeAccepted = true
+        this.#settleIfReady()
+    }
+
+    channelOpened(): void {
+        this.#channelOpen = true
+        this.#settleIfReady()
+    }
+
+    #settleIfReady(): void {
+        if (!this.settled && this.#bridgeAccepted && this.#channelOpen) {
             this.settled = true
             this.#resolve()
         }
@@ -355,11 +372,11 @@ abstract class Endpoint {
     protected watchChannel(channel: RTCDataChannel): void {
         this.acceptance = new Acceptance()
         const acceptance = this.acceptance
-        waitOpen(channel, openTimeoutMs).catch((error: Error) => acceptance.reject(error))
+        waitOpen(channel, openTimeoutMs).then(() => acceptance.channelOpened(), (error: Error) => acceptance.reject(error))
     }
 
     _accepted(): void {
-        this.acceptance.accept()
+        this.acceptance.bridgeAccepted()
     }
 
     _rejected(reason: string): void {

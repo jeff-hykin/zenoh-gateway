@@ -3779,3 +3779,49 @@ fn kps_816_deferred_reset_completes_when_the_application_drains() -> Result<()> 
     );
     Ok(())
 }
+
+/// zenoh-web patch, RFC 6525 Sec 5.2.2: a retransmitted reset request (one whose response
+/// crossed it on the wire) must not be performed again. By the time the duplicate arrives
+/// the peer may already have reused the stream id for a new channel; resetting it again
+/// silently drops that channel's data.
+#[test]
+fn test_assoc_duplicate_reset_request_does_not_reset_a_reused_stream() -> Result<()> {
+    let si: u16 = 3;
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    // the client closes its outgoing stream; keep a copy of its reset request
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?.stop(now)?;
+    pair.drive_client();
+    let reset_request: Vec<_> = pair.server.inbound.iter().cloned().collect();
+    assert!(!reset_request.is_empty(), "the client must have sent a RE-CONFIG");
+    pair.drive();
+
+    // the client reuses the stream id for a new channel
+    let _ = pair.client_conn_mut(client_ch).open_stream(si, PayloadProtocolIdentifier::Binary)?;
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?.write_sctp(now, &Bytes::from_static(b"first"), PayloadProtocolIdentifier::Binary)?;
+    pair.drive_client();
+    // ...and only now does the retransmitted reset request arrive
+    pair.server.inbound.extend(reset_request);
+    pair.drive();
+
+    let stream = pair.server_conn_mut(server_ch).accept_stream().expect("the reused stream is accepted");
+    assert_eq!(stream.stream_identifier, si);
+    let mut buf = vec![0u8; 64];
+    let mut read = |pair: &mut Pair| -> Result<Vec<u8>> {
+        let chunks = pair.server_stream(server_ch, si)?.read_sctp()?.expect("a message");
+        let n = chunks.read(&mut buf)?;
+        Ok(buf[..n].to_vec())
+    };
+    assert_eq!(read(&mut pair)?, b"first");
+
+    // the stream is still alive: a later message arrives on it without another accept
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?.write_sctp(now, &Bytes::from_static(b"second"), PayloadProtocolIdentifier::Binary)?;
+    pair.drive();
+    assert!(pair.server_conn_mut(server_ch).accept_stream().is_none(), "the stream must not have been reset and reopened");
+    assert_eq!(read(&mut pair)?, b"second");
+    Ok(())
+}

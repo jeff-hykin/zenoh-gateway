@@ -421,6 +421,20 @@ try {
         const allowed = client.publisher("test/frombrowser/allowed", { delivery: "reliable" })
         out.allowedReady = await outcome(allowed.ready())
         allowed.put("allowed-arrives")
+        // regression: a put right after ready() must go out even when the bridge's `accepted`
+        // overtakes the channel's own open, here on stream ids the bridge just closed
+        out.firstPuts = []
+        for (let index = 0; index < 15; index++) {
+            await client.publisher("test/frombrowser/denied", { delivery: "reliable" }).ready().catch(() => {})
+            await sleep(150)
+            const fresh = client.publisher(`test/frombrowser/first${index}`, { delivery: "reliable" })
+            await fresh.ready()
+            fresh.put(`first-${index}`)
+            out.firstPuts.push(fresh)
+        }
+        await sleep(500)
+        out.firstPutsUnsent = out.firstPuts.filter((publisher) => publisher.sent !== 1).length
+        delete out.firstPuts
         const secret = client.subscribe("test/secret/plans", { delivery: "reliable" }, () => {})
         out.secretReady = await outcome(secret.ready())
         out.secretState = secret.state
@@ -489,10 +503,12 @@ try {
     check(extra.deniedPut.includes("rejected"), "put on a rejected publisher throws")
     await $.sleep(500)
     check(recvCount("denied", "must-not-arrive") === 0 && !peerOutput.lines.some((line) => line.startsWith("RECV test/frombrowser/denied")), "a denied put never reaches the zenoh subscriber")
-    check(extra.allowedReady === "accepted" && recvCount("allowed", "allowed-arrives") === 1, "an allowed key still works under access_control")
+    check(extra.allowedReady === "accepted" && recvCount("allowed", "allowed-arrives") === 1, `an allowed key still works under access_control (ready: ${extra.allowedReady}, received ${recvCount("allowed", "allowed-arrives")}x, peer lines for it: ${JSON.stringify(peerOutput.lines.filter((line) => line.includes("frombrowser/allowed")))})`)
+    const firstPutsArrived = Array.from({ length: 15 }, (_, index) => recvCount(`first${index}`, `first-${index}`)).filter((count) => count === 1).length
+    check(firstPutsArrived === 15 && extra.firstPutsUnsent === 0, `a put right after ready() always reaches zenoh (${firstPutsArrived}/15 arrived, ${extra.firstPutsUnsent} left unsent in the browser)`)
     check(extra.secretReady.includes("no-secret-subscribe") && extra.secretState === "rejected", `denied subscribe is refused (${extra.secretReady})`)
     check(extra.forbiddenGet.includes("no-forbidden-query"), `denied get is refused (${extra.forbiddenGet})`)
-    check(extra.access?.enabled === true && extra.access?.denied === 3, `access-control stat counts refusals (${JSON.stringify(extra.access)})`)
+    check(extra.access?.enabled === true && extra.access?.denied === 18, `access-control stat counts refusals (${JSON.stringify(extra.access)})`)
 
     check(extra.reliableBig.length === 3 && extra.reliableBig.every((message) => message.length === 2_500_000 && message.check === "ok"), `reliable: 2.5 MB messages arrive chunked and byte-exact (${JSON.stringify(extra.reliableBig)})`)
     check(extra.latestBig.delivered > 0 && extra.latestBig.bad.length === 0, `latest: every delivered big message is whole (${extra.latestBig.delivered} delivered, ${extra.latestBig.bad.length} bad)`)
