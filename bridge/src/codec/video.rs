@@ -8,7 +8,7 @@ use crate::codec::{PixelFormat, VideoImage};
 use anyhow::{Result, anyhow};
 use openh264::OpenH264API;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile, RateControlMode, UsageType};
-use openh264::formats::{RgbSliceU8, YUVBuffer};
+use openh264::formats::YUVBuffer;
 #[cfg(test)]
 use crate::codec::image::Rgb8;
 
@@ -39,38 +39,87 @@ pub fn bytes_per_frame(width: u32, height: u32, quality: f64) -> f64 {
     scaled_width as f64 * scaled_height as f64 * bits_per_pixel(quality) / 8.0
 }
 
+/// The source range `[start, end)` each destination index averages: a box filter when shrinking,
+/// nearest when growing (the even-size rounding can add a pixel).
+fn spans(destination_len: u32, source_len: u32) -> Vec<(usize, usize)> {
+    (0..destination_len as u64)
+        .map(|index| {
+            let start = (index * source_len as u64 / destination_len as u64) as u32;
+            let end = ((index + 1) * source_len as u64).div_ceil(destination_len as u64) as u32;
+            (start as usize, end.clamp(start + 1, source_len) as usize)
+        })
+        .collect()
+}
+
 /// Box-filter downscale (or nearest upscale for the even-size rounding) of a packed plane with
-/// `channels` bytes per pixel.
+/// `channels` (1 or 3) bytes per pixel. Row at a time: each destination row sums its source rows
+/// once into per-column totals, then each destination pixel sums its span of those, so every source
+/// byte is read once.
 fn resize_plane(source: &[u8], (source_width, source_height): (u32, u32), channels: usize, (width, height): (u32, u32)) -> Vec<u8> {
-    if (width, height) == (source_width, source_height) {
-        return source[..width as usize * height as usize * channels].to_vec();
+    match channels {
+        1 => resize_packed::<1>(source, (source_width, source_height), (width, height)),
+        3 => resize_packed::<3>(source, (source_width, source_height), (width, height)),
+        other => unreachable!("{other} channels"),
     }
-    let mut out = vec![0u8; width as usize * height as usize * channels];
-    let span = |dest: u32, dest_len: u32, source_len: u32| {
-        let start = (dest as u64 * source_len as u64 / dest_len as u64) as u32;
-        let end = (((dest as u64 + 1) * source_len as u64).div_ceil(dest_len as u64) as u32).clamp(start + 1, source_len);
-        (start, end)
-    };
-    let mut sum = vec![0u32; channels];
-    for y in 0..height {
-        let (y0, y1) = span(y, height, source_height);
-        for x in 0..width {
-            let (x0, x1) = span(x, width, source_width);
-            sum.fill(0);
-            for source_y in y0..y1 {
-                let row_start = source_y as usize * source_width as usize;
-                let row = &source[(row_start + x0 as usize) * channels..(row_start + x1 as usize) * channels];
-                for pixel in row.chunks_exact(channels) {
-                    for (total, &value) in sum.iter_mut().zip(pixel) {
-                        *total += value as u32;
-                    }
+}
+
+fn resize_packed<const CHANNELS: usize>(source: &[u8], (source_width, source_height): (u32, u32), (width, height): (u32, u32)) -> Vec<u8> {
+    let row_len = source_width as usize * CHANNELS;
+    if (width, height) == (source_width, source_height) {
+        return source[..row_len * height as usize].to_vec();
+    }
+    let (columns, rows) = (spans(width, source_width), spans(height, source_height));
+    let mut out = vec![0u8; width as usize * height as usize * CHANNELS];
+    let mut column_totals = vec![0u32; row_len];
+    for (destination_row, &(row_start, row_end)) in out.chunks_exact_mut(width as usize * CHANNELS).zip(&rows) {
+        let (first, rest) = source[row_start * row_len..row_end * row_len].split_at(row_len);
+        for (total, &value) in column_totals.iter_mut().zip(first) {
+            *total = value as u32;
+        }
+        for source_row in rest.chunks_exact(row_len) {
+            for (total, &value) in column_totals.iter_mut().zip(source_row) {
+                *total += value as u32;
+            }
+        }
+        let row_count = (row_end - row_start) as f32;
+        for (pixel, &(column_start, column_end)) in destination_row.as_chunks_mut::<CHANNELS>().0.iter_mut().zip(&columns) {
+            let mut totals = [0u32; CHANNELS];
+            for source_pixel in column_totals[column_start * CHANNELS..column_end * CHANNELS].as_chunks::<CHANNELS>().0 {
+                for (total, value) in totals.iter_mut().zip(source_pixel) {
+                    *total += value;
                 }
             }
-            let count = (y1 - y0) * (x1 - x0);
-            let destination = &mut out[(y as usize * width as usize + x as usize) * channels..][..channels];
-            for (value, total) in destination.iter_mut().zip(&sum) {
-                *value = ((total + count / 2) / count) as u8;
+            let scale = 1.0 / (row_count * (column_end - column_start) as f32);
+            for (value, total) in pixel.iter_mut().zip(totals) {
+                *value = (total as f32 * scale + 0.5) as u8;
             }
+        }
+    }
+    out
+}
+
+/// Packed RGB8 to I420 (BT.601 limited range, openh264's own coefficients) in integer math; chroma
+/// from each 2×2 block's mean. `width` and `height` are even.
+pub(crate) fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; width * height * 3 / 2];
+    let (luma, chroma) = out.split_at_mut(width * height);
+    let (u_plane, v_plane) = chroma.split_at_mut(width * height / 4);
+    for (luma_row, rgb_row) in luma.chunks_exact_mut(width).zip(rgb.chunks_exact(width * 3)) {
+        for (value, pixel) in luma_row.iter_mut().zip(rgb_row.chunks_exact(3)) {
+            let (r, g, b) = (pixel[0] as i32, pixel[1] as i32, pixel[2] as i32);
+            *value = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+        }
+    }
+    let half_width = width / 2;
+    for (block_row, (u_row, v_row)) in u_plane.chunks_exact_mut(half_width).zip(v_plane.chunks_exact_mut(half_width)).enumerate() {
+        let top = &rgb[block_row * 2 * width * 3..][..width * 3];
+        let bottom = &rgb[(block_row * 2 + 1) * width * 3..][..width * 3];
+        for (column, (u, v)) in u_row.iter_mut().zip(v_row.iter_mut()).enumerate() {
+            let at = column * 6;
+            let sum = |channel: usize| (top[at + channel] as i32 + top[at + 3 + channel] as i32 + bottom[at + channel] as i32 + bottom[at + 3 + channel] as i32 + 2) >> 2;
+            let (r, g, b) = (sum(0), sum(1), sum(2));
+            *u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+            *v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
         }
     }
     out
@@ -82,7 +131,7 @@ fn to_yuv(image: &VideoImage, width: u32, height: u32) -> YUVBuffer {
     match image.format() {
         PixelFormat::Rgb8 => {
             let pixels = resize_plane(image.data(), source, 3, (width, height));
-            YUVBuffer::from_rgb8_source(RgbSliceU8::new(&pixels, (width as usize, height as usize)))
+            YUVBuffer::from_vec(rgb_to_i420(&pixels, width as usize, height as usize), width as usize, height as usize)
         }
         PixelFormat::I420 => {
             let luma_len = source.0 as usize * source.1 as usize;
@@ -198,6 +247,19 @@ mod tests {
     }
 
     #[test]
+    fn rgb_to_i420_matches_openh264() {
+        let (width, height) = (64usize, 48usize);
+        let rgb: Vec<u8> = (0..width * height * 3).map(|index| ((index * 7919) % 251) as u8).collect();
+        let ours = rgb_to_i420(&rgb, width, height);
+        let theirs = YUVBuffer::from_rgb8_source(openh264::formats::RgbSliceU8::new(&rgb, (width, height)));
+        use openh264::formats::YUVSource;
+        let (y, u, v) = (theirs.y(), theirs.u(), theirs.v());
+        let reference: Vec<u8> = y.iter().chain(u).chain(v).copied().collect();
+        let worst = ours.iter().zip(&reference).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        assert!(worst <= 1, "differs from openh264's conversion by up to {worst}");
+    }
+
+    #[test]
     fn encodes_keyframe_then_smaller_frames() {
         let mut encoder = VideoEncoder::default();
         let frame = pattern(320, 240);
@@ -224,5 +286,38 @@ mod tests {
         assert_eq!((frame.width, frame.height), scaled_size(width, height, 0.5));
         assert!(VideoImage::i420(63, 48, vec![0; 63 * 48 * 3 / 2]).is_err(), "odd sizes are refused");
         assert!(VideoImage::rgb8(2, 2, vec![0; 11]).is_err(), "wrong length is refused");
+    }
+
+    /// Per-stage timing on a real camera frame: `ZW_BENCH_JPEG=frame.jpg cargo test --release bench_stages -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_stages() {
+        let path = std::env::var("ZW_BENCH_JPEG").expect("ZW_BENCH_JPEG");
+        let jpeg = std::fs::read(path).unwrap();
+        let time = |name: &str, runs: u32, mut work: Box<dyn FnMut() + '_>| {
+            work();
+            let start = std::time::Instant::now();
+            for _ in 0..runs {
+                work();
+            }
+            println!("{name:<40} {:7.2} ms", start.elapsed().as_secs_f64() * 1000.0 / runs as f64);
+        };
+        time("jpeg -> rgb (zune)", 10, Box::new(|| drop(crate::codec::image::compressed_to_rgb(&jpeg, "jpeg").unwrap())));
+        time("jpeg -> i420 (the video path)", 10, Box::new(|| drop(crate::codec::image::compressed_to_video(&jpeg, "jpeg").unwrap())));
+        let image = crate::codec::image::compressed_to_video(&jpeg, "jpeg").unwrap();
+        println!("source {}x{} {:?}", image.width(), image.height(), image.format());
+        // the same picture one pixel over, so every P-frame has real motion to code
+        let shifted: Vec<u8> = image.data()[1..].iter().chain(&image.data()[..1]).copied().collect();
+        let shifted = VideoImage { data: shifted, ..image.clone() };
+        for quality in [0.8, 0.6, 0.3, 0.1] {
+            let (width, height) = scaled_size(image.width(), image.height(), quality);
+            time(&format!("to_yuv q{quality} {width}x{height}"), 10, Box::new(|| drop(to_yuv(&image, width, height))));
+            let mut encoder = VideoEncoder::default();
+            let mut flip = false;
+            time(&format!("encode (to_yuv + h264) q{quality}"), 20, Box::new(|| {
+                flip = !flip;
+                drop(encoder.encode(if flip { &image } else { &shifted }, quality, 30.0).unwrap())
+            }));
+        }
     }
 }

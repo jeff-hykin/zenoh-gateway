@@ -180,6 +180,10 @@ Inputs:
 - mono16 is ambiguous (IR intensity or depth-like); the subscriber decides: `*-image` shows its top
   8 bits as gray video, `*-depth` delivers it losslessly with encoding `mono16`.
 - Decoders are pure Rust (zune-jpeg, png, image-webp, jxl-oxide); H.264 is openh264, compression zstd.
+- For video, a YCbCr JPEG with even sides decodes straight to I420 (full range → BT.601 limited), never
+  through RGB; everything else decodes to RGB8. Scaling is a box filter; RGB → I420 is integer BT.601.
+- A video subscription decodes its next frame while it encodes the current one (two blocking-pool
+  tasks), so the rate is set by the slower stage, not their sum.
 
 Work happens lazily and on send: only messages the pacing/queues let through are transcoded, on
 tokio's blocking pool. Work is shared across frontends through two small caches per bridge: decoded
@@ -257,7 +261,7 @@ Per frontend, every 250 ms:
    delay trigger above: blocked on the network more than 20% of the interval → estimate = 0.9 ×
    measured rate (at most halving per step); otherwise, while streams want more, probe up (start
    1 MB/s). Video: GCC's target bitrate (TWCC feedback), counted while a video track is in use; video
-   tracks are paced by the GCC pacer, not the bulk gate. Budget = min(`--max-bandwidth-bytes-per-sec`
+   tracks are paced by the GCC pacer (at 2.5 × the GCC target, as libwebrtc paces), not the bulk gate. Budget = min(`--max-bandwidth-bytes-per-sec`
    if set, target fraction × (data estimate + video estimate)).
 2. **Demand.** Each subscription wants `price(maxQuality) × Hz`, Hz being each key's measured source
    rate capped by `maxHz`, summed over its keys. Price = bytes per message: measured for raw streams

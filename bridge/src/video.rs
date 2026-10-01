@@ -6,7 +6,7 @@
 
 use crate::codec::registry;
 use crate::codec::video::{EncodedFrame, VideoEncoder};
-use crate::codec::{CodecSample, DecodedFrame};
+use crate::codec::{Codec, CodecSample, DecodedFrame};
 use crate::subscription::{self, SubShared};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -32,6 +32,8 @@ const H264_PAYLOAD_TYPE: u8 = 102;
 const GCC_INITIAL_BPS: f64 = 1_000_000.0;
 const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 50_000_000.0;
+/// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
+const PACING_FACTOR: f64 = 2.5;
 /// Video metadata frame on the `sub` channel (SPEC "Wire formats").
 pub const METADATA_LEN: usize = 28;
 
@@ -65,8 +67,13 @@ impl BandwidthEstimator for ReportingEstimator {
         self.publish();
     }
 
+    /// What the pacer drains at: a multiple of the estimate, as libwebrtc paces (its default pace
+    /// multiplier is 2.5). The pacer smooths bursts; it is not the rate limit — the allocator keeps
+    /// the encoders near the estimate itself. Paced at exactly the estimate, every keyframe or
+    /// overshoot queued behind it and that queue only drained as fast as the estimate grew, which
+    /// held video seconds behind its data channel after a subscription started.
     fn target_bitrate(&self) -> f64 {
-        self.inner.target_bitrate()
+        self.inner.target_bitrate() * PACING_FACTOR
     }
 
     fn handle_timeout(&mut self, now: Instant) {
@@ -216,42 +223,92 @@ fn metadata(frame: &EncodedFrame, source: (u32, u32), quality: f64) -> [u8; META
     out
 }
 
+/// A picked frame and its decode, running on the blocking pool.
+struct Decoding {
+    key: String,
+    item: subscription::Pending,
+    task: tokio::task::JoinHandle<(std::result::Result<Arc<DecodedFrame>, String>, bool)>,
+}
+
+fn start_decode(shared: &SubShared, codec: &Arc<dyn Codec>, key: String, item: subscription::Pending) -> Decoding {
+    let payload = item.payload.to_bytes().into_owned();
+    let (hash_key, encoding, codecs, codec) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone());
+    let task = tokio::task::spawn_blocking(move || {
+        let sample = CodecSample::new(&hash_key, &payload, &encoding);
+        codecs.decode_shared(&*codec, &sample, registry::sample_hash(&sample))
+    });
+    Decoding { key, item, task }
+}
+
 /// Sends a video subscription's frames: pick (paced by maxHz and the allocation), decode (shared
 /// across frontends), encode at the allocated quality and Hz (off the runtime), write to the track.
+/// The next frame's decode overlaps this frame's encode: in series, a big camera frame (a 1920x1536
+/// jpeg is ~16 ms to decode and ~20 ms to scale and encode on a Jetson Orin core) could not keep up
+/// with 30 Hz; overlapped, the slower of the two sets the rate.
 pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: Arc<VideoTrack>) {
     let Some(codec) = shared.codec.clone() else { return };
     let mut encoder = Some(VideoEncoder::default());
     let mut next_frame_id: u32 = 0;
     let mut last_write: Option<Instant> = None;
     let mut warned_write = false;
+    let mut next: Option<Decoding> = None;
     // a new subscriber starts from a keyframe (the new encoder's first frame is one anyway)
     track.keyframe_requested.store(true, Ordering::Release);
     while !shared.is_closed() {
-        let (next, wake_at) = shared.pick(Instant::now());
-        let Some((key, item)) = next else {
-            shared.wait_for_data(wake_at).await;
-            continue;
+        let decoding = match next.take() {
+            Some(decoding) => decoding,
+            None => {
+                let (picked, wake_at) = shared.pick(Instant::now());
+                let Some((key, item)) = picked else {
+                    shared.wait_for_data(wake_at).await;
+                    continue;
+                };
+                start_decode(&shared, &codec, key, item)
+            }
+        };
+        let Decoding { key, item, task } = decoding;
+        let (decoded, reused) = match task.await {
+            Ok((Ok(decoded), reused)) => (decoded, reused),
+            Ok((Err(error), _)) => {
+                shared.record_codec_error(&error);
+                continue;
+            }
+            Err(error) => {
+                shared.record_codec_error(&format!("decoder task failed: {error}"));
+                continue;
+            }
         };
         let quality = shared.current_quality();
         let hz = shared.key_hz(&key);
         let keyframe = track.keyframe_requested.swap(false, Ordering::AcqRel);
-        let payload = item.payload.to_bytes().into_owned();
         let mut working = encoder.take().unwrap_or_default();
-        let (hash_key, encoding, codecs, codec) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone());
-        let outcome = tokio::task::spawn_blocking(move || {
-            let sample = CodecSample::new(&hash_key, &payload, &encoding);
-            let (decoded, reused) = codecs.decode_shared(&*codec, &sample, registry::sample_hash(&sample));
-            let result = decoded.and_then(|decoded| {
-                let DecodedFrame::Video(image) = &*decoded else { return Err(format!("video codec {:?} decoded to a data frame", codec.name())) };
-                if keyframe {
-                    working.request_keyframe();
-                }
-                working.encode(image, quality, hz).map(|frame| (frame, (image.width(), image.height()), reused)).map_err(|error| format!("{error:#}"))
-            });
+        let codec_name = codec.name().to_owned();
+        let mut encoding = tokio::task::spawn_blocking(move || {
+            let DecodedFrame::Video(image) = &*decoded else {
+                return (working, Err(format!("video codec {codec_name:?} decoded to a data frame")));
+            };
+            if keyframe {
+                working.request_keyframe();
+            }
+            let result = working.encode(image, quality, hz).map(|frame| (frame, (image.width(), image.height()))).map_err(|error| format!("{error:#}"));
             (working, result)
-        })
-        .await;
-        let (frame, source, reused) = match outcome {
+        });
+        // while it encodes, pick the next frame and start decoding it as soon as one may go
+        let outcome = loop {
+            if next.is_some() {
+                break (&mut encoding).await;
+            }
+            let (picked, wake_at) = shared.pick(Instant::now());
+            if let Some((key, item)) = picked {
+                next = Some(start_decode(&shared, &codec, key, item));
+                continue;
+            }
+            tokio::select! {
+                outcome = &mut encoding => break outcome,
+                _ = shared.wait_for_data(wake_at) => {}
+            }
+        };
+        let (frame, source) = match outcome {
             Ok((returned, Ok(encoded))) => {
                 encoder = Some(returned);
                 encoded

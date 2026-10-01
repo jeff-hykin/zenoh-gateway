@@ -60,10 +60,10 @@ impl Codec for Builtin {
     fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame> {
         let payload = sample.payload;
         Ok(match self.input {
-            Input::Image => DecodedFrame::Video(image::raw_to_rgb(&wire::parse_image(self.protocol, payload)?)?.into()),
+            Input::Image => DecodedFrame::Video(image::raw_to_video(&wire::parse_image(self.protocol, payload)?)?),
             Input::CompressedImage => {
                 let message = wire::parse_compressed_image(self.protocol, payload)?;
-                DecodedFrame::Video(image::compressed_to_rgb(message.data, &message.format)?.into())
+                DecodedFrame::Video(image::compressed_to_video(message.data, &message.format)?)
             }
             Input::Depth => DecodedFrame::data(image::raw_to_depth(&wire::parse_image(self.protocol, payload)?)?),
             Input::CompressedDepth => {
