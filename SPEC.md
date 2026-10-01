@@ -197,6 +197,13 @@ bridge keeps the path's queues short and lets urgent streams skip what queue rem
   the level that caused the queue and 2% above it (before any congestion: 50% per interval, a slow
   start). No loss is needed to react.
 
+Measured by `test/latency.js` through real queueing: a userspace UDP shaper (in the test process)
+sits between Chrome and the bridge, 2 MB/s bridge→browser with a 1 MB drop-tail queue and 5 ms each
+way (browser→bridge is delayed, not rate limited); a signaling proxy rewrites the SDP so ICE can only
+use the shaper. A strict-priority 200 B stream at 50 Hz, alone: p99 ≈ 7.7 ms; with five 200 KB × 10 Hz
+bulk streams (10 MB/s wanted) the bulk gets ~1.7 MB/s and the strict p99 is ≈ 17 ms (+9 ms). The same
+stream without strict priority under that load: p99 ≈ 0.4–0.5 s.
+
 Per frontend, every 250 ms:
 1. **Estimate.** Data channels: a delivery-rate estimator over what the `sub` channels pushed into SCTP
    and how long their senders waited on SCTP (webrtc-rs doesn't expose the congestion window), plus the
