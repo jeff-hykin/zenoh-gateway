@@ -4,8 +4,6 @@
 /// <reference lib="esnext" />
 // zenoh-web browser client: one WebRTC data channel per subscription/publisher, see SPEC.md
 
-import { decompress as zstdDecompress } from "./vendor/fzstd.ts"
-
 /** zenoh priorities (lower = more important). */
 export const Priority = Object.freeze({
     REAL_TIME: 1,
@@ -22,52 +20,23 @@ export type ConnectionState = "connecting" | "connected" | "degraded" | "lost"
 export type PublisherState = "connecting" | "open" | "tripped" | "rejected" | "closed"
 export type SubscriptionState = "connecting" | "open" | "rejected" | "closed"
 
-/** The bridge's built-in transcoders, picked with the subscribe option `codec` (SPEC "Codecs"). A bridge may register more (`ZenohWeb.codecs`). */
-export const CODECS = Object.freeze([
-    "ros2-image",
-    "ros2-compressed-image",
-    "ros2-depth",
-    "ros2-compressed-depth",
-    "ros2-pointcloud2",
-    "dimos-image",
-    "dimos-compressed-image",
-    "dimos-depth",
-    "dimos-compressed-depth",
-    "dimos-pointcloud2",
-] as const)
-
-export type CodecName = typeof CODECS[number]
-/** What a built-in codec delivers: a video track, lossless depth or a point cloud. */
-export type CodecOutput = "video" | "depth" | "pointcloud"
 /** Where any codec's output goes: the bridge's H.264 video track, or bytes on the data channel. */
 export type CodecKind = "video" | "data"
 
-/** A codec the bridge has registered (built-in or the host application's own). */
+/** A codec the bridge has registered. */
 export interface CodecInfo {
     name: string
     output: CodecKind
 }
 
-/**
- * Turns a data codec's bytes into what `msg.decoded` carries. It may also set other message
- * fields (the built-in depth and point cloud decoders set `msg.depth` / `msg.points`).
- */
+/** Turns a data codec's bytes into what `msg.decoded` carries. */
 export type CodecDecoder = (bytes: Uint8Array, message: Message) => unknown
 
-/** The output of a built-in codec. */
-export function codecOutput(codec: CodecName): CodecOutput {
-    if (codec.endsWith("pointcloud2")) {
-        return "pointcloud"
-    }
-    return codec.endsWith("depth") ? "depth" : "video"
-}
-
-const builtinCodecInfos: readonly CodecInfo[] = CODECS.map((name) => ({ name, output: codecOutput(name) === "video" ? "video" : "data" }))
 const codecDecoders = new Map<string, CodecDecoder>()
 
 /**
- * Registers the browser decoder for a data codec the bridge runs (e.g. a Rust codec the host
- * application added with `ServerBuilder::codec`). Messages of subscriptions using that codec get
+ * Registers the browser decoder for a data codec the bridge runs (a Rust codec the host
+ * application added with `ServerBuilder::codec`, e.g. zenoh-dimos-codecs). Messages of subscriptions using that codec get
  * `msg.decoded = decoder(msg.bytes, msg)`. Video codecs need no decoder. Registering a different
  * decoder under a name that already has one throws.
  */
@@ -83,45 +52,6 @@ export function registerCodec(name: string, decoder: CodecDecoder): void {
         throw new Error(`zenoh-web: a decoder for codec "${name}" is already registered`)
     }
     codecDecoders.set(name, decoder)
-}
-
-for (const name of CODECS) {
-    if (codecOutput(name) === "depth") {
-        registerCodec(name, (bytes, message) => (message.depth = decodeDepth(bytes)))
-    } else if (codecOutput(name) === "pointcloud") {
-        registerCodec(name, (bytes, message) => (message.points = decodePointCloud(bytes)))
-    }
-}
-
-/** Lossless depth, downscaled by `stride` (nearest neighbor) at lower quality. */
-export interface DepthImage {
-    width: number
-    height: number
-    sourceWidth: number
-    sourceHeight: number
-    stride: number
-    encoding: "16UC1" | "32FC1" | "mono16"
-    /** row-major; Uint16Array for 16UC1/mono16, Float32Array for 32FC1 */
-    data: Uint16Array | Float32Array
-}
-
-export interface PointCloud {
-    count: number
-    /** finite points in the source message, before thinning */
-    sourceCount: number
-    /** x, y, z per point */
-    positions: Float32Array
-    /** 0..255 per point; the source value is intensityMin + value * intensityScale */
-    intensity: Uint8Array | null
-    intensityMin: number
-    intensityScale: number
-    origin: [number, number, number]
-    /** cloud units per quantization step */
-    scale: number
-    /** 1 point kept in every `keepEvery` source points (1 = all) */
-    keepEvery: number
-    /** largest per-axis error of a sent point against its source point: scale / 2 */
-    maxError: number
 }
 
 /** Per-frame details of a video subscription; the pixels are on `mediaStream`. */
@@ -141,8 +71,6 @@ export interface Message {
     bytes: Uint8Array
     timestamp: number
     seq: number
-    depth?: DepthImage
-    points?: PointCloud
     /** data codecs: what the codec's registered decoder returned (see `registerCodec`) */
     decoded?: unknown
     video?: VideoFrameInfo
@@ -157,16 +85,13 @@ export interface Message {
 export interface SubscribeOptions {
     delivery?: Delivery
     priority?: number
-    bandwidthPriority?: number
-    queueSize?: number
     maxAge?: number
     maxHz?: number
-    dangerousMinHz?: number
     minQuality?: number
     maxQuality?: number
     qualityToHzTradeoff?: number
-    /** a built-in codec or any other name the bridge registered (`ZenohWeb.codecs`) */
-    codec?: CodecName | (string & Record<never, never>)
+    /** a name the bridge registered (`ZenohWeb.codecs`) */
+    codec?: string
     /**
      * video codecs: `"video"` (default) streams H.264 on a WebRTC video track (`msg.mediaStream`);
      * `"jpeg"` sends each picture as a JPEG file on the data channel, decoded into `msg.image`
@@ -191,8 +116,6 @@ export interface ConnectOptions {
     heartbeatHz?: number
     heartbeatMisses?: number
     clock?: () => number
-    /** fraction of the estimated bandwidth the bridge allocates to this connection (default: the bridge's, 0.75) */
-    bandwidthTargetFraction?: number
 }
 
 export interface KeyStats {
@@ -211,43 +134,11 @@ export interface BridgeChannelStats {
     opts: Record<string, unknown>
     stats: Record<string, number | boolean | string | null>
     /** subscriptions: this stream's share of the frontend's bandwidth (SPEC "Bandwidth allocation") */
-    allocation: Allocation | null
+    allocation: Record<string, number | boolean | null> | null
 }
 
-export interface Allocation {
-    demandBytesPerSec: number
-    floorBytesPerSec: number
-    budgetBytesPerSec: number
-    hz: number
-    hzFraction: number
-    quality: number | null
-    constrained: boolean
-}
-
-export interface BandwidthStats {
-    dataEstimateBytesPerSec: number
-    videoEstimateBytesPerSec: number
-    capBytesPerSec: number | null
-    budgetBytesPerSec: number
-    targetFraction: number
-    /** latest RTT minus its 30 s minimum: the delay trigger's input */
-    queueDelayMs: number | null
-    minRttMs: number | null
-    delayEvents: number
-    reservedBytesPerSec: number
-    bulkChunkBytes: number
-    demandBytesPerSec: number
-    sentBytesPerSec: number
-    networkBlockedFraction: number
-    constrained: boolean
-}
-
-export interface BridgeStats {
-    clock: { offsetMs: number | null, rttMs: number | null }
-    heartbeat: Record<string, unknown>
-    access: { enabled: boolean, denied: number }
-    bandwidth: BandwidthStats | null
-}
+/** The bridge's `clock`, `heartbeat` and `bandwidth` stats (SPEC "Stats"). */
+export type BridgeStats = Record<string, Record<string, unknown> | null>
 
 export interface GetReply {
     key: string | null
@@ -255,7 +146,7 @@ export interface GetReply {
     error?: boolean
 }
 
-export type TopicSource = "subscriber" | "queryable" | "token" | "advancedPublisher" | "sample"
+export type TopicSource = "token" | "advancedPublisher" | "sample"
 
 export interface Topic {
     key: string
@@ -307,74 +198,6 @@ const initialClockPings = 5
 const putHeaderBytes = 8
 // incomplete chunked messages kept per subscription before the oldest is dropped
 const maxPartialMessages = 8
-
-const subscribeOptionNames = new Set(["delivery", "priority", "bandwidthPriority", "queueSize", "maxAge", "maxHz", "dangerousMinHz", "minQuality", "maxQuality", "qualityToHzTradeoff", "codec", "imageTransport"])
-const publisherOptionNames = new Set(["delivery", "priority", "repeatMs", "latencyLimit"])
-
-function checkNumber(name: string, value: unknown, isValid: (value: number) => boolean, expected: string): void {
-    if (value === undefined) {
-        return
-    }
-    if (typeof value !== "number" || Number.isNaN(value) || !isValid(value)) {
-        throw new RangeError(`zenoh-web: ${name} must be ${expected}, got ${String(value)}`)
-    }
-}
-
-function checkCommon(options: object, allowed: Set<string>, where: string): void {
-    for (const name of Object.keys(options)) {
-        if (!allowed.has(name)) {
-            throw new TypeError(`zenoh-web: unknown ${where} option "${name}" (allowed: ${[...allowed].join(", ")})`)
-        }
-    }
-    const { delivery, priority } = options as { delivery?: unknown, priority?: unknown }
-    if (delivery !== undefined && delivery !== "latest" && delivery !== "reliable") {
-        throw new TypeError(`zenoh-web: delivery must be "latest" or "reliable", got ${String(delivery)}`)
-    }
-    checkNumber("priority", priority, (v) => Number.isInteger(v) && v >= 1 && v <= 7, "an integer 1..7 (see Priority)")
-}
-
-/**
- * Throws on an invalid option. `codecs` is what the bridge has (`ZenohWeb.codecs`); without it
- * only the built-in codecs are known.
- */
-export function validateSubscribeOptions(options: SubscribeOptions, codecs: readonly CodecInfo[] = builtinCodecInfos): void {
-    checkCommon(options, subscribeOptionNames, "subscribe")
-    const isUnit = (v: number) => v >= 0 && v <= 1
-    checkNumber("bandwidthPriority", options.bandwidthPriority, (v) => Number.isFinite(v) && v >= 0, ">= 0")
-    checkNumber("queueSize", options.queueSize, (v) => v === Infinity || (Number.isInteger(v) && v >= 1), "an integer >= 1 or Infinity")
-    checkNumber("maxAge", options.maxAge, (v) => Number.isFinite(v) && v > 0, "> 0 (ms)")
-    checkNumber("maxHz", options.maxHz, (v) => Number.isFinite(v) && v > 0, "> 0")
-    checkNumber("dangerousMinHz", options.dangerousMinHz, (v) => Number.isFinite(v) && v >= 0 && v <= (options.maxHz ?? Infinity), ">= 0 and <= maxHz")
-    checkNumber("minQuality", options.minQuality, isUnit, "within 0..1")
-    checkNumber("maxQuality", options.maxQuality, isUnit, "within 0..1")
-    checkNumber("qualityToHzTradeoff", options.qualityToHzTradeoff, isUnit, "within 0..1")
-    if ((options.minQuality ?? 0) > (options.maxQuality ?? 1)) {
-        throw new RangeError("zenoh-web: minQuality must be <= maxQuality")
-    }
-    if (options.imageTransport !== undefined && options.imageTransport !== "video" && options.imageTransport !== "jpeg") {
-        throw new TypeError(`zenoh-web: imageTransport must be "video" or "jpeg", got ${String(options.imageTransport)}`)
-    }
-    if (options.codec !== undefined) {
-        const codec = codecs.find((info) => info.name === options.codec)
-        if (codec === undefined) {
-            throw new TypeError(`zenoh-web: unknown codec "${String(options.codec)}" (the bridge has: ${codecs.map((info) => info.name).join(", ")})`)
-        }
-        if (codec.output !== "video" && options.imageTransport !== undefined) {
-            throw new TypeError(`zenoh-web: imageTransport applies to video codecs; ${options.codec} sends data`)
-        }
-        if (codec.output === "video" && options.imageTransport !== "jpeg" && options.delivery === "reliable") {
-            throw new TypeError(`zenoh-web: ${options.codec} is a video codec (a lossy video track); use delivery "latest" (or imageTransport "jpeg")`)
-        }
-    } else if (options.imageTransport !== undefined) {
-        throw new TypeError("zenoh-web: imageTransport needs a video codec")
-    }
-}
-
-export function validatePublisherOptions(options: PublisherOptions): void {
-    checkCommon(options, publisherOptionNames, "publisher")
-    checkNumber("repeatMs", options.repeatMs, (v) => Number.isFinite(v) && v > 0, "> 0 (ms)")
-    checkNumber("latencyLimit", options.latencyLimit, (v) => Number.isFinite(v) && v > 0, "> 0 (ms)")
-}
 
 /** Delivery -> data channel reliability (SPEC "Delivery -> transport mapping"). */
 function channelInit(delivery: Delivery | undefined, maxAge: number | undefined): RTCDataChannelInit {
@@ -446,59 +269,6 @@ export function decodeFrame(buffer: ArrayBuffer): Frame {
         chunkIndex: view.getUint32(offset + 16, true),
         chunkCount: view.getUint32(offset + 20, true),
         chunk: new Uint8Array(buffer, offset + 24),
-    }
-}
-
-// browsers are little endian, so typed arrays can view the decoded little-endian values directly
-const depthEncodings = { 1: "16UC1", 2: "32FC1", 3: "mono16" } as const
-
-/** Depth codec payload: 20-byte header + zstd(values), see SPEC "Wire formats". */
-export function decodeDepth(bytes: Uint8Array): DepthImage {
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    if (bytes[0] !== 1) {
-        throw new Error(`zenoh-web: unknown depth format version ${bytes[0]}`)
-    }
-    const encoding = depthEncodings[bytes[1] as 1 | 2 | 3]
-    if (!encoding) {
-        throw new Error(`zenoh-web: unknown depth encoding ${bytes[1]}`)
-    }
-    const width = view.getUint32(4, true)
-    const height = view.getUint32(8, true)
-    const values = zstdDecompress(bytes.subarray(20)) as Uint8Array
-    const aligned = values.byteOffset % 4 === 0 ? values : values.slice()
-    const count = width * height
-    const data = encoding === "32FC1" ? new Float32Array(aligned.buffer, aligned.byteOffset, count) : new Uint16Array(aligned.buffer, aligned.byteOffset, count)
-    return { width, height, sourceWidth: view.getUint32(12, true), sourceHeight: view.getUint32(16, true), stride: view.getUint16(2, true), encoding, data }
-}
-
-/** Point cloud codec payload: 40-byte header + zstd(int16 xyz, u8 intensity), see SPEC "Wire formats". */
-export function decodePointCloud(bytes: Uint8Array): PointCloud {
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    if (bytes[0] !== 2) {
-        throw new Error(`zenoh-web: unknown point cloud format version ${bytes[0]}`)
-    }
-    const hasIntensity = (bytes[1] & 1) === 1
-    const count = view.getUint32(4, true)
-    const origin: [number, number, number] = [view.getFloat32(12, true), view.getFloat32(16, true), view.getFloat32(20, true)]
-    const scale = view.getFloat32(24, true)
-    const keepEvery = view.getUint32(28, true)
-    const body = zstdDecompress(bytes.subarray(40)) as Uint8Array
-    const quantized = new DataView(body.buffer, body.byteOffset, body.byteLength)
-    const positions = new Float32Array(count * 3)
-    for (let index = 0; index < count * 3; index++) {
-        positions[index] = origin[index % 3] + quantized.getInt16(index * 2, true) * scale
-    }
-    return {
-        count,
-        sourceCount: view.getUint32(8, true),
-        positions,
-        intensity: hasIntensity ? body.slice(count * 6, count * 7) : null,
-        intensityMin: view.getFloat32(32, true),
-        intensityScale: view.getFloat32(36, true),
-        origin,
-        scale,
-        keepEvery,
-        maxError: scale / 2,
     }
 }
 
@@ -736,7 +506,6 @@ export class Subscription extends Endpoint {
     }
 
     #openChannel(peer: RTCPeerConnection, acceptance: Acceptance, mid: string | null): void {
-        // JSON turns queueSize Infinity into null, which the bridge reads as unbounded
         const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts: this.options, ...(mid === null ? {} : { mid }) })
         const channel = peer.createDataChannel(label, channelInit(this.options.delivery, this.options.maxAge))
         channel.binaryType = "arraybuffer"
@@ -1083,7 +852,7 @@ export class Publisher extends Endpoint {
     }
 }
 
-type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "bandwidthTargetFraction">> & Pick<ConnectOptions, "clock" | "bandwidthTargetFraction">
+type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock">> & Pick<ConnectOptions, "clock">
 
 export class ZenohWeb {
     state: ConnectionState = "connecting"
@@ -1093,10 +862,10 @@ export class ZenohWeb {
     rttMs: number | null = null
     /** bridge clock minus this client's clock, from the lowest-RTT recent sample */
     clockOffsetMs: number | null = null
-    /** bridge-side heartbeat, clock and access-control stats */
+    /** bridge-side heartbeat, clock and bandwidth stats */
     bridgeStats: BridgeStats | null = null
-    /** the codecs the bridge runs (built-in and its host application's), fetched on connect */
-    codecs: readonly CodecInfo[] = builtinCodecInfos
+    /** the codecs the bridge runs, fetched on connect */
+    codecs: readonly CodecInfo[] = []
     readonly url: string
     readonly options: ResolvedConnectOptions
     /** this client's clock in ms; put timestamps and clock sync use it */
@@ -1127,9 +896,6 @@ export class ZenohWeb {
     constructor(url: string, options: ConnectOptions = {}) {
         this.url = url.replace(/\/+$/, "")
         this.options = { iceServers: [], reconnect: true, statsIntervalMs: 1000, heartbeatHz: 0, heartbeatMisses: 3, ...options }
-        checkNumber("heartbeatHz", this.options.heartbeatHz, (v) => Number.isFinite(v) && v >= 0, ">= 0 (0 = no heartbeat)")
-        checkNumber("heartbeatMisses", this.options.heartbeatMisses, (v) => Number.isInteger(v) && v >= 1, "an integer >= 1")
-        checkNumber("bandwidthTargetFraction", this.options.bandwidthTargetFraction, (v) => v > 0 && v <= 1, "within (0, 1]")
         this.now = this.options.clock ?? (() => performance.timeOrigin + performance.now())
     }
 
@@ -1274,9 +1040,6 @@ export class ZenohWeb {
             }
             await peer.setRemoteDescription(await response.json())
             await waitOpen(control, openTimeoutMs)
-            if (this.options.bandwidthTargetFraction !== undefined) {
-                await this._request({ op: "configure", bandwidthTargetFraction: this.options.bandwidthTargetFraction }, pingTimeoutMs)
-            }
             this.codecs = Object.freeze((await this._request({ op: "codecs" }, pingTimeoutMs)).codecs as CodecInfo[])
             // a few quick samples so the bridge knows the clock offset before the first put
             for (let index = 0; index < initialClockPings; index++) {
@@ -1405,15 +1168,14 @@ export class ZenohWeb {
         })
     }
 
+    /** Options are checked by the bridge: a bad one rejects the subscription (`state`, `ready()`). */
     subscribe(key: string, options: SubscribeOptions, callback: (message: Message) => void): Subscription {
-        validateSubscribeOptions(options ?? {}, this.codecs)
         const subscription = new Subscription(this, this.#nextId++, key, { ...options }, callback)
         this.#addEndpoint(subscription)
         return subscription
     }
 
     publisher(key: string, options: PublisherOptions = {}): Publisher {
-        validatePublisherOptions(options)
         const publisher = new Publisher(this, this.#nextId++, key, { ...options })
         this.#addEndpoint(publisher)
         return publisher
@@ -1451,7 +1213,7 @@ export class ZenohWeb {
     /**
      * Keys currently live on the zenoh network under `filter`, including ones never subscribed to.
      * See SPEC.md "Topic enumeration" for which kinds of keys can and can't be seen.
-     * `probeMs: 0` lists declarations and tokens only, without subscribing to `filter`.
+     * `probeMs: 0` lists liveliness tokens only, without subscribing to `filter`.
      */
     async listTopics(filter = "**", { probeMs = 600 }: { probeMs?: number } = {}): Promise<Topic[]> {
         const response = await this._request({ op: "listTopics", key: filter, probeMs }, probeMs + 5000)
@@ -1473,7 +1235,7 @@ export class ZenohWeb {
         }
         const response = await this._request({ op: "stats" }, pingTimeoutMs).catch(() => null)
         if (response) {
-            this.bridgeStats = { clock: response.clock, heartbeat: response.heartbeat, access: response.access, bandwidth: response.bandwidth ?? null } as BridgeStats
+            this.bridgeStats = { clock: response.clock, heartbeat: response.heartbeat, bandwidth: response.bandwidth ?? null } as BridgeStats
         }
         this.#refreshStats((response?.channels as BridgeChannelStats[] | undefined) ?? null)
     }

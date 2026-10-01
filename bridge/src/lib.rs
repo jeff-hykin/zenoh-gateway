@@ -4,8 +4,8 @@
 //! publisher) and H.264 video tracks, with a per-browser bandwidth allocator, heartbeats and
 //! deadmen. The browser side is `client/zenoh_web.ts` in the repository.
 //!
-//! This crate is both the `zenoh-web` command and a library for embedding the server in another
-//! application:
+//! This crate is the library for embedding the server in an application; the `zenoh-web` command
+//! (with the ROS 2 / dimos codecs) is [zenoh-web-cli](https://github.com/jeff-hykin/zenoh-web-cli):
 //!
 //! ```no_run
 //! # async fn run() -> anyhow::Result<()> {
@@ -27,20 +27,14 @@
 //!
 //! # Codecs
 //!
-//! A subscription may pick a transcoder by name (`codec: "ros2-image"`). The built-in `ros2-*` and
-//! `dimos-*` codecs are registered by default; add your own by implementing [`Codec`] and passing
-//! it to [`ServerBuilder::codec`]. A codec either produces [`VideoImage`]s, which the bridge turns
+//! A subscription may pick a transcoder by name (`codec: "<name>"`). The server has none built in:
+//! implement [`Codec`] and pass it to [`ServerBuilder::codec`] (the ROS 2 / dimos ones are
+//! [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)). A codec either produces [`VideoImage`]s, which the bridge turns
 //! into H.264 on a video track (no browser code needed), or bytes for the data channel, which the
 //! page decodes with a decoder registered through the client's `registerCodec(name, decoder)`.
 
 #![warn(missing_docs)]
 
-// zenoh's admin space deadlocked against concurrent declarations (eclipse-zenoh/zenoh#2619, unmerged);
-// zenoh-web needs its fork, `bridge/forks/zenoh`. A crate depending on zenoh-web must add
-// `[patch.crates-io] zenoh = { git = "https://github.com/jeff-hykin/zenoh-web", rev = "<same rev>" }`.
-const _: u32 = zenoh::ZENOH_WEB_PATCHES;
-
-mod acl;
 mod allocator;
 mod codec;
 mod frame;

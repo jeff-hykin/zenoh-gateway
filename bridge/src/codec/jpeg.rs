@@ -105,26 +105,11 @@ pub fn jpeg_size(data: &[u8]) -> Option<(u32, u32)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::codec::image::Rgb8;
+    use crate::codec::video::tests::quadrants;
 
-    fn quadrants(width: u32, height: u32) -> VideoImage {
-        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
-        for y in 0..height {
-            for x in 0..width {
-                pixels.extend_from_slice(match (y < height / 2, x < width / 2) {
-                    (true, true) => &[255, 0, 0],
-                    (true, false) => &[0, 255, 0],
-                    (false, true) => &[0, 0, 255],
-                    (false, false) => &[255, 255, 255],
-                });
-            }
-        }
-        Rgb8 { width, height, pixels }.into()
-    }
-
-    fn decode(data: &[u8]) -> (usize, usize, Vec<u8>) {
+    pub(crate) fn decode(data: &[u8]) -> (usize, usize, Vec<u8>) {
         use zune_jpeg::zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
         let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(data), DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB));
         let pixels = decoder.decode().unwrap();

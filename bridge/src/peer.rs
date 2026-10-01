@@ -1,6 +1,5 @@
 //! One browser = one PeerConnection; each data channel it opens is dispatched by its label.
 
-use crate::acl::{AccessControl, AclMessage};
 use crate::allocator::{self, Estimator};
 use crate::codec::registry::CodecRegistry;
 use crate::codec::{Codec, CodecOutput};
@@ -31,7 +30,7 @@ const MAX_MESSAGE_SIZE: u32 = 256 * 1024;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GET_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_LIST_PROBE_MS: u64 = 600;
-const ADMIN_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+const LIVELINESS_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// A connection that stays `disconnected` this long is treated as gone.
 const DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 /// Longest a shutdown waits for one browser connection to close.
@@ -50,8 +49,6 @@ pub struct AllocationConfig {
     pub max_bandwidth: Option<f64>,
     /// fraction of the estimate the allocator hands out (`--bandwidth-target-fraction`)
     pub target_fraction: f64,
-    /// zenoh priority at or above which (numerically <=) streams are strict; 0 = none
-    pub strict_priority: u8,
 }
 
 /// The frontend-level side of allocation, reported in stats as `bandwidth`.
@@ -117,10 +114,7 @@ struct HeartbeatStats {
 struct PeerState {
     peer_id: u64,
     session: zenoh::Session,
-    access_control: Arc<AccessControl>,
     codecs: Arc<CodecRegistry>,
-    /// browser requests refused by access_control
-    access_denied: AtomicU64,
     channels: Mutex<HashMap<u64, ChannelEntry>>,
     next_channel: AtomicU64,
     connection_state: Mutex<Option<RTCPeerConnectionState>>,
@@ -142,8 +136,6 @@ struct PeerState {
     /// (when, rtt ms) reported by the browser's clock sync
     rtt_samples: Mutex<VecDeque<(Instant, f64)>>,
     last_allocation: Mutex<Instant>,
-    /// this connection's `bandwidthTargetFraction`, if it set one
-    target_fraction_override: Mutex<Option<f64>>,
     estimator: Mutex<Estimator>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
@@ -155,9 +147,7 @@ impl PeerState {
         PeerState {
             peer_id,
             session: bridge.session.clone(),
-            access_control: bridge.access_control.clone(),
             codecs: bridge.codecs.clone(),
-            access_denied: AtomicU64::new(0),
             channels: Mutex::new(HashMap::new()),
             next_channel: AtomicU64::new(0),
             connection_state: Mutex::new(None),
@@ -176,7 +166,6 @@ impl PeerState {
             last_allocation: Mutex::new(Instant::now()),
             estimator: Mutex::new(Estimator::default()),
             bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, target_fraction: config.target_fraction, ..Default::default() }),
-            target_fraction_override: Mutex::new(None),
             gone: AtomicBool::new(false),
         }
     }
@@ -215,13 +204,12 @@ impl PeerState {
         let high_rtt_ms = self.high_rtt(now);
         let subscriptions = self.subscriptions();
         let usages: Vec<subscription::Usage> = subscriptions.iter().map(|shared| shared.usage(interval_secs)).collect();
-        let wants = |demand: &allocator::Demand| demand.fixed_bytes_per_sec.unwrap_or_else(|| (demand.price)(demand.quality_range.map_or(1.0, |(_, max)| max)) * demand.max_hz);
         let data_usages = || usages.iter().filter(|usage| !usage.is_video);
         let sent: u64 = data_usages().map(|usage| usage.bytes_sent).sum();
         let blocked_ms: f64 = data_usages().map(|usage| usage.network_blocked_ms).sum();
         let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.network_blocked_ms > 0.0).count();
-        let data_demand: f64 = data_usages().map(|usage| wants(&usage.demand)).sum();
-        let total_demand: f64 = usages.iter().map(|usage| wants(&usage.demand)).sum();
+        let data_demand: f64 = data_usages().map(|usage| usage.demand.wants()).sum();
+        let total_demand: f64 = usages.iter().map(|usage| usage.demand.wants()).sum();
         let estimator = {
             let mut estimator = self.estimator.lock().unwrap();
             estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, active_senders: active, data_demand, queue_delay_ms });
@@ -230,7 +218,7 @@ impl PeerState {
         let has_video = usages.iter().any(|usage| usage.is_video);
         let video_estimate = if has_video { video::gcc_target_bytes_per_sec(&self.video_target_bps) } else { 0.0 };
         let estimate = estimator.data_bytes_per_sec + video_estimate;
-        let target_fraction = self.target_fraction_override.lock().unwrap().unwrap_or(self.config.target_fraction);
+        let target_fraction = self.config.target_fraction;
         let usable = estimate * target_fraction;
         let budget = self.config.max_bandwidth.map_or(usable, |cap| cap.min(usable));
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.is_video).collect();
@@ -279,16 +267,6 @@ impl PeerState {
                 samples.pop_front();
             }
         }
-    }
-
-    /// Checks access_control; a refusal is counted and returned as the reason.
-    fn check_access(&self, message: AclMessage, key: &str) -> Result<(), String> {
-        let result = self.access_control.check(message, key);
-        if let Err(reason) = &result {
-            self.access_denied.fetch_add(1, Ordering::Relaxed);
-            info!("peer {}: {reason}", self.peer_id);
-        }
-        result
     }
 
     /// Sends `{event, ...}` on the control channel, waiting briefly if it is still opening
@@ -354,10 +332,9 @@ struct PeerEntry {
     state: Arc<PeerState>,
 }
 
-/// Every connected browser, and what they share: the zenoh session, access control, codecs.
+/// Every connected browser, and what they share: the zenoh session and the codecs.
 pub struct Bridge {
     session: zenoh::Session,
-    access_control: Arc<AccessControl>,
     codecs: Arc<CodecRegistry>,
     allocation: AllocationConfig,
     peers: Mutex<HashMap<u64, PeerEntry>>,
@@ -365,10 +342,9 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(session: zenoh::Session, access_control: AccessControl, codecs: CodecRegistry, allocation: AllocationConfig) -> Arc<Self> {
+    pub fn new(session: zenoh::Session, codecs: CodecRegistry, allocation: AllocationConfig) -> Arc<Self> {
         Arc::new(Bridge {
             session,
-            access_control: Arc::new(access_control),
             codecs: Arc::new(codecs),
             allocation,
             peers: Mutex::new(HashMap::new()),
@@ -534,16 +510,6 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     let register = |opts: Value, stats: ChannelStats| {
         state.channels.lock().unwrap().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
-    let access = match label.kind.as_str() {
-        "sub" => state.check_access(AclMessage::DeclareSubscriber, &label.key),
-        "pub" => state.check_access(AclMessage::Put, &label.key),
-        _ => Ok(()),
-    };
-    if let Err(reason) = access {
-        state.send_rejection(label.id, &reason).await;
-        let _ = dc.close().await;
-        return;
-    }
     let rejected = match label.kind.as_str() {
         "sub" => match SubOpts::parse(&label.opts).and_then(|opts| {
             let codec = opts.resolve_codec(&state.codecs)?;
@@ -552,7 +518,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
             Ok((opts, codec, video))
         }) {
             Ok((opts, codec, video)) => {
-                let shared = Arc::new(SubShared::new(&opts, codec, state.codecs.clone(), state.gate.clone(), state.config.strict_priority));
+                let shared = Arc::new(SubShared::new(&opts, codec, state.codecs.clone(), state.gate.clone()));
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
                 state.send_accepted(label.id).await;
                 subscription::run(dc.clone(), label.clone(), session, shared, video).await;
@@ -717,8 +683,6 @@ struct ControlRequest {
     sdp: Option<RTCSessionDescription>,
     #[serde(default)]
     add_video: bool,
-    #[serde(default)]
-    bandwidth_target_fraction: Option<f64>,
 }
 
 fn ok(id: &Value, extra: Value) -> Value {
@@ -754,10 +718,6 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
         let response = match request.op.as_str() {
             // a get can take seconds; don't hold up stats and pings behind it
             "get" => {
-                if let Err(reason) = state.check_access(AclMessage::Query, &request.key) {
-                    let _ = dc.send_text(&fail(&request.id, reason).to_string()).await;
-                    continue;
-                }
                 let dc = dc.clone();
                 let session = state.session.clone();
                 tokio::spawn(async move {
@@ -787,23 +747,14 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             "stats" => {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock().unwrap(), "rttMs": *state.rtt_ms.lock().unwrap()});
                 let heartbeat = serde_json::to_value(state.heartbeat.lock().unwrap().clone()).unwrap_or_default();
-                let access = json!({"enabled": state.access_control.enabled(), "denied": state.access_denied.load(Ordering::Relaxed)});
                 let bandwidth = serde_json::to_value(state.bandwidth.lock().unwrap().clone()).unwrap_or_default();
-                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "access": access, "bandwidth": bandwidth}))
+                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
             "codecs" => {
                 let codecs: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
                 ok(&request.id, json!({"codecs": codecs}))
             }
-            "configure" => match request.bandwidth_target_fraction {
-                Some(fraction) if fraction > 0.0 && fraction <= 1.0 => {
-                    *state.target_fraction_override.lock().unwrap() = Some(fraction);
-                    ok(&request.id, json!({}))
-                }
-                Some(fraction) => fail(&request.id, format!("bandwidthTargetFraction must be within (0, 1], got {fraction}")),
-                None => ok(&request.id, json!({})),
-            },
             // can wait on the peer connection's driver; keep stats and pings flowing meanwhile
             "renegotiate" => {
                 let dc = dc.clone();
@@ -877,22 +828,20 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
 }
 
 /// Every key the bridge can find live under `filter`, with where it was seen:
-/// - `subscriber` / `queryable` / `token`: declarations in this bridge's routing tables (admin space)
 /// - `advancedPublisher`: liveliness tokens of zenoh-ext AdvancedPublishers with publisher_detection
-/// - `token`: any liveliness token
+/// - `token`: any other liveliness token
 /// - `sample`: data seen on a `filter` subscription during `probe` (catches undeclared publishers);
 ///   a zero `probe` skips that subscription
 ///
-/// Plain publishers that are declared but silent are invisible: zenoh peers only propagate
-/// publisher declarations to nodes that declared interest, which the public API can't do.
+/// Plain publishers, subscribers and queryables without a token are invisible.
 async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) -> anyhow::Result<Vec<Value>> {
     let found: Arc<Mutex<BTreeMap<String, BTreeSet<&'static str>>>> = Arc::default();
     let note = |found: &Mutex<BTreeMap<String, BTreeSet<&'static str>>>, key: &str, source: &'static str| {
         found.lock().unwrap().entry(key.to_owned()).or_default().insert(source);
     };
     let sink = found.clone();
-    // probe 0 = declarations and tokens only: no subscription, so publishers that only send while
-    // matched (matching listeners) aren't woken by a listing
+    // probe 0 = tokens only: no subscription, so publishers that only send while matched (matching
+    // listeners) aren't woken by a listing
     let probe_subscriber = match probe.is_zero() {
         true => None,
         false => Some(
@@ -903,21 +852,8 @@ async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) ->
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
         ),
     };
-    for (segment, source) in [("subscriber", "subscriber"), ("queryable", "queryable"), ("token", "token")] {
-        let selector = format!("@/*/*/{segment}/{filter}");
-        let Ok(replies) = session.get(selector.as_str()).timeout(ADMIN_QUERY_TIMEOUT).await else { continue };
-        while let Ok(reply) = replies.recv_async().await {
-            if let Ok(sample) = reply.result() {
-                // @/<zid>/<whatami>/<segment>/<key...>
-                let admin_key = sample.key_expr().as_str();
-                if let Some(key) = admin_key.splitn(5, '/').nth(4) {
-                    note(&found, key, source);
-                }
-            }
-        }
-    }
     for selector in [filter.to_owned(), format!("{filter}/@adv/pub/**")] {
-        let Ok(replies) = session.liveliness().get(selector.as_str()).timeout(ADMIN_QUERY_TIMEOUT).await else { continue };
+        let Ok(replies) = session.liveliness().get(selector.as_str()).timeout(LIVELINESS_QUERY_TIMEOUT).await else { continue };
         while let Ok(reply) = replies.recv_async().await {
             if let Ok(sample) = reply.result() {
                 let token = sample.key_expr().as_str();
@@ -939,7 +875,7 @@ async fn handle_get(session: &zenoh::Session, request: &ControlRequest) -> Value
     let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_GET_TIMEOUT_MS));
     let replies = match session.get(request.key.as_str()).timeout(timeout).await {
         Ok(replies) => replies,
-        Err(error) => return json!({"id": request.id, "ok": false, "error": error.to_string()}),
+        Err(error) => return fail(&request.id, error),
     };
     let mut results = Vec::new();
     while let Ok(reply) = replies.recv_async().await {
@@ -951,7 +887,7 @@ async fn handle_get(session: &zenoh::Session, request: &ControlRequest) -> Value
             Err(error) => results.push(json!({"error": base64.encode(error.payload().to_bytes())})),
         }
     }
-    json!({"id": request.id, "ok": true, "replies": results})
+    ok(&request.id, json!({"replies": results}))
 }
 
 fn collect_stats(state: &PeerState) -> Vec<Value> {
@@ -973,7 +909,7 @@ mod tests {
     use super::*;
 
     fn stream(bytes_per_message: f64, hz: f64) -> allocator::Demand {
-        allocator::Demand { weight: 1.0, max_hz: hz, min_hz: 0.0, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None }
+        allocator::Demand { max_hz: hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None }
     }
 
     #[test]
@@ -987,9 +923,7 @@ mod tests {
         assert_eq!((allocations[0].budget_bytes_per_sec, allocations[1].budget_bytes_per_sec), (500_000.0, 500_000.0));
     }
 
-    /// zenoh 1.10.1's admin space replied while holding its routing tables' read lock, and the
-    /// reply takes that lock again; a declaration waiting for the write lock in between wedged
-    /// every zenoh and tokio thread (a page polling listTopics while another subscribed hung web_ctrl).
+    /// zenoh 1.7.0-1.10.1 answer the admin space under the routing tables' read lock and take it again, so a racing declaration deadlocked every thread (it hung web_ctrl).
     #[test]
     fn list_topics_survives_concurrent_declarations() {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1020,6 +954,9 @@ mod tests {
                     tasks.push(tokio::spawn(async move {
                         while Instant::now() < deadline {
                             list_topics(&session, "**", Duration::ZERO).await.unwrap();
+                            // what listTopics used to ask: the bridge's own declarations, from the admin space
+                            let replies = session.get("@/*/*/subscriber/**").timeout(Duration::from_secs(1)).await.unwrap();
+                            while replies.recv_async().await.is_ok() {}
                         }
                     }));
                 }

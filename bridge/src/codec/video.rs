@@ -9,8 +9,6 @@ use anyhow::{Result, anyhow};
 use openh264::OpenH264API;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile, RateControlMode, UsageType};
 use openh264::formats::YUVBuffer;
-#[cfg(test)]
-use crate::codec::image::Rgb8;
 
 const MIN_DIMENSION: u32 = 16;
 /// Keyframe at least this often (seconds), on top of PLI/FIR requests from the browser.
@@ -100,7 +98,7 @@ fn resize_packed<const CHANNELS: usize>(source: &[u8], (source_width, source_hei
 
 /// Packed RGB8 to I420 (BT.601 limited range, openh264's own coefficients) in integer math; chroma
 /// from each 2×2 block's mean. `width` and `height` are even.
-pub(crate) fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
+fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut out = vec![0u8; width * height * 3 / 2];
     let (luma, chroma) = out.split_at_mut(width * height);
     let (u_plane, v_plane) = chroma.split_at_mut(width * height / 4);
@@ -219,10 +217,11 @@ impl VideoEncoder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn pattern(width: u32, height: u32) -> VideoImage {
+    /// Four solid quadrants: red, green / blue, white.
+    pub(crate) fn quadrants(width: u32, height: u32) -> VideoImage {
         let mut pixels = Vec::with_capacity((width * height * 3) as usize);
         for y in 0..height {
             for x in 0..width {
@@ -234,7 +233,7 @@ mod tests {
                 });
             }
         }
-        Rgb8 { width, height, pixels }.into()
+        VideoImage::rgb8(width, height, pixels).unwrap()
     }
 
     #[test]
@@ -247,7 +246,7 @@ mod tests {
 
     #[test]
     fn resize_averages_quadrants() {
-        let small = resize_plane(pattern(320, 240).data(), (320, 240), 3, (2, 2));
+        let small = resize_plane(quadrants(320, 240).data(), (320, 240), 3, (2, 2));
         assert_eq!(small, vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
     }
 
@@ -267,7 +266,7 @@ mod tests {
     #[test]
     fn encodes_keyframe_then_smaller_frames() {
         let mut encoder = VideoEncoder::default();
-        let frame = pattern(320, 240);
+        let frame = quadrants(320, 240);
         let first = encoder.encode(&frame, 1.0, 10.0).unwrap();
         assert!(first.keyframe && first.data.starts_with(&[0, 0, 0, 1]));
         assert_eq!((first.width, first.height), (320, 240));
@@ -307,9 +306,12 @@ mod tests {
             }
             println!("{name:<40} {:7.2} ms", start.elapsed().as_secs_f64() * 1000.0 / runs as f64);
         };
-        time("jpeg -> rgb (zune)", 10, Box::new(|| drop(crate::codec::image::compressed_to_rgb(&jpeg, "jpeg").unwrap())));
-        time("jpeg -> i420 (the video path)", 10, Box::new(|| drop(crate::codec::image::compressed_to_video(&jpeg, "jpeg").unwrap())));
-        let image = crate::codec::image::compressed_to_video(&jpeg, "jpeg").unwrap();
+        let decode = || {
+            let (width, height, pixels) = crate::codec::jpeg::tests::decode(&jpeg);
+            VideoImage::rgb8(width as u32, height as u32, pixels).unwrap()
+        };
+        time("jpeg -> rgb (zune)", 10, Box::new(|| drop(decode())));
+        let image = decode();
         println!("source {}x{} {:?}", image.width(), image.height(), image.format());
         // the same picture one pixel over, so every P-frame has real motion to code
         let shifted: Vec<u8> = image.data()[1..].iter().chain(&image.data()[..1]).copied().collect();

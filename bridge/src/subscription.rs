@@ -42,6 +42,9 @@ const MIN_ALLOCATED_HZ: f64 = 0.05;
 const EWMA_GAIN: f64 = 0.5;
 /// Per-frame overhead on the wire besides the payload (frame header + key, SCTP/DTLS/UDP).
 const FRAME_OVERHEAD_BYTES: f64 = 90.0;
+/// Streams at this zenoh priority or more urgent (2 INTERACTIVE_HIGH, 1 REAL_TIME) bypass
+/// allocation and pacing and preempt everything else.
+const STRICT_PRIORITY: u8 = 2;
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,15 +176,11 @@ pub struct SubShared {
     /// the server's codecs, with the caches that share work across frontends
     pub codecs: Arc<CodecRegistry>,
     max_hz: Option<f64>,
-    min_hz: f64,
-    weight: f64,
     quality_range: (f64, f64),
     tradeoff: f64,
     /// this frontend's shared send gate, and this stream's id in it
     gate: Arc<SendGate>,
     stream_id: usize,
-    /// streams at this zenoh priority or more urgent bypass allocation and pacing (0 = none)
-    strict_threshold: u8,
     /// published priority of the latest sample (used when the subscription sets none)
     sample_priority: AtomicU8,
     bucket: Mutex<TokenBucket>,
@@ -208,22 +207,19 @@ fn sample_timestamp_ms(sample: &Sample) -> f64 {
 }
 
 impl SubShared {
-    pub fn new(opts: &SubOpts, codec: Option<Arc<dyn Codec>>, codecs: Arc<CodecRegistry>, gate: Arc<SendGate>, strict_threshold: u8) -> Self {
+    pub fn new(opts: &SubOpts, codec: Option<Arc<dyn Codec>>, codecs: Arc<CodecRegistry>, gate: Arc<SendGate>) -> Self {
         static NEXT_STREAM: AtomicUsize = AtomicUsize::new(0);
         SubShared {
             gate,
             stream_id: NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
-            strict_threshold,
             sample_priority: AtomicU8::new(0),
             bucket: Mutex::new(TokenBucket::default()),
             delivery: opts.delivery(),
             min_interval: opts.min_interval(),
-            priority_override: opts.zenoh_priority().map(|p| p as u8),
+            priority_override: opts.priority,
             codec,
             codecs,
             max_hz: opts.max_hz,
-            min_hz: opts.dangerous_min_hz.unwrap_or(0.0),
-            weight: opts.bandwidth_priority.unwrap_or(1.0),
             quality_range: opts.quality_range(),
             tradeoff: opts.quality_to_hz_tradeoff.unwrap_or(0.5),
             state: Mutex::new(SubState::default()),
@@ -247,11 +243,11 @@ impl SubShared {
         self.closed.load(Ordering::Relaxed)
     }
 
-    /// Strict-priority tier: its priority (subscribe option, else as published) is at or above the
-    /// bridge's threshold. Strict streams bypass allocation and pacing and preempt bulk streams.
+    /// Strict-priority tier: its priority (subscribe option, else as published) is
+    /// `STRICT_PRIORITY` or more urgent. Strict streams bypass allocation and pacing and preempt bulk streams.
     pub fn is_strict(&self) -> bool {
         let priority = self.priority_override.unwrap_or_else(|| self.sample_priority.load(Ordering::Relaxed));
-        priority != 0 && priority <= self.strict_threshold
+        priority != 0 && priority <= STRICT_PRIORITY
     }
 
     /// The subscription's minQuality.
@@ -277,8 +273,7 @@ impl SubShared {
             return None;
         }
         let wanted = self.max_hz.map_or(rate_hz, |max| max.min(rate_hz));
-        let floor = self.min_hz.min(wanted);
-        Some((wanted * allocation.hz_fraction).max(floor).max(MIN_ALLOCATED_HZ))
+        Some((wanted * allocation.hz_fraction).max(MIN_ALLOCATED_HZ))
     }
 
     /// Spacing between two sends of a key: maxHz, tightened by the allocation.
@@ -306,13 +301,11 @@ impl SubShared {
     /// Measures rates since the previous call and describes what this stream wants.
     pub fn usage(&self, interval_secs: f64) -> Usage {
         let mut state = self.state.lock().unwrap();
-        let (mut max_hz, mut min_hz) = (0.0, 0.0);
+        let mut max_hz = 0.0;
         for queue in state.keys.values_mut() {
             queue.rate_hz = ewma(queue.rate_hz, queue.arrivals as f64 / interval_secs.max(1e-3));
             queue.arrivals = 0;
-            let wanted = self.max_hz.map_or(queue.rate_hz, |max| max.min(queue.rate_hz));
-            max_hz += wanted;
-            min_hz += self.min_hz.min(wanted);
+            max_hz += self.max_hz.map_or(queue.rate_hz, |max| max.min(queue.rate_hz));
         }
         let bytes_sent = state.stats.bytes_sent - state.accounted_bytes_sent;
         let network_blocked_ms = state.stats.blocked_on_network_ms - state.accounted_blocked_ms;
@@ -328,38 +321,31 @@ impl SubShared {
                 let (width, height) = state.video_source.unwrap_or((640, 480));
                 Box::new(move |quality| crate::codec::video::bytes_per_frame(width, height, quality))
             }
-            Some(_) if self.jpeg => {
-                // JPEG files: measured sizes per quality, scaled between qualities by the JPEG model
-                let (width, height) = state.video_source.unwrap_or((640, 480));
-                let measured: Vec<(f64, f64)> = state.encoded_bytes.iter().map(|(&bucket, &bytes)| (bucket as f64 / 1000.0, bytes)).collect();
-                Box::new(move |quality| {
-                    let estimate = |quality: f64| crate::codec::jpeg::bytes_per_frame(width, height, quality);
-                    let nearest = measured.iter().min_by(|a, b| (a.0 - quality).abs().total_cmp(&(b.0 - quality).abs()));
-                    match nearest {
-                        Some(&(measured_quality, bytes)) => bytes * estimate(quality) / estimate(measured_quality).max(1e-9),
-                        None => estimate(quality) + FRAME_OVERHEAD_BYTES,
-                    }
-                })
-            }
             Some(codec) => {
-                // measured sizes, scaled between qualities by the codec's own estimate
-                let codec = codec.clone();
-                let payload_len = payload_bytes.round() as usize;
+                // measured sizes per quality, scaled between qualities by a model: the JPEG one for
+                // pictures sent as files, else the codec's own estimate
+                let model: crate::allocator::Price = match self.jpeg {
+                    true => {
+                        let (width, height) = state.video_source.unwrap_or((640, 480));
+                        Box::new(move |quality| crate::codec::jpeg::bytes_per_frame(width, height, quality))
+                    }
+                    false => {
+                        let (codec, payload_len) = (codec.clone(), payload_bytes.round() as usize);
+                        Box::new(move |quality| codec.estimated_bytes(payload_len, quality).max(0.0))
+                    }
+                };
                 let measured: Vec<(f64, f64)> = state.encoded_bytes.iter().map(|(&bucket, &bytes)| (bucket as f64 / 1000.0, bytes)).collect();
                 Box::new(move |quality| {
-                    let estimate = |quality: f64| codec.estimated_bytes(payload_len, quality).max(0.0);
                     let nearest = measured.iter().min_by(|a, b| (a.0 - quality).abs().total_cmp(&(b.0 - quality).abs()));
                     match nearest {
-                        Some(&(measured_quality, bytes)) => bytes * estimate(quality) / estimate(measured_quality).max(1e-9),
-                        None => estimate(quality) + FRAME_OVERHEAD_BYTES,
+                        Some(&(measured_quality, bytes)) => bytes * model(quality) / model(measured_quality).max(1e-9),
+                        None => model(quality) + FRAME_OVERHEAD_BYTES,
                     }
                 })
             }
         };
         let demand = Demand {
-            weight: self.weight,
             max_hz,
-            min_hz,
             quality_range: self.codec.as_ref().map(|_| self.quality_range),
             tradeoff: self.tradeoff,
             price,
@@ -852,7 +838,7 @@ mod tests {
 
     fn shared(opts: &str) -> SubShared {
         let registry = Arc::new(CodecRegistry::new([]).unwrap());
-        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), None, registry, Arc::default(), 2)
+        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), None, registry, Arc::default())
     }
 
     #[test]
@@ -915,7 +901,7 @@ mod tests {
 
     #[test]
     fn max_age_drops() {
-        let shared = shared(r#"{"maxAge":100,"queueSize":null}"#);
+        let shared = shared(r#"{"maxAge":100,"delivery":"reliable"}"#);
         let t0 = Instant::now();
         insert(&shared, "a/x", pending(0, 5, t0), None);
         let (next, _) = shared.pick(t0 + Duration::from_millis(500));
@@ -925,7 +911,7 @@ mod tests {
 
     #[test]
     fn hz_cap_defers() {
-        let shared = shared(r#"{"maxHz":10,"queueSize":5}"#);
+        let shared = shared(r#"{"maxHz":10,"delivery":"reliable"}"#);
         let t0 = Instant::now();
         insert(&shared, "a/x", pending(0, 5, t0), None);
         insert(&shared, "a/x", pending(1, 5, t0), None);

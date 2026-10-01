@@ -1,7 +1,6 @@
 //! The embeddable server: [`Server::builder`] → [`ServerBuilder::build`] → [`Server::bind`] (or
 //! [`Server::serve`], or [`Server::router`] to mount it in your own axum app).
 
-use crate::acl::AccessControl;
 use crate::codec::Codec;
 use crate::codec::registry::CodecRegistry;
 use crate::peer::{AllocationConfig, Bridge};
@@ -55,7 +54,6 @@ pub struct ServerBuilder {
     serve_dir: Option<PathBuf>,
     max_bandwidth_bytes_per_sec: Option<f64>,
     bandwidth_target_fraction: f64,
-    strict_priority: u8,
     codecs: Vec<Arc<dyn Codec>>,
 }
 
@@ -68,7 +66,6 @@ impl Default for ServerBuilder {
             serve_dir: None,
             max_bandwidth_bytes_per_sec: None,
             bandwidth_target_fraction: 0.75,
-            strict_priority: 2,
             codecs: Vec::new(),
         }
     }
@@ -76,10 +73,8 @@ impl Default for ServerBuilder {
 
 impl ServerBuilder {
     /// The zenoh configuration for the session the server opens (default: zenoh's defaults, a
-    /// peer with multicast scouting). Its `access_control` section is also applied to browser
-    /// puts, subscriptions and queries, so a refusal reaches the page as a `rejected` state
-    /// (zenoh alone would drop them silently). With [`session`](Self::session), only that
-    /// `access_control` section is used.
+    /// peer with multicast scouting). Its `access_control` section applies to browsers' puts,
+    /// subscriptions and queries like to any other traffic of the session (dropped silently).
     pub fn zenoh_config(mut self, config: zenoh::Config) -> Self {
         self.zenoh_config = Some(config);
         self
@@ -93,8 +88,7 @@ impl ServerBuilder {
     }
 
     /// Uses a zenoh session the host application already has instead of opening one. The server
-    /// never closes it. Topic listing's routing-table sources (`subscriber`, `queryable`) need the
-    /// session's admin space to be readable; without it `listTopics` still sees tokens and samples.
+    /// never closes it.
     pub fn session(mut self, session: zenoh::Session) -> Self {
         self.session = Some(session);
         self
@@ -122,22 +116,13 @@ impl ServerBuilder {
     }
 
     /// Share of the estimated bandwidth the allocator hands out, in (0, 1]; the rest is headroom
-    /// that keeps the path's queues short. A connection may override it (`bandwidthTargetFraction`).
-    /// Default 0.75.
+    /// that keeps the path's queues short. Default 0.75.
     pub fn bandwidth_target_fraction(mut self, fraction: f64) -> Self {
         self.bandwidth_target_fraction = fraction;
         self
     }
 
-    /// Subscriptions at this zenoh priority or more urgent (1 REAL_TIME … 7 BACKGROUND) bypass
-    /// allocation and pacing and preempt everything else; 0 disables. Default 2 (INTERACTIVE_HIGH).
-    pub fn strict_priority(mut self, priority: u8) -> Self {
-        self.strict_priority = priority;
-        self
-    }
-
-    /// Registers an external codec next to the built-in ones. A name that is already registered
-    /// (built-in or not) makes [`build`](Self::build) fail.
+    /// Registers a codec. A name that is already registered makes [`build`](Self::build) fail.
     pub fn codec(self, codec: impl Codec + 'static) -> Self {
         self.shared_codec(Arc::new(codec))
     }
@@ -159,13 +144,8 @@ impl ServerBuilder {
         if let Some(cap) = self.max_bandwidth_bytes_per_sec {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
-        ensure!(self.strict_priority <= 7, "strict priority must be 0..7, got {}", self.strict_priority);
         let codecs = CodecRegistry::new(self.codecs)?;
         let mut config = self.zenoh_config.unwrap_or_default();
-        let access_control = AccessControl::from_config(&config)?;
-        if access_control.enabled() {
-            info!("access_control enabled: browser puts/subscribes/gets are checked against it");
-        }
         let (session, owns_session) = match self.session {
             Some(session) => {
                 ensure!(self.connect.is_empty(), "connect endpoints only apply to a session zenoh-web opens; configure them on the session you pass instead");
@@ -175,18 +155,14 @@ impl ServerBuilder {
                 if !self.connect.is_empty() {
                     config.insert_json5("connect/endpoints", &serde_json::to_string(&self.connect)?).map_err(|error| anyhow!("{error}"))?;
                 }
-                // listTopics reads this bridge's own routing tables through the admin space (read-only)
-                config.insert_json5("adminspace/enabled", "true").map_err(|error| anyhow!("{error}"))?;
-                config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).map_err(|error| anyhow!("{error}"))?;
                 (zenoh::open(config).await.map_err(|error| anyhow!("opening the zenoh session: {error}"))?, true)
             }
         };
         let allocation = AllocationConfig {
             max_bandwidth: self.max_bandwidth_bytes_per_sec,
             target_fraction: self.bandwidth_target_fraction,
-            strict_priority: self.strict_priority,
         };
-        let bridge = Bridge::new(session.clone(), access_control, codecs, allocation);
+        let bridge = Bridge::new(session.clone(), codecs, allocation);
         Ok(Server { inner: Arc::new(Inner { bridge, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false) }) })
     }
 }

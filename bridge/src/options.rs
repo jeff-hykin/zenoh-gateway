@@ -2,7 +2,7 @@
 
 use crate::codec::registry::CodecRegistry;
 use crate::codec::{Codec, CodecOutput};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,25 +42,16 @@ pub enum ImageTransport {
     Jpeg,
 }
 
-/// Present-but-null (what JSON.stringify makes of Infinity) becomes `Some(None)`.
-fn present_or_null<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Option<f64>>, D::Error> {
-    Option::<f64>::deserialize(deserializer).map(Some)
-}
-
-/// Subscribe options. bandwidthPriority, dangerousMinHz, the quality range and the tradeoff feed
-/// the per-frontend allocator; `codec` picks a transcoder (none = raw passthrough).
+/// Subscribe options. The quality range and the tradeoff feed the per-frontend allocator; `codec`
+/// picks a transcoder (none = raw passthrough).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubOpts {
     #[serde(default)]
     pub delivery: DeliveryKind,
     pub priority: Option<u8>,
-    pub bandwidth_priority: Option<f64>,
-    #[serde(default, deserialize_with = "present_or_null")]
-    pub queue_size: Option<Option<f64>>,
     pub max_age: Option<f64>,
     pub max_hz: Option<f64>,
-    pub dangerous_min_hz: Option<f64>,
     pub min_quality: Option<f64>,
     pub max_quality: Option<f64>,
     pub quality_to_hz_tradeoff: Option<f64>,
@@ -89,7 +80,7 @@ pub struct HeartbeatOpts {
 /// Normalized delivery policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Delivery {
-    /// Max pending samples per key; `None` = unbounded.
+    /// Max pending samples per key: 1 (the newest) for `latest`, unbounded (`None`) for `reliable`.
     pub queue: Option<usize>,
     pub max_age_ms: Option<f64>,
     pub reliable: bool,
@@ -127,20 +118,6 @@ impl SubOpts {
         check_priority(self.priority)?;
         check_positive("maxAge", self.max_age)?;
         check_positive("maxHz", self.max_hz)?;
-        if let Some(Some(n)) = self.queue_size
-            && !(n >= 1.0 && n.fract() == 0.0)
-        {
-            return Err(format!("queueSize must be an integer >= 1 or Infinity, got {n}"));
-        }
-        match self.bandwidth_priority {
-            Some(w) if !(w.is_finite() && w >= 0.0) => return Err(format!("bandwidthPriority must be >= 0, got {w}")),
-            _ => {}
-        }
-        match self.dangerous_min_hz {
-            Some(v) if !(v.is_finite() && v >= 0.0) => return Err(format!("dangerousMinHz must be >= 0, got {v}")),
-            Some(v) if self.max_hz.is_some_and(|max| v > max) => return Err("dangerousMinHz must be <= maxHz".into()),
-            _ => {}
-        }
         check_unit("minQuality", self.min_quality)?;
         check_unit("maxQuality", self.max_quality)?;
         check_unit("qualityToHzTradeoff", self.quality_to_hz_tradeoff)?;
@@ -180,13 +157,7 @@ impl SubOpts {
 
     pub fn delivery(&self) -> Delivery {
         let reliable = self.delivery == DeliveryKind::Reliable;
-        let queue = match self.queue_size {
-            Some(Some(n)) => Some(n as usize),
-            Some(None) => None,
-            None if reliable => None,
-            None => Some(1),
-        };
-        Delivery { queue, max_age_ms: self.max_age, reliable }
+        Delivery { queue: (!reliable).then_some(1), max_age_ms: self.max_age, reliable }
     }
 
     /// Minimum spacing between two sends of the same key, from `maxHz`.
@@ -194,21 +165,13 @@ impl SubOpts {
         self.max_hz.map(|hz| Duration::from_secs_f64(1.0 / hz))
     }
 
-    pub fn zenoh_priority(&self) -> Option<zenoh::qos::Priority> {
-        self.priority.and_then(|p| zenoh::qos::Priority::try_from(p).ok())
-    }
-
     /// Every option with its default filled in, for stats.
     pub fn normalized(&self) -> Value {
-        let delivery = self.delivery();
         json!({
             "delivery": self.delivery,
             "priority": self.priority,
-            "bandwidthPriority": self.bandwidth_priority.unwrap_or(1.0),
-            "queueSize": delivery.queue,
             "maxAge": self.max_age,
             "maxHz": self.max_hz,
-            "dangerousMinHz": self.dangerous_min_hz.unwrap_or(0.0),
             "minQuality": self.min_quality.unwrap_or(0.0),
             "maxQuality": self.max_quality.unwrap_or(1.0),
             "qualityToHzTradeoff": self.quality_to_hz_tradeoff.unwrap_or(0.5),
@@ -250,9 +213,26 @@ impl HeartbeatOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::{CodecSample, DecodedFrame};
 
     fn sub(opts: &str) -> Result<SubOpts, String> {
         SubOpts::parse(&serde_json::from_str(opts).unwrap())
+    }
+
+    struct Named(&'static str, CodecOutput);
+
+    impl Codec for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn output(&self) -> CodecOutput {
+            self.1
+        }
+
+        fn decode(&self, _: &CodecSample<'_>) -> anyhow::Result<DecodedFrame> {
+            anyhow::bail!("not decoded in these tests")
+        }
     }
 
     #[test]
@@ -260,38 +240,33 @@ mod tests {
         let latest = Delivery { queue: Some(1), max_age_ms: None, reliable: false };
         assert_eq!(sub(r#"{}"#).unwrap().delivery(), latest);
         assert_eq!(sub(r#"{"delivery":"latest"}"#).unwrap().delivery(), latest);
-        let reliable = sub(r#"{"delivery":"reliable"}"#).unwrap().delivery();
-        assert_eq!(reliable, Delivery { queue: None, max_age_ms: None, reliable: true });
-        let custom = sub(r#"{"queueSize":3,"maxAge":500}"#).unwrap().delivery();
-        assert_eq!(custom, Delivery { queue: Some(3), max_age_ms: Some(500.0), reliable: false });
-        assert_eq!(sub(r#"{"queueSize":null}"#).unwrap().delivery().queue, None);
+        let reliable = sub(r#"{"delivery":"reliable","maxAge":500}"#).unwrap().delivery();
+        assert_eq!(reliable, Delivery { queue: None, max_age_ms: Some(500.0), reliable: true });
     }
 
     #[test]
     fn validation() {
-        assert!(sub(r#"{"hz":[1,2]}"#).is_err(), "old option names are rejected");
+        assert!(sub(r#"{"hz":[1,2]}"#).is_err(), "unknown option names are rejected");
+        assert!(sub(r#"{"queueSize":3}"#).is_err());
         assert!(sub(r#"{"delivery":"sometimes"}"#).is_err());
-        assert!(sub(r#"{"queueSize":0}"#).is_err());
-        assert!(sub(r#"{"queueSize":1.5}"#).is_err());
         assert!(sub(r#"{"maxHz":0}"#).is_err());
         assert!(sub(r#"{"priority":9}"#).is_err());
         assert!(sub(r#"{"minQuality":0.8,"maxQuality":0.2}"#).is_err());
         assert!(sub(r#"{"qualityToHzTradeoff":2}"#).is_err());
-        assert!(sub(r#"{"maxHz":5,"dangerousMinHz":10}"#).is_err());
-        let registry = CodecRegistry::new([]).unwrap();
+        let registry = CodecRegistry::new([Arc::new(Named("image", CodecOutput::Video)) as Arc<dyn Codec>, Arc::new(Named("depth", CodecOutput::Data))]).unwrap();
         let resolve = |opts: &str| sub(opts).unwrap().resolve_codec(&registry).map(|codec| codec.map(|codec| codec.name().to_owned()));
-        assert!(resolve(r#"{"codec":"ros2-jpeg"}"#).unwrap_err().contains("unknown codec"));
-        assert!(resolve(r#"{"codec":"ros2-image","delivery":"reliable"}"#).unwrap_err().contains("video codec"), "video is lossy");
-        assert_eq!(resolve(r#"{"codec":"dimos-depth","delivery":"reliable"}"#).unwrap().as_deref(), Some("dimos-depth"));
+        assert!(resolve(r#"{"codec":"jpeg"}"#).unwrap_err().contains("unknown codec"));
+        assert!(resolve(r#"{"codec":"image","delivery":"reliable"}"#).unwrap_err().contains("video codec"), "video is lossy");
+        assert_eq!(resolve(r#"{"codec":"depth","delivery":"reliable"}"#).unwrap().as_deref(), Some("depth"));
         assert_eq!(resolve(r#"{}"#).unwrap(), None);
         assert!(sub(r#"{"imageTransport":"png"}"#).is_err());
-        assert_eq!(resolve(r#"{"codec":"ros2-image","delivery":"reliable","imageTransport":"jpeg"}"#).unwrap().as_deref(), Some("ros2-image"), "jpeg files can be reliable");
-        assert!(resolve(r#"{"codec":"dimos-depth","imageTransport":"jpeg"}"#).unwrap_err().contains("video codecs"));
+        assert_eq!(resolve(r#"{"codec":"image","delivery":"reliable","imageTransport":"jpeg"}"#).unwrap().as_deref(), Some("image"), "jpeg files can be reliable");
+        assert!(resolve(r#"{"codec":"depth","imageTransport":"jpeg"}"#).unwrap_err().contains("video codecs"));
         assert!(resolve(r#"{"imageTransport":"jpeg"}"#).unwrap_err().contains("video codec"));
-        assert!(sub(r#"{"codec":"ros2-image","imageTransport":"jpeg"}"#).unwrap().jpeg());
-        assert!(!sub(r#"{"codec":"ros2-image","imageTransport":"video"}"#).unwrap().jpeg());
-        let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"dangerousMinHz":1,"minQuality":0.3,"maxQuality":0.9,"qualityToHzTradeoff":0.7}"#).unwrap();
-        assert_eq!(full.normalized()["bandwidthPriority"], 2.0);
+        assert!(sub(r#"{"codec":"image","imageTransport":"jpeg"}"#).unwrap().jpeg());
+        assert!(!sub(r#"{"codec":"image","imageTransport":"video"}"#).unwrap().jpeg());
+        let full = sub(r#"{"maxHz":20,"minQuality":0.3,"maxQuality":0.9,"qualityToHzTradeoff":0.7}"#).unwrap();
+        assert_eq!(full.normalized()["qualityToHzTradeoff"], 0.7);
         assert_eq!(full.min_interval(), Some(Duration::from_millis(50)));
     }
 

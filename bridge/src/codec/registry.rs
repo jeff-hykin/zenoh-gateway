@@ -1,6 +1,6 @@
 //! The server's codecs by name, and the caches that share decodes and encodes across frontends.
 
-use super::{Codec, CodecOutput, CodecSample, DecodedFrame, builtin};
+use super::{Codec, CodecOutput, CodecSample, DecodedFrame};
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -63,7 +63,7 @@ pub fn quality_bucket(quality: f64) -> u16 {
     (quality.clamp(0.0, 1.0) * 1000.0).round() as u16
 }
 
-/// Name → codec, built-ins first, plus the decode/encode caches.
+/// Name → codec, plus the decode/encode caches.
 pub struct CodecRegistry {
     codecs: BTreeMap<String, Arc<dyn Codec>>,
     decoded: WorkCache<(String, u64), DecodedFrame>,
@@ -71,16 +71,16 @@ pub struct CodecRegistry {
 }
 
 impl CodecRegistry {
-    /// The built-in codecs plus `extra`; a name registered twice is an error.
-    pub fn new(extra: impl IntoIterator<Item = Arc<dyn Codec>>) -> Result<Self> {
+    /// `codecs` by name; a name registered twice is an error.
+    pub fn new(registered: impl IntoIterator<Item = Arc<dyn Codec>>) -> Result<Self> {
         let mut codecs: BTreeMap<String, Arc<dyn Codec>> = BTreeMap::new();
-        for codec in builtin::all().into_iter().chain(extra) {
+        for codec in registered {
             let name = codec.name().to_owned();
             if name.is_empty() {
                 bail!("a codec's name must not be empty");
             }
             if codecs.insert(name.clone(), codec).is_some() {
-                bail!("codec {name:?} is registered twice (built-in codecs: {})", builtin::all().iter().map(|codec| codec.name().to_owned()).collect::<Vec<_>>().join(", "));
+                bail!("codec {name:?} is registered twice");
             }
         }
         Ok(CodecRegistry { codecs, decoded: WorkCache::new(DECODED_CAPACITY), encoded: WorkCache::new(ENCODED_CAPACITY) })
@@ -138,14 +138,14 @@ mod tests {
     }
 
     #[test]
-    fn builtins_registered_unknown_and_duplicate_fail() {
-        let registry = CodecRegistry::new([Arc::new(Named("custom")) as Arc<dyn Codec>]).unwrap();
-        for name in ["ros2-image", "dimos-pointcloud2", "custom"] {
+    fn registered_unknown_and_duplicate_fail() {
+        let registry = CodecRegistry::new([Arc::new(Named("custom")) as Arc<dyn Codec>, Arc::new(Named("other"))]).unwrap();
+        for name in ["other", "custom"] {
             assert_eq!(registry.get(name).unwrap().name(), name);
         }
         let error = registry.get("ros2-jpeg").err().unwrap();
-        assert!(error.contains("unknown codec") && error.contains("dimos-pointcloud2") && error.contains("custom"), "{error}");
-        let duplicate = CodecRegistry::new([Arc::new(Named("ros2-depth")) as Arc<dyn Codec>]).err().unwrap();
+        assert!(error.contains("unknown codec") && error.contains("other") && error.contains("custom"), "{error}");
+        let duplicate = CodecRegistry::new([Arc::new(Named("custom")) as Arc<dyn Codec>, Arc::new(Named("custom"))]).err().unwrap();
         assert!(duplicate.to_string().contains("registered twice"), "{duplicate}");
         assert!(CodecRegistry::new([Arc::new(Named("")) as Arc<dyn Codec>]).is_err());
     }

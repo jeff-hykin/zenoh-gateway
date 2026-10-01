@@ -1,6 +1,6 @@
 //! Codecs: transcoders picked per subscription with the subscribe option `codec`.
 //!
-//! Every codec, built-in or external, implements [`Codec`] and lives in the server's registry
+//! Every codec implements [`Codec`] and lives in the server's registry
 //! under its [`name`](Codec::name). A codec decodes a zenoh sample into a [`DecodedFrame`], then
 //! either hands the bridge raw video ([`CodecOutput::Video`]: the bridge scales it, encodes H.264
 //! and sends it on a WebRTC video track) or encodes bytes for the subscription's data channel at
@@ -11,14 +11,9 @@
 //! pool. Decodes are shared across frontends by (codec, key, payload), data encodes by (codec,
 //! quality, key, payload), so identical requests from several browsers compute once.
 
-pub(crate) mod builtin;
-pub(crate) mod depth;
-pub(crate) mod image;
 pub(crate) mod jpeg;
-pub(crate) mod pointcloud;
 pub(crate) mod registry;
 pub(crate) mod video;
-pub(crate) mod wire;
 
 use anyhow::{Result, anyhow, ensure};
 use std::any::Any;
