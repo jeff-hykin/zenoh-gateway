@@ -250,6 +250,12 @@ const CPU_STEP: f64 = 0.1;
 const CPU_HEADROOM: f64 = 0.85;
 /// Time after a step before the next, so the costs are measured at the new size.
 const CPU_SETTLE: Duration = Duration::from_secs(1);
+/// Stepping up needs the next step's predicted encode within this share of the frame interval, and
+/// this long since the last step: a resolution change restarts the encoder (a keyframe), so a ceiling
+/// that flapped between two steps cost a keyframe every few seconds and grew the browser's jitter
+/// buffer.
+const CPU_UP_HEADROOM: f64 = 0.6;
+const CPU_UP_SETTLE: Duration = Duration::from_secs(5);
 /// Weight of the newest sample in the cost averages.
 const CPU_EWMA_GAIN: f64 = 0.2;
 
@@ -286,7 +292,8 @@ impl CpuGovernor {
     /// The quality to encode at: `allocated`, lowered to the governor's ceiling.
     fn quality(&mut self, allocated: f64, min_quality: f64, hz: f64, now: Instant) -> f64 {
         let floor = min_quality.min(allocated);
-        let settled = self.changed_at.is_none_or(|at| now.duration_since(at) >= CPU_SETTLE);
+        let since_change = self.changed_at.map(|at| now.duration_since(at));
+        let settled = since_change.is_none_or(|elapsed| elapsed >= CPU_SETTLE);
         if let (true, Some(encode_ms)) = (settled, self.encode_ms) {
             let budget_ms = 1000.0 / hz.max(0.1) * CPU_HEADROOM;
             let current = allocated.min(self.cap);
@@ -294,11 +301,11 @@ impl CpuGovernor {
                 self.cap = (current - CPU_STEP).max(floor);
                 self.encode_ms = None;
                 self.changed_at = Some(now);
-            } else if self.cap < 1.0 && self.cap < allocated {
+            } else if self.cap < 1.0 && self.cap < allocated && since_change.is_none_or(|elapsed| elapsed >= CPU_UP_SETTLE) {
                 let next = (self.cap + CPU_STEP).min(1.0);
                 let pixels = |quality: f64| crate::codec::video::resolution_scale(quality).powi(2);
                 let predicted_ms = encode_ms * pixels(next) / pixels(self.cap);
-                if predicted_ms < budget_ms * 0.9 {
+                if predicted_ms < 1000.0 / hz.max(0.1) * CPU_UP_HEADROOM {
                     self.cap = next;
                     self.encode_ms = None;
                     self.changed_at = Some(now);
@@ -451,10 +458,17 @@ mod tests {
         assert_eq!(floor.quality(0.5, 0.5, 30.0, start), 0.5);
         // cheap again: steps back up when the next step's predicted cost fits
         governor.observe_encode(5.0);
-        let later = start + CPU_SETTLE * 3;
+        let later = start + CPU_SETTLE + CPU_UP_SETTLE;
+        assert!((governor.quality(0.8, 0.1, 30.0, start + CPU_SETTLE * 2) - 0.6).abs() < 1e-9, "waits longer to step up");
         assert!((governor.quality(0.8, 0.1, 30.0, later) - 0.7).abs() < 1e-9, "steps up");
         // and never above what the allocator granted
         governor.observe_encode(1.0);
-        assert!(governor.quality(0.3, 0.1, 30.0, later + CPU_SETTLE) <= 0.3 + 1e-9);
+        assert!(governor.quality(0.3, 0.1, 30.0, later + CPU_UP_SETTLE) <= 0.3 + 1e-9);
+        // a step up that would land near the budget is not taken (no flapping)
+        let mut near = CpuGovernor::new();
+        near.observe_encode(40.0);
+        assert!((near.quality(0.8, 0.1, 30.0, start) - 0.7).abs() < 1e-9);
+        near.observe_encode(20.0);
+        assert!((near.quality(0.8, 0.1, 30.0, start + CPU_UP_SETTLE) - 0.7).abs() < 1e-9, "20 ms now, ~24 predicted: stays");
     }
 }

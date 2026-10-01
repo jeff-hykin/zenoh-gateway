@@ -186,6 +186,8 @@ pub struct SubShared {
     data_ready: Notify,
     drained: Notify,
     closed: AtomicBool,
+    /// flips to true on close, so `run` also stops when the channel never reports its own close
+    closed_signal: tokio::sync::watch::Sender<bool>,
 }
 
 pub fn now_unix_ms() -> f64 {
@@ -223,6 +225,7 @@ impl SubShared {
             data_ready: Notify::new(),
             drained: Notify::new(),
             closed: AtomicBool::new(false),
+            closed_signal: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -524,10 +527,12 @@ impl SubShared {
         }
     }
 
-    fn close(&self) {
+    /// Ends the subscription: its sender stops and `run` returns, dropping the zenoh subscriber.
+    pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         self.data_ready.notify_one();
         self.drained.notify_one();
+        self.closed_signal.send_replace(true);
     }
 }
 
@@ -556,14 +561,22 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
         Some(track) => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), track)),
         None => tokio::spawn(send_loop(dc.clone(), shared.clone())),
     };
-    while let Some(event) = dc.poll().await {
+    // A browser that vanishes (killed, crashed, lid closed) never closes its channels; the peer is
+    // dropped instead and closes this subscription, which must end it even though `poll` never
+    // returns. Without this, every such browser left its streams decoding and encoding forever.
+    let mut closed = shared.closed_signal.subscribe();
+    loop {
+        let event = tokio::select! {
+            event = dc.poll() => event,
+            _ = closed.wait_for(|closed| *closed) => None,
+        };
         match event {
-            DataChannelEvent::OnBufferedAmountLow => shared.drained.notify_one(),
-            DataChannelEvent::OnMessage(message) if message.data.len() == 4 => {
+            None | Some(DataChannelEvent::OnClose) => break,
+            Some(DataChannelEvent::OnBufferedAmountLow) => shared.drained.notify_one(),
+            Some(DataChannelEvent::OnMessage(message)) if message.data.len() == 4 => {
                 shared.ack(u32::from_le_bytes([message.data[0], message.data[1], message.data[2], message.data[3]]));
             }
-            DataChannelEvent::OnClose => break,
-            _ => {}
+            Some(_) => {}
         }
     }
     shared.close();

@@ -399,6 +399,12 @@ impl Bridge {
             entry.state.gone.store(true, Ordering::Relaxed);
             entry.state.connection.lock().unwrap().take();
             entry.state.video_tracks.lock().unwrap().clear();
+            // the channels of a browser that vanished never report their own close
+            for channel in entry.state.channels.lock().unwrap().values() {
+                if let ChannelStats::Sub(shared) = &channel.stats {
+                    shared.close();
+                }
+            }
             tokio::spawn(async move {
                 entry.state.fire_deadmen("disconnected").await;
                 let _ = entry.connection.close().await;
