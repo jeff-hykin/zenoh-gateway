@@ -50,19 +50,10 @@ fn spans(destination_len: u32, source_len: u32) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Box-filter downscale (or nearest upscale for the even-size rounding) of a packed plane with
-/// `channels` (1 or 3) bytes per pixel. Row at a time: each destination row sums its source rows
-/// once into per-column totals, then each destination pixel sums its span of those, so every source
-/// byte is read once.
-fn resize_plane(source: &[u8], (source_width, source_height): (u32, u32), channels: usize, (width, height): (u32, u32)) -> Vec<u8> {
-    match channels {
-        1 => resize_packed::<1>(source, (source_width, source_height), (width, height)),
-        3 => resize_packed::<3>(source, (source_width, source_height), (width, height)),
-        other => unreachable!("{other} channels"),
-    }
-}
-
-fn resize_packed<const CHANNELS: usize>(source: &[u8], (source_width, source_height): (u32, u32), (width, height): (u32, u32)) -> Vec<u8> {
+/// Box-filter downscale (or nearest upscale for the even-size rounding) of a packed plane with `CHANNELS` bytes per
+/// pixel. Each destination row sums its source rows into per-column totals, then each pixel its span of those, so every
+/// source byte is read once.
+fn resize_plane<const CHANNELS: usize>(source: &[u8], (source_width, source_height): (u32, u32), (width, height): (u32, u32)) -> Vec<u8> {
     let row_len = source_width as usize * CHANNELS;
     if (width, height) == (source_width, source_height) {
         return source[..row_len * height as usize].to_vec();
@@ -129,7 +120,7 @@ pub(crate) fn to_i420(image: &VideoImage, width: u32, height: u32) -> Vec<u8> {
     let source = (image.width(), image.height());
     match image.format() {
         PixelFormat::Rgb8 => {
-            let pixels = resize_plane(image.data(), source, 3, (width, height));
+            let pixels = resize_plane::<3>(image.data(), source, (width, height));
             rgb_to_i420(&pixels, width as usize, height as usize)
         }
         PixelFormat::I420 => {
@@ -138,9 +129,9 @@ pub(crate) fn to_i420(image: &VideoImage, width: u32, height: u32) -> Vec<u8> {
             let (u, v) = chroma.split_at(luma_len / 4);
             let half_source = (source.0 / 2, source.1 / 2);
             let half = (width / 2, height / 2);
-            let mut yuv = resize_plane(luma, source, 1, (width, height));
-            yuv.extend(resize_plane(u, half_source, 1, half));
-            yuv.extend(resize_plane(v, half_source, 1, half));
+            let mut yuv = resize_plane::<1>(luma, source, (width, height));
+            yuv.extend(resize_plane::<1>(u, half_source, half));
+            yuv.extend(resize_plane::<1>(v, half_source, half));
             yuv
         }
     }
@@ -240,14 +231,9 @@ impl VideoEncoder for H264Encoder {
         let VideoTarget { width, height, bitrate_bps, fps: hz, .. } = *target;
         let wanted = Settings { width, height, bitrate_bps, fps: hz as f32 };
         let drifted = |old: f64, new: f64| old / new > RECONFIGURE_RATIO || new / old > RECONFIGURE_RATIO;
-        let reconfigure = match &self.encoder {
-            None => true,
-            Some((_, current)) => {
-                (current.width, current.height) != (width, height)
-                    || drifted(current.bitrate_bps as f64, bitrate_bps as f64)
-                    || drifted(current.fps as f64, hz)
-            }
-        };
+        let reconfigure = self.encoder.as_ref().is_none_or(|(_, current)| {
+            (current.width, current.height) != (width, height) || drifted(current.bitrate_bps as f64, bitrate_bps as f64) || drifted(current.fps as f64, hz)
+        });
         if reconfigure {
             let config = EncoderConfig::new()
                 .bitrate(BitRate::from_bps(bitrate_bps))
@@ -309,7 +295,7 @@ mod tests {
 
     #[test]
     fn resize_averages_quadrants() {
-        let small = resize_plane(quadrants(320, 240).data(), (320, 240), 3, (2, 2));
+        let small = resize_plane::<3>(quadrants(320, 240).data(), (320, 240), (2, 2));
         assert_eq!(small, vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
     }
 

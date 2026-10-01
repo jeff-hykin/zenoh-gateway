@@ -1,11 +1,9 @@
 //! Per-frontend bandwidth allocation (SPEC "Bandwidth allocation").
 //!
-//! Every stream (subscription) wants `price(maxQuality) * maxHz` bytes/s, where maxHz is its
-//! source rate capped by its `maxHz` option. Reliable and strict streams can't drop messages: their
-//! measured rate is reserved. When the rest want more than the budget left, they shrink like CSS flex
-//! items with `flex-shrink = demand / bandwidthPriority`: a higher priority keeps more. Priority-0
-//! streams give up everything before any other stream gives up anything. A transcoded stream then splits its grant between quality and Hz along
-//! `qualityToHzTradeoff`.
+//! Every stream (subscription) wants `price(maxQuality) * maxHz` bytes/s, maxHz being its source rate capped by its
+//! `maxHz` option. Reliable and strict streams can't drop messages: their measured rate is reserved. When the rest want
+//! more than the budget left, they shrink like CSS flex items with `flex-shrink = demand / bandwidthPriority`; priority-0
+//! streams give up everything first. A transcoded stream splits its grant between quality and Hz by `qualityToHzTradeoff`.
 
 use serde::Serialize;
 
@@ -116,22 +114,16 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
         .collect()
 }
 
-/// Data-channel capacity estimate (bytes/s). webrtc-rs doesn't expose the SCTP congestion window,
-/// so this combines what the `sub` channels actually pushed into SCTP with two congestion signals:
-/// - delay: the connection's RTT (the smallest browser clock-sync sample of the interval) stayed
-///   above its recent minimum by more than the path's usual jitter for `DELAY_PERSISTENCE`
-///   intervals in a row, i.e. a queue is building somewhere on the path. The threshold is
-///   `DELAY_THRESHOLD_MS` plus twice the median of the last `JITTER_WINDOW` of these delays: a
-///   Wi-Fi or VPN path whose RTT swings by tens of ms with no load must not read as congested (on
-///   one, a fixed 5 ms threshold held the estimate at its floor while the link idled). The estimate
-///   drops at once by 15% and probing pauses 1 s while the queue drains;
-/// - loss/backpressure: senders blocked on SCTP more than 20% of the interval: 0.9 x measured rate,
-///   but at most 15% down per interval.
+/// Data-channel capacity estimate (bytes/s). webrtc-rs hides SCTP's congestion window, so this combines what the `sub`
+/// channels pushed into SCTP with two congestion signals:
+/// - delay: the RTT (the interval's smallest clock-sync sample) stayed above its recent minimum by more than the path's
+///   usual jitter (`DELAY_THRESHOLD_MS` + twice the median delay over `JITTER_WINDOW`, so an idle jittery Wi-Fi or VPN
+///   path doesn't read as congested) for `DELAY_PERSISTENCE` intervals: -15% at once, and probing pauses 1 s;
+/// - backpressure: senders blocked on SCTP more than 20% of the interval: 0.9 x measured rate, at most -15% per interval.
 ///
-/// Otherwise, while streams want more, it probes up: 50% per interval until the first congestion
-/// event (slow start), then 10% per interval below 90% of the level that last triggered congestion
-/// and 2% above it, so overshoot builds queue slowly enough to be caught; 10% again once that level
-/// is 5 s old (on Wi-Fi one early stall had held probing at 2% for good).
+/// Otherwise, while streams want more, it probes up 50% per interval until the first congestion event, then 10% below
+/// 90% of the level that last triggered congestion and 2% above it (overshoot builds queue slowly enough to be caught),
+/// and 10% again once that level is 5 s old.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Estimator {
@@ -167,11 +159,9 @@ const DELAY_PERSISTENCE: u32 = 2;
 /// How far back the path's usual queue-delay jitter is measured.
 const JITTER_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 const DELAY_DECREASE: f64 = 0.85;
-/// Blocked on SCTP: down to 0.9 x what went out, but by at most this per interval (~halving a
-/// second), since a long round trip blocks the first intervals before the RTT is known.
+/// Blocked on SCTP: down to 0.9 x what went out, but at most this per interval (a long RTT blocks the first intervals).
 const BLOCKED_DECREASE: f64 = 0.85;
-/// Slow probing (2%) near the last congestion level only while that level is this recent; older, it
-/// is stale (on Wi-Fi one early stall had held probing at 2% per interval for good).
+/// Slow probing (2%) near the last congestion level only while that level is this recent (one early stall held it for good).
 const STALE_CONGESTION: std::time::Duration = std::time::Duration::from_secs(5);
 const HOLD_AFTER_CONGESTION: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -249,19 +239,10 @@ impl Estimator {
         let mut recent: Vec<f64> = self.delay_samples.iter().map(|(_, delay)| *delay).collect();
         // the path's own swing: twice its median queue delay (a median, so a queue that stands for
         // less than half the window can't raise the bar it is measured against)
-        let jitter = if recent.is_empty() {
-            0.0
-        } else {
-            recent.sort_by(f64::total_cmp);
-            2.0 * recent[recent.len() / 2]
-        };
-        self.delay_threshold_ms = DELAY_THRESHOLD_MS + jitter;
+        recent.sort_by(f64::total_cmp);
+        self.delay_threshold_ms = DELAY_THRESHOLD_MS + recent.get(recent.len() / 2).map_or(0.0, |median| 2.0 * median);
         self.delay_samples.push_back((now, delay));
-        if delay > self.delay_threshold_ms {
-            self.over_threshold += 1;
-        } else {
-            self.over_threshold = 0;
-        }
+        self.over_threshold = if delay > self.delay_threshold_ms { self.over_threshold + 1 } else { 0 };
         self.over_threshold >= DELAY_PERSISTENCE
     }
 }

@@ -14,12 +14,10 @@ pub struct Label {
     #[serde(default)]
     pub key: String,
     /// Client-chosen id, echoed back in stats and used to address a publisher's deadman.
-    #[serde(default)]
     pub id: Option<u64>,
     #[serde(default)]
     pub opts: Value,
     /// video codecs: the browser transceiver (renegotiated earlier) whose track carries the frames
-    #[serde(default)]
     pub mid: Option<String>,
 }
 
@@ -76,49 +74,36 @@ pub struct Delivery {
     pub reliable: bool,
 }
 
-fn check_priority(priority: Option<u8>) -> Result<(), String> {
-    match priority {
-        Some(p) if !(1..=7).contains(&p) => Err(format!("priority must be 1..7, got {p}")),
+/// `Err("<name> must be <must_be>, got <value>")` for a value that is set and not `valid`.
+fn check(name: &str, value: Option<f64>, valid: impl Fn(f64) -> bool, must_be: &str) -> Result<(), String> {
+    match value {
+        Some(v) if !valid(v) => Err(format!("{name} must be {must_be}, got {v}")),
         _ => Ok(()),
     }
+}
+
+fn check_priority(priority: Option<u8>) -> Result<(), String> {
+    check("priority", priority.map(f64::from), |p| (1.0..=7.0).contains(&p), "1..7")
 }
 
 fn check_positive(name: &str, value: Option<f64>) -> Result<(), String> {
-    match value {
-        Some(v) if !(v.is_finite() && v > 0.0) => Err(format!("{name} must be a positive number, got {v}")),
-        _ => Ok(()),
-    }
-}
-
-fn check_unit(name: &str, value: Option<f64>) -> Result<(), String> {
-    match value {
-        Some(v) if !(0.0..=1.0).contains(&v) => Err(format!("{name} must be within 0..1, got {v}")),
-        _ => Ok(()),
-    }
+    check(name, value, |v| v.is_finite() && v > 0.0, "a positive number")
 }
 
 impl SubOpts {
     pub fn parse(opts: &Value) -> Result<Self, String> {
         let parsed: SubOpts = serde_json::from_value(opts.clone()).map_err(|e| e.to_string())?;
-        parsed.validate()?;
-        Ok(parsed)
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        check_priority(self.priority)?;
-        check_positive("maxAge", self.max_age)?;
-        check_positive("maxHz", self.max_hz)?;
-        match self.bandwidth_priority {
-            Some(weight) if !(weight.is_finite() && weight >= 0.0) => return Err(format!("bandwidthPriority must be >= 0, got {weight}")),
-            _ => {}
+        check_priority(parsed.priority)?;
+        check_positive("maxAge", parsed.max_age)?;
+        check_positive("maxHz", parsed.max_hz)?;
+        check("bandwidthPriority", parsed.bandwidth_priority, |weight| weight.is_finite() && weight >= 0.0, ">= 0")?;
+        for (name, value) in [("minQuality", parsed.min_quality), ("maxQuality", parsed.max_quality), ("qualityToHzTradeoff", parsed.quality_to_hz_tradeoff)] {
+            check(name, value, |v| (0.0..=1.0).contains(&v), "within 0..1")?;
         }
-        check_unit("minQuality", self.min_quality)?;
-        check_unit("maxQuality", self.max_quality)?;
-        check_unit("qualityToHzTradeoff", self.quality_to_hz_tradeoff)?;
-        if self.min_quality.unwrap_or(0.0) > self.max_quality.unwrap_or(1.0) {
+        if parsed.min_quality.unwrap_or(0.0) > parsed.max_quality.unwrap_or(1.0) {
             return Err("minQuality must be <= maxQuality".into());
         }
-        Ok(())
+        Ok(parsed)
     }
 
     /// The subscription's codec from `registry` (None = raw), filling `compress` in with the codec's

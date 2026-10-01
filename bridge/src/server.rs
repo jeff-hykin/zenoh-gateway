@@ -1,5 +1,4 @@
-//! The embeddable server: [`Server::builder`] → [`ServerBuilder::build`] → [`Server::bind`] (or
-//! [`Server::serve`], or [`Server::router`] to mount it in your own axum app).
+//! The embeddable server: [`Server::builder`] → [`ServerBuilder::build`] → [`Server::bind`] (or [`Server::serve`], or [`Server::router`]).
 
 use crate::codec::Codec;
 use crate::codec::registry::CodecRegistry;
@@ -26,8 +25,7 @@ use webrtc::peer_connection::RTCSessionDescription;
 /// Default HTTP port of the `zenoh-web` command.
 pub const DEFAULT_PORT: u16 = 7448;
 
-/// `GET` this path for `{"service": "zenoh-web", "version": "<crate version>"}`: how a program
-/// checks whether a zenoh-web server is already listening somewhere before starting its own.
+/// `GET` this path for `{"service": "zenoh-web", "version": "<crate version>"}`, to check a zenoh-web server is listening.
 pub const HEALTH_PATH: &str = "/zenoh-web/health";
 
 /// Configures a [`Server`]. Start with [`Server::builder`].
@@ -72,9 +70,8 @@ impl Default for ServerBuilder {
 }
 
 impl ServerBuilder {
-    /// The zenoh configuration for the session the server opens (default: zenoh's defaults, a
-    /// peer with multicast scouting). Its `access_control` section applies to browsers' puts,
-    /// subscriptions and queries like to any other traffic of the session (dropped silently).
+    /// The zenoh configuration for the session the server opens (default: a peer with multicast scouting). Its
+    /// `access_control` section applies to browsers' puts, subscriptions and queries too (dropped silently).
     pub fn zenoh_config(mut self, config: zenoh::Config) -> Self {
         self.zenoh_config = Some(config);
         self
@@ -87,36 +84,32 @@ impl ServerBuilder {
         Ok(self.zenoh_config(config))
     }
 
-    /// Uses a zenoh session the host application already has instead of opening one. The server
-    /// never closes it.
+    /// Uses a zenoh session the host application already has instead of opening one; the server never closes it.
     pub fn session(mut self, session: zenoh::Session) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Adds a zenoh endpoint to connect to, e.g. `tcp/192.168.1.2:7447` (repeatable; replaces the
-    /// config's `connect/endpoints`). Not allowed together with [`session`](Self::session).
+    /// Adds a zenoh endpoint to connect to, e.g. `tcp/192.168.1.2:7447` (repeatable; replaces the config's
+    /// `connect/endpoints`). Not allowed together with [`session`](Self::session).
     pub fn connect(mut self, endpoint: impl Into<String>) -> Self {
         self.connect.push(endpoint.into());
         self
     }
 
-    /// Serves a directory over HTTP next to the signaling endpoint (`/` serves `index.html`); the
-    /// files are read on every request, so the UI is live-editable on disk.
+    /// Serves a directory over HTTP (`/` serves `index.html`), read on every request so the UI is live-editable on disk.
     pub fn serve_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.serve_dir = Some(dir.into());
         self
     }
 
-    /// Caps every browser's bandwidth budget (bytes/s) below its estimate, e.g. for a known-slow
-    /// link. Default: no cap.
+    /// Caps every browser's bandwidth budget (bytes/s) below its estimate, e.g. for a known-slow link. Default: no cap.
     pub fn max_bandwidth_bytes_per_sec(mut self, bytes_per_sec: f64) -> Self {
         self.max_bandwidth_bytes_per_sec = Some(bytes_per_sec);
         self
     }
 
-    /// Share of the estimated bandwidth the allocator hands out, in (0, 1]; the rest is headroom
-    /// that keeps the path's queues short. Default 0.75.
+    /// Share of the estimated bandwidth the allocator hands out, in (0, 1]; the rest keeps queues short. Default 0.75.
     pub fn bandwidth_target_fraction(mut self, fraction: f64) -> Self {
         self.bandwidth_target_fraction = fraction;
         self
@@ -133,14 +126,10 @@ impl ServerBuilder {
         self
     }
 
-    /// Validates the options, registers the codecs and opens the zenoh session (unless one was
-    /// given).
+    /// Validates the options, registers the codecs and opens the zenoh session (unless one was given).
     pub async fn build(self) -> Result<Server> {
-        ensure!(
-            self.bandwidth_target_fraction > 0.0 && self.bandwidth_target_fraction <= 1.0,
-            "bandwidth target fraction must be within (0, 1], got {}",
-            self.bandwidth_target_fraction
-        );
+        let fraction = self.bandwidth_target_fraction;
+        ensure!(fraction > 0.0 && fraction <= 1.0, "bandwidth target fraction must be within (0, 1], got {fraction}");
         if let Some(cap) = self.max_bandwidth_bytes_per_sec {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
@@ -158,11 +147,7 @@ impl ServerBuilder {
                 (zenoh::open(config).await.map_err(|error| anyhow!("opening the zenoh session: {error}"))?, true)
             }
         };
-        let allocation = AllocationConfig {
-            max_bandwidth: self.max_bandwidth_bytes_per_sec,
-            target_fraction: self.bandwidth_target_fraction,
-        };
-        let bridge = Bridge::new(session.clone(), codecs, allocation);
+        let bridge = Bridge::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction });
         Ok(Server { inner: Arc::new(Inner { bridge, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false) }) })
     }
 }
@@ -175,9 +160,8 @@ struct Inner {
     shut_down: AtomicBool,
 }
 
-/// A configured zenoh-web server: the zenoh side is live, browsers connect once it is bound to an
-/// HTTP address ([`bind`](Self::bind), [`serve`](Self::serve)) or mounted in a host's router
-/// ([`router`](Self::router)). Cheap to clone; clones share everything.
+/// A configured zenoh-web server: the zenoh side is live, browsers connect once it is bound ([`bind`](Self::bind),
+/// [`serve`](Self::serve)) or mounted in a host's router ([`router`](Self::router)). Clones share everything.
 #[derive(Clone)]
 pub struct Server {
     inner: Arc<Inner>,
@@ -194,11 +178,8 @@ impl Server {
         &self.inner.session
     }
 
-    /// The HTTP routes: `POST /offer` (WebRTC signaling, CORS-permissive), `GET /zenoh-web/health`
-    /// (`{"service": "zenoh-web", "version": ...}`, so another program can tell a zenoh-web server is
-    /// already listening on a port) and, with [`ServerBuilder::serve_dir`], static files for
-    /// everything else. Mount it in a host application's axum server; call
-    /// [`shutdown`](Self::shutdown) when the host stops.
+    /// The HTTP routes: `POST /offer` (WebRTC signaling, CORS-permissive), `GET` [`HEALTH_PATH`] and, with
+    /// [`ServerBuilder::serve_dir`], static files. Mount it in a host's axum server; call [`shutdown`](Self::shutdown) when it stops.
     pub fn router(&self) -> Router {
         let mut router = Router::new()
             .route("/offer", post(offer))
@@ -211,8 +192,7 @@ impl Server {
         router
     }
 
-    /// Binds the HTTP listener (e.g. `("0.0.0.0", 7448)`, or port 0 for any free port) and serves
-    /// on a background task until [`RunningServer::shutdown`].
+    /// Binds the HTTP listener (e.g. `("0.0.0.0", 7448)`, or port 0) and serves on a task until [`RunningServer::shutdown`].
     pub async fn bind(self, addr: impl ToSocketAddrs) -> Result<RunningServer> {
         let listener = tokio::net::TcpListener::bind(addr).await.context("binding the HTTP listener")?;
         let local_addr = listener.local_addr()?;
@@ -238,8 +218,7 @@ impl Server {
         self.serve_with_shutdown(addr, std::future::pending()).await
     }
 
-    /// Serves on `addr` until `signal` completes (e.g. Ctrl-C), then shuts down like
-    /// [`RunningServer::shutdown`].
+    /// Serves on `addr` until `signal` completes (e.g. Ctrl-C), then shuts down like [`RunningServer::shutdown`].
     pub async fn serve_with_shutdown(self, addr: impl ToSocketAddrs, signal: impl Future<Output = ()>) -> Result<()> {
         let mut running = self.bind(addr).await?;
         let failed = tokio::select! {
@@ -256,9 +235,8 @@ impl Server {
         }
     }
 
-    /// Fires every connected browser's deadmen (reason `"shutdown"`, published once, reliably),
-    /// closes the browser connections and, if the server opened the zenoh session, closes it.
-    /// Later calls do nothing.
+    /// Fires every connected browser's deadmen (reason `"shutdown"`, once, reliably), closes the browser connections and,
+    /// if the server opened the zenoh session, closes it. Later calls do nothing.
     pub async fn shutdown(&self) -> Result<()> {
         if self.inner.shut_down.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -272,8 +250,7 @@ impl Server {
     }
 }
 
-/// A server bound to an HTTP address, serving on a background task. Dropping it leaves the task
-/// running; call [`shutdown`](Self::shutdown) to stop it and fire deadmen.
+/// A server serving on a background task; dropping it leaves the task running, [`shutdown`](Self::shutdown) stops it.
 pub struct RunningServer {
     server: Server,
     local_addr: SocketAddr,
@@ -292,8 +269,7 @@ impl RunningServer {
         &self.server
     }
 
-    /// Stops accepting HTTP requests, waits for the ones in flight, fires every browser's deadmen,
-    /// closes the browser connections and (if the server opened it) the zenoh session.
+    /// Stops accepting HTTP requests, waits for the ones in flight, then [`Server::shutdown`].
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());

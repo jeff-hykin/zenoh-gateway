@@ -1,9 +1,7 @@
-//! Media subscriptions: frames decoded by a video or audio codec, encoded (the codec's
-//! `VideoEncoder`, or Opus in `audio`) and written to a WebRTC track (one per frontend and
-//! subscription). The browser adds a recvonly transceiver and renegotiates over `control`, naming
-//! the codec; the bridge answers with a new track of that codec's format bound to the transceiver's
-//! mid. A subscription's `sub` data channel names the mid in its label and carries a small frame per
-//! media frame. Tracks are reused by later subscriptions on the same mid and format.
+//! Media subscriptions: frames decoded by a video or audio codec, encoded (the codec's `VideoEncoder`, or Opus in
+//! `audio`) and written to a WebRTC track. The browser adds a recvonly transceiver and renegotiates over `control`
+//! naming the codec; the bridge answers with a track of that codec's format bound to the transceiver's mid, which the
+//! `sub` channel's label names (it then carries a small frame per media frame). Later subscriptions reuse the track.
 
 use crate::codec::registry;
 use crate::codec::video::{EncodedVideo, target};
@@ -88,11 +86,8 @@ impl BandwidthEstimator for ReportingEstimator {
         self.publish();
     }
 
-    /// What the pacer drains at: a multiple of the estimate, as libwebrtc paces (its default pace
-    /// multiplier is 2.5). The pacer smooths bursts; it is not the rate limit — the allocator keeps
-    /// the encoders near the estimate itself. Paced at exactly the estimate, every keyframe or
-    /// overshoot queued behind it and that queue only drained as fast as the estimate grew, which
-    /// held video seconds behind its data channel after a subscription started.
+    /// What the pacer drains at: a multiple of the estimate, as libwebrtc paces; the allocator keeps the encoders near the
+    /// estimate itself. Paced at exactly the estimate, keyframes queued and held video seconds behind its data channel.
     fn target_bitrate(&self) -> f64 {
         self.inner.target_bitrate() * PACING_FACTOR
     }
@@ -111,8 +106,7 @@ impl BandwidthEstimator for ReportingEstimator {
     }
 }
 
-/// The track formats + RTCP reports + NACK + send-side congestion control (TWCC feedback into
-/// GCC). Returns the GCC target (f64 bits/s as bits in an AtomicU64).
+/// Track formats, RTCP reports, NACK and TWCC-fed GCC; returns the GCC target (f64 bits/s as bits in an AtomicU64).
 pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<AtomicU64>)> {
     let mut media_engine = MediaEngine::default();
     for (mime, payload_type) in FORMATS {
@@ -222,9 +216,8 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
     let mid = mid.context("the offer had no new m-line for the track (add a recvonly transceiver of its kind before renegotiating)")?;
     let payload_type = negotiated_payload_type(&sender, mime).await.with_context(|| format!("the browser did not accept {mime}"))?;
     let keyframe_requested = Arc::new(AtomicBool::new(true));
-    let keyframe_requests = Arc::new(AtomicU64::new(0));
-    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested: keyframe_requested.clone(), keyframe_requests: keyframe_requests.clone(), in_use: AtomicBool::new(false) });
-    spawn_rtcp_reader(track, Arc::downgrade(&video), keyframe_requested, keyframe_requests);
+    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), in_use: AtomicBool::new(false) });
+    spawn_rtcp_reader(track, Arc::downgrade(&video), video.keyframe_requested.clone(), video.keyframe_requests.clone());
     Ok((local, Some(video)))
 }
 
@@ -285,23 +278,17 @@ const CPU_STEP: f64 = 0.1;
 const CPU_HEADROOM: f64 = 0.85;
 /// Time after a step before the next, so the costs are measured at the new size.
 const CPU_SETTLE: Duration = Duration::from_secs(1);
-/// Stepping up needs the next step's predicted encode within this share of the frame interval, and
-/// this long since the last step: a resolution change restarts the encoder (a keyframe), so a ceiling
-/// that flapped between two steps cost a keyframe every few seconds and grew the browser's jitter
-/// buffer.
+/// Stepping up needs the next step's predicted encode within this share of the frame interval, and this long since the
+/// last step: a resolution change costs a keyframe, and a flapping ceiling grew the browser's jitter buffer.
 const CPU_UP_HEADROOM: f64 = 0.6;
 const CPU_UP_SETTLE: Duration = Duration::from_secs(5);
 /// Weight of the newest sample in the cost averages.
 const CPU_EWMA_GAIN: f64 = 0.2;
 
-/// Keeps a video stream within what the machine's cores can encode at the granted rate. The
-/// allocator picks quality for bandwidth; on a small CPU (a Jetson with a 1920x1536 camera) the
-/// encoder then fell behind and the frame rate collapsed instead. When scaling + encoding a frame
-/// takes more than `CPU_HEADROOM` of the frame interval, the ceiling steps down (never below
-/// minQuality), trading resolution for frames the way a bandwidth shortfall would; it steps back up
-/// when the encode cost predicted at the next step (it scales with pixels) fits again. Decoding
-/// overlaps encoding and does not depend on quality, so it never moves the ceiling: a slow decode
-/// caps the frame rate whatever the resolution.
+/// Keeps a video stream within what the cores can encode at the granted rate (on a small CPU the frame rate collapsed):
+/// past `CPU_HEADROOM` of the frame interval the quality ceiling steps down (never below minQuality), and back up when
+/// the encode cost predicted at the next step (it scales with pixels) fits. Decode cost never moves it: it overlaps
+/// encoding and does not depend on quality.
 struct CpuGovernor {
     cap: f64,
     decode_ms: Option<f64>,
@@ -351,11 +338,9 @@ impl CpuGovernor {
     }
 }
 
-/// Sends a video subscription's frames: pick (paced by maxHz and the allocation), decode (shared
-/// across frontends), encode with the codec's encoder at the allocated quality and Hz (off the
-/// runtime), and write to the track. The next frame's decode overlaps this frame's encode: in series, a big camera frame (a
-/// 1920x1536 jpeg is ~16 ms to decode and ~20 ms to scale and encode on a Jetson Orin core) could
-/// not keep up with 30 Hz; overlapped, the slower of the two sets the rate.
+/// Sends a video subscription's frames: pick (paced), decode (shared across frontends), encode at the allocated quality
+/// and Hz (off the runtime), write to the track. The next decode overlaps this encode, so the slower of the two sets the
+/// rate (in series a 1920x1536 jpeg on a Jetson Orin core, ~16 ms + ~20 ms, could not keep up with 30 Hz).
 pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: Arc<MediaTrack>) {
     let Some(codec) = shared.codec.clone() else { return };
     let mut encoder = Some(codec.video_encoder());
@@ -428,10 +413,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 encoder = returned;
                 governor.observe_encode(encode_ms);
                 shared.record_video_timing(governor.decode_ms, governor.encode_ms, governor.cap);
-                match frame {
-                    Some(frame) => frame,
-                    None => continue,
-                }
+                frame
             }
             Ok((returned, Err(error))) => {
                 encoder = returned;
@@ -444,6 +426,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 continue;
             }
         };
+        let Some(frame) = frame else { continue };
         if !is_picture {
             source = (frame.width, frame.height);
         }
@@ -452,7 +435,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         let duration = last_write.map_or(Duration::from_secs_f64(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
         last_write = Some(now);
         let meta = metadata(&frame, source, quality);
-        let (width, height, keyframe, encoded_len) = (frame.width, frame.height, frame.keyframe, frame.data.len());
+        let encoded_len = frame.data.len();
         if let Err(error) = track.write(frame.data, duration).await {
             if !warned_write {
                 log::warn!("video track {}: write failed: {error:#}", track.mid);
@@ -461,7 +444,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             shared.record_codec_error(&format!("track write: {error:#}"));
             continue;
         }
-        shared.record_video_frame(encoded_len, (width, height), quality, keyframe, reused, track.keyframe_requests.load(Ordering::Relaxed));
+        shared.record_video_frame(encoded_len, (frame.width, frame.height), quality, frame.keyframe, reused, track.keyframe_requests.load(Ordering::Relaxed));
         if subscription::send_small_frame(&dc, &key, &item, next_frame_id, &meta).await.is_err() && shared.is_closed() {
             break;
         }

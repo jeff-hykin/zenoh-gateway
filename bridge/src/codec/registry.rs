@@ -1,7 +1,7 @@
 //! The server's codecs by name, and the caches that share decodes and encodes across frontends.
 
 use super::{Codec, CodecOutput, CodecSample, Compress, DecodedFrame};
-use anyhow::{Result, bail};
+use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -13,8 +13,7 @@ const DECODED_CAPACITY: usize = 8;
 
 type Shared<T> = Arc<OnceLock<Result<Arc<T>, String>>>;
 
-/// A tiny FIFO of in-flight or finished results. Concurrent callers for the same key block on
-/// one `OnceLock`, so each key is computed once while it stays cached.
+/// A tiny FIFO of in-flight or finished results; callers for the same key block on one `OnceLock`, so it computes once.
 struct WorkCache<K, T> {
     capacity: usize,
     entries: Mutex<VecDeque<(K, Shared<T>)>>,
@@ -82,12 +81,8 @@ impl CodecRegistry {
         let mut codecs: BTreeMap<String, Arc<dyn Codec>> = BTreeMap::new();
         for codec in registered {
             let name = codec.name().to_owned();
-            if name.is_empty() {
-                bail!("a codec's name must not be empty");
-            }
-            if codecs.insert(name.clone(), codec).is_some() {
-                bail!("codec {name:?} is registered twice");
-            }
+            ensure!(!name.is_empty(), "a codec's name must not be empty");
+            ensure!(codecs.insert(name.clone(), codec).is_none(), "codec {name:?} is registered twice");
         }
         Ok(CodecRegistry { codecs, decoded: WorkCache::new(DECODED_CAPACITY), encoded: WorkCache::new(ENCODED_CAPACITY) })
     }
@@ -107,16 +102,13 @@ impl CodecRegistry {
         self.decoded.get_or_compute((codec.name().to_owned(), hash), || codec.decode(sample).map_err(|error| format!("{error:#}")))
     }
 
-    /// Blocking: a data codec's bytes for `sample` at `quality`, compressed as asked (or another
-    /// frontend's identical encode). `true` = reused.
+    /// Blocking: a data codec's bytes for `sample` at `quality`, compressed as asked (or another frontend's). `true` = reused.
     pub fn encode_shared(&self, codec: &dyn Codec, sample: &CodecSample<'_>, hash: u64, quality: f64, compress: Compress) -> (Result<Arc<Encoded>, String>, bool) {
         self.encoded.get_or_compute((codec.name().to_owned(), quality_bucket(quality), hash, compress), || {
             let (frame, _) = self.decode_shared(codec, sample, hash);
             let bytes = codec.encode(&*frame?, quality).map_err(|error| format!("{error:#}"))?;
-            Ok(match compress.apply(&bytes) {
-                Some(compressed) => Encoded { bytes: compressed, compressed: true },
-                None => Encoded { bytes, compressed: false },
-            })
+            let compressed = compress.apply(&bytes);
+            Ok(Encoded { compressed: compressed.is_some(), bytes: compressed.unwrap_or(bytes) })
         })
     }
 }

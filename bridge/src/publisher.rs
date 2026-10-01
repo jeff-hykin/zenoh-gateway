@@ -54,19 +54,9 @@ fn age_ms(sent_at_ms: f64, offset_ms: f64, bridge_now_ms: f64) -> f64 {
     bridge_now_ms - (sent_at_ms + offset_ms)
 }
 
-pub async fn run(
-    dc: Arc<dyn DataChannel>,
-    label: Label,
-    opts: PubOpts,
-    session: zenoh::Session,
-    shared: Arc<PubShared>,
-    clock_offset_ms: Arc<Mutex<Option<f64>>>,
-) {
+pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session: zenoh::Session, shared: Arc<PubShared>, clock_offset_ms: Arc<Mutex<Option<f64>>>) {
     let priority = opts.zenoh_priority().unwrap_or_default();
-    let congestion_control = match opts.delivery {
-        DeliveryKind::Reliable => CongestionControl::Block,
-        DeliveryKind::Latest => CongestionControl::Drop,
-    };
+    let congestion_control = if opts.delivery == DeliveryKind::Reliable { CongestionControl::Block } else { CongestionControl::Drop };
     let publisher = session
         .declare_publisher(label.key.clone())
         .priority(priority)

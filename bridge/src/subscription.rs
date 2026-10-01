@@ -19,21 +19,16 @@ use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::sample::Sample;
 use zenoh_ext::{AdvancedSubscriberBuilderExt, HistoryConfig};
 
-/// The smallest send window: above this many unacknowledged bytes the channel counts as backed up
-/// (the window grows with the path's bandwidth-delay product, `SendGate::window_bytes`). Sending
-/// resumes once the channel drains to half its window.
+/// Smallest send window (it grows with the bandwidth-delay product); sending resumes at half the window.
 pub const BACKED_UP_BYTES: usize = 64 * 1024;
 /// Backstop re-check while backed up, in case a low-water event is missed.
 const BACKSTOP: Duration = Duration::from_millis(20);
-/// Max bytes sent but not yet acknowledged as consumed by the page's JS (see `ack`), or twice the
-/// send window if larger (the page's acks take a round trip too).
-/// SCTP's buffered amount only covers the network: a busy browser main thread acks SCTP
-/// on its network thread and then queues messages internally without limit.
+/// Max bytes sent but not yet consumed by the page's JS (`ack`), or twice the send window if larger:
+/// SCTP's backlog only covers the network, and a busy page queues what SCTP delivered without limit.
 pub const UNCONSUMED_WINDOW: usize = 256 * 1024;
 /// A sent frame never acked for this long is assumed lost (lossy channels), not unconsumed.
 const ASSUME_LOST_AFTER: Duration = Duration::from_secs(1);
-/// Lossy channels blocked only by the ack window send one probe frame after this (doubling
-/// while no ack comes back): if the window's tail was lost, the probe's ack releases it.
+/// A lossy channel blocked only by the ack window probes after this (doubling while unacked), in case its tail was lost.
 const FIRST_PROBE_AFTER: Duration = Duration::from_millis(50);
 const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// An allocation never paces a key slower than this (a starved key still trickles).
@@ -42,8 +37,7 @@ const MIN_ALLOCATED_HZ: f64 = 0.05;
 const EWMA_GAIN: f64 = 0.5;
 /// Per-frame overhead on the wire besides the payload (frame header + key, SCTP/DTLS/UDP).
 const FRAME_OVERHEAD_BYTES: f64 = 90.0;
-/// Streams at this zenoh priority or more urgent (2 INTERACTIVE_HIGH, 1 REAL_TIME) bypass
-/// allocation and pacing and preempt everything else.
+/// Streams at this zenoh priority or more urgent (2 INTERACTIVE_HIGH, 1 REAL_TIME) bypass allocation and pacing.
 const STRICT_PRIORITY: u8 = 2;
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -75,8 +69,7 @@ pub struct SubStats {
     pub paced_ms: f64,
     /// Bridge receive time minus sample timestamp (upstream lag), largest seen.
     pub max_receive_lag_ms: f64,
-    /// Time a message's last frame was handed to SCTP minus its sample timestamp, largest seen
-    /// (upstream lag + queueing, pacing and encoding in the bridge).
+    /// Time a message's last frame was handed to SCTP minus its sample timestamp, largest seen.
     pub max_send_lag_ms: f64,
     /// frame bytes handed to SCTP (data channel) or video bytes handed to the track
     pub bytes_sent: u64,
@@ -92,8 +85,7 @@ pub struct SubStats {
     pub keyframe_requests: u64,
     pub video_width: u32,
     pub video_height: u32,
-    /// video: smoothed time to decode / to scale and encode one frame, and the quality ceiling
-    /// the CPU governor holds (1 = none) so both fit the frame interval
+    /// video: smoothed decode / scale+encode time per frame, and the CPU governor's quality ceiling (1 = none)
     pub decode_ms: Option<f64>,
     pub encode_ms: Option<f64>,
     pub cpu_quality_cap: Option<f64>,
@@ -137,6 +129,13 @@ struct SubState {
     /// counters as of the allocator's previous look
     accounted_bytes_sent: u64,
     accounted_blocked_ms: f64,
+}
+
+impl SubStats {
+    fn unqueue(&mut self, item: &Pending) {
+        self.queued -= 1;
+        self.queued_bytes -= item.payload.len();
+    }
 }
 
 fn ewma(previous: f64, sample: f64) -> f64 {
@@ -201,11 +200,8 @@ pub fn now_unix_ms() -> f64 {
 }
 
 fn sample_timestamp_ms(sample: &Sample) -> f64 {
-    sample
-        .timestamp()
-        .and_then(|ts| ts.get_time().to_system_time().duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .unwrap_or_else(now_unix_ms)
+    let since_epoch = sample.timestamp().and_then(|ts| ts.get_time().to_system_time().duration_since(UNIX_EPOCH).ok());
+    since_epoch.map_or_else(now_unix_ms, |d| d.as_secs_f64() * 1000.0)
 }
 
 impl SubShared {
@@ -363,11 +359,7 @@ impl SubShared {
         let previous = state.encoded_bytes.get(&bucket).copied().unwrap_or(0.0);
         state.encoded_bytes.insert(bucket, ewma(previous, encoded_len as f64 + FRAME_OVERHEAD_BYTES));
         state.stats.quality = Some(quality);
-        if shared {
-            state.stats.shared_encodes += 1;
-        } else {
-            state.stats.encodes += 1;
-        }
+        *if shared { &mut state.stats.shared_encodes } else { &mut state.stats.encodes } += 1;
     }
 
     pub fn record_codec_error(&self, error: &str) {
@@ -404,11 +396,7 @@ impl SubShared {
         state.stats.video_height = height;
         state.stats.quality = Some(quality);
         state.stats.keyframes += keyframe as u64;
-        if shared_decode {
-            state.stats.shared_encodes += 1;
-        } else {
-            state.stats.encodes += 1;
-        }
+        *if shared_decode { &mut state.stats.shared_encodes } else { &mut state.stats.encodes } += 1;
     }
 
     fn push(&self, sample: Sample) {
@@ -445,10 +433,8 @@ impl SubShared {
             state.payload_bytes = ewma(state.payload_bytes, payload_len as f64);
             if let Some(cap) = self.delivery.queue {
                 while queue.items.len() > cap {
-                    let dropped = queue.items.pop_front().unwrap();
+                    state.stats.unqueue(&queue.items.pop_front().unwrap());
                     state.stats.dropped_queue += 1;
-                    state.stats.queued -= 1;
-                    state.stats.queued_bytes -= dropped.payload.len();
                 }
             }
         }
@@ -463,10 +449,8 @@ impl SubShared {
             let max_age = Duration::from_secs_f64(max_age_ms / 1000.0);
             for queue in state.keys.values_mut() {
                 while queue.items.front().is_some_and(|item| now.duration_since(item.arrived) > max_age) {
-                    let dropped = queue.items.pop_front().unwrap();
+                    state.stats.unqueue(&queue.items.pop_front().unwrap());
                     state.stats.dropped_age += 1;
-                    state.stats.queued -= 1;
-                    state.stats.queued_bytes -= dropped.payload.len();
                 }
             }
         }
@@ -491,24 +475,22 @@ impl SubShared {
         let queue = state.keys.get_mut(&key).unwrap();
         let item = queue.items.pop_front().unwrap();
         queue.last_sent = Some(now);
-        state.stats.queued -= 1;
-        state.stats.queued_bytes -= item.payload.len();
+        state.stats.unqueue(&item);
         (Some((key, item)), wake_at)
     }
 
     /// Page consumed every frame up to `frame_id` (4-byte little endian message on the sub channel).
     fn ack(&self, frame_id: u32) {
         let mut state = self.state.lock().unwrap();
-        let mut released = false;
+        let before = state.unconsumed.len();
         while let Some(&(sent_frame_id, len, _)) = state.unconsumed.front() {
             if !seq_at_or_before(sent_frame_id, frame_id) {
                 break;
             }
             state.unconsumed.pop_front();
             state.stats.unconsumed_bytes -= len;
-            released = true;
         }
-        if released {
+        if state.unconsumed.len() != before {
             state.acks_with_progress += 1;
         }
         drop(state);
@@ -528,14 +510,9 @@ impl SubShared {
 
     /// Waits for new data or until `wake_at` (a key's pacing), whichever comes first.
     pub async fn wait_for_data(&self, wake_at: Option<Instant>) {
-        match wake_at {
-            Some(at) => {
-                tokio::select! {
-                    _ = self.data_ready.notified() => {}
-                    _ = tokio::time::sleep_until(at.into()) => {}
-                }
-            }
-            None => self.data_ready.notified().await,
+        tokio::select! {
+            _ = self.data_ready.notified() => {}
+            _ = tokio::time::sleep_until(wake_at.unwrap_or_else(Instant::now).into()), if wake_at.is_some() => {}
         }
     }
 
@@ -715,21 +692,17 @@ async fn encode(shared: &SubShared, codec: Arc<dyn Codec>, key: &str, item: &Pen
         codecs.encode_shared(&*codec, &sample, registry::sample_hash(&sample), quality, compress)
     })
     .await;
-    match outcome {
+    let error = match outcome {
         Ok((Ok(encoded), reused)) => {
             // the price model learns the bytes actually sent, after compression
             shared.record_encode(registry::quality_bucket(quality), quality, encoded.bytes.len(), reused);
-            Some(encoded)
+            return Some(encoded);
         }
-        Ok((Err(error), _)) => {
-            shared.record_codec_error(&error);
-            None
-        }
-        Err(error) => {
-            shared.record_codec_error(&format!("encoder task failed: {error}"));
-            None
-        }
-    }
+        Ok((Err(error), _)) => error,
+        Err(error) => format!("encoder task failed: {error}"),
+    };
+    shared.record_codec_error(&error);
+    None
 }
 
 async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
@@ -812,10 +785,7 @@ impl MessageSender {
                     warn!("send on {key:?} failed ({frame_len} bytes): {error}");
                     self.warned_send_error = true;
                 }
-                if matches!(error, webrtc::error::Error::ErrDataChannelClosed) {
-                    return Sent::Closed;
-                }
-                return Sent::Partial;
+                return if matches!(error, webrtc::error::Error::ErrDataChannelClosed) { Sent::Closed } else { Sent::Partial };
             }
             message_bytes += frame_len;
             {
@@ -844,8 +814,7 @@ impl MessageSender {
 
 /// Sends one small frame (e.g. a video frame's metadata) without pacing; returns its size.
 pub async fn send_small_frame(dc: &Arc<dyn DataChannel>, key: &str, item: &Pending, frame_id: u32, payload: &[u8]) -> Result<usize, webrtc::error::Error> {
-    let header = frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index: 0, chunk_count: 1, flags: 0 };
-    let frame = frame::encode(&header, payload);
+    let frame = frame::encode(&frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index: 0, chunk_count: 1, flags: 0 }, payload);
     let length = frame.len();
     dc.send(frame).await.map(|_| length)
 }

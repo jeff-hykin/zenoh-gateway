@@ -172,13 +172,7 @@ impl PeerState {
 
     fn subscriptions(&self) -> Vec<Arc<SubShared>> {
         let channels = self.channels.lock().unwrap();
-        channels
-            .values()
-            .filter_map(|entry| match &entry.stats {
-                ChannelStats::Sub(shared) => Some(shared.clone()),
-                ChannelStats::Pub(_) => None,
-            })
-            .collect()
+        channels.values().filter_map(|entry| if let ChannelStats::Sub(shared) = &entry.stats { Some(shared.clone()) } else { None }).collect()
     }
 
     /// (queue delay, minimum RTT): the smallest RTT since `since` minus the window's minimum. A
@@ -218,8 +212,7 @@ impl PeerState {
         let has_video = usages.iter().any(|usage| usage.on_track);
         let video_estimate = if has_video { media::gcc_target_bytes_per_sec(&self.video_target_bps) } else { 0.0 };
         let estimate = estimator.data_bytes_per_sec + video_estimate;
-        let target_fraction = self.config.target_fraction;
-        let usable = estimate * target_fraction;
+        let usable = estimate * self.config.target_fraction;
         let budget = self.config.max_bandwidth.map_or(usable, |cap| cap.min(usable));
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
@@ -228,9 +221,7 @@ impl PeerState {
         let strict_present = subscriptions.iter().any(|shared| shared.is_strict());
         self.gate.configure((budget - reserved).max(0.0), min_rtt_ms, allocator::DELAY_THRESHOLD_MS, strict_present);
         self.gate.set_window(budget, min_rtt_ms, high_rtt_ms);
-        let video_cap = video_estimate.min(budget);
-        let allocations = allocate_within_video_cap(budget, video_cap, demands, &is_video);
-        for (shared, allocation) in subscriptions.iter().zip(allocations) {
+        for (shared, allocation) in subscriptions.iter().zip(allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video)) {
             shared.apply(allocation);
         }
         *self.bandwidth.lock().unwrap() = BandwidthStats {
@@ -238,7 +229,7 @@ impl PeerState {
             video_estimate_bytes_per_sec: video_estimate,
             cap_bytes_per_sec: self.config.max_bandwidth,
             budget_bytes_per_sec: budget,
-            target_fraction,
+            target_fraction: self.config.target_fraction,
             queue_delay_ms,
             min_rtt_ms,
             delay_events: estimator.delay_events,
@@ -281,10 +272,6 @@ impl PeerState {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         warn!("peer {}: control channel never opened, dropped {event}", self.peer_id);
-    }
-
-    async fn send_rejection(&self, id: Option<u64>, reason: &str) {
-        self.send_event(json!({"event": "rejected", "id": id, "reason": reason})).await;
     }
 
     async fn send_accepted(&self, id: Option<u64>) {
@@ -478,9 +465,7 @@ impl PeerConnectionEventHandler for Handler {
 
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
         // Must not block here: the driver waits for this to return.
-        let bridge = self.bridge.clone();
-        let state = self.state.clone();
-        tokio::spawn(run_channel(dc, bridge, state));
+        tokio::spawn(run_channel(dc, self.bridge.clone(), self.state.clone()));
     }
 }
 
@@ -546,7 +531,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     };
     if let Some(error) = rejected {
         warn!("peer {peer_id}: rejected channel {raw_label}: {error}");
-        state.send_rejection(label.id, &error).await;
+        state.send_event(json!({"event": "rejected", "id": label.id, "reason": error})).await;
         let _ = dc.close().await;
     }
     state.channels.lock().unwrap().remove(&entry_id);
@@ -583,16 +568,9 @@ fn allocate_within_video_cap(budget: f64, video_cap: f64, demands: Vec<allocator
     if video_total <= video_cap * (1.0 + 1e-9) {
         return joint;
     }
-    let (mut video_indices, mut video_demands, mut data_indices, mut data_demands) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for (index, demand) in demands.into_iter().enumerate() {
-        if is_video[index] {
-            video_indices.push(index);
-            video_demands.push(demand);
-        } else {
-            data_indices.push(index);
-            data_demands.push(demand);
-        }
-    }
+    let (video, data): (Vec<_>, Vec<_>) = demands.into_iter().enumerate().partition(|(index, _)| is_video[*index]);
+    let (video_indices, video_demands): (Vec<usize>, Vec<_>) = video.into_iter().unzip();
+    let (data_indices, data_demands): (Vec<usize>, Vec<_>) = data.into_iter().unzip();
     let video_allocations = allocator::allocate(video_cap, &video_demands);
     let video_used: f64 = video_allocations.iter().map(|allocation| allocation.budget_bytes_per_sec).sum();
     let data_allocations = allocator::allocate((budget - video_used).max(0.0), &data_demands);
@@ -607,9 +585,7 @@ fn allocate_within_video_cap(budget: f64, video_cap: f64, demands: Vec<allocator
 #[serde(rename_all = "camelCase")]
 struct ClockSample {
     t0: f64,
-    #[serde(default)]
     offset_ms: Option<f64>,
-    #[serde(default)]
     rtt_ms: Option<f64>,
 }
 
@@ -667,24 +643,15 @@ struct ControlRequest {
     op: String,
     #[serde(default)]
     key: String,
-    #[serde(default)]
     timeout_ms: Option<u64>,
-    #[serde(default)]
     t0: Option<f64>,
-    #[serde(default)]
     offset_ms: Option<f64>,
-    #[serde(default)]
     rtt_ms: Option<f64>,
-    #[serde(default)]
     pub_id: Option<u64>,
-    #[serde(default)]
     probe_ms: Option<u64>,
-    #[serde(default)]
     bytes: Option<String>,
-    #[serde(default)]
     sdp: Option<RTCSessionDescription>,
     /// renegotiate: add a track for this codec's format
-    #[serde(default)]
     codec: Option<String>,
 }
 
@@ -719,25 +686,14 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             }
         };
         let response = match request.op.as_str() {
-            // a get can take seconds; don't hold up stats and pings behind it
-            "get" => {
-                let dc = dc.clone();
-                let session = state.session.clone();
+            // these can take seconds or wait on the peer connection's driver; keep stats and pings flowing meanwhile
+            "get" | "listTopics" | "renegotiate" => {
+                let (dc, state) = (dc.clone(), state.clone());
                 tokio::spawn(async move {
-                    let response = handle_get(&session, &request).await;
-                    let _ = dc.send_text(&response.to_string()).await;
-                });
-                continue;
-            }
-            "listTopics" => {
-                let dc = dc.clone();
-                let session = state.session.clone();
-                tokio::spawn(async move {
-                    let filter = if request.key.is_empty() { "**".to_owned() } else { request.key.clone() };
-                    let probe = Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS));
-                    let response = match list_topics(&session, &filter, probe).await {
-                        Ok(topics) => ok(&request.id, json!({"topics": topics})),
-                        Err(error) => fail(&request.id, error),
+                    let response = match request.op.as_str() {
+                        "get" => handle_get(&state.session, &request).await,
+                        "listTopics" => handle_list_topics(&state.session, &request).await,
+                        _ => handle_renegotiate(&state, &request).await,
                     };
                     let _ = dc.send_text(&response.to_string()).await;
                 });
@@ -758,16 +714,6 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 let codecs: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
                 ok(&request.id, json!({"codecs": codecs}))
             }
-            // can wait on the peer connection's driver; keep stats and pings flowing meanwhile
-            "renegotiate" => {
-                let dc = dc.clone();
-                let state = state.clone();
-                tokio::spawn(async move {
-                    let response = handle_renegotiate(&state, request).await;
-                    let _ = dc.send_text(&response.to_string()).await;
-                });
-                continue;
-            }
             "clearDeadman" => {
                 let pub_id = request.pub_id.unwrap_or_default();
                 if let Some(deadman) = state.deadmen.lock().unwrap().remove(&pub_id) {
@@ -783,8 +729,8 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
 
 /// Browser-initiated renegotiation (it added a recvonly transceiver): answer, and with `codec` add a
 /// track of that codec's format and report its mid.
-async fn handle_renegotiate(state: &PeerState, request: ControlRequest) -> Value {
-    let Some(offer) = request.sdp else { return fail(&request.id, "renegotiate needs sdp") };
+async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Value {
+    let Some(offer) = request.sdp.clone() else { return fail(&request.id, "renegotiate needs sdp") };
     let mime = match request.codec.as_deref().map(|name| state.codecs.get(name)) {
         None => None,
         Some(Ok(codec)) => match media::track_mime(&*codec) {
@@ -879,6 +825,14 @@ async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) ->
     drop(probe_subscriber);
     let found = found.lock().unwrap();
     Ok(found.iter().map(|(key, sources)| json!({"key": key, "sources": sources})).collect())
+}
+
+async fn handle_list_topics(session: &zenoh::Session, request: &ControlRequest) -> Value {
+    let filter = if request.key.is_empty() { "**" } else { &request.key };
+    match list_topics(session, filter, Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS))).await {
+        Ok(topics) => ok(&request.id, json!({"topics": topics})),
+        Err(error) => fail(&request.id, error),
+    }
 }
 
 async fn handle_get(session: &zenoh::Session, request: &ControlRequest) -> Value {
