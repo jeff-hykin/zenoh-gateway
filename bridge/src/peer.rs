@@ -571,6 +571,7 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
 /// - `advancedPublisher`: liveliness tokens of zenoh-ext AdvancedPublishers with publisher_detection
 /// - `token`: any liveliness token
 /// - `sample`: data seen on a `filter` subscription during `probe` (catches undeclared publishers)
+///
 /// Plain publishers that are declared but silent are invisible: zenoh peers only propagate
 /// publisher declarations to nodes that declared interest, which the public API can't do.
 async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) -> anyhow::Result<Vec<Value>> {
