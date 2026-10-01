@@ -2,8 +2,8 @@
 
 View and drive a [zenoh](https://zenoh.io) system from a browser over a squeezed network (a phone on
 weak wifi), without a heavy bridge: a Rust library that serves browsers over WebRTC, and a
-dependency-free TypeScript client. Pictures arrive as H.264 video, other data as
-bytes on per-stream data channels, and a per-browser bandwidth allocator decides who gets what when
+dependency-free TypeScript client. Pictures arrive as video (H.264 by default, or any encoder a
+codec brings), sound as Opus audio, other data as bytes on per-stream data channels, and a per-browser bandwidth allocator decides who gets what when
 the link is short. Codecs are plugged in by the application:
 
 - [zenoh-web-cli](https://github.com/jeff-hykin/zenoh-web-cli): the `zenoh-web` command (install,
@@ -22,7 +22,7 @@ zenoh peers / routers (publishers you don't control: ROS 2 over rmw_zenoh, dimos
         │  zenoh (the bridge is a normal zenoh peer or client)
    zenoh-web server  (Rust, in your process: zenoh 1.6.2, webrtc-rs, tokio, axum)
         │  HTTP: POST /offer (signaling) + optional static files
-        │  WebRTC: one SCTP data channel per subscription/publisher, + H.264 video tracks
+        │  WebRTC: one SCTP data channel per subscription/publisher, + video and audio tracks
    browser page  (client/zenoh_web.ts, loaded from esm.sh or bundled)
 ```
 
@@ -125,10 +125,13 @@ Also exported: `Priority` (`REAL_TIME` 1, `INTERACTIVE_HIGH` 2, `INTERACTIVE_LOW
 
 ## Codecs
 
-Picked explicitly per subscription; there is no auto-detection and none is built in. No codec = raw
-bytes, rate is the only degradation. A **video** codec hands the bridge pictures, which it scales to
-the allocated quality and sends as H.264 on a video track (`sub.mediaStream`, `msg.video`); a
-**fields** codec sends named numbers and arrays (built with `zenoh_web::Fields`) that the client
+Picked explicitly per subscription; there is no auto-detection and none is built in, and the core
+knows no message types. No codec = raw bytes, rate is the only degradation. A **video** codec hands
+the bridge frames for its `VideoEncoder`: by default pictures, which the bridge scales to the
+allocated quality and encodes as H.264; a codec can bring its own encoder (H.264, VP8, VP9 or AV1,
+e.g. a hardware one) and the bridge negotiates, packetizes and paces it on a video track
+(`sub.mediaStream`, `msg.video`). An **audio** codec hands it PCM, sent as Opus on an audio track
+(`sub.mediaStream`). A **fields** codec sends named numbers and arrays (built with `zenoh_web::Fields`) that the client
 decodes into `msg.decoded` itself; a **data** codec sends its own bytes, which the page decodes with
 `registerCodec`. A codec can ask for zstd by default (`Codec::default_compress`, e.g. depth and point
 clouds); the `compress` option overrides it.
@@ -168,9 +171,11 @@ is already running on a port before starting its own (`zenoh_web::HEALTH_PATH`).
 ### Custom codecs
 
 Implement `zenoh_web::Codec`: decode a zenoh sample (key, payload, encoding) once, then produce
-either **video** (`DecodedFrame::Video(VideoImage::rgb8(..)` or `::i420(..))`: the bridge scales it
+**video** (`DecodedFrame::Video(VideoImage::rgb8(..)` or `::i420(..))`: the bridge scales it
 to the allocated quality, encodes H.264 and sends it on a video track, so the page just shows
-`sub.mediaStream`) or bytes for the data channel from `encode(frame, quality)`: **fields** (built
+`sub.mediaStream`; override `video_encoder()` to return your own `VideoEncoder`, e.g. NVENC or a
+Jetson's encoder, declaring its `VideoFormat`), **audio** (`DecodedFrame::Audio(AudioPcm::new(..))`,
+Opus on an audio track) or bytes for the data channel from `encode(frame, quality)`: **fields** (built
 with `zenoh_web::Fields`, decoded by the client with no page code) or **data** (any format; the page
 decodes it with `registerCodec`). Decodes are shared across browsers per sample, data encodes per
 (sample, quality, compression). `estimated_bytes(payload_bytes, quality)` is an optional cost model
@@ -254,7 +259,9 @@ deadmen, allocation, latency under load, throughput on a shaped link, video late
 
 - Topic listing sees liveliness tokens (incl. AdvancedPublishers with publisher detection) and keys
   that publish during its probe; plain declarations without a token are invisible.
-- Video is software H.264 (openh264), one encoder per browser subscription: CPU scales with viewers × streams.
+- The default video encoder is software H.264 (openh264), one per browser subscription: CPU scales
+  with viewers × streams unless a codec brings a hardware encoder.
+- Audio goes to the browser only; the microphone direction is designed (SPEC "Audio") but not built.
 - No per-user identity or auth on `/offer`. Run it on a trusted network.
 - No TURN/relay configuration on the bridge side: the browser must reach the bridge's UDP ports (LAN, VPN).
 - Codecs are compiled into the application (codecs shipped from the browser as WASM are a later phase).

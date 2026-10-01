@@ -22,8 +22,8 @@ export type ConnectionState = "connecting" | "connected" | "degraded" | "lost"
 export type PublisherState = "connecting" | "open" | "tripped" | "rejected" | "closed"
 export type SubscriptionState = "connecting" | "open" | "rejected" | "closed"
 
-/** Where any codec's output goes: the bridge's H.264 video track, or bytes on the data channel (`fields`: decoded by this client). */
-export type CodecKind = "video" | "data" | "fields"
+/** Where a codec's output goes: a video or audio track, or bytes on the data channel (`fields`: decoded by this client). */
+export type CodecKind = "video" | "audio" | "data" | "fields"
 
 /** A codec the bridge has registered. */
 export interface CodecInfo {
@@ -482,12 +482,12 @@ export class Subscription extends Endpoint {
     partialDropped = 0
     /** codec payloads that failed to decode in this page */
     decodeErrors = 0
-    /** video codecs: the decoded video (also on each message as `mediaStream`) */
+    /** video and audio codecs: the track (also on each message as `mediaStream`) */
     mediaStream: MediaStream | null = null
     /** where the codec's output arrives (null: no codec, raw bytes) */
     readonly codecKind: CodecKind | null
     #warnedNoDecoder = false
-    #videoTransceiver: RTCRtpTransceiver | null = null
+    #transceiver: RTCRtpTransceiver | null = null
     /** drops before the current channel (each new channel restarts seq at 0) */
     #droppedBefore = 0
     #firstSeq = -1
@@ -528,21 +528,22 @@ export class Subscription extends Endpoint {
         this.#bytesSinceAck = 0
         this.#partials.clear()
         const acceptance = this.beginAttempt()
-        if (this.codecKind !== "video") {
+        if (this.codecKind !== "video" && this.codecKind !== "audio") {
             this.#openChannel(peer, acceptance, null)
             return
         }
-        // video: a recvonly transceiver (renegotiated with the bridge) carries the frames
-        this.#videoTransceiver = null
-        this.owner._acquireVideoTransceiver(peer).then((transceiver) => {
+        // a recvonly transceiver (renegotiated with the bridge for this codec's format) carries the frames
+        this.#transceiver = null
+        const codec = String(this.options.codec)
+        this.owner._acquireTransceiver(peer, this.codecKind, codec).then((transceiver) => {
             if (this.closed || acceptance !== this.acceptance) {
-                this.owner._releaseVideoTransceiver(peer, transceiver)
+                this.owner._releaseTransceiver(peer, codec, transceiver)
                 return
             }
-            this.#videoTransceiver = transceiver
+            this.#transceiver = transceiver
             this.mediaStream = new MediaStream([transceiver.receiver.track])
             this.#openChannel(peer, acceptance, transceiver.mid)
-        }, (error: Error) => acceptance.reject(new Error(`zenoh-web: video renegotiation for ${this.key} failed: ${error.message}`)))
+        }, (error: Error) => acceptance.reject(new Error(`zenoh-web: ${this.codecKind} renegotiation for ${this.key} failed: ${error.message}`)))
     }
 
     #openChannel(peer: RTCPeerConnection, acceptance: Acceptance, mid: string | null): void {
@@ -564,10 +565,10 @@ export class Subscription extends Endpoint {
         }
         super.close()
         const peer = this.owner._peer
-        if (this.#videoTransceiver && peer) {
-            this.owner._releaseVideoTransceiver(peer, this.#videoTransceiver)
+        if (this.#transceiver && peer) {
+            this.owner._releaseTransceiver(peer, String(this.options.codec), this.#transceiver)
         }
-        this.#videoTransceiver = null
+        this.#transceiver = null
     }
 
     #onFrame(channel: RTCDataChannel, frame: Frame, frameBytes: number): void {
@@ -624,8 +625,8 @@ export class Subscription extends Endpoint {
     /** Adds the codec's decoded form; false if it can't be decoded. */
     #decode(message: Message): boolean {
         try {
-            if (this.codecKind === "video") {
-                message.video = decodeVideoFrameInfo(message.bytes)
+            if (this.codecKind === "video" || this.codecKind === "audio") {
+                message.video = this.codecKind === "video" ? decodeVideoFrameInfo(message.bytes) : undefined
                 message.mediaStream = this.mediaStream ?? undefined
                 return true
             }
@@ -900,7 +901,8 @@ export class ZenohWeb {
     #connected: Promise<void> = new Promise(() => {})
     #markConnected: () => void = () => {}
     /** video transceivers of closed subscriptions, reused before adding new ones */
-    #freeVideoTransceivers = new Map<RTCPeerConnection, RTCRtpTransceiver[]>()
+    /** per codec: transceivers whose track carries its format, free for the next subscription */
+    #freeTransceivers = new Map<RTCPeerConnection, Map<string, RTCRtpTransceiver[]>>()
 
     constructor(url: string, options: ConnectOptions = {}) {
         this.url = url.replace(/\/+$/, "")
@@ -958,11 +960,11 @@ export class ZenohWeb {
     }
 
     /**
-     * A recvonly video transceiver bound to a bridge track: a free one, or a new one added through
-     * a renegotiation over `control` (the bridge answers with a track for the new m-line).
+     * A recvonly transceiver bound to a bridge track of `codec`'s format: a free one, or a new one
+     * added through a renegotiation over `control` (the bridge answers with a track for the new m-line).
      */
-    _acquireVideoTransceiver(peer: RTCPeerConnection): Promise<RTCRtpTransceiver> {
-        const free = this.#freeVideoTransceivers.get(peer)?.pop()
+    _acquireTransceiver(peer: RTCPeerConnection, kind: "video" | "audio", codec: string): Promise<RTCRtpTransceiver> {
+        const free = this.#freeTransceivers.get(peer)?.get(codec)?.pop()
         if (free) {
             return Promise.resolve(free)
         }
@@ -971,17 +973,17 @@ export class ZenohWeb {
             if (peer !== this.#peer) {
                 throw new Error("connection replaced")
             }
-            const transceiver = peer.addTransceiver("video", { direction: "recvonly" })
-            // show frames as soon as they decode (the bridge also asks for zero playout delay)
+            const transceiver = peer.addTransceiver(kind, { direction: "recvonly" })
+            // video shows frames as soon as they decode (the bridge also asks for zero playout delay); audio keeps its jitter buffer
             const receiver = transceiver.receiver as unknown as { jitterBufferTarget?: number | null, playoutDelayHint?: number }
-            if ("jitterBufferTarget" in receiver) {
+            if (kind === "video" && "jitterBufferTarget" in receiver) {
                 receiver.jitterBufferTarget = 0
-            } else {
+            } else if (kind === "video") {
                 receiver.playoutDelayHint = 0
             }
             await peer.setLocalDescription(await peer.createOffer())
             const offer = peer.localDescription
-            const response = await this._request({ op: "renegotiate", addVideo: true, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
+            const response = await this._request({ op: "renegotiate", codec, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
             await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
             if (response.mid !== transceiver.mid) {
                 throw new Error(`bridge bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
@@ -993,11 +995,11 @@ export class ZenohWeb {
         return result
     }
 
-    _releaseVideoTransceiver(peer: RTCPeerConnection, transceiver: RTCRtpTransceiver): void {
+    _releaseTransceiver(peer: RTCPeerConnection, codec: string, transceiver: RTCRtpTransceiver): void {
         if (peer === this.#peer && peer.connectionState !== "closed") {
-            const free = this.#freeVideoTransceivers.get(peer) ?? []
-            free.push(transceiver)
-            this.#freeVideoTransceivers.set(peer, free)
+            const byCodec = this.#freeTransceivers.get(peer) ?? new Map<string, RTCRtpTransceiver[]>()
+            byCodec.set(codec, [...byCodec.get(codec) ?? [], transceiver])
+            this.#freeTransceivers.set(peer, byCodec)
         }
     }
 
@@ -1009,7 +1011,7 @@ export class ZenohWeb {
             this.#markConnected = resolve
         })
         if (this.#peer) {
-            this.#freeVideoTransceivers.delete(this.#peer)
+            this.#freeTransceivers.delete(this.#peer)
         }
         const peer = new RTCPeerConnection({ iceServers: this.options.iceServers })
         const control = peer.createDataChannel("control", { ordered: true })

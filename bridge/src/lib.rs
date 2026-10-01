@@ -39,18 +39,19 @@
 #![warn(missing_docs)]
 
 mod allocator;
+mod audio;
 mod codec;
 pub mod fields;
 mod frame;
+mod media;
 mod options;
 mod pacing;
 mod peer;
 mod publisher;
 mod server;
 mod subscription;
-mod video;
 
-pub use codec::{Codec, CodecOutput, CodecSample, Compress, DecodedFrame, PixelFormat, VideoImage};
+pub use codec::{AudioPcm, Codec, CodecOutput, CodecSample, Compress, DecodedFrame, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoTarget};
 pub use fields::Fields;
 pub use server::{DEFAULT_PORT, HEALTH_PATH, RunningServer, Server, ServerBuilder};
 /// The zenoh version this crate is built against (for [`ServerBuilder::session`] and

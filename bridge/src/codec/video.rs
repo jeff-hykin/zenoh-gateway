@@ -1,10 +1,11 @@
-//! Video codecs' frames (RGB8 or I420) to H.264 (openh264, constrained baseline) for a WebRTC video track.
+//! Video encoders: the [`VideoEncoder`] trait, and the default one, pictures (RGB8 or I420) to H.264
+//! (openh264, constrained baseline).
 //!
 //! Quality `q` (0..1) sets resolution scale `0.25 + 0.75 q` and a bits-per-pixel target
 //! `0.03 + 0.12 q`; the allocator's (quality, Hz) becomes the encoder's resolution, frame rate and
-//! target bitrate (`bytes_per_frame(q) * hz`).
+//! target bitrate (`bytes_per_frame(q) * hz`), handed to the encoder as a [`VideoTarget`].
 
-use crate::codec::{PixelFormat, VideoImage};
+use crate::codec::{DecodedFrame, PixelFormat, VideoImage};
 use anyhow::{Result, anyhow};
 use openh264::OpenH264API;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile, RateControlMode, UsageType};
@@ -145,17 +146,73 @@ pub(crate) fn to_i420(image: &VideoImage, width: u32, height: u32) -> Vec<u8> {
     }
 }
 
-/// The picture scaled to `width × height` (both even) as an I420 buffer for the encoder.
-fn to_yuv(image: &VideoImage, width: u32, height: u32) -> YUVBuffer {
-    YUVBuffer::from_vec(to_i420(image, width, height), width as usize, height as usize)
+/// The WebRTC video codec a [`VideoEncoder`] produces; the bridge negotiates it and packetizes its frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VideoFormat {
+    /// H.264 constrained baseline, Annex B access units.
+    H264,
+    /// VP8 frames.
+    Vp8,
+    /// VP9 (profile 0) frames.
+    Vp9,
+    /// AV1 temporal units (OBUs with size fields).
+    Av1,
 }
 
-pub struct EncodedFrame {
-    /// Annex B access unit
-    pub data: Vec<u8>,
+impl VideoFormat {
+    /// The RTP mime type, e.g. `"video/AV1"`.
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            VideoFormat::H264 => "video/H264",
+            VideoFormat::Vp8 => "video/VP8",
+            VideoFormat::Vp9 => "video/VP9",
+            VideoFormat::Av1 => "video/AV1",
+        }
+    }
+}
+
+/// What the bridge asks of the next frame: the allocator's quality (lowered by the CPU governor) as
+/// a size, bitrate and rate, plus whether the browser needs a keyframe.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct VideoTarget {
+    /// 0..1
+    pub quality: f64,
+    /// Even output size for `quality` (the source picture's size scaled by `0.25 + 0.75 quality`).
     pub width: u32,
+    /// See `width`.
     pub height: u32,
+    /// What the allocator granted: `quality`'s bits per pixel at `fps`.
+    pub bitrate_bps: u32,
+    /// Frames per second the stream is granted.
+    pub fps: f64,
+    /// A viewer joined or lost a frame (PLI/FIR): this frame must be a keyframe.
     pub keyframe: bool,
+}
+
+/// One encoded frame, in its [`VideoFormat`]'s bitstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedVideo {
+    /// The frame's bitstream.
+    pub data: Vec<u8>,
+    /// Its size, in pixels.
+    pub width: u32,
+    /// See `width`.
+    pub height: u32,
+    /// Decodable on its own.
+    pub keyframe: bool,
+}
+
+/// Turns a video codec's decoded frames into one WebRTC codec's frames. The bridge makes one per
+/// (frontend, subscription) with [`Codec::video_encoder`](crate::Codec::video_encoder) and calls it
+/// on tokio's blocking pool; it negotiates [`format`](Self::format), packetizes and paces the frames
+/// and measures them for the allocator. A hardware encoder (NVENC, a Jetson's) implements this.
+pub trait VideoEncoder: Send {
+    /// The codec of the frames (fixed for the encoder's life).
+    fn format(&self) -> VideoFormat;
+
+    /// Encodes one decoded frame at `target`; `None` while a pipelined encoder has nothing out yet.
+    fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>>;
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -166,22 +223,21 @@ struct Settings {
     fps: f32,
 }
 
-/// One per (frontend, subscription): rate control and reference frames are per receiver.
+/// The default encoder: [`DecodedFrame::Video`] to H.264 with openh264, reconfigured when the
+/// target's size, bitrate or rate moves.
 #[derive(Default)]
-pub struct VideoEncoder {
+pub struct H264Encoder {
     encoder: Option<(Encoder, Settings)>,
-    keyframe_requested: bool,
 }
 
-impl VideoEncoder {
-    pub fn request_keyframe(&mut self) {
-        self.keyframe_requested = true;
+impl VideoEncoder for H264Encoder {
+    fn format(&self) -> VideoFormat {
+        VideoFormat::H264
     }
 
-    pub fn encode(&mut self, image: &VideoImage, quality: f64, hz: f64) -> Result<EncodedFrame> {
-        let (width, height) = scaled_size(image.width(), image.height(), quality);
-        let hz = hz.max(0.1);
-        let bitrate_bps = (bytes_per_frame(image.width(), image.height(), quality) * hz * 8.0).max(10_000.0) as u32;
+    fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>> {
+        let DecodedFrame::Video(image) = frame else { return Err(anyhow!("the software H.264 encoder takes pictures, got {frame:?}")) };
+        let VideoTarget { width, height, bitrate_bps, fps: hz, .. } = *target;
         let wanted = Settings { width, height, bitrate_bps, fps: hz as f32 };
         let drifted = |old: f64, new: f64| old / new > RECONFIGURE_RATIO || new / old > RECONFIGURE_RATIO;
         let reconfigure = match &self.encoder {
@@ -203,17 +259,24 @@ impl VideoEncoder {
                 .intra_frame_period(IntraFramePeriod::from_num_frames(((hz * KEYFRAME_SECONDS).ceil() as u32).max(1)));
             let encoder = Encoder::with_api_config(OpenH264API::from_source(), config).map_err(|e| anyhow!("openh264: {e}"))?;
             self.encoder = Some((encoder, wanted));
-            self.keyframe_requested = false;
+        } else if target.keyframe {
+            // a new encoder starts with one anyway
+            self.encoder.as_mut().expect("configured").0.force_intra_frame();
         }
         let (encoder, _) = self.encoder.as_mut().expect("encoder configured above");
-        if std::mem::take(&mut self.keyframe_requested) {
-            encoder.force_intra_frame();
-        }
-        let yuv = to_yuv(image, width, height);
+        let yuv = YUVBuffer::from_vec(to_i420(image, width, height), width as usize, height as usize);
         let bitstream = encoder.encode(&yuv).map_err(|e| anyhow!("openh264: {e}"))?;
         let keyframe = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);
-        Ok(EncodedFrame { data: bitstream.to_vec(), width, height, keyframe })
+        Ok(Some(EncodedVideo { data: bitstream.to_vec(), width, height, keyframe }))
     }
+}
+
+/// The target for `quality` at `hz` for a source picture of `width × height`.
+pub(crate) fn target(width: u32, height: u32, quality: f64, hz: f64, keyframe: bool) -> VideoTarget {
+    let (scaled_width, scaled_height) = scaled_size(width, height, quality);
+    let fps = hz.max(0.1);
+    let bitrate_bps = (bytes_per_frame(width, height, quality) * fps * 8.0).max(10_000.0) as u32;
+    VideoTarget { quality, width: scaled_width, height: scaled_height, bitrate_bps, fps, keyframe }
 }
 
 #[cfg(test)]
@@ -263,19 +326,25 @@ mod tests {
         assert!(worst <= 1, "differs from openh264's conversion by up to {worst}");
     }
 
+    /// The default encoder's frame for `image` at `quality`, 10 Hz.
+    fn encode(encoder: &mut H264Encoder, image: &VideoImage, quality: f64, keyframe: bool) -> EncodedVideo {
+        let frame = DecodedFrame::Video(image.clone());
+        encoder.encode(&frame, &target(image.width(), image.height(), quality, 10.0, keyframe)).unwrap().unwrap()
+    }
+
     #[test]
     fn encodes_keyframe_then_smaller_frames() {
-        let mut encoder = VideoEncoder::default();
+        let mut encoder = H264Encoder::default();
+        assert_eq!(encoder.format(), VideoFormat::H264);
         let frame = quadrants(320, 240);
-        let first = encoder.encode(&frame, 1.0, 10.0).unwrap();
+        let first = encode(&mut encoder, &frame, 1.0, false);
         assert!(first.keyframe && first.data.starts_with(&[0, 0, 0, 1]));
         assert_eq!((first.width, first.height), (320, 240));
-        let second = encoder.encode(&frame, 1.0, 10.0).unwrap();
-        assert!(!second.keyframe);
-        encoder.request_keyframe();
-        assert!(encoder.encode(&frame, 1.0, 10.0).unwrap().keyframe);
-        let low = encoder.encode(&frame, 0.0, 10.0).unwrap();
+        assert!(!encode(&mut encoder, &frame, 1.0, false).keyframe);
+        assert!(encode(&mut encoder, &frame, 1.0, true).keyframe, "asked for");
+        let low = encode(&mut encoder, &frame, 0.0, false);
         assert_eq!((low.width, low.height), (80, 60));
+        assert!(encoder.encode(&DecodedFrame::data(1u8), &target(8, 8, 1.0, 10.0, false)).is_err(), "takes pictures only");
     }
 
     #[test]
@@ -284,10 +353,11 @@ mod tests {
         let mut data = vec![200u8; (width * height) as usize];
         data.extend(vec![90u8; (width * height / 2) as usize]);
         let image = VideoImage::i420(width, height, data).unwrap();
-        let mut encoder = VideoEncoder::default();
-        let frame = encoder.encode(&image, 0.5, 10.0).unwrap();
+        let frame = encode(&mut H264Encoder::default(), &image, 0.5, false);
         assert!(frame.keyframe && frame.data.starts_with(&[0, 0, 0, 1]));
         assert_eq!((frame.width, frame.height), scaled_size(width, height, 0.5));
+        let small = quadrants(64, 48).to_i420(32, 24).unwrap();
+        assert_eq!((small.width(), small.height(), small.format(), small.data()[0]), (32, 24, PixelFormat::I420, 82), "red's luma");
         assert!(VideoImage::i420(63, 48, vec![0; 63 * 48 * 3 / 2]).is_err(), "odd sizes are refused");
         assert!(VideoImage::rgb8(2, 2, vec![0; 11]).is_err(), "wrong length is refused");
     }
@@ -321,12 +391,12 @@ mod tests {
         let shifted = VideoImage { data: shifted, ..image.clone() };
         for quality in [0.8, 0.6, 0.3, 0.1] {
             let (width, height) = scaled_size(image.width(), image.height(), quality);
-            time(&format!("to_yuv q{quality} {width}x{height}"), 10, Box::new(|| drop(to_yuv(&image, width, height))));
-            let mut encoder = VideoEncoder::default();
+            time(&format!("to_i420 q{quality} {width}x{height}"), 10, Box::new(|| drop(to_i420(&image, width, height))));
+            let mut encoder = H264Encoder::default();
             let mut flip = false;
-            time(&format!("encode (to_yuv + h264) q{quality}"), 20, Box::new(|| {
+            time(&format!("encode (to_i420 + h264) q{quality}"), 20, Box::new(|| {
                 flip = !flip;
-                drop(encoder.encode(if flip { &image } else { &shifted }, quality, 30.0).unwrap())
+                drop(encode(&mut encoder, if flip { &image } else { &shifted }, quality, false))
             }));
         }
     }

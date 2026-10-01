@@ -138,16 +138,18 @@ one completes or more than 8 are pending (`partialDropped`).
 Picked explicitly per subscription with `codec`. No `codec` = raw passthrough (Hz is the only
 degradation). There is no auto-detection and none is built in: the application embedding the bridge
 registers codecs by name (`ServerBuilder::codec`; a name registered twice fails the build), e.g. the
-ROS 2 / dimos image, depth and point cloud codecs of
-[zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs). The client fetches the
-registry on connect (`control` op `codecs` → `{codecs: [{name, output}]}`, output `"video"`, `"fields"` or `"data"`, as `z.codecs`); the bridge
-refuses an unknown name (`rejected` event, listing the known names).
+robotics codecs of [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs). The core
+knows no message types: its only special paths are video and audio tracks. The client fetches the
+registry on connect (`control` op `codecs` → `{codecs: [{name, output}]}`, output `"video"`,
+`"audio"`, `"fields"` or `"data"`, as `z.codecs`), which is how a page learns which codecs need a
+track; the bridge refuses an unknown name (`rejected` event, listing the known names).
 
 Every codec implements one Rust trait (`zenoh_web::Codec`):
 
-- `name()`, and `output()`: **video**, **fields** or **data**.
-- `decode(sample)`: the sample's key, payload and zenoh encoding → a decoded frame. A video codec's
-  frame is a picture (packed RGB8 or planar I420, any size).
+- `name()`, and `output()`: **video**, **audio**, or data (**fields** or **data**).
+- `decode(sample)`: the sample's key, payload and zenoh encoding → a decoded frame: a picture (packed
+  RGB8 or planar I420, any size) for the default video encoder, anything a codec's own video encoder
+  takes, PCM for audio, any value for data codecs.
 - fields and data codecs: `encode(frame, quality)` → the bytes sent on the data channel (quality
   0..1, from the allocator). A **fields** codec builds them with `zenoh_web::Fields` (see "Fields") and
   the client decodes them into `msg.decoded` by itself. A **data** codec uses its own format, which the
@@ -156,9 +158,10 @@ Every codec implements one Rust trait (`zenoh_web::Codec`):
   a fields codec's automatic decoding.
 - `default_compress()`: compression for the codec's messages when the subscription doesn't set
   `compress` (default none; zenoh-dimos-codecs' depth and point clouds use zstd).
-- video codecs: the bridge scales the picture to the allocated quality, encodes H.264 and sends it on
-  the subscription's video track (see "Video"); the page needs no codec code. They require
-  `delivery: "latest"`.
+- video codecs: `video_encoder()` → a `VideoEncoder` per (frontend, subscription), default the
+  bridge's software H.264 (see "Video encoders"); its frames go on the subscription's video track
+  (see "Video"); the page needs no codec code. They require `delivery: "latest"`.
+- audio codecs: PCM, which the bridge encodes to Opus on an audio track (see "Audio").
 - `estimated_bytes(payloadBytes, quality)`: optional cost model for data codecs (bytes per message),
   the allocator's prior until sizes are measured and its shape between measured qualities (default:
   10–100 % of the payload, linear in quality). Video is priced by the bridge's own model.
@@ -179,7 +182,7 @@ tokio's blocking pool. Work is shared across frontends through two small caches 
 frames keyed by (codec, key + payload hash), and data-channel encodes keyed by (codec, quality in
 1/1000 steps, key + payload hash, compression). Identical requests compute once (`encodes` vs `sharedEncodes` in
 stats: data codecs count shared encodes, video codecs shared decodes). Each (frontend, subscription)
-has its own H.264 encoder, because rate control and reference frames are per receiver.
+has its own video encoder (and Opus encoder), because rate control and reference frames are per receiver.
 
 ### Fields
 
@@ -208,13 +211,57 @@ message zstd would not shrink is sent as is; each frame's `flags` says which. Th
 the compressed sizes from what is sent. Video codecs are already compressed (H.264): `compress: "zstd"`
 on one is rejected, `"none"` accepted, their default ignored.
 
+### Video encoders
+
+`zenoh_web::VideoEncoder` turns a video codec's decoded frames into one WebRTC codec's frames:
+`format()` declares the codec (`VideoFormat::H264`, `Vp8`, `Vp9` or `Av1`) and
+`encode(frame, target)` returns an `EncodedVideo` (bitstream, size, keyframe) or `None` while a
+pipelined encoder has nothing out yet. `target` carries what the allocator and CPU governor
+granted: quality, the even output size for it, bitrate, frame rate, and whether this frame must be a
+keyframe (a viewer joined or sent PLI/FIR). The bridge negotiates the format (it offers all four),
+packetizes (webrtc-rs payloaders), paces (GCC), measures the frames for the allocator and sends the
+per-frame metadata. `H264Encoder` (openh264, constrained baseline) is the default.
+
+A hardware encoder plugs in as a codec's `video_encoder()`: e.g. NVENC through an FFmpeg or
+`nvidia-video-codec-sdk` binding, or a Jetson's encoder through GStreamer (`nvv4l2h264enc`,
+`nvv4l2av1enc`) or the V4L2 M2M API, fed from `VideoImage::to_i420(target.width, target.height)`
+(or the codec's own frames, e.g. GPU buffers decoded into `DecodedFrame::Data`, which the encoder
+downcasts), returning access units. A camera that already sends H.264 can be passed through the
+same way: the codec's decode keeps the access unit and its encoder returns it (keyframes then
+come from the source). zenoh-web-cli's `examples/custom_codec.rs` has an AV1 encoder (rav1e) that
+`test/custom_codec.js` shows in Chrome.
+
+### Audio
+
+An audio codec decodes each sample to `AudioPcm` (interleaved i16, 8/12/16/24/48 kHz, mono or
+stereo). The bridge encodes it with libopus (`unsafe-libopus`, libopus transpiled to Rust, so it
+builds for every target without a C toolchain) in 20 ms packets, carrying any remainder into the
+next sample, and writes them to an Opus track (the client adds a recvonly audio transceiver and
+renegotiates with the codec's name, as for video). The browser's jitter buffer smooths arrival;
+`sub.mediaStream` plays in an `<audio>` element. Audio streams are reserved at their measured rate
+like reliable ones (never paced or thinned). Each sample also sends an empty frame on the `sub`
+channel, so the callback runs per message.
+
+Microphone (browser → zenoh), not implemented, fits without redesign:
+- the page needs a secure context for `getUserMedia` (HTTPS, or `http://localhost`), so a robot's
+  bridge would be served over TLS (a reverse proxy, or `ServerBuilder` behind one);
+- the client adds a `sendonly` audio transceiver with the mic track and renegotiates
+  (`{op: "renegotiate", publish: "<codec>", sdp}`), and opens a `pub` channel naming that mid, as a
+  video subscription names its track's;
+- the bridge's `on_track` reads the Opus RTP, decodes it with libopus (`opus_decode`) to PCM and
+  hands it to the codec's inverse of `decode` (e.g. `encode_pcm(&AudioPcm) -> Vec<u8>`, a new
+  `Codec` method with a default error), whose bytes are put on the key like any `pub` channel's,
+  with the same latency limit and deadman rules. Only the Opus decode and the `on_track` handler are
+  new; negotiation, codecs and publishing are the existing paths.
+
 ### Video
 
-The client adds a recvonly video transceiver and renegotiates over `control`
-(`{op: "renegotiate", addVideo: true, sdp}` → `{sdp, mid}`); the bridge adds an H.264 track
-(constrained baseline, `profile-level-id=42e01f`) that pairs with the new m-line, then the `sub`
-channel's label names that `mid`. Renegotiations run one at a time. A closed video subscription's
-transceiver (and the bridge's track) is reused by the next one instead of renegotiating again.
+The client adds a recvonly video (or audio) transceiver and renegotiates over `control`
+(`{op: "renegotiate", codec, sdp}` → `{sdp, mid}`); the bridge adds a track of that codec's format
+(H.264 is constrained baseline, `profile-level-id=42e01f`; VP9 profile 0; Opus 48 kHz) that pairs
+with the new m-line, then the `sub` channel's label names that `mid` (the bridge refuses a track of
+another format). Renegotiations run one at a time. A closed subscription's transceiver (and the
+bridge's track) is reused by the next one of the same codec instead of renegotiating again.
 Each video frame also sends a 28-byte metadata frame on the `sub` channel (`msg.video`).
 Quality q maps to resolution scale `0.25 + 0.75 q` (even sizes) and a target of `0.03 + 0.12 q`
 bits per pixel; the encoder's bitrate is that size times the allocated Hz. Keyframes: the first

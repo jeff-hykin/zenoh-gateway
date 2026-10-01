@@ -2,12 +2,12 @@
 
 use crate::allocator::{self, Estimator};
 use crate::codec::registry::CodecRegistry;
-use crate::codec::{Codec, CodecOutput};
+use crate::codec::Codec;
 use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
 use crate::pacing::SendGate;
 use crate::publisher::{self, PubShared};
 use crate::subscription::{self, SubShared, now_unix_ms};
-use crate::video::{self, VideoTrack};
+use crate::media::{self, MediaTrack};
 use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
@@ -129,7 +129,7 @@ struct PeerState {
     connection: Mutex<Option<Arc<dyn PeerConnection>>>,
     /// one renegotiation at a time
     negotiation: tokio::sync::Mutex<()>,
-    video_tracks: Mutex<HashMap<String, Arc<VideoTrack>>>,
+    tracks: Mutex<HashMap<String, Arc<MediaTrack>>>,
     video_target_bps: Arc<AtomicU64>,
     config: AllocationConfig,
     gate: Arc<SendGate>,
@@ -158,7 +158,7 @@ impl PeerState {
             heartbeat: Mutex::new(HeartbeatStats::default()),
             connection: Mutex::new(None),
             negotiation: tokio::sync::Mutex::new(()),
-            video_tracks: Mutex::new(HashMap::new()),
+            tracks: Mutex::new(HashMap::new()),
             video_target_bps,
             config,
             gate: Arc::default(),
@@ -204,7 +204,7 @@ impl PeerState {
         let high_rtt_ms = self.high_rtt(now);
         let subscriptions = self.subscriptions();
         let usages: Vec<subscription::Usage> = subscriptions.iter().map(|shared| shared.usage(interval_secs)).collect();
-        let data_usages = || usages.iter().filter(|usage| !usage.is_video);
+        let data_usages = || usages.iter().filter(|usage| !usage.on_track);
         let sent: u64 = data_usages().map(|usage| usage.bytes_sent).sum();
         let blocked_ms: f64 = data_usages().map(|usage| usage.network_blocked_ms).sum();
         let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.network_blocked_ms > 0.0).count();
@@ -215,13 +215,13 @@ impl PeerState {
             estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, active_senders: active, data_demand, queue_delay_ms });
             estimator.clone()
         };
-        let has_video = usages.iter().any(|usage| usage.is_video);
-        let video_estimate = if has_video { video::gcc_target_bytes_per_sec(&self.video_target_bps) } else { 0.0 };
+        let has_video = usages.iter().any(|usage| usage.on_track);
+        let video_estimate = if has_video { media::gcc_target_bytes_per_sec(&self.video_target_bps) } else { 0.0 };
         let estimate = estimator.data_bytes_per_sec + video_estimate;
         let target_fraction = self.config.target_fraction;
         let usable = estimate * target_fraction;
         let budget = self.config.max_bandwidth.map_or(usable, |cap| cap.min(usable));
-        let is_video: Vec<bool> = usages.iter().map(|usage| usage.is_video).collect();
+        let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
         // the in-flight limit only protects strict streams' latency; without one it only costs throughput
@@ -356,7 +356,7 @@ impl Bridge {
     pub async fn answer(self: &Arc<Self>, offer: RTCSessionDescription) -> anyhow::Result<RTCSessionDescription> {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
-        let (media_engine, interceptors, video_target_bps) = video::media_setup()?;
+        let (media_engine, interceptors, video_target_bps) = media::media_setup()?;
         let state = Arc::new(PeerState::new(peer_id, self, video_target_bps));
         let handler = Arc::new(Handler { bridge: Arc::downgrade(self), peer_id, gathered_tx, state: state.clone() });
         let setting_engine = SettingEngineBuilder::new()
@@ -394,7 +394,7 @@ impl Bridge {
             info!("peer {peer_id}: gone");
             entry.state.gone.store(true, Ordering::Relaxed);
             entry.state.connection.lock().unwrap().take();
-            entry.state.video_tracks.lock().unwrap().clear();
+            entry.state.tracks.lock().unwrap().clear();
             // the channels of a browser that vanished never report their own close
             for channel in entry.state.channels.lock().unwrap().values() {
                 if let ChannelStats::Sub(shared) = &channel.stats {
@@ -513,14 +513,14 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     let rejected = match label.kind.as_str() {
         "sub" => match SubOpts::parse(&label.opts).and_then(|mut opts| {
             let codec = opts.resolve_codec(&state.codecs)?;
-            let video = bind_video(&state, codec.as_deref(), &label)?;
-            Ok((opts, codec, video))
+            let track = bind_track(&state, codec.as_deref(), &label)?;
+            Ok((opts, codec, track))
         }) {
-            Ok((opts, codec, video)) => {
+            Ok((opts, codec, track)) => {
                 let shared = Arc::new(SubShared::new(&opts, codec, state.codecs.clone(), state.gate.clone()));
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
                 state.send_accepted(label.id).await;
-                subscription::run(dc.clone(), label.clone(), session, shared, video).await;
+                subscription::run(dc.clone(), label.clone(), session, shared, track).await;
                 None
             }
             Err(error) => Some(error),
@@ -558,11 +558,14 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     }
 }
 
-/// A video codec subscription claims the track the browser renegotiated for it (by mid).
-fn bind_video(state: &PeerState, codec: Option<&dyn Codec>, label: &Label) -> Result<Option<Arc<VideoTrack>>, String> {
-    let Some(codec) = codec.filter(|codec| codec.output() == CodecOutput::Video) else { return Ok(None) };
-    let mid = label.mid.as_deref().ok_or_else(|| format!("{} is a video codec: the label needs the mid of a renegotiated video transceiver", codec.name()))?;
-    let track = state.video_tracks.lock().unwrap().get(mid).cloned().ok_or_else(|| format!("no video track for mid {mid:?} (renegotiate with addVideo first)"))?;
+/// A video or audio codec's subscription claims the track the browser renegotiated for it (by mid).
+fn bind_track(state: &PeerState, codec: Option<&dyn Codec>, label: &Label) -> Result<Option<Arc<MediaTrack>>, String> {
+    let Some((codec, mime)) = codec.and_then(|codec| Some((codec, media::track_mime(codec)?))) else { return Ok(None) };
+    let mid = label.mid.as_deref().ok_or_else(|| format!("{} is a {} codec: the label needs the mid of a renegotiated transceiver", codec.name(), codec.output().as_str()))?;
+    let track = state.tracks.lock().unwrap().get(mid).cloned().ok_or_else(|| format!("no track for mid {mid:?} (renegotiate with the codec first)"))?;
+    if track.mime != mime {
+        return Err(format!("track {mid:?} carries {}, {} needs {mime}", track.mime, codec.name()));
+    }
     if !track.claim() {
         return Err(format!("video track {mid:?} is in use by another subscription"));
     }
@@ -680,8 +683,9 @@ struct ControlRequest {
     bytes: Option<String>,
     #[serde(default)]
     sdp: Option<RTCSessionDescription>,
+    /// renegotiate: add a track for this codec's format
     #[serde(default)]
-    add_video: bool,
+    codec: Option<String>,
 }
 
 fn ok(id: &Value, extra: Value) -> Value {
@@ -777,17 +781,25 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
     }
 }
 
-/// Browser-initiated renegotiation (it added a recvonly video transceiver): answer, and with
-/// `addVideo` report the mid of the new track.
+/// Browser-initiated renegotiation (it added a recvonly transceiver): answer, and with `codec` add a
+/// track of that codec's format and report its mid.
 async fn handle_renegotiate(state: &PeerState, request: ControlRequest) -> Value {
     let Some(offer) = request.sdp else { return fail(&request.id, "renegotiate needs sdp") };
+    let mime = match request.codec.as_deref().map(|name| state.codecs.get(name)) {
+        None => None,
+        Some(Ok(codec)) => match media::track_mime(&*codec) {
+            Some(mime) => Some(mime),
+            None => return fail(&request.id, format!("{} is not a video or audio codec", codec.name())),
+        },
+        Some(Err(error)) => return fail(&request.id, error),
+    };
     let Some(connection) = state.connection.lock().unwrap().clone() else { return fail(&request.id, "peer is gone") };
     let _negotiating = state.negotiation.lock().await;
-    match video::renegotiate(&connection, offer, request.add_video).await {
+    match media::renegotiate(&connection, offer, mime).await {
         Ok((answer, track)) => {
             let mid = track.map(|track| {
                 let mid = track.mid.clone();
-                state.video_tracks.lock().unwrap().insert(mid.clone(), track);
+                state.tracks.lock().unwrap().insert(mid.clone(), track);
                 mid
             });
             ok(&request.id, json!({"sdp": answer, "mid": mid}))

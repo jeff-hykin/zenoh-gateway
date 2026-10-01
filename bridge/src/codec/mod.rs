@@ -1,13 +1,16 @@
 //! Codecs: transcoders picked per subscription with the subscribe option `codec`.
 //!
-//! Every codec implements [`Codec`] and lives in the server's registry
-//! under its [`name`](Codec::name). A codec decodes a zenoh sample into a [`DecodedFrame`], then
-//! either hands the bridge raw video ([`CodecOutput::Video`]: the bridge scales it, encodes H.264
-//! and sends it on a WebRTC video track) or encodes bytes for the subscription's data channel at
-//! the quality the bandwidth allocator picked: [`Fields`](crate::Fields), which the browser client
-//! decodes by itself ([`CodecOutput::Fields`]), or the codec's own format, decoded by a decoder
-//! registered through the client's `registerCodec` ([`CodecOutput::Data`]). Data-channel bytes may
-//! be zstd-compressed on the way ([`Compress`], [`Codec::default_compress`]).
+//! Every codec implements [`Codec`] and lives in the server's registry under its
+//! [`name`](Codec::name). A codec decodes a zenoh sample into a [`DecodedFrame`], then one of:
+//! - video ([`CodecOutput::Video`]): a [`VideoEncoder`] (the codec's own, e.g. a hardware one, or
+//!   the bridge's software H.264) turns the frames into a WebRTC codec's frames, which the bridge
+//!   sends on a video track;
+//! - audio ([`CodecOutput::Audio`]): PCM, which the bridge encodes to Opus on an audio track;
+//! - data: bytes for the subscription's data channel at the quality the bandwidth allocator
+//!   picked: [`Fields`](crate::Fields), which the browser client decodes by itself
+//!   ([`CodecOutput::Fields`]), or the codec's own format, decoded by a decoder registered
+//!   through the client's `registerCodec` ([`CodecOutput::Data`]). Data-channel bytes may be
+//!   zstd-compressed on the way ([`Compress`], [`Codec::default_compress`]).
 //!
 //! Work is lazy (only messages the pacing and queues let through) and runs on tokio's blocking
 //! pool. Decodes are shared across frontends by (codec, key, payload), data encodes by (codec,
@@ -16,6 +19,8 @@
 pub(crate) mod registry;
 pub(crate) mod video;
 
+pub use video::{EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoTarget};
+
 use anyhow::{Result, anyhow, ensure};
 use std::any::Any;
 use std::fmt;
@@ -23,10 +28,13 @@ use std::fmt;
 /// Where a codec's output goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CodecOutput {
-    /// [`DecodedFrame::Video`] frames, which the bridge scales to the allocated quality, encodes
-    /// to H.264 and sends on a WebRTC video track (the page gets `sub.mediaStream`). The
-    /// subscription must use `delivery: "latest"`. No browser code is needed.
+    /// Frames for the codec's [`VideoEncoder`] (by default [`DecodedFrame::Video`] pictures, which
+    /// the bridge scales to the allocated quality and encodes to H.264), sent on a WebRTC video
+    /// track (the page gets `sub.mediaStream`). The subscription must use `delivery: "latest"`.
     Video,
+    /// [`DecodedFrame::Audio`] PCM, which the bridge encodes to Opus in 20 ms packets and sends on a
+    /// WebRTC audio track (the page gets `sub.mediaStream`). Never paced or thinned by the allocator.
+    Audio,
     /// Bytes from [`Codec::encode`], sent on the subscription's data channel. In the browser,
     /// `msg.bytes` holds them and `msg.decoded` what the decoder registered for this codec's name
     /// (client `registerCodec(name, decoder)`) returned.
@@ -38,10 +46,11 @@ pub enum CodecOutput {
 }
 
 impl CodecOutput {
-    /// `"video"` or `"data"`, as the browser client sees it.
+    /// `"video"`, `"audio"`, `"data"` or `"fields"`, as the browser client sees it.
     pub fn as_str(self) -> &'static str {
         match self {
             CodecOutput::Video => "video",
+            CodecOutput::Audio => "audio",
             CodecOutput::Data => "data",
             CodecOutput::Fields => "fields",
         }
@@ -148,13 +157,60 @@ impl VideoImage {
     pub fn data(&self) -> &[u8] {
         &self.data
     }
+
+    /// Box-filtered to `width × height` as I420 (BT.601 limited range), e.g. to a [`VideoTarget`]'s size.
+    pub fn to_i420(&self, width: u32, height: u32) -> Result<VideoImage> {
+        ensure!(width.is_multiple_of(2) && height.is_multiple_of(2), "i420 needs even sizes, got {width}x{height}");
+        VideoImage::i420(width, height, video::to_i420(self, width, height))
+    }
+}
+
+/// Interleaved signed 16-bit PCM that an audio codec hands to the bridge's Opus path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AudioPcm {
+    sample_rate: u32,
+    channels: u8,
+    samples: Vec<i16>,
+}
+
+impl fmt::Debug for AudioPcm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "AudioPcm({} Hz x{}, {} samples)", self.sample_rate, self.channels, self.samples.len())
+    }
+}
+
+impl AudioPcm {
+    /// Fails unless the rate is one Opus takes (8, 12, 16, 24 or 48 kHz; resample others), there
+    /// are 1 or 2 channels and the samples are a whole number of frames.
+    pub fn new(sample_rate: u32, channels: u8, samples: Vec<i16>) -> Result<Self> {
+        ensure!([8000, 12000, 16000, 24000, 48000].contains(&sample_rate), "Opus takes 8, 12, 16, 24 or 48 kHz, not {sample_rate} Hz");
+        ensure!((1..=2).contains(&channels) && samples.len().is_multiple_of(channels as usize), "{} samples are not whole frames of {channels} (1 or 2) channels", samples.len());
+        Ok(AudioPcm { sample_rate, channels, samples })
+    }
+
+    /// Samples per second (per channel).
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// 1 (mono) or 2 (stereo, interleaved left, right).
+    pub fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    /// The samples, channels interleaved.
+    pub fn samples(&self) -> &[i16] {
+        &self.samples
+    }
 }
 
 /// What [`Codec::decode`] produced from one sample. Decoded frames are cached and shared by every
 /// frontend that subscribes to the same key with the same codec.
 pub enum DecodedFrame {
-    /// A picture for the bridge's H.264 path ([`CodecOutput::Video`] codecs).
+    /// A picture for the bridge's software H.264 encoder ([`CodecOutput::Video`] codecs).
     Video(VideoImage),
+    /// PCM for the bridge's Opus encoder ([`CodecOutput::Audio`] codecs).
+    Audio(AudioPcm),
     /// Anything the codec's own [`encode`](Codec::encode) understands (data-channel
     /// codecs); build it with [`DecodedFrame::data`], read it back with [`DecodedFrame::downcast`].
     Data(Box<dyn Any + Send + Sync>),
@@ -164,6 +220,7 @@ impl fmt::Debug for DecodedFrame {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DecodedFrame::Video(image) => write!(formatter, "DecodedFrame::Video({image:?})"),
+            DecodedFrame::Audio(pcm) => write!(formatter, "DecodedFrame::Audio({pcm:?})"),
             DecodedFrame::Data(_) => write!(formatter, "DecodedFrame::Data(..)"),
         }
     }
@@ -175,12 +232,12 @@ impl DecodedFrame {
         DecodedFrame::Data(Box::new(value))
     }
 
-    /// The value stored with [`DecodedFrame::data`], if it is a `T`; an error otherwise (a video
-    /// frame, or another type).
+    /// The value stored with [`DecodedFrame::data`], if it is a `T`; an error otherwise (a picture,
+    /// PCM, or another type).
     pub fn downcast<T: Any>(&self) -> Result<&T> {
         match self {
             DecodedFrame::Data(value) => value.downcast_ref::<T>().ok_or_else(|| anyhow!("decoded frame is not a {}", std::any::type_name::<T>())),
-            DecodedFrame::Video(_) => Err(anyhow!("decoded frame is video, not {}", std::any::type_name::<T>())),
+            other => Err(anyhow!("{other:?} is not a {}", std::any::type_name::<T>())),
         }
     }
 }
@@ -222,8 +279,16 @@ pub trait Codec: Send + Sync {
     /// the same for the codec's lifetime; by convention `<protocol>-<message type>`.
     fn name(&self) -> &str;
 
-    /// Whether the output is video (the bridge's H.264 track) or bytes on the data channel.
+    /// Whether the output is a video track, an audio track or bytes on the data channel.
     fn output(&self) -> CodecOutput;
+
+    /// Video codecs: a new encoder for one (frontend, subscription), which also declares the WebRTC
+    /// codec the track negotiates. Default: the bridge's software H.264 (openh264), which takes
+    /// [`DecodedFrame::Video`]. Return a hardware encoder here (NVENC, a Jetson's), or one that
+    /// passes frames through that arrive already encoded.
+    fn video_encoder(&self) -> Box<dyn VideoEncoder> {
+        Box::new(H264Encoder::default())
+    }
 
     /// Data-channel codecs: compression used when the subscription doesn't set `compress`
     /// (e.g. [`Compress::Zstd`] for output that compresses well). Ignored for video.
@@ -232,15 +297,15 @@ pub trait Codec: Send + Sync {
     }
 
     /// Parses and decodes one sample. The result is shared by every frontend that receives this
-    /// sample through this codec, at any quality. [`CodecOutput::Video`] codecs must return
-    /// [`DecodedFrame::Video`] (any size: the bridge scales it per quality and keeps it even).
+    /// sample through this codec, at any quality. Video codecs return what their encoder takes
+    /// ([`DecodedFrame::Video`] for the default, any size), audio codecs [`DecodedFrame::Audio`].
     /// An error skips the message and is counted in the subscription's `codecErrors` stats.
     fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame>;
 
     /// Data-channel codecs: the bytes to send for `frame` at `quality` (0 = smallest,
     /// 1 = best, picked by the bandwidth allocator within the subscription's
     /// `minQuality..maxQuality`). Results are shared across frontends asking for the same
-    /// quality (in 1/1000 steps). Video codecs never get this call.
+    /// quality (in 1/1000 steps). Video and audio codecs never get this call.
     fn encode(&self, frame: &DecodedFrame, quality: f64) -> Result<Vec<u8>> {
         let _ = (frame, quality);
         Err(anyhow!("codec {:?} has no data-channel encoder", self.name()))
@@ -249,8 +314,8 @@ pub trait Codec: Send + Sync {
     /// The allocator's prior for data-channel codecs: expected bytes per message as sent (after
     /// any compression) at `quality`, for a sample of `payload_bytes`. Used until sizes are measured, and after
     /// that as the shape between measured qualities (so it should be monotone in `quality`).
-    /// The default assumes the output scales linearly from 10% to 100% of the payload. Video
-    /// codecs are priced by the bridge from resolution and bits per pixel instead.
+    /// The default assumes the output scales linearly from 10% to 100% of the payload. Video is
+    /// priced by the bridge from resolution and bits per pixel instead, audio by what it sends.
     fn estimated_bytes(&self, payload_bytes: usize, quality: f64) -> f64 {
         payload_bytes as f64 * (0.1 + 0.9 * quality.clamp(0.0, 1.0))
     }

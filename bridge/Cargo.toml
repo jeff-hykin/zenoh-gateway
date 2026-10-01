@@ -32,6 +32,8 @@ log = "0.4"
 futures = "0.3"
 # subscribe option compress: "zstd" (builds its C sources)
 zstd = "0.13"
+# audio tracks: libopus transpiled to Rust (no C toolchain, so it cross-compiles like the rest)
+unsafe-libopus = "0.2"
 # H.264 video (openh264 builds its C sources)
 openh264 = "0.9"
 

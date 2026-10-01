@@ -104,13 +104,7 @@ impl CodecRegistry {
 
     /// Blocking: decodes `sample` (or reuses another frontend's decode of it). `true` = reused.
     pub fn decode_shared(&self, codec: &dyn Codec, sample: &CodecSample<'_>, hash: u64) -> (Result<Arc<DecodedFrame>, String>, bool) {
-        self.decoded.get_or_compute((codec.name().to_owned(), hash), || {
-            let frame = codec.decode(sample).map_err(|error| format!("{error:#}"))?;
-            match (codec.output(), &frame) {
-                (CodecOutput::Video, DecodedFrame::Data(_)) => Err(format!("video codec {:?} decoded to a data frame (expected DecodedFrame::Video)", codec.name())),
-                _ => Ok(frame),
-            }
-        })
+        self.decoded.get_or_compute((codec.name().to_owned(), hash), || codec.decode(sample).map_err(|error| format!("{error:#}")))
     }
 
     /// Blocking: a data codec's bytes for `sample` at `quality`, compressed as asked (or another

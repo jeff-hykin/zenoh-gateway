@@ -1,12 +1,13 @@
-//! Video subscriptions: frames decoded by a codec, encoded to H.264 and written to a WebRTC
-//! video track (one track per frontend and subscription). The browser adds a recvonly
-//! transceiver and renegotiates over `control`; the bridge answers with a new track bound to that
-//! transceiver's mid. A subscription's `sub` data channel names the mid in its label and carries a
-//! small metadata frame per video frame. Tracks are reused by later subscriptions on the same mid.
+//! Media subscriptions: frames decoded by a video or audio codec, encoded (the codec's
+//! `VideoEncoder`, or Opus in `audio`) and written to a WebRTC track (one per frontend and
+//! subscription). The browser adds a recvonly transceiver and renegotiates over `control`, naming
+//! the codec; the bridge answers with a new track of that codec's format bound to the transceiver's
+//! mid. A subscription's `sub` data channel names the mid in its label and carries a small frame per
+//! media frame. Tracks are reused by later subscriptions on the same mid and format.
 
 use crate::codec::registry;
-use crate::codec::video::{EncodedFrame, VideoEncoder};
-use crate::codec::{Codec, CodecSample, DecodedFrame};
+use crate::codec::video::{EncodedVideo, target};
+use crate::codec::{Codec, CodecOutput, CodecSample, DecodedFrame};
 use crate::subscription::{self, SubShared};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -14,7 +15,7 @@ use rtc::interceptor::{BandwidthEstimator, EstimatorStats, Gcc, PacketReport, Re
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::{CongestionFeedback, configure_congestion_control, register_default_interceptors};
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::MediaEngine;
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::extension::HeaderExtension;
@@ -30,7 +31,9 @@ use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
 use webrtc::peer_connection::{PeerConnection, RTCSessionDescription};
 use webrtc::rtp_transceiver::RtpSender;
 
-const H264_PAYLOAD_TYPE: u8 = 102;
+/// Every format a track can have, with the payload type the bridge offers it at.
+const FORMATS: [(&str, u8); 5] = [("video/H264", 102), ("video/VP8", 96), ("video/VP9", 98), ("video/AV1", 45), (OPUS, 111)];
+const OPUS: &str = "audio/opus";
 /// Google Congestion Control bounds, bits/s. It starts where the data-channel estimator starts
 /// (`allocator::INITIAL_ESTIMATE`, 1 MB/s), since video is allocated no more than this estimate.
 const GCC_INITIAL_BPS: f64 = crate::allocator::INITIAL_ESTIMATE * 8.0;
@@ -44,15 +47,26 @@ const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/pl
 /// Video metadata frame on the `sub` channel (SPEC "Wire formats").
 pub const METADATA_LEN: usize = 28;
 
-fn h264_codec() -> RTCRtpCodec {
+fn rtp_codec(mime: &str) -> RTCRtpCodec {
+    if mime == OPUS {
+        return RTCRtpCodec { mime_type: mime.to_owned(), clock_rate: 48_000, channels: 2, sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(), rtcp_feedback: vec![] };
+    }
     let feedback = |typ: &str, parameter: &str| RTCPFeedback { typ: typ.to_owned(), parameter: parameter.to_owned() };
-    RTCRtpCodec {
-        mime_type: MIME_TYPE_H264.to_owned(),
-        clock_rate: 90_000,
-        channels: 0,
+    let sdp_fmtp_line = match mime {
         // constrained baseline, what openh264 produces and every browser decodes
-        sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_owned(),
-        rtcp_feedback: vec![feedback("ccm", "fir"), feedback("nack", ""), feedback("nack", "pli")],
+        "video/H264" => "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+        "video/VP9" => "profile-id=0",
+        _ => "",
+    };
+    RTCRtpCodec { mime_type: mime.to_owned(), clock_rate: 90_000, channels: 0, sdp_fmtp_line: sdp_fmtp_line.to_owned(), rtcp_feedback: vec![feedback("ccm", "fir"), feedback("nack", ""), feedback("nack", "pli")] }
+}
+
+/// The track format a media codec needs: its encoder's video format, or Opus.
+pub fn track_mime(codec: &dyn Codec) -> Option<&'static str> {
+    match codec.output() {
+        CodecOutput::Video => Some(codec.video_encoder().format().mime_type()),
+        CodecOutput::Audio => Some(OPUS),
+        _ => None,
     }
 }
 
@@ -97,11 +111,14 @@ impl BandwidthEstimator for ReportingEstimator {
     }
 }
 
-/// H.264 + RTCP reports + NACK + send-side congestion control (TWCC feedback into GCC).
-/// Returns the GCC target (f64 bits/s as bits in an AtomicU64).
+/// The track formats + RTCP reports + NACK + send-side congestion control (TWCC feedback into
+/// GCC). Returns the GCC target (f64 bits/s as bits in an AtomicU64).
 pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<AtomicU64>)> {
     let mut media_engine = MediaEngine::default();
-    media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: h264_codec(), payload_type: H264_PAYLOAD_TYPE }, RtpCodecKind::Video)?;
+    for (mime, payload_type) in FORMATS {
+        let kind = if mime == OPUS { RtpCodecKind::Audio } else { RtpCodecKind::Video };
+        media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: rtp_codec(mime), payload_type }, kind)?;
+    }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
     let target_bps = Arc::new(AtomicU64::new(GCC_INITIAL_BPS.to_bits()));
     let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), target_bps: target_bps.clone() };
@@ -114,8 +131,10 @@ pub fn gcc_target_bytes_per_sec(target_bps: &AtomicU64) -> f64 {
     f64::from_bits(target_bps.load(Ordering::Relaxed)) / 8.0
 }
 
-pub struct VideoTrack {
+pub struct MediaTrack {
     pub mid: String,
+    /// its format, e.g. "video/H264"
+    pub mime: &'static str,
     track: Arc<TrackLocalStaticSample>,
     ssrc: u32,
     payload_type: u8,
@@ -125,26 +144,28 @@ pub struct VideoTrack {
     in_use: AtomicBool,
 }
 
-impl VideoTrack {
+impl MediaTrack {
     /// Claims the track for one subscription; false if another one holds it.
     pub fn claim(&self) -> bool {
         self.in_use.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
     }
 
-    fn release(&self) {
+    pub fn release(&self) {
         self.in_use.store(false, Ordering::Release);
     }
 
-    async fn write(&self, data: Vec<u8>, duration: Duration) -> Result<()> {
+    pub async fn write(&self, data: Vec<u8>, duration: Duration) -> Result<()> {
         let sample = Sample { data: Bytes::from(data), duration, ..Sample::new(Instant::now()) };
-        let no_playout_delay = HeaderExtension::PlayoutDelay(PlayoutDelayExtension { min_delay: 0, max_delay: 0 });
-        self.track.sample_writer(self.ssrc, self.payload_type).with_extension(no_playout_delay).write_sample(&sample).await?;
+        let writer = self.track.sample_writer(self.ssrc, self.payload_type);
+        // video only: audio has its own jitter buffer and no playout-delay extension negotiated
+        let writer = if self.mime == OPUS { writer } else { writer.with_extension(HeaderExtension::PlayoutDelay(PlayoutDelayExtension { min_delay: 0, max_delay: 0 })) };
+        writer.write_sample(&sample).await?;
         Ok(())
     }
 }
 
 /// Watches the track's RTCP for keyframe requests until the track is dropped.
-fn spawn_rtcp_reader(track: Arc<TrackLocalStaticSample>, owner: Weak<VideoTrack>, keyframe_requested: Arc<AtomicBool>, keyframe_requests: Arc<AtomicU64>) {
+fn spawn_rtcp_reader(track: Arc<TrackLocalStaticSample>, owner: Weak<MediaTrack>, keyframe_requested: Arc<AtomicBool>, keyframe_requests: Arc<AtomicU64>) {
     tokio::spawn(async move {
         while owner.strong_count() > 0 {
             match track.poll().await {
@@ -164,19 +185,20 @@ fn spawn_rtcp_reader(track: Arc<TrackLocalStaticSample>, owner: Weak<VideoTrack>
     });
 }
 
-/// Applies a browser offer (renegotiation over `control`). With `add_video`, first adds a video
-/// track, which pairs with the offer's new recvonly video m-line, and returns it with its mid.
-pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSessionDescription, add_video: bool) -> Result<(RTCSessionDescription, Option<Arc<VideoTrack>>)> {
-    let added = if add_video {
+/// Applies a browser offer (renegotiation over `control`). With `add` (a track format), first adds
+/// a track, which pairs with the offer's new recvonly m-line of its kind, and returns it with its mid.
+pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSessionDescription, add: Option<&'static str>) -> Result<(RTCSessionDescription, Option<Arc<MediaTrack>>)> {
+    let added = if let Some(mime) = add {
         let ssrc = rand_ssrc();
+        let kind = if mime == OPUS { RtpCodecKind::Audio } else { RtpCodecKind::Video };
         let track = Arc::new(TrackLocalStaticSample::new(
             Instant::now(),
             MediaStreamTrack::new(
                 format!("zenoh-web-{ssrc}"),
-                format!("zenoh-web-video-{ssrc}"),
-                "zenoh-web video".to_owned(),
-                RtpCodecKind::Video,
-                vec![RTCRtpEncodingParameters { rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() }, codec: h264_codec(), ..Default::default() }],
+                format!("zenoh-web-track-{ssrc}"),
+                "zenoh-web".to_owned(),
+                kind,
+                vec![RTCRtpEncodingParameters { rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() }, codec: rtp_codec(mime), ..Default::default() }],
             ),
         )?);
         let sender = connection.add_track(track.clone() as Arc<dyn TrackLocal>).await?;
@@ -188,7 +210,7 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
     let answer = connection.create_answer(None).await?;
     connection.set_local_description(answer).await?;
     let local = connection.local_description().await.context("no local description after renegotiation")?;
-    let Some((track, sender, ssrc)) = added else { return Ok((local, None)) };
+    let (Some((track, sender, ssrc)), Some(mime)) = (added, add) else { return Ok((local, None)) };
     let mut mid = None;
     for transceiver in connection.get_transceivers().await {
         if let Ok(Some(transceiver_sender)) = transceiver.sender().await
@@ -197,17 +219,18 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
             mid = transceiver.mid().await?;
         }
     }
-    let mid = mid.context("the offer had no new video m-line for the track (add a recvonly video transceiver before renegotiating)")?;
-    let payload_type = negotiated_payload_type(&sender).await.unwrap_or(H264_PAYLOAD_TYPE);
+    let mid = mid.context("the offer had no new m-line for the track (add a recvonly transceiver of its kind before renegotiating)")?;
+    let payload_type = negotiated_payload_type(&sender, mime).await.with_context(|| format!("the browser did not accept {mime}"))?;
     let keyframe_requested = Arc::new(AtomicBool::new(true));
     let keyframe_requests = Arc::new(AtomicU64::new(0));
-    let video = Arc::new(VideoTrack { mid, track: track.clone(), ssrc, payload_type, keyframe_requested: keyframe_requested.clone(), keyframe_requests: keyframe_requests.clone(), in_use: AtomicBool::new(false) });
+    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested: keyframe_requested.clone(), keyframe_requests: keyframe_requests.clone(), in_use: AtomicBool::new(false) });
     spawn_rtcp_reader(track, Arc::downgrade(&video), keyframe_requested, keyframe_requests);
     Ok((local, Some(video)))
 }
 
-async fn negotiated_payload_type(sender: &Arc<dyn RtpSender>) -> Result<u8> {
-    sender.get_parameters().await?.rtp_parameters.codecs.first().map(|codec| codec.payload_type).context("sender has no negotiated codec")
+async fn negotiated_payload_type(sender: &Arc<dyn RtpSender>, mime: &str) -> Result<u8> {
+    let codecs = sender.get_parameters().await?.rtp_parameters.codecs;
+    codecs.iter().find(|codec| codec.rtp_codec.mime_type.eq_ignore_ascii_case(mime)).map(|codec| codec.payload_type).context("not negotiated")
 }
 
 fn rand_ssrc() -> u32 {
@@ -219,7 +242,7 @@ fn rand_ssrc() -> u32 {
 
 /// `u8 version=1 | u8 flags (bit0 keyframe) | u16 0 | u32 width | u32 height | u32 sourceWidth |
 ///  u32 sourceHeight | f32 quality | u32 encodedBytes`, little endian.
-fn metadata(frame: &EncodedFrame, source: (u32, u32), quality: f64) -> [u8; METADATA_LEN] {
+fn metadata(frame: &EncodedVideo, source: (u32, u32), quality: f64) -> [u8; METADATA_LEN] {
     let mut out = [0u8; METADATA_LEN];
     out[0] = 1;
     out[1] = frame.keyframe as u8;
@@ -232,19 +255,19 @@ fn metadata(frame: &EncodedFrame, source: (u32, u32), quality: f64) -> [u8; META
     out
 }
 
-/// A decoded picture and whether another frontend's decode was reused, or the decode error.
+/// A decoded frame and whether another frontend's decode was reused, or the decode error.
 type DecodeOutcome = std::result::Result<(Arc<DecodedFrame>, bool), String>;
 
 /// A picked frame and its decode, running on the blocking pool.
-struct Decoding {
-    key: String,
-    item: subscription::Pending,
+pub struct Decoding {
+    pub key: String,
+    pub item: subscription::Pending,
     /// (what came of the sample, milliseconds it took)
-    task: tokio::task::JoinHandle<(DecodeOutcome, f64)>,
+    pub task: tokio::task::JoinHandle<(DecodeOutcome, f64)>,
 }
 
 /// Starts decoding a picked sample.
-fn start_decode(shared: &SubShared, codec: &Arc<dyn Codec>, key: String, item: subscription::Pending) -> Decoding {
+pub fn start_decode(shared: &SubShared, codec: &Arc<dyn Codec>, key: String, item: subscription::Pending) -> Decoding {
     let payload = item.payload.to_bytes().into_owned();
     let (hash_key, encoding, codecs, codec) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone());
     let task = tokio::task::spawn_blocking(move || {
@@ -329,13 +352,15 @@ impl CpuGovernor {
 }
 
 /// Sends a video subscription's frames: pick (paced by maxHz and the allocation), decode (shared
-/// across frontends), encode H.264 at the allocated quality and Hz (off the runtime), and write to
-/// the track. The next frame's decode overlaps this frame's encode: in series, a big camera frame (a
+/// across frontends), encode with the codec's encoder at the allocated quality and Hz (off the
+/// runtime), and write to the track. The next frame's decode overlaps this frame's encode: in series, a big camera frame (a
 /// 1920x1536 jpeg is ~16 ms to decode and ~20 ms to scale and encode on a Jetson Orin core) could
 /// not keep up with 30 Hz; overlapped, the slower of the two sets the rate.
-pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: Arc<VideoTrack>) {
+pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: Arc<MediaTrack>) {
     let Some(codec) = shared.codec.clone() else { return };
-    let mut encoder = Some(VideoEncoder::default());
+    let mut encoder = Some(codec.video_encoder());
+    // the picture size the target scales (an encoder fed other frames reports it by its output)
+    let mut source = (640, 480);
     let mut next_frame_id: u32 = 0;
     let mut last_write: Option<Instant> = None;
     let mut warned_write = false;
@@ -372,20 +397,16 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         };
         let hz = shared.key_hz(&key);
         let quality = governor.quality(shared.current_quality(), shared.min_quality(), hz, Instant::now());
-        let keyframe = track.keyframe_requested.swap(false, Ordering::AcqRel);
+        let is_picture = matches!(&*decoded, DecodedFrame::Video(_));
+        if let DecodedFrame::Video(image) = &*decoded {
+            source = (image.width(), image.height());
+        }
+        let target = target(source.0, source.1, quality, hz, track.keyframe_requested.swap(false, Ordering::AcqRel));
         let mut working = encoder.take();
-        let codec_name = codec.name().to_owned();
         let mut encoding = tokio::task::spawn_blocking(move || {
-            let DecodedFrame::Video(image) = &*decoded else {
-                return (working, Err(format!("video codec {codec_name:?} decoded to a data frame")));
-            };
             let started = Instant::now();
-            let h264 = working.as_mut().expect("the encoder comes back with every frame");
-            if keyframe {
-                h264.request_keyframe();
-            }
-            let result = h264.encode(image, quality, hz).map(|frame| (frame, (image.width(), image.height()), started.elapsed().as_secs_f64() * 1000.0)).map_err(|error| format!("{error:#}"));
-            (working, result)
+            let result = working.as_mut().expect("the encoder comes back with every frame").encode(&decoded, &target);
+            (working, result.map(|frame| (frame, started.elapsed().as_secs_f64() * 1000.0)).map_err(|error| format!("{error:#}")))
         });
         // while it encodes, pick the next frame and start decoding it as soon as one may go
         let outcome = loop {
@@ -402,12 +423,15 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 _ = shared.wait_for_data(wake_at) => {}
             }
         };
-        let (frame, source) = match outcome {
-            Ok((returned, Ok((frame, source, encode_ms)))) => {
+        let frame = match outcome {
+            Ok((returned, Ok((frame, encode_ms)))) => {
                 encoder = returned;
                 governor.observe_encode(encode_ms);
                 shared.record_video_timing(governor.decode_ms, governor.encode_ms, governor.cap);
-                (frame, source)
+                match frame {
+                    Some(frame) => frame,
+                    None => continue,
+                }
             }
             Ok((returned, Err(error))) => {
                 encoder = returned;
@@ -415,11 +439,14 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 continue;
             }
             Err(error) => {
-                encoder = Some(VideoEncoder::default());
+                encoder = Some(codec.video_encoder());
                 shared.record_codec_error(&format!("encoder task failed: {error}"));
                 continue;
             }
         };
+        if !is_picture {
+            source = (frame.width, frame.height);
+        }
         shared.note_video_source(source.0, source.1);
         let now = Instant::now();
         let duration = last_write.map_or(Duration::from_secs_f64(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));

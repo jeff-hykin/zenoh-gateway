@@ -148,7 +148,8 @@ pub struct Usage {
     pub demand: Demand,
     pub bytes_sent: u64,
     pub network_blocked_ms: f64,
-    pub is_video: bool,
+    /// sent on an RTP track (video, audio), not the data channel
+    pub on_track: bool,
 }
 
 impl SubState {
@@ -271,7 +272,7 @@ impl SubShared {
 
     /// Per-key Hz cap from the allocation (None = no allocation cap).
     fn allocated_key_hz(&self, rate_hz: f64, allocation: &Allocation) -> Option<f64> {
-        if self.delivery.reliable || self.is_strict() || !allocation.constrained || rate_hz <= 0.0 {
+        if self.reserved() || !allocation.constrained || rate_hz <= 0.0 {
             return None;
         }
         let wanted = self.max_hz.map_or(rate_hz, |max| max.min(rate_hz));
@@ -286,9 +287,14 @@ impl SubShared {
         }
     }
 
-    /// A video codec's subscription (H.264 on a track).
-    pub fn is_video(&self) -> bool {
-        self.codec.as_ref().is_some_and(|codec| codec.output() == CodecOutput::Video)
+    /// A video or audio codec's subscription (frames on an RTP track).
+    pub fn on_track(&self) -> bool {
+        self.codec.as_ref().is_some_and(|codec| matches!(codec.output(), CodecOutput::Video | CodecOutput::Audio))
+    }
+
+    /// Reserved at its measured rate, never paced or shrunk: reliable, strict-priority and audio streams.
+    fn reserved(&self) -> bool {
+        self.delivery.reliable || self.is_strict() || self.codec.as_ref().is_some_and(|codec| codec.output() == CodecOutput::Audio)
     }
 
     pub fn note_video_source(&self, width: u32, height: u32) {
@@ -338,14 +344,14 @@ impl SubShared {
             quality_range: self.codec.as_ref().map(|_| self.quality_range),
             tradeoff: self.tradeoff,
             price,
-            fixed_bytes_per_sec: (self.delivery.reliable || self.is_strict()).then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
+            fixed_bytes_per_sec: self.reserved().then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
         };
-        Usage { demand, bytes_sent, network_blocked_ms, is_video: self.is_video() }
+        Usage { demand, bytes_sent, network_blocked_ms, on_track: self.on_track() }
     }
 
     pub fn apply(&self, allocation: Allocation) {
-        // bulk streams trickle at their grant; strict and reliable ones aren't paced
-        let paced = !self.delivery.reliable && !self.is_strict() && allocation.demand_bytes_per_sec > 0.0;
+        // bulk streams trickle at their grant; reserved ones aren't paced
+        let paced = !self.reserved() && allocation.demand_bytes_per_sec > 0.0;
         let rate = paced.then_some(allocation.budget_bytes_per_sec * PACING_SLACK);
         self.bucket.lock().unwrap().set_rate(rate, 2 * self.gate.chunk_bytes());
         self.state.lock().unwrap().allocation = allocation;
@@ -379,6 +385,13 @@ impl SubShared {
         state.stats.decode_ms = decode_ms;
         state.stats.encode_ms = encode_ms;
         state.stats.cpu_quality_cap = Some(cpu_quality_cap);
+    }
+
+    /// Audio packets went to the track.
+    pub fn record_media_bytes(&self, bytes: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.stats.bytes_sent += bytes as u64;
+        state.stats.sent += 1;
     }
 
     /// A video frame went to the track.
@@ -535,8 +548,8 @@ impl SubShared {
     }
 }
 
-/// Runs a `sub` channel until it closes. Video codecs send frames to `video` instead of `dc`.
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>, video: Option<Arc<crate::video::VideoTrack>>) {
+/// Runs a `sub` channel until it closes. Video and audio codecs send frames to `track` instead of `dc`.
+pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>, track: Option<Arc<crate::media::MediaTrack>>) {
     let _ = dc.set_buffered_amount_low_threshold((shared.gate.window_bytes() / 2) as u32).await;
     let feed = shared.clone();
     let subscriber = session
@@ -556,8 +569,9 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     debug!("subscribed {:?} with {:?}", label.key, shared.delivery);
 
     shared.gate.register(shared.stream_id, dc.clone());
-    let sender = match video {
-        Some(track) => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), track)),
+    let sender = match track {
+        Some(track) if track.mime.starts_with("audio/") => tokio::spawn(crate::audio::send_loop(dc.clone(), shared.clone(), track)),
+        Some(track) => tokio::spawn(crate::media::send_loop(dc.clone(), shared.clone(), track)),
         None => tokio::spawn(send_loop(dc.clone(), shared.clone())),
     };
     // A browser that vanishes (killed, crashed, lid closed) never closes its channels; the peer is
