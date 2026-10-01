@@ -1455,6 +1455,9 @@ impl Association {
                 self.fwd_tsn_stream_map.clear();
             }
 
+            // zenoh-web patch: extend abandonment to whole messages before C2 reads it.
+            self.abandon_whole_messages();
+
             // RFC 3758 Sec 3.5 C2 — advance over newly-abandoned chunks,
             // folding each ordered one into the forward-TSN stream map so
             // create_forward_tsn needn't rescan the window.
@@ -1937,6 +1940,9 @@ impl Association {
         htna: u32,
         cum_tsn_ack_point_advanced: bool,
     ) -> Result<()> {
+        // zenoh-web patch: a fragment of an abandoned message must not be fast-retransmitted
+        self.abandon_whole_messages();
+
         // HTNA algorithm - RFC 4960 Sec 7.2.4
         // Increment missIndicator of each chunks that the SACK reported missing
         // when either of the following is met:
@@ -2407,7 +2413,9 @@ impl Association {
                     // wire and nothing delivered. RFC 3758 Sec 3.5 A3 wants the whole run
                     // abandoned together, which needs per-message state this does not have;
                     // until then a fragmented message keeps its previous behaviour.
-                    if c.abandoned() && c.beginning_fragment && c.ending_fragment {
+                    // zenoh-web patch: fragments are abandoned together (see
+                    // `abandon_whole_messages`), so any abandoned chunk can be skipped.
+                    if c.abandoned() {
                         i += 1;
                         continue;
                     }
@@ -2569,6 +2577,8 @@ impl Association {
     /// get_data_packets_to_retransmit is called when T3-rtx is timed out and retransmit outstanding data chunks
     /// that are not acked or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self, now: Instant, raw_packets: &mut Vec<Bytes>) {
+        // zenoh-web patch: nor T3-retransmitted
+        self.abandon_whole_messages();
         let awnd = std::cmp::min(self.cwnd, self.rwnd);
         let mut chunks = vec![];
         let mut bytes_to_send = 0;
@@ -2597,8 +2607,8 @@ impl Association {
                     self.side,
                     &self.streams,
                 );
-                // Whole messages only; see the matching guard on the fast-retransmit path.
-                if c.abandoned() && c.beginning_fragment && c.ending_fragment {
+                // zenoh-web patch: fragments are abandoned together, see `abandon_whole_messages`.
+                if c.abandoned() {
                     c.retransmit = false;
                     i += 1;
                     continue;
@@ -2961,7 +2971,9 @@ impl Association {
             // A3 wants the whole run abandoned together, which needs per-message state
             // this does not have; until then a fragmented message keeps its previous
             // behaviour of being retransmitted late rather than abandoned.
-            if !c.acked && c.beginning_fragment && c.ending_fragment {
+            // zenoh-web patch: fragments are evaluated too; `abandon_whole_messages` below
+            // then extends any abandonment to every fragment of that message.
+            if !c.acked {
                 Association::check_partial_reliability_status(
                     c,
                     now,
@@ -2969,6 +2981,49 @@ impl Association {
                     self.side,
                     &self.streams,
                 );
+            }
+            tsn = tsn.wrapping_add(1);
+        }
+        self.abandon_whole_messages();
+    }
+
+    /// zenoh-web patch, RFC 3758 Sec 3.5 A3: "the data sender MUST abandon all the
+    /// fragments of the same user message". Upstream only ever abandoned single-chunk
+    /// messages, so on a partially reliable channel every message bigger than one chunk
+    /// was retransmitted (with T3 backoff) instead of dropped. Walks the in-flight window
+    /// and, for each fully in-flight message with any abandoned fragment, marks every
+    /// fragment still in the window (gap-acked ones too, so C2 advances over the whole
+    /// run). A message's fragments have consecutive TSNs: `send_payload_data` queues them
+    /// back to back and `PendingQueue` keeps a selected message contiguous.
+    fn abandon_whole_messages(&mut self) {
+        if !self.use_forward_tsn {
+            return;
+        }
+        let mut run_start = self.cumulative_tsn_ack_point.wrapping_add(1);
+        let mut tsn = run_start;
+        let mut run_abandoned = false;
+        while let Some(c) = self.inflight_queue.get(tsn) {
+            if c.beginning_fragment {
+                run_start = tsn;
+                run_abandoned = false;
+            }
+            run_abandoned |= c.abandoned;
+            if c.ending_fragment {
+                if run_abandoned && c.all_inflight && run_start != tsn {
+                    let mut fragment_tsn = run_start;
+                    loop {
+                        if let Some(fragment) = self.inflight_queue.get_mut(fragment_tsn) {
+                            fragment.abandoned = true;
+                            fragment.all_inflight = true;
+                        }
+                        if fragment_tsn == tsn {
+                            break;
+                        }
+                        fragment_tsn = fragment_tsn.wrapping_add(1);
+                    }
+                }
+                run_start = tsn.wrapping_add(1);
+                run_abandoned = false;
             }
             tsn = tsn.wrapping_add(1);
         }

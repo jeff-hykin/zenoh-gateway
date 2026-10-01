@@ -5,6 +5,12 @@
 //! - `test/jpeg`: a real JPEG at 5 Hz
 //! - `test/queryable`: replies "pong"
 //! - `test/frombrowser/**`: printed to stdout as `RECV <key> <utf8 payload>`
+//! - topic enumeration fixtures nobody subscribes to: `test/unsubscribed/declared` (declared
+//!   publisher, 2 Hz), `test/unsubscribed/silent` (declared publisher, never puts),
+//!   `test/unsubscribed/undeclared` (plain session.put, 2 Hz), `test/unsubscribed/token` (liveliness token)
+//!
+//! - `test/big`: `--big-bytes` at `--big-hz`, only while someone subscribes; byte i (i >= 8) is
+//!   `(counter * 31 + i * 7) & 0xff`, bytes 0..4 the counter, 4..8 the length (u32 little endian)
 //!
 //! Prints `READY` once everything is declared.
 
@@ -25,6 +31,18 @@ struct Cli {
     fast_hz: f64,
     #[arg(long, default_value_t = 16 * 1024)]
     fast_bytes: usize,
+    #[arg(long, default_value_t = 20.0)]
+    big_hz: f64,
+    #[arg(long, default_value_t = 2_500_000)]
+    big_bytes: usize,
+}
+
+/// The `test/big` payload for `counter`; checkable byte by byte in the browser.
+fn big_payload(counter: u32, length: usize) -> Vec<u8> {
+    let mut payload: Vec<u8> = (0..length).map(|i| (counter as usize * 31 + i * 7) as u8).collect();
+    payload[0..4].copy_from_slice(&counter.to_le_bytes());
+    payload[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+    payload
 }
 
 fn unix_ms() -> f64 {
@@ -74,6 +92,33 @@ async fn main() -> anyhow::Result<()> {
         })
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let declared = session.declare_publisher("test/unsubscribed/declared").await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _silent = session.declare_publisher("test/unsubscribed/silent").await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _token = session.liveliness().declare_token("test/unsubscribed/token").await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let undeclared_session = session.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            ticker.tick().await;
+            let _ = declared.put("declared").await;
+            let _ = undeclared_session.put("test/unsubscribed/undeclared", "undeclared").await;
+        }
+    });
+
+    let big_publisher = session.declare_publisher("test/big").await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (big_hz, big_bytes) = (cli.big_hz, cli.big_bytes.max(8));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs_f64(1.0 / big_hz));
+        let mut counter: u32 = 0;
+        loop {
+            ticker.tick().await;
+            if big_publisher.matching_status().await.is_ok_and(|status| status.matching()) {
+                let _ = big_publisher.put(big_payload(counter, big_bytes)).await;
+                counter = counter.wrapping_add(1);
+            }
+        }
+    });
 
     let jpeg_publisher = session.declare_publisher("test/jpeg").await.map_err(|e| anyhow::anyhow!("{e}"))?;
     tokio::spawn(async move {

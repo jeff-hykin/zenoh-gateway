@@ -1,5 +1,6 @@
 //! zenoh-web: a dumb pipe between zenoh key expressions and browser WebRTC data channels.
 
+mod acl;
 mod frame;
 mod options;
 mod peer;
@@ -63,8 +64,16 @@ fn zenoh_config(cli: &Cli) -> anyhow::Result<zenoh::Config> {
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zenoh=warn,zenoh_ext=warn,zenoh_web=info,rtc=warn,webrtc=warn")).init();
     let cli = Cli::parse();
-    let session = zenoh::open(zenoh_config(&cli)?).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    let bridge = Bridge::new(session.clone());
+    let mut config = zenoh_config(&cli)?;
+    let access_control = acl::AccessControl::from_config(&config)?;
+    if access_control.enabled() {
+        info!("access_control enabled: browser puts/subscribes/gets are checked against it");
+    }
+    // listTopics reads this bridge's own routing tables through the admin space (read-only)
+    config.insert_json5("adminspace/enabled", "true").map_err(|e| anyhow::anyhow!("{e}"))?;
+    config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let session = zenoh::open(config).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bridge = Bridge::new(session.clone(), access_control);
 
     let mut app = Router::new().route("/offer", post(offer)).with_state(bridge.clone()).layer(CorsLayer::permissive());
     if let Some(dir) = &cli.serve {

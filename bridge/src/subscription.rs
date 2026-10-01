@@ -45,8 +45,16 @@ pub struct SubStats {
     pub outstanding_bytes: usize,
     pub backed_up: bool,
     pub unconsumed_bytes: usize,
+    /// frames (chunks) handed to SCTP; `sent` counts whole messages
+    pub frames_sent: u64,
+    /// lossy channel stopped sending a chunked message that outlived maxAge
+    pub abandoned_partial: u64,
     /// lossy channel blocked by the ack window sent a frame anyway (tail-loss recovery)
     pub probes: u64,
+    /// time the sender waited for SCTP to release bytes (network/peer receive path)
+    pub blocked_on_network_ms: f64,
+    /// time the sender waited only for the page to consume what it already has
+    pub blocked_on_page_ms: f64,
     /// Bridge receive time minus sample timestamp (upstream lag), largest seen.
     pub max_receive_lag_ms: f64,
 }
@@ -70,7 +78,7 @@ struct SubState {
     keys: HashMap<String, KeyQueue>,
     next_seq: u32,
     stats: SubStats,
-    /// (seq, frame bytes, sent at) in send order, until the page acks a seq at or past it
+    /// (frameId, frame bytes, sent at) in send order, until the page acks a frameId at or past it
     unconsumed: VecDeque<(u32, usize, Instant)>,
     /// acks that released something; lets a blocked sender notice progress
     acks_with_progress: u64,
@@ -213,12 +221,12 @@ impl SubShared {
         (Some((key, item)), wake_at)
     }
 
-    /// Page consumed everything up to `seq` (4-byte little endian message on the sub channel).
-    fn ack(&self, seq: u32) {
+    /// Page consumed every frame up to `frame_id` (4-byte little endian message on the sub channel).
+    fn ack(&self, frame_id: u32) {
         let mut state = self.state.lock().unwrap();
         let mut released = false;
-        while let Some(&(sent_seq, len, _)) = state.unconsumed.front() {
-            if !seq_at_or_before(sent_seq, seq) {
+        while let Some(&(sent_frame_id, len, _)) = state.unconsumed.front() {
+            if !seq_at_or_before(sent_frame_id, frame_id) {
                 break;
             }
             state.unconsumed.pop_front();
@@ -230,6 +238,11 @@ impl SubShared {
         }
         drop(state);
         self.drained.notify_one();
+    }
+
+    /// Older than this subscription's maxAge (never, without one).
+    fn expired(&self, item: &Pending, now: Instant) -> bool {
+        self.delivery.max_age_ms.is_some_and(|max_age_ms| now.duration_since(item.arrived).as_secs_f64() * 1000.0 > max_age_ms)
     }
 
     fn unconsumed_bytes(&self) -> usize {
@@ -282,10 +295,69 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     debug!("unsubscribed {:?}", label.key);
 }
 
+/// Paces one channel: tracks SCTP backlog, the page's ack window and tail-loss probes.
+struct Pacer {
+    probe_interval: Duration,
+    acks_seen: u64,
+}
+
+impl Pacer {
+    /// After a frame went out: wait while the network or the page is behind.
+    async fn wait_writable(&mut self, dc: &Arc<dyn DataChannel>, shared: &SubShared) {
+        let mut outstanding = dc.outstanding_bytes().await.unwrap_or(0);
+        let unconsumed = {
+            let mut state = shared.state.lock().unwrap();
+            state.stats.outstanding_bytes = outstanding;
+            state.stats.unconsumed_bytes
+        };
+        if outstanding < BACKED_UP_BYTES && unconsumed < UNCONSUMED_WINDOW {
+            return;
+        }
+        shared.state.lock().unwrap().stats.backed_up = true;
+        let mut probe_at = Instant::now() + self.probe_interval;
+        while (outstanding > RESUME_BYTES || shared.unconsumed_bytes() >= UNCONSUMED_WINDOW)
+            && !shared.closed.load(Ordering::Relaxed)
+        {
+            let waiting_on_network = outstanding > RESUME_BYTES;
+            let wait_started = Instant::now();
+            tokio::select! {
+                _ = shared.drained.notified() => {}
+                _ = tokio::time::sleep(BACKSTOP) => {}
+            }
+            let waited_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+            let acks_now = {
+                let mut state = shared.state.lock().unwrap();
+                if waiting_on_network {
+                    state.stats.blocked_on_network_ms += waited_ms;
+                } else {
+                    state.stats.blocked_on_page_ms += waited_ms;
+                }
+                state.acks_with_progress
+            };
+            outstanding = dc.outstanding_bytes().await.unwrap_or(0);
+            if acks_now != self.acks_seen {
+                self.acks_seen = acks_now;
+                self.probe_interval = FIRST_PROBE_AFTER;
+                probe_at = Instant::now() + self.probe_interval;
+            }
+            let window_only = outstanding <= RESUME_BYTES;
+            if window_only && !shared.delivery.reliable && Instant::now() >= probe_at {
+                shared.state.lock().unwrap().stats.probes += 1;
+                // if this probe isn't acked either, the page is busy rather than the tail lost
+                self.probe_interval = (self.probe_interval * 2).min(MAX_PROBE_INTERVAL);
+                break;
+            }
+        }
+        let mut state = shared.state.lock().unwrap();
+        state.stats.outstanding_bytes = outstanding;
+        state.stats.backed_up = false;
+    }
+}
+
 async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
     let mut warned_send_error = false;
-    let mut probe_interval = FIRST_PROBE_AFTER;
-    let mut acks_seen = 0;
+    let mut pacer = Pacer { probe_interval: FIRST_PROBE_AFTER, acks_seen: 0 };
+    let mut next_frame_id: u32 = 0;
     while !shared.closed.load(Ordering::Relaxed) {
         let (next, wake_at) = shared.pick(Instant::now());
         let Some((key, item)) = next else {
@@ -300,61 +372,51 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             }
             continue;
         };
-        let frame = frame::encode(&key, item.timestamp_ms, item.seq, &item.payload.to_bytes());
-        let frame_len = frame.len();
-        if let Err(error) = dc.send(frame).await {
+        let payload = item.payload.to_bytes();
+        let chunk_count = frame::chunk_count(payload.len());
+        let mut completed = true;
+        for chunk_index in 0..chunk_count {
+            // a lossy channel stops a chunked message that outlived maxAge; otherwise it finishes
+            // what it started, so big messages make progress even when newer ones keep arriving
+            if chunk_index > 0 && !shared.delivery.reliable && shared.expired(&item, Instant::now()) {
+                shared.state.lock().unwrap().stats.abandoned_partial += 1;
+                completed = false;
+                break;
+            }
+            let frame_id = next_frame_id;
+            next_frame_id = next_frame_id.wrapping_add(1);
+            let header = frame::FrameHeader { key: &key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index, chunk_count };
+            let frame = frame::encode(&header, frame::chunk(&payload, chunk_index));
+            let frame_len = frame.len();
+            if let Err(error) = dc.send(frame).await {
+                if shared.closed.load(Ordering::Relaxed) {
+                    return;
+                }
+                shared.state.lock().unwrap().stats.dropped_send_error += 1;
+                if !warned_send_error {
+                    warn!("send on {key:?} failed ({frame_len} bytes): {error}");
+                    warned_send_error = true;
+                }
+                if matches!(error, webrtc::error::Error::ErrDataChannelClosed) {
+                    return;
+                }
+                completed = false;
+                break;
+            }
+            {
+                let mut state = shared.state.lock().unwrap();
+                state.unconsumed.push_back((frame_id, frame_len, Instant::now()));
+                state.stats.unconsumed_bytes += frame_len;
+                state.stats.frames_sent += 1;
+            }
+            pacer.wait_writable(&dc, &shared).await;
             if shared.closed.load(Ordering::Relaxed) {
-                break;
-            }
-            shared.state.lock().unwrap().stats.dropped_send_error += 1;
-            if !warned_send_error {
-                warn!("send on {key:?} failed ({frame_len} bytes): {error}");
-                warned_send_error = true;
-            }
-            if matches!(error, webrtc::error::Error::ErrDataChannelClosed) {
-                break;
-            }
-            continue;
-        }
-        let mut outstanding = dc.outstanding_bytes().await.unwrap_or(0);
-        let unconsumed = {
-            let mut state = shared.state.lock().unwrap();
-            state.unconsumed.push_back((item.seq, frame_len, Instant::now()));
-            state.stats.unconsumed_bytes += frame_len;
-            state.stats.sent += 1;
-            state.stats.outstanding_bytes = outstanding;
-            state.stats.unconsumed_bytes
-        };
-        if outstanding < BACKED_UP_BYTES && unconsumed < UNCONSUMED_WINDOW {
-            continue;
-        }
-        shared.state.lock().unwrap().stats.backed_up = true;
-        let mut probe_at = Instant::now() + probe_interval;
-        while (outstanding > RESUME_BYTES || shared.unconsumed_bytes() >= UNCONSUMED_WINDOW)
-            && !shared.closed.load(Ordering::Relaxed)
-        {
-            tokio::select! {
-                _ = shared.drained.notified() => {}
-                _ = tokio::time::sleep(BACKSTOP) => {}
-            }
-            outstanding = dc.outstanding_bytes().await.unwrap_or(0);
-            let acks_now = shared.state.lock().unwrap().acks_with_progress;
-            if acks_now != acks_seen {
-                acks_seen = acks_now;
-                probe_interval = FIRST_PROBE_AFTER;
-                probe_at = Instant::now() + probe_interval;
-            }
-            let window_only = outstanding <= RESUME_BYTES;
-            if window_only && !shared.delivery.reliable && Instant::now() >= probe_at {
-                shared.state.lock().unwrap().stats.probes += 1;
-                // if this probe isn't acked either, the page is busy rather than the tail lost
-                probe_interval = (probe_interval * 2).min(MAX_PROBE_INTERVAL);
-                break;
+                return;
             }
         }
-        let mut state = shared.state.lock().unwrap();
-        state.stats.outstanding_bytes = outstanding;
-        state.stats.backed_up = false;
+        if completed {
+            shared.state.lock().unwrap().stats.sent += 1;
+        }
     }
 }
 

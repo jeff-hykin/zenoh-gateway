@@ -1808,22 +1808,17 @@ fn test_assoc_timed_reliability_forwards_past_expired_without_extra_backoff() ->
     Ok(())
 }
 
-/// Documents a limitation rather than a fix. `all_inflight`, and therefore
-/// `abandoned`, is set on the ending fragment alone, so a fragmented message cannot be
-/// abandoned as a unit the way RFC 3758 Sec 3.5 A3 requires. Acting on the ending
-/// fragment by itself would be worse than doing nothing: `mark_all_to_retrasmit` would
-/// drop that one fragment, the earlier ones would still be sent, and the peer could
-/// never reassemble -- the same bytes on the wire and nothing delivered.
-///
-/// So a fragmented message keeps the behaviour it had before this change: retransmitted
-/// after its lifetime and delivered late. This test pins that, so the hole stays visible
-/// and cannot quietly turn into orphaned fragments.
+/// zenoh-web patch: RFC 3758 Sec 3.5 A3 -- a fragmented message whose lifetime expired is
+/// abandoned as a whole. Nothing of it is delivered (no orphan fragments), and the stream
+/// keeps going: the next message on the same ordered stream arrives. Upstream pinned the
+/// opposite (late retransmission of the whole message) as a documented limitation.
 #[test]
-fn test_assoc_timed_reliability_leaves_fragmented_messages_alone() -> Result<()> {
+fn test_assoc_timed_reliability_abandons_fragmented_messages_whole() -> Result<()> {
     let si: u16 = 20;
     let lifetime_ms: u32 = 100;
     // Comfortably over max_payload_size_for_mtu(INITIAL_MTU), so this fragments.
     let big = Bytes::from(vec![0x5Au8; 3000]);
+    let next = Bytes::from_static(b"next message");
 
     let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
@@ -1844,25 +1839,79 @@ fn test_assoc_timed_reliability_leaves_fragmented_messages_alone() -> Result<()>
     pair.drive_client();
     pair.server.inbound.clear(); // every fragment is lost
 
-    // Well past the lifetime, and past T3.
+    // Well past the lifetime, and past T3: the message is abandoned and a ForwardTSN sent.
     pair.time += Duration::from_millis(1500);
     pair.drive_client();
     pair.drive_server();
 
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?
+        .write_sctp(now, &next, PayloadProtocolIdentifier::Binary)?;
+    for _ in 0..10 {
+        pair.drive_client();
+        pair.drive_server();
+    }
+
     let mut buf = vec![0u8; 8000];
-    let mut delivered = 0usize;
+    let mut delivered = Vec::new();
     while let Some(chunks) = pair.server_stream(server_ch, si)?.read_sctp()? {
-        delivered += chunks.len();
-        chunks.read(&mut buf)?;
+        let n = chunks.read(&mut buf)?;
+        delivered.push(buf[..n].to_vec());
     }
 
     assert_eq!(
-        big.len(),
         delivered,
-        "a fragmented message must still arrive whole; abandoning only its ending \
-         fragment would put the other fragments on the wire and deliver nothing"
+        vec![next.to_vec()],
+        "the expired fragmented message must be dropped whole and the next one delivered"
     );
 
+    Ok(())
+}
+
+/// zenoh-web patch: with maxRetransmits 0, losing one middle fragment abandons the whole
+/// message (no retransmission, nothing partial delivered) and later messages still arrive.
+#[test]
+fn test_assoc_rexmit_zero_abandons_fragmented_message_with_a_lost_fragment() -> Result<()> {
+    let si: u16 = 22;
+    let big = Bytes::from(vec![0x33u8; 5000]);
+    let next = Bytes::from_static(b"after the lossy one");
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+    pair.client_stream(client_ch, si)?.set_reliability_params(true, ReliabilityType::Rexmit, 0)?;
+    pair.server_stream(server_ch, si)?.set_reliability_params(true, ReliabilityType::Rexmit, 0)?;
+
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?
+        .write_sctp(now, &big, PayloadProtocolIdentifier::Binary)?;
+    pair.drive_client();
+    assert!(pair.server.inbound.len() >= 3, "the message must span several packets");
+    pair.server.inbound.remove(1); // lose one middle fragment
+
+    for _ in 0..5 {
+        pair.drive_server();
+        pair.drive_client();
+    }
+    pair.time += Duration::from_millis(1500); // past T3
+    for _ in 0..5 {
+        pair.drive_client();
+        pair.drive_server();
+    }
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?
+        .write_sctp(now, &next, PayloadProtocolIdentifier::Binary)?;
+    for _ in 0..10 {
+        pair.drive_client();
+        pair.drive_server();
+    }
+
+    let mut buf = vec![0u8; 8000];
+    let mut delivered = Vec::new();
+    while let Some(chunks) = pair.server_stream(server_ch, si)?.read_sctp()? {
+        let n = chunks.read(&mut buf)?;
+        delivered.push(buf[..n].to_vec());
+    }
+    assert_eq!(delivered, vec![next.to_vec()], "no partial message, and the stream keeps flowing");
     Ok(())
 }
 

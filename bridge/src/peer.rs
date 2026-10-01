@@ -1,5 +1,6 @@
 //! One browser = one PeerConnection; each data channel it opens is dispatched by its label.
 
+use crate::acl::{AccessControl, AclMessage};
 use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
 use crate::publisher::{self, PubShared};
 use crate::subscription::{self, SubShared, now_unix_ms};
@@ -7,7 +8,7 @@ use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,6 +25,8 @@ use zenoh::qos::{CongestionControl, Priority, Reliability};
 const MAX_MESSAGE_SIZE: u32 = 256 * 1024;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GET_TIMEOUT_MS: u64 = 5000;
+const DEFAULT_LIST_PROBE_MS: u64 = 600;
+const ADMIN_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// A connection that stays `disconnected` this long is treated as gone.
 const DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 
@@ -60,6 +63,9 @@ struct HeartbeatStats {
 struct PeerState {
     peer_id: u64,
     session: zenoh::Session,
+    access_control: Arc<AccessControl>,
+    /// browser requests refused by access_control
+    access_denied: AtomicU64,
     channels: Mutex<HashMap<u64, ChannelEntry>>,
     next_channel: AtomicU64,
     connection_state: Mutex<Option<RTCPeerConnectionState>>,
@@ -73,10 +79,12 @@ struct PeerState {
 }
 
 impl PeerState {
-    fn new(peer_id: u64, session: zenoh::Session) -> Self {
+    fn new(peer_id: u64, session: zenoh::Session, access_control: Arc<AccessControl>) -> Self {
         PeerState {
             peer_id,
             session,
+            access_control,
+            access_denied: AtomicU64::new(0),
             channels: Mutex::new(HashMap::new()),
             next_channel: AtomicU64::new(0),
             connection_state: Mutex::new(None),
@@ -96,6 +104,38 @@ impl PeerState {
         if let Some(rtt) = rtt_ms.filter(|v| v.is_finite()) {
             *self.rtt_ms.lock().unwrap() = Some(rtt);
         }
+    }
+
+    /// Checks access_control; a refusal is counted and returned as the reason.
+    fn check_access(&self, message: AclMessage, key: &str) -> Result<(), String> {
+        let result = self.access_control.check(message, key);
+        if let Err(reason) = &result {
+            self.access_denied.fetch_add(1, Ordering::Relaxed);
+            info!("peer {}: {reason}", self.peer_id);
+        }
+        result
+    }
+
+    /// Sends `{event, ...}` on the control channel, waiting briefly if it is still opening
+    /// (a page creates its channels together with `control`).
+    async fn send_event(&self, event: Value) {
+        for _ in 0..200 {
+            let control = self.control.lock().unwrap().clone();
+            if let Some(control) = control {
+                let _ = control.send_text(&event.to_string()).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        warn!("peer {}: control channel never opened, dropped {event}", self.peer_id);
+    }
+
+    async fn send_rejection(&self, id: Option<u64>, reason: &str) {
+        self.send_event(json!({"event": "rejected", "id": id, "reason": reason})).await;
+    }
+
+    async fn send_accepted(&self, id: Option<u64>) {
+        self.send_event(json!({"event": "accepted", "id": id})).await;
     }
 
     fn find_publisher(&self, pub_id: u64) -> Option<(String, Arc<PubShared>)> {
@@ -141,20 +181,26 @@ struct PeerEntry {
 
 pub struct Bridge {
     pub session: zenoh::Session,
+    access_control: Arc<AccessControl>,
     peers: Mutex<HashMap<u64, PeerEntry>>,
     next_peer: AtomicU64,
 }
 
 impl Bridge {
-    pub fn new(session: zenoh::Session) -> Arc<Self> {
-        Arc::new(Bridge { session, peers: Mutex::new(HashMap::new()), next_peer: AtomicU64::new(1) })
+    pub fn new(session: zenoh::Session, access_control: AccessControl) -> Arc<Self> {
+        Arc::new(Bridge {
+            session,
+            access_control: Arc::new(access_control),
+            peers: Mutex::new(HashMap::new()),
+            next_peer: AtomicU64::new(1),
+        })
     }
 
     /// Non-trickle signaling: take an offer, return an answer with all our candidates in it.
     pub async fn answer(self: &Arc<Self>, offer: RTCSessionDescription) -> anyhow::Result<RTCSessionDescription> {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
-        let state = Arc::new(PeerState::new(peer_id, self.session.clone()));
+        let state = Arc::new(PeerState::new(peer_id, self.session.clone(), self.access_control.clone()));
         let handler = Arc::new(Handler { bridge: Arc::downgrade(self), peer_id, gathered_tx, state: state.clone() });
         let setting_engine = SettingEngineBuilder::new()
             .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
@@ -276,11 +322,22 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     let register = |opts: Value, stats: ChannelStats| {
         state.channels.lock().unwrap().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
+    let access = match label.kind.as_str() {
+        "sub" => state.check_access(AclMessage::DeclareSubscriber, &label.key),
+        "pub" => state.check_access(AclMessage::Put, &label.key),
+        _ => Ok(()),
+    };
+    if let Err(reason) = access {
+        state.send_rejection(label.id, &reason).await;
+        let _ = dc.close().await;
+        return;
+    }
     let rejected = match label.kind.as_str() {
         "sub" => match SubOpts::parse(&label.opts) {
             Ok(opts) => {
                 let shared = Arc::new(SubShared::new(&opts));
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
+                state.send_accepted(label.id).await;
                 subscription::run(dc.clone(), label.clone(), session, shared).await;
                 None
             }
@@ -290,6 +347,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
             Ok(opts) => {
                 let shared = Arc::new(PubShared::default());
                 register(json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit}), ChannelStats::Pub(shared.clone()));
+                state.send_accepted(label.id).await;
                 publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone()).await;
                 None
             }
@@ -306,6 +364,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     };
     if let Some(error) = rejected {
         warn!("peer {peer_id}: rejected channel {raw_label}: {error}");
+        state.send_rejection(label.id, &error).await;
         let _ = dc.close().await;
     }
     state.channels.lock().unwrap().remove(&entry_id);
@@ -392,6 +451,8 @@ struct ControlRequest {
     #[serde(default)]
     pub_id: Option<u64>,
     #[serde(default)]
+    probe_ms: Option<u64>,
+    #[serde(default)]
     bytes: Option<String>,
 }
 
@@ -428,10 +489,28 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
         let response = match request.op.as_str() {
             // a get can take seconds; don't hold up stats and pings behind it
             "get" => {
+                if let Err(reason) = state.check_access(AclMessage::Query, &request.key) {
+                    let _ = dc.send_text(&fail(&request.id, reason).to_string()).await;
+                    continue;
+                }
                 let dc = dc.clone();
                 let session = state.session.clone();
                 tokio::spawn(async move {
                     let response = handle_get(&session, &request).await;
+                    let _ = dc.send_text(&response.to_string()).await;
+                });
+                continue;
+            }
+            "listTopics" => {
+                let dc = dc.clone();
+                let session = state.session.clone();
+                tokio::spawn(async move {
+                    let filter = if request.key.is_empty() { "**".to_owned() } else { request.key.clone() };
+                    let probe = Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS));
+                    let response = match list_topics(&session, &filter, probe).await {
+                        Ok(topics) => ok(&request.id, json!({"topics": topics})),
+                        Err(error) => fail(&request.id, error),
+                    };
                     let _ = dc.send_text(&response.to_string()).await;
                 });
                 continue;
@@ -443,7 +522,8 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             "stats" => {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock().unwrap(), "rttMs": *state.rtt_ms.lock().unwrap()});
                 let heartbeat = serde_json::to_value(state.heartbeat.lock().unwrap().clone()).unwrap_or_default();
-                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat}))
+                let access = json!({"enabled": state.access_control.enabled(), "denied": state.access_denied.load(Ordering::Relaxed)});
+                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "access": access}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
             "clearDeadman" => {
@@ -484,6 +564,55 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
     shared.stats.lock().unwrap().deadman_armed = true;
     state.deadmen.lock().unwrap().insert(pub_id, Deadman { key, bytes, shared });
     ok(&request.id, json!({}))
+}
+
+/// Every key the bridge can find live under `filter`, with where it was seen:
+/// - `subscriber` / `queryable` / `token`: declarations in this bridge's routing tables (admin space)
+/// - `advancedPublisher`: liveliness tokens of zenoh-ext AdvancedPublishers with publisher_detection
+/// - `token`: any liveliness token
+/// - `sample`: data seen on a `filter` subscription during `probe` (catches undeclared publishers)
+/// Plain publishers that are declared but silent are invisible: zenoh peers only propagate
+/// publisher declarations to nodes that declared interest, which the public API can't do.
+async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) -> anyhow::Result<Vec<Value>> {
+    let found: Arc<Mutex<BTreeMap<String, BTreeSet<&'static str>>>> = Arc::default();
+    let note = |found: &Mutex<BTreeMap<String, BTreeSet<&'static str>>>, key: &str, source: &'static str| {
+        found.lock().unwrap().entry(key.to_owned()).or_default().insert(source);
+    };
+    let sink = found.clone();
+    let probe_subscriber = session
+        .declare_subscriber(filter)
+        .callback(move |sample| note(&sink, sample.key_expr().as_str(), "sample"))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    for (segment, source) in [("subscriber", "subscriber"), ("queryable", "queryable"), ("token", "token")] {
+        let selector = format!("@/*/*/{segment}/{filter}");
+        let Ok(replies) = session.get(selector.as_str()).timeout(ADMIN_QUERY_TIMEOUT).await else { continue };
+        while let Ok(reply) = replies.recv_async().await {
+            if let Ok(sample) = reply.result() {
+                // @/<zid>/<whatami>/<segment>/<key...>
+                let admin_key = sample.key_expr().as_str();
+                if let Some(key) = admin_key.splitn(5, '/').nth(4) {
+                    note(&found, key, source);
+                }
+            }
+        }
+    }
+    for selector in [filter.to_owned(), format!("{filter}/@adv/pub/**")] {
+        let Ok(replies) = session.liveliness().get(selector.as_str()).timeout(ADMIN_QUERY_TIMEOUT).await else { continue };
+        while let Ok(reply) = replies.recv_async().await {
+            if let Ok(sample) = reply.result() {
+                let token = sample.key_expr().as_str();
+                match token.split_once("/@adv/pub/") {
+                    Some((key, _)) => note(&found, key, "advancedPublisher"),
+                    None => note(&found, token, "token"),
+                }
+            }
+        }
+    }
+    tokio::time::sleep(probe).await;
+    drop(probe_subscriber);
+    let found = found.lock().unwrap();
+    Ok(found.iter().map(|(key, sources)| json!({"key": key, "sources": sources})).collect())
 }
 
 async fn handle_get(session: &zenoh::Session, request: &ControlRequest) -> Value {

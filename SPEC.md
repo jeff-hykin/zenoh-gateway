@@ -18,7 +18,7 @@ except for the hardcoded transcoders (point clouds, video) described in phase 2.
 ## JS API
 
 ```js
-import { connect, Priority } from "./zenoh_web.js"
+import { connect, Priority } from "./zenoh_web.ts"   // via esm.sh, or bundled: see "Client"
 
 const z = await connect("http://robot.local:7448", {
     heartbeatHz: 5,         // 0 (default) = no heartbeat; needed for deadmen
@@ -53,6 +53,10 @@ cmd.onTripped((reason) => {})     // "heartbeat" | "disconnected" | "shutdown"
 cmd.close()
 
 const replies = await z.get("some/key/**")   // zenoh query, returns [{ key, bytes }]
+const topics = await z.listTopics("robot/**")  // [{ key, sources }], see "Topic enumeration"
+
+await sub.ready()      // resolves when the bridge accepted the channel, rejects with its reason
+sub.state              // "connecting" | "open" | "rejected" | "closed" (publishers add "tripped")
 
 z.stats          // per-key: received, dropped, backlogBytes, rttMs, bridge (incl. normalized options)
 z.clockOffsetMs  // bridge clock - browser clock
@@ -86,6 +90,51 @@ so a slow phone sees fewer frames instead of stale ones.
 Browser → zenoh puts: priority from the publisher options, congestion control Block for `"reliable"`,
 Drop otherwise, express for priority ≤ INTERACTIVE_HIGH.
 
+## Client
+
+`client/zenoh_web.ts` (strict TypeScript, no dependencies). Browsers load it either from esm.sh, which
+transpiles it (`https://esm.sh/gh/<owner>/zenoh-web@<tag>/client/zenoh_web.ts`), or bundled locally:
+`deno task build` runs `deno bundle` (the same esbuild transform) into `build/client/zenoh_web.js` next
+to copies of `examples/` and `test/`, so `zenoh-web --serve build` works offline. The e2e test does the same.
+
+## Large messages
+
+Any size: the bridge splits a message into 64 KiB chunks (one frame each, sharing the message's `seq`)
+and the client reassembles. The page acks frames, not messages, so a big message never deadlocks the
+consumption window. On `latest`, a message that can't arrive whole is dropped whole, never delivered
+partially: the bridge finishes a chunked message it started (so big messages make progress even when
+newer ones keep arriving) unless it outlives `maxAge` (`abandonedPartial`); SCTP drops lost chunks
+(`maxRetransmits: 0` / `maxPacketLifeTime`); and the client discards incomplete messages once a newer
+one completes or more than 8 are pending (`partialDropped`).
+
+## Topic enumeration
+
+`z.listTopics(filter = "**", { probeMs = 600 })` merges what the bridge can see, each key tagged with its sources:
+
+| source | what it sees |
+|---|---|
+| `subscriber`, `queryable` | declarations in the bridge's zenoh routing tables (read through its own admin space) |
+| `token` | liveliness tokens (`liveliness().get`) |
+| `advancedPublisher` | zenoh-ext AdvancedPublishers with publisher_detection (their `@adv/pub` token) |
+| `sample` | keys that published during a `probeMs` subscription on `filter`, declared or not |
+
+It can't see a plain publisher that is declared but silent during the probe: zenoh peers only forward
+publisher declarations to nodes that declared interest in them, which zenoh's public API doesn't expose.
+rmw_zenoh liveliness tokens (`@ros2_lv/...`) only appear when the filter names them; they're returned raw.
+The bridge enables its own admin space read-only for this.
+
+## Access control
+
+The bridge reads `access_control` from its zenoh config (`--zenoh-config`). zenoh enforces it on the
+bridge's own session too (verified: an egress `put` deny stops the bridge's puts), but silently. So the
+bridge also applies it before a browser's `put` (publisher channel), `declare_subscriber` (subscription)
+and `query` (`get`), with zenoh's decision logic (a matching deny rule wins; otherwise
+`default_permission`, or an allow rule whose key expression includes the key; only rules referenced by a
+policy and covering the `egress` flow count). Browsers have no zenoh subject, so rules apply whatever
+their subjects. A refused channel gets a `rejected` event with the reason (the publisher/subscription
+goes to state `"rejected"`, `ready()` rejects, `put` throws), a refused `get` rejects, and
+`stats.access.denied` counts refusals.
+
 ## Clock sync
 
 Per connection, NTP-style: the browser sends `t0` (its clock), the bridge answers with `t1`/`t2` (its
@@ -116,8 +165,11 @@ resolving so the bridge has an offset before the first put.
 - The bridge can also serve a static directory (`--serve <dir>`) so the UI is live-editable on disk.
 - Each subscribe/publisher is its own data channel. Its label is JSON: `{"type":"sub"|"pub", "key":..., "id":n, "opts":{...}}`.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.
-- One extra channel labeled `control` carries JSON request/response (`get`, `stats`, `ping`, `setDeadman`, `clearDeadman`) and `tripped` events.
-- Bridge → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | payload`, little endian.
+- One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`, `setDeadman`, `clearDeadman`)
+  and events: `accepted` / `rejected` (per sub/pub channel, by label id) and `tripped`.
+- Bridge → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | chunk`,
+  little endian. `seq` numbers messages per channel, `frameId` numbers frames; the page acks the highest
+  `frameId` it has processed with a 4-byte `u32` message on the same channel.
 - Browser → bridge put: `f64 sentAtMs (browser clock) | payload`, little endian.
 - Heartbeat: browser sends `{"t0", "offsetMs", "rttMs"}` (JSON), bridge answers `{"t0", "t1", "t2"}`.
 

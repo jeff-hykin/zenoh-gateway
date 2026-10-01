@@ -1,0 +1,7 @@
+{
+    "tasks": {
+        "build": "deno run --allow-all tools/build_web.js build",
+        "check": "deno check client/zenoh_web.ts",
+        "e2e": "deno run --allow-all test/e2e.js"
+    }
+}

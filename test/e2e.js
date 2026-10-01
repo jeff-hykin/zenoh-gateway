@@ -4,6 +4,7 @@
 
 import { $ } from "https://esm.sh/dax-sh@0.42.0"
 import { launch } from "jsr:@astral/astral@0.5.6"
+import { buildWeb } from "../tools/build_web.js"
 
 const repoRoot = $.path(import.meta.url).parentOrThrow().parentOrThrow()
 const bridgeDir = repoRoot.join("bridge")
@@ -83,6 +84,8 @@ function lineCollector(stream, name) {
     }
 }
 
+const machineLoad = async () => (await $`uptime`.text()).replace(/.*load averages?: /, "")
+console.log(`machine load at start: ${await machineLoad()}`)
 $.logStep("building bridge + test peer (release)")
 await $`cargo build --release --bin zenoh-web --example test_peer`.cwd(bridgeDir)
 
@@ -92,7 +95,23 @@ const bridgeUrl = `http://127.0.0.1:${httpPort}`
 
 // Isolated zenoh: no multicast scouting, so the test never touches other zenoh systems on the LAN.
 const zenohConfigPath = scratch.join("bridge_zenoh.json5")
-zenohConfigPath.writeTextSync(JSON.stringify({ mode: "peer", scouting: { multicast: { enabled: false } }, listen: { endpoints: [] } }))
+const aclRules = [
+    { id: "no-denied-put", messages: ["put"], flows: ["egress", "ingress"], permission: "deny", key_exprs: ["test/frombrowser/denied"] },
+    { id: "no-secret-subscribe", messages: ["declare_subscriber"], flows: ["egress"], permission: "deny", key_exprs: ["test/secret/**"] },
+    { id: "no-forbidden-query", messages: ["query"], flows: ["egress"], permission: "deny", key_exprs: ["test/forbidden/**"] },
+]
+zenohConfigPath.writeTextSync(JSON.stringify({
+    mode: "peer",
+    scouting: { multicast: { enabled: false } },
+    listen: { endpoints: [] },
+    access_control: {
+        enabled: true,
+        default_permission: "allow",
+        rules: aclRules,
+        subjects: [{ id: "anyone" }],
+        policies: [{ rules: aclRules.map((rule) => rule.id), subjects: ["anyone"] }],
+    },
+}))
 
 /** @type {{ kill: (signal?: Deno.Signal) => void }[]} */
 const children = []
@@ -118,8 +137,11 @@ try {
     const peerOutput = lineCollector(peer.stdout(), "peer")
     await peerOutput.waitFor((line) => line === "READY", 15000)
 
+    $.logStep("building the web root (client/zenoh_web.ts bundled by deno bundle)")
+    const webRoot = await buildWeb(scratch.join("web").toString())
+
     $.logStep(`starting bridge on ${bridgeUrl}`)
-    const bridge = $`${bridgeDir.join("target/release/zenoh-web")} --port ${httpPort} --zenoh-config ${zenohConfigPath} --connect tcp/127.0.0.1:${zenohPort} --serve ${repoRoot}`
+    const bridge = $`${bridgeDir.join("target/release/zenoh-web")} --port ${httpPort} --zenoh-config ${zenohConfigPath} --connect tcp/127.0.0.1:${zenohPort} --serve ${webRoot}`
         .env("RUST_LOG", Deno.env.get("RUST_LOG") ?? "info,zenoh=warn,zenoh_web=info")
         .stdout("inherit").stderr("piped").noThrow().spawn()
     children.push(bridge)
@@ -240,6 +262,7 @@ try {
                 p99: quantile(0.99),
                 medianEarly: window(1000, 3000),
                 medianLate: window(durationMs - 1000, durationMs),
+                max: sorted.length ? sorted[sorted.length - 1] : null,
                 slowest: settled.filter((sample) => sample.latencyMs > 50).slice(0, 10).map((sample) => [Math.round(sample.at - started), Math.round(sample.latencyMs)]),
                 bridge: bridgeStats,
                 gaps,
@@ -333,6 +356,9 @@ try {
     // p90/p99 are reported, not asserted: a stalled headless-Chrome main thread delays every queued message at once
     console.log(`latest: p50=${latest.p50?.toFixed(1)} p90=${latest.p90?.toFixed(1)} p99=${latest.p99?.toFixed(1)} ms, slowest=${JSON.stringify(latest.slowest)}, probes=${latest.bridge?.probes}, streams=${["latest", "maxAge", "hzCapped", "reliable"].map((name) => results[name].channelId).join(",")}`)
     check(latest.p50 !== null && latest.p50 < 50, `latest: median latency stays low (${latest.p50?.toFixed(1)} ms)`)
+    check(latest.p99 !== null && latest.p99 < 50, `latest: p99 latency stays low (${latest.p99?.toFixed(1)} ms)`)
+    check(latest.max !== null && latest.max < 250, `latest: no delivered message waits on a retransmission timeout (worst ${latest.max?.toFixed(1)} ms)`)
+    console.log(`latest: sender waited ${latest.bridge?.blockedOnNetworkMs?.toFixed(0)} ms on the network, ${latest.bridge?.blockedOnPageMs?.toFixed(0)} ms on the page`)
     check(latest.bridge?.maxReceiveLagMs < 100, `latest: upstream zenoh lag into the bridge stays low (${latest.bridge?.maxReceiveLagMs?.toFixed(1)} ms)`)
     check(latest.medianEarly !== null && latest.medianLate !== null && latest.medianLate < latest.medianEarly + 50, `latest: latency does not grow (${latest.medianEarly?.toFixed(1)} -> ${latest.medianLate?.toFixed(1)} ms)`)
     check(latest.bridge?.queued <= 1, `latest: bridge queue stays at <= 1 (${latest.bridge?.queued})`)
@@ -372,6 +398,106 @@ try {
     check(recvCount("cleared", "STOP-cleared") === 0 && results.trip.clearedState === "open", "a cleared deadman does not fire on heartbeat loss")
     check(recvCount("stop", "recreated-works") === 1 && results.recreatedState === "open", "recreated publisher works again")
 
+    $.logStep("topic enumeration, access control, chunking")
+    const extra = await page.evaluate(async (bridgeUrl) => {
+        const { connect } = await import("/client/zenoh_web.js")
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+        const out = {}
+        const client = await connect(bridgeUrl)
+
+        out.topics = await client.listTopics("test/unsubscribed/**", { probeMs: 1500 })
+        out.allTopics = (await client.listTopics()).map((topic) => topic.key)
+
+        const outcome = (promise) => promise.then(() => "accepted", (error) => error.message)
+        const denied = client.publisher("test/frombrowser/denied", { delivery: "reliable" })
+        out.deniedReady = await outcome(denied.ready())
+        out.deniedState = denied.state
+        try {
+            denied.put("must-not-arrive")
+            out.deniedPut = "no error"
+        } catch (error) {
+            out.deniedPut = error.message
+        }
+        const allowed = client.publisher("test/frombrowser/allowed", { delivery: "reliable" })
+        out.allowedReady = await outcome(allowed.ready())
+        allowed.put("allowed-arrives")
+        const secret = client.subscribe("test/secret/plans", { delivery: "reliable" }, () => {})
+        out.secretReady = await outcome(secret.ready())
+        out.secretState = secret.state
+        out.forbiddenGet = await outcome(client.get("test/forbidden/thing"))
+        await sleep(300)
+        await client.pollStats()
+        out.access = client.bridgeStats?.access
+
+        // reliable: a 2.5 MB message arrives whole and byte-exact
+        const checkBig = (bytes) => {
+            if (bytes.length < 8) {
+                return `short (${bytes.length})`
+            }
+            const view = new DataView(bytes.buffer, bytes.byteOffset, 8)
+            const counter = view.getUint32(0, true)
+            const length = view.getUint32(4, true)
+            if (length !== bytes.length) {
+                return `length ${bytes.length} != ${length}`
+            }
+            for (let index = 8; index < bytes.length; index++) {
+                if (bytes[index] !== ((counter * 31 + index * 7) & 0xff)) {
+                    return `byte ${index} wrong`
+                }
+            }
+            return "ok"
+        }
+        const reliableBig = []
+        const bigReliable = client.subscribe("test/big", { delivery: "reliable" }, (message) => {
+            reliableBig.push({ length: message.bytes.length, check: checkBig(message.bytes) })
+        })
+        await bigReliable.ready()
+        for (let waited = 0; waited < 15000 && reliableBig.length < 3; waited += 100) {
+            await sleep(100)
+        }
+        bigReliable.close()
+        out.reliableBig = reliableBig.slice(0, 3)
+
+        // latest + maxAge with a page that stalls after each message: the message in flight during
+        // the stall outlives maxAge and is dropped whole; the next one completes
+        const latestBig = []
+        const bigLatest = client.subscribe("test/big", { delivery: "latest", maxAge: 300 }, (message) => {
+            latestBig.push(checkBig(message.bytes))
+            const busyUntil = performance.now() + 400
+            while (performance.now() < busyUntil) {
+                // stand-in for a page busy decoding: lets newer samples overtake chunked ones
+            }
+        })
+        await bigLatest.ready()
+        await sleep(6000)
+        await client.pollStats()
+        out.latestBig = { delivered: latestBig.length, bad: latestBig.filter((check) => check !== "ok"), partialDropped: bigLatest.partialDropped, abandoned: bigLatest.bridgeStats?.stats?.abandonedPartial }
+        bigLatest.close()
+        client.close()
+        return out
+    }, { args: [bridgeUrl] })
+    console.log(JSON.stringify(extra, null, 2))
+
+    const topicKeys = extra.topics.map((topic) => topic.key)
+    const sourcesOf = (key) => extra.topics.find((topic) => topic.key === key)?.sources ?? []
+    check(sourcesOf("test/unsubscribed/declared").includes("sample") && sourcesOf("test/unsubscribed/undeclared").includes("sample"), `listTopics finds keys the page never subscribed to (${topicKeys.join(", ")})`)
+    check(sourcesOf("test/unsubscribed/token").includes("token"), "listTopics finds liveliness tokens")
+    check(!topicKeys.includes("test/unsubscribed/silent"), "listTopics can't see a declared publisher that never puts (documented)")
+    check(extra.allTopics.includes("test/cached") && extra.allTopics.includes("test/queryable") && extra.allTopics.includes("test/frombrowser/**"), "listTopics(**) sees the AdvancedPublisher, the queryable and the remote subscriber")
+
+    check(extra.deniedReady.includes("no-denied-put") && extra.deniedState === "rejected", `denied publisher is rejected with the rule as reason (${extra.deniedReady})`)
+    check(extra.deniedPut.includes("rejected"), "put on a rejected publisher throws")
+    await $.sleep(500)
+    check(recvCount("denied", "must-not-arrive") === 0 && !peerOutput.lines.some((line) => line.startsWith("RECV test/frombrowser/denied")), "a denied put never reaches the zenoh subscriber")
+    check(extra.allowedReady === "accepted" && recvCount("allowed", "allowed-arrives") === 1, "an allowed key still works under access_control")
+    check(extra.secretReady.includes("no-secret-subscribe") && extra.secretState === "rejected", `denied subscribe is refused (${extra.secretReady})`)
+    check(extra.forbiddenGet.includes("no-forbidden-query"), `denied get is refused (${extra.forbiddenGet})`)
+    check(extra.access?.enabled === true && extra.access?.denied === 3, `access-control stat counts refusals (${JSON.stringify(extra.access)})`)
+
+    check(extra.reliableBig.length === 3 && extra.reliableBig.every((message) => message.length === 2_500_000 && message.check === "ok"), `reliable: 2.5 MB messages arrive chunked and byte-exact (${JSON.stringify(extra.reliableBig)})`)
+    check(extra.latestBig.delivered > 0 && extra.latestBig.bad.length === 0, `latest: every delivered big message is whole (${extra.latestBig.delivered} delivered, ${extra.latestBig.bad.length} bad)`)
+    check(extra.latestBig.partialDropped + (extra.latestBig.abandoned ?? 0) > 0, `latest: incomplete big messages were dropped whole (client partialDropped=${extra.latestBig.partialDropped}, bridge abandonedPartial=${extra.latestBig.abandoned})`)
+
     $.logStep("closing the page with an armed deadman")
     await page.close()
     const closeLine = await peerOutput.waitFor((line) => line === "RECV test/frombrowser/stop STOP-close", 20000).catch(() => null)
@@ -397,6 +523,7 @@ try {
     await cleanup()
 }
 
+console.log(`machine load at end: ${await machineLoad()}`)
 console.log(`\n${failures.length === 0 ? "ALL PASSED" : `${failures.length} FAILED:\n  ${failures.join("\n  ")}`}`)
 console.log(`artifacts: ${scratch}`)
 Deno.exit(failures.length === 0 ? 0 : 1)

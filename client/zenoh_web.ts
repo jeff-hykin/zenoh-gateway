@@ -1,3 +1,7 @@
+/// <reference no-default-lib="true" />
+/// <reference lib="dom" />
+/// <reference lib="dom.iterable" />
+/// <reference lib="esnext" />
 // zenoh-web browser client: one WebRTC data channel per subscription/publisher, see SPEC.md
 
 /** zenoh priorities (lower = more important). */
@@ -9,36 +13,114 @@ export const Priority = Object.freeze({
     DATA: 5,
     DATA_LOW: 6,
     BACKGROUND: 7,
-})
+} as const)
 
-/**
- * @typedef {"latest" | "reliable"} Delivery
- * @typedef {"connecting" | "connected" | "degraded" | "lost"} ConnectionState
- * @typedef {"connecting" | "open" | "tripped" | "closed"} PublisherState
- * @typedef {{ key: string, bytes: Uint8Array, timestamp: number, seq: number }} Message
- * @typedef {{
- *     delivery?: Delivery,
- *     priority?: number,
- *     bandwidthPriority?: number,
- *     queueSize?: number,
- *     maxAge?: number,
- *     maxHz?: number,
- *     dangerousMinHz?: number,
- *     minQuality?: number,
- *     maxQuality?: number,
- *     qualityToHzTradeoff?: number,
- * }} SubscribeOptions
- * @typedef {{ delivery?: Delivery, priority?: number, repeatMs?: number, latencyLimit?: number }} PublisherOptions
- * @typedef {{ received: number, dropped: number, backlogBytes: number, rttMs: number | null, bridge: object | null }} KeyStats
- * @typedef {{
- *     iceServers?: RTCIceServer[],
- *     reconnect?: boolean,
- *     statsIntervalMs?: number,
- *     heartbeatHz?: number,
- *     heartbeatMisses?: number,
- *     clock?: () => number,
- * }} ConnectOptions
- */
+export type Delivery = "latest" | "reliable"
+export type ConnectionState = "connecting" | "connected" | "degraded" | "lost"
+export type PublisherState = "connecting" | "open" | "tripped" | "rejected" | "closed"
+export type SubscriptionState = "connecting" | "open" | "rejected" | "closed"
+
+export interface Message {
+    key: string
+    bytes: Uint8Array
+    timestamp: number
+    seq: number
+}
+
+export interface SubscribeOptions {
+    delivery?: Delivery
+    priority?: number
+    bandwidthPriority?: number
+    queueSize?: number
+    maxAge?: number
+    maxHz?: number
+    dangerousMinHz?: number
+    minQuality?: number
+    maxQuality?: number
+    qualityToHzTradeoff?: number
+}
+
+export interface PublisherOptions {
+    delivery?: Delivery
+    priority?: number
+    repeatMs?: number
+    latencyLimit?: number
+}
+
+export interface ConnectOptions {
+    iceServers?: RTCIceServer[]
+    reconnect?: boolean
+    statsIntervalMs?: number
+    heartbeatHz?: number
+    heartbeatMisses?: number
+    clock?: () => number
+}
+
+export interface KeyStats {
+    received: number
+    dropped: number
+    backlogBytes: number
+    rttMs: number | null
+    bridge: BridgeChannelStats | null
+}
+
+/** One channel as the bridge reports it in `stats`. */
+export interface BridgeChannelStats {
+    id: number | null
+    type: string
+    key: string
+    opts: Record<string, unknown>
+    stats: Record<string, number | boolean | null>
+}
+
+export interface BridgeStats {
+    clock: { offsetMs: number | null, rttMs: number | null }
+    heartbeat: Record<string, unknown>
+    access: { enabled: boolean, denied: number }
+}
+
+export interface GetReply {
+    key: string | null
+    bytes: Uint8Array
+    error?: boolean
+}
+
+export type TopicSource = "subscriber" | "queryable" | "token" | "advancedPublisher" | "sample"
+
+export interface Topic {
+    key: string
+    sources: TopicSource[]
+}
+
+type Bytesish = Uint8Array | ArrayBuffer | ArrayBufferView | string
+
+interface ControlResponse {
+    id?: number
+    ok?: boolean
+    error?: string
+    event?: "tripped" | "rejected" | "accepted"
+    reason?: string
+    [field: string]: unknown
+}
+
+interface PendingRequest {
+    resolve: (response: ControlResponse) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+}
+
+interface ClockSample {
+    offsetMs: number
+    rttMs: number
+}
+
+interface PartialMessage {
+    key: string
+    timestamp: number
+    chunks: (Uint8Array | undefined)[]
+    receivedChunks: number
+    receivedBytes: number
+}
 
 const backedUpBytes = 64 * 1024
 const resumeBytes = 16 * 1024
@@ -53,17 +135,13 @@ const ackDelayMs = 5
 const clockWindow = 16
 const initialClockPings = 5
 const putHeaderBytes = 8
+// incomplete chunked messages kept per subscription before the oldest is dropped
+const maxPartialMessages = 8
 
 const subscribeOptionNames = new Set(["delivery", "priority", "bandwidthPriority", "queueSize", "maxAge", "maxHz", "dangerousMinHz", "minQuality", "maxQuality", "qualityToHzTradeoff"])
 const publisherOptionNames = new Set(["delivery", "priority", "repeatMs", "latencyLimit"])
 
-/**
- * @param {string} name
- * @param {unknown} value
- * @param {(value: number) => boolean} isValid
- * @param {string} expected
- */
-function checkNumber(name, value, isValid, expected) {
+function checkNumber(name: string, value: unknown, isValid: (value: number) => boolean, expected: string): void {
     if (value === undefined) {
         return
     }
@@ -72,27 +150,22 @@ function checkNumber(name, value, isValid, expected) {
     }
 }
 
-/**
- * @param {Record<string, unknown>} options
- * @param {Set<string>} allowed
- * @param {string} where
- */
-function checkCommon(options, allowed, where) {
+function checkCommon(options: object, allowed: Set<string>, where: string): void {
     for (const name of Object.keys(options)) {
         if (!allowed.has(name)) {
             throw new TypeError(`zenoh-web: unknown ${where} option "${name}" (allowed: ${[...allowed].join(", ")})`)
         }
     }
-    if (options.delivery !== undefined && options.delivery !== "latest" && options.delivery !== "reliable") {
-        throw new TypeError(`zenoh-web: delivery must be "latest" or "reliable", got ${String(options.delivery)}`)
+    const { delivery, priority } = options as { delivery?: unknown, priority?: unknown }
+    if (delivery !== undefined && delivery !== "latest" && delivery !== "reliable") {
+        throw new TypeError(`zenoh-web: delivery must be "latest" or "reliable", got ${String(delivery)}`)
     }
-    checkNumber("priority", options.priority, (v) => Number.isInteger(v) && v >= 1 && v <= 7, "an integer 1..7 (see Priority)")
+    checkNumber("priority", priority, (v) => Number.isInteger(v) && v >= 1 && v <= 7, "an integer 1..7 (see Priority)")
 }
 
-/** @param {SubscribeOptions} options */
-export function validateSubscribeOptions(options) {
+export function validateSubscribeOptions(options: SubscribeOptions): void {
     checkCommon(options, subscribeOptionNames, "subscribe")
-    const isUnit = (/** @type {number} */ v) => v >= 0 && v <= 1
+    const isUnit = (v: number) => v >= 0 && v <= 1
     checkNumber("bandwidthPriority", options.bandwidthPriority, (v) => Number.isFinite(v) && v >= 0, ">= 0")
     checkNumber("queueSize", options.queueSize, (v) => v === Infinity || (Number.isInteger(v) && v >= 1), "an integer >= 1 or Infinity")
     checkNumber("maxAge", options.maxAge, (v) => Number.isFinite(v) && v > 0, "> 0 (ms)")
@@ -106,20 +179,14 @@ export function validateSubscribeOptions(options) {
     }
 }
 
-/** @param {PublisherOptions} options */
-export function validatePublisherOptions(options) {
+export function validatePublisherOptions(options: PublisherOptions): void {
     checkCommon(options, publisherOptionNames, "publisher")
     checkNumber("repeatMs", options.repeatMs, (v) => Number.isFinite(v) && v > 0, "> 0 (ms)")
     checkNumber("latencyLimit", options.latencyLimit, (v) => Number.isFinite(v) && v > 0, "> 0 (ms)")
 }
 
-/**
- * Delivery -> data channel reliability (SPEC "Delivery -> transport mapping").
- * @param {Delivery | undefined} delivery
- * @param {number | undefined} maxAge
- * @returns {RTCDataChannelInit}
- */
-function channelInit(delivery, maxAge) {
+/** Delivery -> data channel reliability (SPEC "Delivery -> transport mapping"). */
+function channelInit(delivery: Delivery | undefined, maxAge: number | undefined): RTCDataChannelInit {
     if (delivery === "reliable") {
         return { ordered: true }
     }
@@ -129,11 +196,7 @@ function channelInit(delivery, maxAge) {
     return { ordered: false, maxRetransmits: 0 }
 }
 
-/**
- * @param {Uint8Array | ArrayBuffer | ArrayBufferView | string} value
- * @returns {Uint8Array}
- */
-function toBytes(value) {
+function toBytes(value: Bytesish): Uint8Array {
     if (typeof value === "string") {
         return new TextEncoder().encode(value)
     }
@@ -146,8 +209,7 @@ function toBytes(value) {
     return new Uint8Array(value)
 }
 
-/** @param {string} text */
-function fromBase64(text) {
+function fromBase64(text: string): Uint8Array {
     const binary = atob(text)
     const bytes = new Uint8Array(binary.length)
     for (let index = 0; index < binary.length; index++) {
@@ -156,8 +218,7 @@ function fromBase64(text) {
     return bytes
 }
 
-/** @param {Uint8Array} bytes */
-function toBase64(bytes) {
+function toBase64(bytes: Uint8Array): string {
     let binary = ""
     for (let index = 0; index < bytes.length; index++) {
         binary += String.fromCharCode(bytes[index])
@@ -167,40 +228,47 @@ function toBase64(bytes) {
 
 const keyDecoder = new TextDecoder()
 
-/**
- * Bridge frame: u16 keyLen | key | f64 timestampMs | u32 seq | payload (little endian).
- * @param {ArrayBuffer} buffer
- * @returns {Message}
- */
-export function decodeFrame(buffer) {
-    const view = new DataView(buffer)
-    const keyLength = view.getUint16(0, true)
-    const key = keyDecoder.decode(new Uint8Array(buffer, 2, keyLength))
-    const timestamp = view.getFloat64(2 + keyLength, true)
-    const seq = view.getUint32(10 + keyLength, true)
-    return { key, bytes: new Uint8Array(buffer, 14 + keyLength), timestamp, seq }
+export interface Frame {
+    key: string
+    timestamp: number
+    seq: number
+    frameId: number
+    chunkIndex: number
+    chunkCount: number
+    chunk: Uint8Array
 }
 
 /**
- * Browser -> bridge put: f64 sentAtMs (browser clock) | payload (little endian).
- * @param {Uint8Array} payload
- * @param {number} sentAtMs
+ * Bridge frame (little endian):
+ * u16 keyLen | key | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | chunk
  */
-export function encodePut(payload, sentAtMs) {
+export function decodeFrame(buffer: ArrayBuffer): Frame {
+    const view = new DataView(buffer)
+    const keyLength = view.getUint16(0, true)
+    const key = keyDecoder.decode(new Uint8Array(buffer, 2, keyLength))
+    const offset = 2 + keyLength
+    return {
+        key,
+        timestamp: view.getFloat64(offset, true),
+        seq: view.getUint32(offset + 8, true),
+        frameId: view.getUint32(offset + 12, true),
+        chunkIndex: view.getUint32(offset + 16, true),
+        chunkCount: view.getUint32(offset + 20, true),
+        chunk: new Uint8Array(buffer, offset + 24),
+    }
+}
+
+/** Browser -> bridge put: f64 sentAtMs (browser clock) | payload (little endian). */
+export function encodePut(payload: Uint8Array, sentAtMs: number): Uint8Array<ArrayBuffer> {
     const frame = new Uint8Array(putHeaderBytes + payload.length)
     new DataView(frame.buffer).setFloat64(0, sentAtMs, true)
     frame.set(payload, putHeaderBytes)
     return frame
 }
 
-/** @param {number} ms */
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
-/**
- * @param {RTCDataChannel} channel
- * @param {number} timeoutMs
- */
-function waitOpen(channel, timeoutMs) {
+function waitOpen(channel: RTCDataChannel, timeoutMs: number): Promise<void> {
     if (channel.readyState === "open") {
         return Promise.resolve()
     }
@@ -208,7 +276,7 @@ function waitOpen(channel, timeoutMs) {
         const timer = setTimeout(() => reject(new Error("data channel open timed out")), timeoutMs)
         channel.addEventListener("open", () => {
             clearTimeout(timer)
-            resolve(undefined)
+            resolve()
         }, { once: true })
         channel.addEventListener("close", () => {
             clearTimeout(timer)
@@ -217,8 +285,7 @@ function waitOpen(channel, timeoutMs) {
     })
 }
 
-/** @param {RTCPeerConnection} peer */
-function waitIceGathering(peer) {
+function waitIceGathering(peer: RTCPeerConnection): Promise<void> {
     if (peer.iceGatheringState === "complete") {
         return Promise.resolve()
     }
@@ -226,7 +293,7 @@ function waitIceGathering(peer) {
         const finish = () => {
             clearTimeout(timer)
             peer.removeEventListener("icegatheringstatechange", onChange)
-            resolve(undefined)
+            resolve()
         }
         const onChange = () => {
             if (peer.iceGatheringState === "complete") {
@@ -238,97 +305,205 @@ function waitIceGathering(peer) {
     })
 }
 
-export class Subscription {
-    /** @type {RTCDataChannel | null} */
-    channel = null
+/** Settles when the bridge accepts or rejects a channel (or it fails to open). */
+class Acceptance {
+    promise: Promise<void>
+    settled = false
+    #resolve: () => void = () => {}
+    #reject: (error: Error) => void = () => {}
+
+    constructor() {
+        this.promise = new Promise<void>((resolve, reject) => {
+            this.#resolve = resolve
+            this.#reject = reject
+        })
+        this.promise.catch(() => {})
+    }
+
+    accept(): void {
+        if (!this.settled) {
+            this.settled = true
+            this.#resolve()
+        }
+    }
+
+    reject(error: Error): void {
+        if (!this.settled) {
+            this.settled = true
+            this.#reject(error)
+        }
+    }
+}
+
+/** Common to subscriptions and publishers: a channel the bridge accepts or rejects. */
+abstract class Endpoint {
+    channel: RTCDataChannel | null = null
+    closed = false
+    rejectionReason: string | null = null
+    bridgeStats: BridgeChannelStats | null = null
+    protected acceptance = new Acceptance()
+
+    constructor(readonly owner: ZenohWeb, readonly id: number, readonly key: string) {}
+
+    abstract attach(peer: RTCPeerConnection): void
+
+    /** Resolves once the bridge accepted this channel; rejects with the bridge's reason otherwise. */
+    ready(): Promise<void> {
+        return this.acceptance.promise
+    }
+
+    protected watchChannel(channel: RTCDataChannel): void {
+        this.acceptance = new Acceptance()
+        const acceptance = this.acceptance
+        waitOpen(channel, openTimeoutMs).catch((error: Error) => acceptance.reject(error))
+    }
+
+    _accepted(): void {
+        this.acceptance.accept()
+    }
+
+    _rejected(reason: string): void {
+        this.rejectionReason = reason
+        this.acceptance.reject(new Error(`zenoh-web: bridge rejected ${this.key}: ${reason}`))
+        this.owner._forget(this)
+    }
+
+    close(): void {
+        if (this.closed) {
+            return
+        }
+        this.closed = true
+        this.channel?.close()
+        this.owner._forget(this)
+    }
+}
+
+export class Subscription extends Endpoint {
     received = 0
+    /** chunked messages dropped incomplete (lost chunk or abandoned for a newer message) */
+    partialDropped = 0
     /** drops before the current channel (each new channel restarts seq at 0) */
     #droppedBefore = 0
     #firstSeq = -1
     #maxSeq = -1
     #receivedOnChannel = 0
-    closed = false
-    /** @type {object | null} latest bridge-side stats for this channel */
-    bridgeStats = null
-    /** @type {Promise<void>} */
-    #ready = Promise.resolve()
-    #highestConsumedSeq = -1
+    #highestConsumedFrame = -1
     #bytesSinceAck = 0
-    /** @type {ReturnType<typeof setTimeout> | null} */
-    #ackTimer = null
+    #ackTimer: ReturnType<typeof setTimeout> | null = null
+    #partials = new Map<number, PartialMessage>()
 
-    /**
-     * @param {ZenohWeb} owner
-     * @param {number} id
-     * @param {string} key
-     * @param {SubscribeOptions} options
-     * @param {(message: Message) => void} callback
-     */
-    constructor(owner, id, key, options, callback) {
-        this.owner = owner
-        this.id = id
-        this.key = key
-        this.options = options
-        this.callback = callback
+    constructor(owner: ZenohWeb, id: number, key: string, readonly options: SubscribeOptions, readonly callback: (message: Message) => void) {
+        super(owner, id, key)
     }
 
-    /** Resolves once the current data channel is open (rejects if it fails to open). */
-    ready() {
-        return this.#ready
+    get state(): SubscriptionState {
+        if (this.closed) {
+            return "closed"
+        }
+        if (this.rejectionReason !== null) {
+            return "rejected"
+        }
+        return this.acceptance.settled ? "open" : "connecting"
     }
 
-    /** samples the bridge accepted for us but we never got (queue, age, maxHz or network) */
-    get dropped() {
+    /** messages the bridge accepted for us but we never got whole (queue, age, maxHz, network) */
+    get dropped(): number {
         const span = this.#maxSeq < 0 ? 0 : this.#maxSeq - this.#firstSeq + 1
         return this.#droppedBefore + Math.max(0, span - this.#receivedOnChannel)
     }
 
-    /** @param {RTCPeerConnection} peer */
-    attach(peer) {
+    attach(peer: RTCPeerConnection): void {
         this.#droppedBefore = this.dropped
         this.#firstSeq = -1
         this.#maxSeq = -1
         this.#receivedOnChannel = 0
-        this.#highestConsumedSeq = -1
+        this.#highestConsumedFrame = -1
         this.#bytesSinceAck = 0
+        this.#partials.clear()
         // JSON turns queueSize Infinity into null, which the bridge reads as unbounded
         const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts: this.options })
         const channel = peer.createDataChannel(label, channelInit(this.options.delivery, this.options.maxAge))
         channel.binaryType = "arraybuffer"
-        channel.onmessage = (event) => {
-            if (!(event.data instanceof ArrayBuffer)) {
-                return
+        channel.onmessage = (event: MessageEvent) => {
+            if (event.data instanceof ArrayBuffer) {
+                this.#onFrame(channel, decodeFrame(event.data), event.data.byteLength)
             }
-            const message = decodeFrame(event.data)
-            this.received++
-            this.#receivedOnChannel++
-            if (this.#firstSeq < 0 || message.seq < this.#firstSeq) {
-                this.#firstSeq = message.seq
-            }
-            if (message.seq > this.#maxSeq) {
-                this.#maxSeq = message.seq
-            }
-            try {
-                this.callback(message)
-            } catch (error) {
-                console.error(`zenoh-web: subscriber callback for ${this.key} threw`, error)
-            }
-            this.#consumed(channel, message.seq, event.data.byteLength)
         }
         this.channel = channel
-        this.#ready = waitOpen(channel, openTimeoutMs)
-        this.#ready.catch(() => {})
+        this.watchChannel(channel)
     }
 
-    /**
-     * Tells the bridge we processed everything up to seq: 4 bytes, little endian.
-     * @param {RTCDataChannel} channel
-     * @param {number} seq
-     * @param {number} byteLength
-     */
-    #consumed(channel, seq, byteLength) {
-        if (seq > this.#highestConsumedSeq) {
-            this.#highestConsumedSeq = seq
+    #onFrame(channel: RTCDataChannel, frame: Frame, frameBytes: number): void {
+        if (frame.chunkCount <= 1) {
+            this.#deliver({ key: frame.key, bytes: frame.chunk, timestamp: frame.timestamp, seq: frame.seq })
+        } else {
+            this.#addChunk(frame)
+        }
+        this.#consumed(channel, frame.frameId, frameBytes)
+    }
+
+    #addChunk(frame: Frame): void {
+        let partial = this.#partials.get(frame.seq)
+        if (!partial) {
+            partial = { key: frame.key, timestamp: frame.timestamp, chunks: new Array(frame.chunkCount), receivedChunks: 0, receivedBytes: 0 }
+            this.#partials.set(frame.seq, partial)
+            this.#evictPartials(maxPartialMessages)
+        }
+        if (partial.chunks[frame.chunkIndex] === undefined) {
+            // the frame's buffer is reused by nothing else, but copy so a partial never pins big buffers
+            partial.chunks[frame.chunkIndex] = frame.chunk.slice()
+            partial.receivedChunks++
+            partial.receivedBytes += frame.chunk.length
+        }
+        if (partial.receivedChunks < partial.chunks.length) {
+            return
+        }
+        this.#partials.delete(frame.seq)
+        const bytes = new Uint8Array(partial.receivedBytes)
+        let offset = 0
+        for (const chunk of partial.chunks) {
+            const piece = chunk as Uint8Array
+            bytes.set(piece, offset)
+            offset += piece.length
+        }
+        // anything older that is still incomplete can only be stale now
+        for (const seq of [...this.#partials.keys()]) {
+            if (seq < frame.seq) {
+                this.#partials.delete(seq)
+                this.partialDropped++
+            }
+        }
+        this.#deliver({ key: partial.key, bytes, timestamp: partial.timestamp, seq: frame.seq })
+    }
+
+    #evictPartials(limit: number): void {
+        while (this.#partials.size > limit) {
+            const oldest = Math.min(...this.#partials.keys())
+            this.#partials.delete(oldest)
+            this.partialDropped++
+        }
+    }
+
+    #deliver(message: Message): void {
+        this.received++
+        this.#receivedOnChannel++
+        if (this.#firstSeq < 0 || message.seq < this.#firstSeq) {
+            this.#firstSeq = message.seq
+        }
+        if (message.seq > this.#maxSeq) {
+            this.#maxSeq = message.seq
+        }
+        try {
+            this.callback(message)
+        } catch (error) {
+            console.error(`zenoh-web: subscriber callback for ${this.key} threw`, error)
+        }
+    }
+
+    /** Tells the bridge we processed every frame up to frameId: 4 bytes, little endian. */
+    #consumed(channel: RTCDataChannel, frameId: number, byteLength: number): void {
+        if (frameId > this.#highestConsumedFrame) {
+            this.#highestConsumedFrame = frameId
         }
         this.#bytesSinceAck += byteLength
         const sendAck = () => {
@@ -338,7 +513,7 @@ export class Subscription {
             }
             this.#bytesSinceAck = 0
             const ack = new Uint8Array(4)
-            new DataView(ack.buffer).setUint32(0, this.#highestConsumedSeq, true)
+            new DataView(ack.buffer).setUint32(0, this.#highestConsumedFrame, true)
             channel.send(ack)
         }
         if (this.#bytesSinceAck >= ackEveryBytes) {
@@ -350,120 +525,88 @@ export class Subscription {
             this.#ackTimer = setTimeout(sendAck, ackDelayMs)
         }
     }
-
-    close() {
-        if (this.closed) {
-            return
-        }
-        this.closed = true
-        this.channel?.close()
-        this.owner._forget(this)
-    }
 }
 
-export class Publisher {
-    /** @type {RTCDataChannel | null} */
-    channel = null
-    /** @type {Uint8Array | null} */
-    #last = null
-    /** @type {Uint8Array[]} stamped frames waiting for the channel (reliable: all, latest: only the newest) */
-    #pending = []
-    /** @type {ReturnType<typeof setInterval> | null} */
-    #repeatTimer = null
+export class Publisher extends Endpoint {
     sent = 0
     dropped = 0
-    closed = false
     tripped = false
-    /** @type {string | null} why the deadman fired: "heartbeat" | "disconnected" | "shutdown" */
-    tripReason = null
+    /** why the deadman fired: "heartbeat" | "disconnected" | "shutdown" */
+    tripReason: string | null = null
     deadmanArmed = false
-    /** @type {object | null} latest bridge-side stats for this channel */
-    bridgeStats = null
-    /** @type {Set<(reason: string) => void>} */
-    #tripListeners = new Set()
-    /** @type {Promise<void>} */
-    #ready = Promise.resolve()
+    #last: Uint8Array | null = null
+    /** stamped frames waiting for the channel (reliable: all, latest: only the newest) */
+    #pending: Uint8Array<ArrayBuffer>[] = []
+    #repeatTimer: ReturnType<typeof setInterval> | null = null
+    #tripListeners = new Set<(reason: string) => void>()
 
-    /**
-     * @param {ZenohWeb} owner
-     * @param {number} id
-     * @param {string} key
-     * @param {PublisherOptions} options
-     */
-    constructor(owner, id, key, options) {
-        this.owner = owner
-        this.id = id
-        this.key = key
-        this.options = options
+    constructor(owner: ZenohWeb, id: number, key: string, readonly options: PublisherOptions) {
+        super(owner, id, key)
         if (options.repeatMs) {
             this.#repeatTimer = setInterval(() => {
-                if (this.#last && !this.tripped) {
+                if (this.#last && !this.tripped && this.rejectionReason === null) {
                     this.#send(encodePut(this.#last, this.owner.now()))
                 }
             }, options.repeatMs)
         }
     }
 
-    /** @returns {PublisherState} */
-    get state() {
+    get state(): PublisherState {
         if (this.closed) {
             return "closed"
+        }
+        if (this.rejectionReason !== null) {
+            return "rejected"
         }
         if (this.tripped) {
             return "tripped"
         }
-        return this.channel?.readyState === "open" ? "open" : "connecting"
+        return this.acceptance.settled ? "open" : "connecting"
     }
 
-    /** Resolves once the current data channel is open (rejects if it fails to open). */
-    ready() {
-        return this.#ready
-    }
-
-    /** @param {(reason: string) => void} listener @returns {() => void} unsubscribe */
-    onTripped(listener) {
+    onTripped(listener: (reason: string) => void): () => void {
         this.#tripListeners.add(listener)
-        return () => this.#tripListeners.delete(listener)
+        return () => {
+            this.#tripListeners.delete(listener)
+        }
     }
 
-    /** @param {RTCPeerConnection} peer */
-    attach(peer) {
+    attach(peer: RTCPeerConnection): void {
         const { delivery, priority, latencyLimit } = this.options
         const label = JSON.stringify({ type: "pub", key: this.key, id: this.id, opts: { delivery, priority, latencyLimit } })
         const channel = peer.createDataChannel(label, channelInit(delivery, undefined))
         channel.binaryType = "arraybuffer"
         channel.bufferedAmountLowThreshold = resumeBytes
-        channel.onopen = () => this.#flush()
         channel.onbufferedamountlow = () => this.#flush()
         this.channel = channel
-        this.#ready = waitOpen(channel, openTimeoutMs)
-        this.#ready.catch(() => {})
+        this.watchChannel(channel)
+        // puts made before the bridge accepted the channel wait for it
+        this.acceptance.promise.then(() => this.#flush(), () => {})
     }
 
-    #checkUsable() {
+    #checkUsable(): void {
         if (this.closed) {
             throw new Error(`zenoh-web: publisher ${this.key} is closed`)
+        }
+        if (this.rejectionReason !== null) {
+            throw new Error(`zenoh-web: publisher ${this.key} was rejected by the bridge: ${this.rejectionReason}`)
         }
         if (this.tripped) {
             throw new Error(`zenoh-web: publisher ${this.key} is tripped (deadman fired: ${this.tripReason}); create a new publisher`)
         }
     }
 
-    /**
-     * @param {Uint8Array | ArrayBuffer | ArrayBufferView | string} value
-     * @param {{ timestamp?: number }} options timestamp: when the value was produced, in this client's clock (`z.now()`); defaults to now
-     */
-    put(value, { timestamp } = {}) {
+    /** `timestamp`: when the value was produced, in this client's clock (`z.now()`); defaults to now. */
+    put(value: Bytesish, { timestamp }: { timestamp?: number } = {}): void {
         this.#checkUsable()
         const bytes = toBytes(value)
         this.#last = bytes
         this.#send(encodePut(bytes, timestamp ?? this.owner.now()))
     }
 
-    /** @param {Uint8Array} frame */
-    #send(frame) {
+    #send(frame: Uint8Array<ArrayBuffer>): void {
         const channel = this.channel
-        const backedUp = !channel || channel.readyState !== "open" || channel.bufferedAmount > backedUpBytes
+        const backedUp = !channel || channel.readyState !== "open" || !this.acceptance.settled || channel.bufferedAmount > backedUpBytes
         if (backedUp || this.#pending.length > 0) {
             if (this.options.delivery !== "reliable") {
                 this.dropped += this.#pending.length
@@ -476,10 +619,10 @@ export class Publisher {
         this.sent++
     }
 
-    #flush() {
+    #flush(): void {
         const channel = this.channel
-        while (this.#pending.length > 0 && channel?.readyState === "open" && channel.bufferedAmount <= backedUpBytes) {
-            channel.send(/** @type {Uint8Array} */ (this.#pending.shift()))
+        while (this.#pending.length > 0 && channel?.readyState === "open" && this.rejectionReason === null && channel.bufferedAmount <= backedUpBytes) {
+            channel.send(this.#pending.shift() as Uint8Array<ArrayBuffer>)
             this.sent++
         }
     }
@@ -487,10 +630,8 @@ export class Publisher {
     /**
      * Stores `value` on the bridge; it is published once (REAL_TIME, reliable) if this frontend's
      * heartbeat stops, it disconnects, or the bridge shuts down. Then this publisher is tripped.
-     * @param {Uint8Array | ArrayBuffer | ArrayBufferView | string} value
-     * @returns {Promise<void>}
      */
-    setDeadman(value) {
+    setDeadman(value: Bytesish): Promise<void> {
         if (!this.owner.options.heartbeatHz) {
             throw new Error("zenoh-web: setDeadman needs a heartbeat; connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })")
         }
@@ -502,15 +643,13 @@ export class Publisher {
         })
     }
 
-    /** @returns {Promise<void>} */
-    async clearDeadman() {
+    async clearDeadman(): Promise<void> {
         this.#checkUsable()
         await this.owner._request({ op: "clearDeadman", pubId: this.id }, pingTimeoutMs)
         this.deadmanArmed = false
     }
 
-    /** @param {string} reason */
-    _trip(reason) {
+    _trip(reason: string): void {
         if (this.tripped || this.closed) {
             return
         }
@@ -532,76 +671,70 @@ export class Publisher {
         }
     }
 
-    close() {
-        if (this.closed) {
-            return
-        }
-        this.closed = true
+    override _rejected(reason: string): void {
+        this.#pending = []
         if (this.#repeatTimer) {
             clearInterval(this.#repeatTimer)
         }
-        this.channel?.close()
-        this.owner._forget(this)
+        super._rejected(reason)
+    }
+
+    override close(): void {
+        if (this.#repeatTimer) {
+            clearInterval(this.#repeatTimer)
+        }
+        super.close()
     }
 }
 
+type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock">> & Pick<ConnectOptions, "clock">
+
 export class ZenohWeb {
-    /** @type {ConnectionState} */
-    state = "connecting"
-    /** @type {Record<string, KeyStats>} per subscribed/published key expression */
-    stats = {}
-    /** @type {number | null} latest round trip to the bridge (heartbeat, else control ping) */
-    rttMs = null
-    /** @type {number | null} bridge clock minus this client's clock, from the lowest-RTT recent sample */
-    clockOffsetMs = null
-    /** @type {object | null} bridge-side heartbeat/clock stats */
-    bridgeStats = null
-    /** @type {RTCPeerConnection | null} */
-    #peer = null
-    /** @type {RTCDataChannel | null} */
-    #control = null
-    /** @type {RTCDataChannel | null} */
-    #heartbeat = null
-    /** @type {ReturnType<typeof setInterval> | null} */
-    #heartbeatTimer = null
+    state: ConnectionState = "connecting"
+    /** per subscribed/published key expression */
+    stats: Record<string, KeyStats> = {}
+    /** latest round trip to the bridge (heartbeat, else control ping) */
+    rttMs: number | null = null
+    /** bridge clock minus this client's clock, from the lowest-RTT recent sample */
+    clockOffsetMs: number | null = null
+    /** bridge-side heartbeat, clock and access-control stats */
+    bridgeStats: BridgeStats | null = null
+    readonly url: string
+    readonly options: ResolvedConnectOptions
+    /** this client's clock in ms; put timestamps and clock sync use it */
+    readonly now: () => number
+    #peer: RTCPeerConnection | null = null
+    #control: RTCDataChannel | null = null
+    #heartbeat: RTCDataChannel | null = null
+    #heartbeatTimer: ReturnType<typeof setInterval> | null = null
     #heartbeatPaused = false
-    /** @type {{ offsetMs: number, rttMs: number }[]} */
-    #clockSamples = []
-    /** @type {Set<Subscription | Publisher>} */
-    #endpoints = new Set()
-    /** @type {Map<number, Publisher>} publishers that may still be tripped by the bridge */
-    #publishers = new Map()
-    /** @type {Map<number, { resolve: (value: any) => void, reject: (error: Error) => void, timer: ReturnType<typeof setTimeout> }>} */
-    #requests = new Map()
-    /** @type {Set<(state: ConnectionState) => void>} */
-    #stateListeners = new Set()
+    #clockSamples: ClockSample[] = []
+    #endpoints = new Set<Subscription | Publisher>()
+    /** every endpoint by id, including tripped/rejected ones the bridge may still talk about */
+    #endpointsById = new Map<number, Subscription | Publisher>()
+    #requests = new Map<number, PendingRequest>()
+    #stateListeners = new Set<(state: ConnectionState) => void>()
     #nextId = 1
     #closed = false
     #generation = 0
-    /** @type {ReturnType<typeof setInterval> | null} */
-    #statsTimer = null
+    #statsTimer: ReturnType<typeof setInterval> | null = null
 
-    /**
-     * @param {string} url bridge base url, e.g. http://robot.local:7448
-     * @param {ConnectOptions} options
-     */
-    constructor(url, options = {}) {
+    constructor(url: string, options: ConnectOptions = {}) {
         this.url = url.replace(/\/+$/, "")
         this.options = { iceServers: [], reconnect: true, statsIntervalMs: 1000, heartbeatHz: 0, heartbeatMisses: 3, ...options }
         checkNumber("heartbeatHz", this.options.heartbeatHz, (v) => Number.isFinite(v) && v >= 0, ">= 0 (0 = no heartbeat)")
         checkNumber("heartbeatMisses", this.options.heartbeatMisses, (v) => Number.isInteger(v) && v >= 1, "an integer >= 1")
-        /** @type {() => number} this client's clock in ms; put timestamps and clock sync use it */
         this.now = this.options.clock ?? (() => performance.timeOrigin + performance.now())
     }
 
-    /** @param {(state: ConnectionState) => void} listener @returns {() => void} unsubscribe */
-    onState(listener) {
+    onState(listener: (state: ConnectionState) => void): () => void {
         this.#stateListeners.add(listener)
-        return () => this.#stateListeners.delete(listener)
+        return () => {
+            this.#stateListeners.delete(listener)
+        }
     }
 
-    /** @param {ConnectionState} state */
-    #setState(state) {
+    #setState(state: ConnectionState): void {
         if (state === this.state) {
             return
         }
@@ -615,11 +748,8 @@ export class ZenohWeb {
         }
     }
 
-    /**
-     * NTP-style sample: t0/t3 in our clock, t1/t2 bridge receive/send in its clock.
-     * @param {number} t0 @param {number} t1 @param {number} t2 @param {number} t3
-     */
-    #addClockSample(t0, t1, t2, t3) {
+    /** NTP-style sample: t0/t3 in our clock, t1/t2 bridge receive/send in its clock. */
+    #addClockSample(t0: number, t1: number, t2: number, t3: number): void {
         const rttMs = (t3 - t0) - (t2 - t1)
         const offsetMs = ((t1 - t0) + (t2 - t3)) / 2
         if (!Number.isFinite(rttMs) || !Number.isFinite(offsetMs)) {
@@ -635,14 +765,14 @@ export class ZenohWeb {
     }
 
     /** Clock-sync ping over control; also reports our current estimate to the bridge. */
-    async #controlPing() {
+    async #controlPing(): Promise<void> {
         const t0 = this.now()
         const response = await this._request({ op: "ping", t0, offsetMs: this.clockOffsetMs, rttMs: this.rttMs }, pingTimeoutMs)
-        this.#addClockSample(t0, response.t1, response.t2, this.now())
+        this.#addClockSample(t0, Number(response.t1), Number(response.t2), this.now())
     }
 
     /** Opens (or re-opens) the peer connection and every channel on it. */
-    async _open() {
+    async _open(): Promise<void> {
         const generation = ++this.#generation
         this.#setState("connecting")
         this.#clockSamples = []
@@ -650,7 +780,7 @@ export class ZenohWeb {
         const control = peer.createDataChannel("control", { ordered: true })
         this.#peer = peer
         this.#control = control
-        control.onmessage = (event) => this.#onControlMessage(event.data)
+        control.onmessage = (event: MessageEvent) => this.#onControlMessage(String(event.data))
         control.onclose = () => this.#onLost(generation)
         peer.onconnectionstatechange = () => {
             if (generation !== this.#generation) {
@@ -688,7 +818,6 @@ export class ZenohWeb {
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()
             }
-            await this.#controlPing()
         } catch (error) {
             this.#onLost(generation)
             throw error
@@ -696,13 +825,12 @@ export class ZenohWeb {
         this.#setState("connected")
     }
 
-    /** @param {RTCPeerConnection} peer */
-    #attachHeartbeat(peer) {
+    #attachHeartbeat(peer: RTCPeerConnection): void {
         const label = JSON.stringify({ type: "heartbeat", opts: { hz: this.options.heartbeatHz, misses: this.options.heartbeatMisses } })
         const heartbeat = peer.createDataChannel(label, { ordered: false, maxRetransmits: 0 })
-        heartbeat.onmessage = (event) => {
+        heartbeat.onmessage = (event: MessageEvent) => {
             try {
-                const reply = JSON.parse(event.data)
+                const reply = JSON.parse(String(event.data))
                 this.#addClockSample(reply.t0, reply.t1, reply.t2, this.now())
             } catch {
                 // a malformed reply is just a lost sample
@@ -721,32 +849,30 @@ export class ZenohWeb {
     }
 
     /** Stops sending heartbeats (the bridge then fires this frontend's deadmen); for testing deadman wiring. */
-    pauseHeartbeat() {
+    pauseHeartbeat(): void {
         this.#heartbeatPaused = true
     }
 
-    resumeHeartbeat() {
+    resumeHeartbeat(): void {
         this.#heartbeatPaused = false
     }
 
-    /** @param {string} reason */
-    #tripArmedPublishers(reason) {
-        for (const publisher of this.#publishers.values()) {
-            if (publisher.deadmanArmed) {
-                publisher._trip(reason)
+    #tripArmedPublishers(reason: string): void {
+        for (const endpoint of this.#endpointsById.values()) {
+            if (endpoint instanceof Publisher && endpoint.deadmanArmed) {
+                endpoint._trip(reason)
             }
         }
     }
 
-    /** @param {number} generation */
-    #onLost(generation) {
+    #onLost(generation: number): void {
         if (generation !== this.#generation || this.state === "lost") {
             return
         }
         this.#setState("lost")
         // the bridge fires this frontend's deadmen when it loses us
         this.#tripArmedPublishers("disconnected")
-        for (const [, request] of this.#requests) {
+        for (const request of this.#requests.values()) {
             clearTimeout(request.timer)
             request.reject(new Error("connection lost"))
         }
@@ -767,23 +893,29 @@ export class ZenohWeb {
         }
     }
 
-    /** @param {string} text */
-    #onControlMessage(text) {
-        let response
+    #onControlMessage(text: string): void {
+        let response: ControlResponse
         try {
             response = JSON.parse(text)
         } catch {
             return
         }
-        if (response.event === "tripped") {
-            this.#publishers.get(response.id)?._trip(response.reason)
+        if (response.event !== undefined) {
+            const endpoint = this.#endpointsById.get(Number(response.id))
+            if (response.event === "tripped" && endpoint instanceof Publisher) {
+                endpoint._trip(String(response.reason))
+            } else if (response.event === "rejected") {
+                endpoint?._rejected(String(response.reason))
+            } else if (response.event === "accepted") {
+                endpoint?._accepted()
+            }
             return
         }
-        const request = this.#requests.get(response.id)
+        const request = this.#requests.get(Number(response.id))
         if (!request) {
             return
         }
-        this.#requests.delete(response.id)
+        this.#requests.delete(Number(response.id))
         clearTimeout(request.timer)
         if (response.ok) {
             request.resolve(response)
@@ -792,12 +924,7 @@ export class ZenohWeb {
         }
     }
 
-    /**
-     * @param {object & { op: string }} body
-     * @param {number} timeoutMs
-     * @returns {Promise<any>}
-     */
-    _request(body, timeoutMs) {
+    _request(body: { op: string, [field: string]: unknown }, timeoutMs: number): Promise<ControlResponse> {
         const control = this.#control
         if (!control || control.readyState !== "open") {
             return Promise.reject(new Error(`not connected (${this.state})`))
@@ -813,65 +940,60 @@ export class ZenohWeb {
         })
     }
 
-    /**
-     * @param {string} key key expression
-     * @param {SubscribeOptions} options
-     * @param {(message: Message) => void} callback
-     */
-    subscribe(key, options, callback) {
+    subscribe(key: string, options: SubscribeOptions, callback: (message: Message) => void): Subscription {
         validateSubscribeOptions(options ?? {})
         const subscription = new Subscription(this, this.#nextId++, key, { ...options }, callback)
         this.#addEndpoint(subscription)
         return subscription
     }
 
-    /**
-     * @param {string} key
-     * @param {PublisherOptions} options
-     */
-    publisher(key, options = {}) {
+    publisher(key: string, options: PublisherOptions = {}): Publisher {
         validatePublisherOptions(options)
         const publisher = new Publisher(this, this.#nextId++, key, { ...options })
-        this.#publishers.set(publisher.id, publisher)
         this.#addEndpoint(publisher)
         return publisher
     }
 
-    /** @param {Subscription | Publisher} endpoint */
-    #addEndpoint(endpoint) {
+    #addEndpoint(endpoint: Subscription | Publisher): void {
         this.#endpoints.add(endpoint)
+        this.#endpointsById.set(endpoint.id, endpoint)
         if (this.#peer && this.#peer.connectionState !== "closed") {
             endpoint.attach(this.#peer)
         }
     }
 
-    /** @param {Subscription | Publisher} endpoint */
-    _forget(endpoint) {
-        this.#endpoints.delete(endpoint)
-        if (endpoint instanceof Publisher && endpoint.closed) {
-            this.#publishers.delete(endpoint.id)
+    /** Stops re-attaching an endpoint on reconnect (closed, tripped or rejected). */
+    _forget(endpoint: Endpoint): void {
+        this.#endpoints.delete(endpoint as Subscription | Publisher)
+        if (endpoint.closed) {
+            this.#endpointsById.delete(endpoint.id)
         }
         this.#refreshStats(null)
     }
 
-    /**
-     * zenoh query.
-     * @param {string} key
-     * @param {{ timeoutMs?: number }} options
-     * @returns {Promise<{ key: string | null, bytes: Uint8Array, error?: boolean }[]>}
-     */
-    async get(key, { timeoutMs = 5000 } = {}) {
+    /** zenoh query. */
+    async get(key: string, { timeoutMs = 5000 }: { timeoutMs?: number } = {}): Promise<GetReply[]> {
         const response = await this._request({ op: "get", key, timeoutMs }, timeoutMs + 2000)
-        return response.replies.map((/** @type {any} */ reply) => {
+        const replies = response.replies as { key?: string, bytes?: string, error?: string }[]
+        return replies.map((reply) => {
             if (reply.error !== undefined) {
                 return { key: null, bytes: fromBase64(reply.error), error: true }
             }
-            return { key: reply.key, bytes: fromBase64(reply.bytes) }
+            return { key: reply.key ?? null, bytes: fromBase64(reply.bytes ?? "") }
         })
     }
 
+    /**
+     * Keys currently live on the zenoh network under `filter`, including ones never subscribed to.
+     * See SPEC.md "Topic enumeration" for which kinds of keys can and can't be seen.
+     */
+    async listTopics(filter = "**", { probeMs = 600 }: { probeMs?: number } = {}): Promise<Topic[]> {
+        const response = await this._request({ op: "listTopics", key: filter, probeMs }, probeMs + 5000)
+        return response.topics as Topic[]
+    }
+
     /** Polls bridge stats (and, without a heartbeat, clock sync) once; also runs on a timer while connected. */
-    async pollStats() {
+    async pollStats(): Promise<void> {
         try {
             await this.#controlPing()
             if (this.state === "degraded" && this.#peer?.connectionState === "connected") {
@@ -885,39 +1007,37 @@ export class ZenohWeb {
         }
         const response = await this._request({ op: "stats" }, pingTimeoutMs).catch(() => null)
         if (response) {
-            this.bridgeStats = { clock: response.clock, heartbeat: response.heartbeat }
+            this.bridgeStats = { clock: response.clock, heartbeat: response.heartbeat, access: response.access } as BridgeStats
         }
-        this.#refreshStats(response?.channels ?? null)
+        this.#refreshStats((response?.channels as BridgeChannelStats[] | undefined) ?? null)
     }
 
-    /** @param {{ id: number, stats: object }[] | null} bridgeChannels */
-    #refreshStats(bridgeChannels) {
+    #refreshStats(bridgeChannels: BridgeChannelStats[] | null): void {
         if (bridgeChannels) {
             const byId = new Map(bridgeChannels.map((channel) => [channel.id, channel]))
-            for (const endpoint of [...this.#endpoints, ...this.#publishers.values()]) {
+            for (const endpoint of this.#endpointsById.values()) {
                 endpoint.bridgeStats = byId.get(endpoint.id) ?? null
             }
         }
-        /** @type {Record<string, KeyStats>} */
-        const stats = {}
+        const stats: Record<string, KeyStats> = {}
         for (const endpoint of this.#endpoints) {
             const entry = stats[endpoint.key] ??= { received: 0, dropped: 0, backlogBytes: 0, rttMs: this.rttMs, bridge: null }
-            const bridge = /** @type {any} */ (endpoint.bridgeStats)
+            const bridge = endpoint.bridgeStats
             entry.bridge = bridge
             if (endpoint instanceof Subscription) {
                 entry.received += endpoint.received
                 entry.dropped += endpoint.dropped
-                entry.backlogBytes += bridge ? bridge.stats.queuedBytes + bridge.stats.outstandingBytes : 0
+                entry.backlogBytes += bridge ? Number(bridge.stats.queuedBytes) + Number(bridge.stats.outstandingBytes) : 0
             } else {
                 entry.received += endpoint.sent
-                entry.dropped += endpoint.dropped + (bridge ? bridge.stats.droppedStale : 0)
+                entry.dropped += endpoint.dropped + (bridge ? Number(bridge.stats.droppedStale) : 0)
                 entry.backlogBytes += endpoint.channel?.bufferedAmount ?? 0
             }
         }
         this.stats = stats
     }
 
-    _startStats() {
+    _startStats(): void {
         this.#statsTimer = setInterval(() => {
             if (this.state === "connected" || this.state === "degraded") {
                 this.pollStats().catch(() => {})
@@ -925,7 +1045,7 @@ export class ZenohWeb {
         }, this.options.statsIntervalMs)
     }
 
-    close() {
+    close(): void {
         this.#closed = true
         if (this.#statsTimer) {
             clearInterval(this.#statsTimer)
@@ -942,13 +1062,8 @@ export class ZenohWeb {
     }
 }
 
-/**
- * Connects to a zenoh-web bridge.
- * @param {string} url e.g. "http://robot.local:7448"
- * @param {ConnectOptions} options
- * @returns {Promise<ZenohWeb>}
- */
-export async function connect(url, options = {}) {
+/** Connects to a zenoh-web bridge, e.g. `await connect("http://robot.local:7448")`. */
+export async function connect(url: string, options: ConnectOptions = {}): Promise<ZenohWeb> {
     const client = new ZenohWeb(url, options)
     await client._open()
     client._startStats()
