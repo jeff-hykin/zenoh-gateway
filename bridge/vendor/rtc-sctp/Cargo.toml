@@ -41,15 +41,6 @@ bench = []
 name = "rtc_sctp"
 path = "src/lib.rs"
 
-[[example]]
-name = "sctp_e2e"
-path = "examples/sctp_e2e.rs"
-
-[[example]]
-name = "sctp_micro"
-path = "examples/sctp_micro.rs"
-required-features = ["bench"]
-
 [dependencies.bytes]
 version = "1.12.0"
 

@@ -99,6 +99,33 @@ impl PendingQueue {
         popped
     }
 
+    /// zenoh-web patch: drop every not-yet-sent chunk of a stream the peer reset, so none of it
+    /// gets a TSN after our answering reset and lands on a new channel that reuses the stream id.
+    /// Returns the bytes dropped.
+    pub(crate) fn remove_stream(&mut self, stream_identifier: u16) -> usize {
+        if self.selected {
+            let selected_queue = if self.unordered_is_selected { &self.unordered_queue } else { &self.ordered_queue };
+            if selected_queue.front().is_some_and(|c| c.stream_identifier == stream_identifier) {
+                self.selected = false;
+            }
+        }
+        let mut removed_bytes = 0;
+        let mut removed_chunks = 0;
+        for queue in [&mut self.unordered_queue, &mut self.ordered_queue] {
+            queue.retain(|c| {
+                let keep = c.stream_identifier != stream_identifier;
+                if !keep {
+                    removed_bytes += c.user_data.len();
+                    removed_chunks += 1;
+                }
+                keep
+            });
+        }
+        self.n_bytes -= removed_bytes;
+        self.queue_len -= removed_chunks;
+        removed_bytes
+    }
+
     pub(crate) fn get_num_bytes(&self) -> usize {
         self.n_bytes
     }

@@ -14,4 +14,6 @@ Client: `client/zenoh_web.js` (no build, no deps). Viewer demo: `examples/viewer
 
 End-to-end test (real zenoh peer, bridge, headless Chrome over WebRTC): `deno run --allow-all test/e2e.js`.
 
-`bridge/vendor/rtc-sctp` is rtc-sctp 0.21.0 with two constants changed (retransmission timeout floor 1 s → 200 ms, backoff cap 60 s → 3 s, matching Chrome); upstream hardcodes them, and the 1 s floor turned every lost packet tail into a multi-second stall.
+`bridge/vendor/` holds webrtc-rs crates with small fixes (each marked `zenoh-web patch`), applied via `[patch.crates-io]`:
+- `rtc`: a channel the browser opens now sends with the reliability the browser asked for; upstream left every accepted channel ordered + fully reliable in the bridge's send direction.
+- `rtc-sctp`: when the browser resets a stream, its unsent chunks are dropped instead of being sent after the reset, where they landed on the next channel that reused the stream id; retransmission timeout floor 1 s → 200 ms and backoff cap 60 s → 3 s (matching Chrome).

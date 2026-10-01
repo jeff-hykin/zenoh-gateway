@@ -206,9 +206,15 @@ try {
          */
         async function measure(options, durationMs) {
             const samples = []
+            const gaps = []
+            let previousSeq = -1
             const subscription = client.subscribe("test/fast", options, (message) => {
                 const view = new DataView(message.bytes.buffer, message.bytes.byteOffset, 12)
                 samples.push({ at: performance.now(), latencyMs: Date.now() - view.getFloat64(0, true) })
+                if (previousSeq >= 0 && message.seq !== previousSeq + 1 && gaps.length < 8) {
+                    gaps.push([previousSeq, message.seq, Math.round(performance.now())])
+                }
+                previousSeq = message.seq
             })
             await subscription.ready()
             const started = performance.now()
@@ -236,6 +242,8 @@ try {
                 medianLate: window(durationMs - 1000, durationMs),
                 slowest: settled.filter((sample) => sample.latencyMs > 50).slice(0, 10).map((sample) => [Math.round(sample.at - started), Math.round(sample.latencyMs)]),
                 bridge: bridgeStats,
+                gaps,
+                channelId: subscription.channel?.id,
             }
         }
 
@@ -323,7 +331,7 @@ try {
     check(latest.received > 100, `latest: messages arrive (${latest.received})`)
     check(latest.bridge?.droppedQueue > 0, `latest: bridge drops under backpressure (droppedQueue=${latest.bridge?.droppedQueue})`)
     // p90/p99 are reported, not asserted: a stalled headless-Chrome main thread delays every queued message at once
-    console.log(`latest: p50=${latest.p50?.toFixed(1)} p90=${latest.p90?.toFixed(1)} p99=${latest.p99?.toFixed(1)} ms, slowest=${JSON.stringify(latest.slowest)}`)
+    console.log(`latest: p50=${latest.p50?.toFixed(1)} p90=${latest.p90?.toFixed(1)} p99=${latest.p99?.toFixed(1)} ms, slowest=${JSON.stringify(latest.slowest)}, probes=${latest.bridge?.probes}, streams=${["latest", "maxAge", "hzCapped", "reliable"].map((name) => results[name].channelId).join(",")}`)
     check(latest.p50 !== null && latest.p50 < 50, `latest: median latency stays low (${latest.p50?.toFixed(1)} ms)`)
     check(latest.bridge?.maxReceiveLagMs < 100, `latest: upstream zenoh lag into the bridge stays low (${latest.bridge?.maxReceiveLagMs?.toFixed(1)} ms)`)
     check(latest.medianEarly !== null && latest.medianLate !== null && latest.medianLate < latest.medianEarly + 50, `latest: latency does not grow (${latest.medianEarly?.toFixed(1)} -> ${latest.medianLate?.toFixed(1)} ms)`)
@@ -338,7 +346,7 @@ try {
     check(hzCapped.ratePerSec <= 11 && hzCapped.ratePerSec >= 7, `maxHz 10: delivered rate capped (${hzCapped.ratePerSec.toFixed(1)}/s)`)
 
     const reliable = results.reliable
-    console.log(`reliable (contrast, not asserted beyond delivery): p50=${reliable.p50?.toFixed(1)}ms, early=${reliable.medianEarly?.toFixed(1)} late=${reliable.medianLate?.toFixed(1)} queued=${reliable.bridge?.queued} dropped=${reliable.dropped}`)
+    console.log(`reliable (contrast, not asserted beyond delivery): p50=${reliable.p50?.toFixed(1)}ms, early=${reliable.medianEarly?.toFixed(1)} late=${reliable.medianLate?.toFixed(1)} queued=${reliable.bridge?.queued} dropped=${reliable.dropped} gaps=${JSON.stringify(reliable.gaps)} streams=${["latest", "maxAge", "hzCapped", "reliable"].map((name) => results[name].channelId).join(",")}`)
     check(reliable.received > 50 && reliable.dropped === 0, `reliable: arrives with no gaps (${reliable.received}, dropped ${reliable.dropped})`)
     check(reliable.medianLate > 10 * Math.max(1, latest.medianLate), `contrast: reliable queues and grows latency where latest does not (${reliable.medianLate?.toFixed(0)} vs ${latest.medianLate?.toFixed(1)} ms)`)
 

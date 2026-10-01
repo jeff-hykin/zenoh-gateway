@@ -77,7 +77,9 @@ z.onState(fn)    // "connecting" | "connected" | "degraded" | "lost"
 
 "Backed up" = the channel's unacknowledged bytes are above ~64 KB, or the page has not yet consumed
 ~256 KB the bridge sent (the client acks consumption with a 4-byte `u32 seq` message on each `sub`
-channel, because browsers queue received messages for the page without limit). The bridge drains
+channel, because browsers queue received messages for the page without limit; on lossy channels a
+sender blocked only by that window sends one probe frame after 50 ms, doubling to 1 s, so a lost tail
+can't wedge it). The bridge drains
 its own queue on bufferedAmountLow / acks. Nothing piles up in kernel/wifi buffers or the browser,
 so a slow phone sees fewer frames instead of stale ones.
 

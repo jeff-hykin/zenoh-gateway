@@ -27,6 +27,10 @@ const BACKSTOP: Duration = Duration::from_millis(20);
 pub const UNCONSUMED_WINDOW: usize = 256 * 1024;
 /// A sent frame never acked for this long is assumed lost (lossy channels), not unconsumed.
 const ASSUME_LOST_AFTER: Duration = Duration::from_secs(1);
+/// Lossy channels blocked only by the ack window send one probe frame after this (doubling
+/// while no ack comes back): if the window's tail was lost, the probe's ack releases it.
+const FIRST_PROBE_AFTER: Duration = Duration::from_millis(50);
+const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +45,8 @@ pub struct SubStats {
     pub outstanding_bytes: usize,
     pub backed_up: bool,
     pub unconsumed_bytes: usize,
+    /// lossy channel blocked by the ack window sent a frame anyway (tail-loss recovery)
+    pub probes: u64,
     /// Bridge receive time minus sample timestamp (upstream lag), largest seen.
     pub max_receive_lag_ms: f64,
 }
@@ -66,6 +72,8 @@ struct SubState {
     stats: SubStats,
     /// (seq, frame bytes, sent at) in send order, until the page acks a seq at or past it
     unconsumed: VecDeque<(u32, usize, Instant)>,
+    /// acks that released something; lets a blocked sender notice progress
+    acks_with_progress: u64,
 }
 
 impl SubState {
@@ -208,12 +216,17 @@ impl SubShared {
     /// Page consumed everything up to `seq` (4-byte little endian message on the sub channel).
     fn ack(&self, seq: u32) {
         let mut state = self.state.lock().unwrap();
+        let mut released = false;
         while let Some(&(sent_seq, len, _)) = state.unconsumed.front() {
             if !seq_at_or_before(sent_seq, seq) {
                 break;
             }
             state.unconsumed.pop_front();
             state.stats.unconsumed_bytes -= len;
+            released = true;
+        }
+        if released {
+            state.acks_with_progress += 1;
         }
         drop(state);
         self.drained.notify_one();
@@ -271,6 +284,8 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
 
 async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
     let mut warned_send_error = false;
+    let mut probe_interval = FIRST_PROBE_AFTER;
+    let mut acks_seen = 0;
     while !shared.closed.load(Ordering::Relaxed) {
         let (next, wake_at) = shared.pick(Instant::now());
         let Some((key, item)) = next else {
@@ -314,6 +329,7 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             continue;
         }
         shared.state.lock().unwrap().stats.backed_up = true;
+        let mut probe_at = Instant::now() + probe_interval;
         while (outstanding > RESUME_BYTES || shared.unconsumed_bytes() >= UNCONSUMED_WINDOW)
             && !shared.closed.load(Ordering::Relaxed)
         {
@@ -322,6 +338,19 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
                 _ = tokio::time::sleep(BACKSTOP) => {}
             }
             outstanding = dc.outstanding_bytes().await.unwrap_or(0);
+            let acks_now = shared.state.lock().unwrap().acks_with_progress;
+            if acks_now != acks_seen {
+                acks_seen = acks_now;
+                probe_interval = FIRST_PROBE_AFTER;
+                probe_at = Instant::now() + probe_interval;
+            }
+            let window_only = outstanding <= RESUME_BYTES;
+            if window_only && !shared.delivery.reliable && Instant::now() >= probe_at {
+                shared.state.lock().unwrap().stats.probes += 1;
+                // if this probe isn't acked either, the page is busy rather than the tail lost
+                probe_interval = (probe_interval * 2).min(MAX_PROBE_INTERVAL);
+                break;
+            }
         }
         let mut state = shared.state.lock().unwrap();
         state.stats.outstanding_bytes = outstanding;

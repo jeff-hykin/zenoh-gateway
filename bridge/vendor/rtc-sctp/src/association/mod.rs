@@ -2069,6 +2069,11 @@ impl Association {
                         sis_to_reset.push(*id);
                     }
                     self.unregister_stream(*id, AssociationError::Reset);
+                    // zenoh-web patch: see PendingQueue::remove_stream
+                    let dropped = self.pending_queue.remove_stream(*id);
+                    if dropped > 0 {
+                        debug!("[{}] resetStream(): dropped {} unsent bytes of stream {}", self.side, dropped, id);
+                    }
                 }
             }
 

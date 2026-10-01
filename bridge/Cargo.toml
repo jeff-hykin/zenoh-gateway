@@ -28,7 +28,9 @@ log = "0.4"
 env_logger = "0.11"
 futures = "0.3"
 
-# rtc-sctp 0.21.0 with only RTO_MIN (1 s -> 200 ms) and RTO_MAX (60 s -> 3 s) changed,
-# see vendor/rtc-sctp/src/association/timer.rs; drop once upstream makes them configurable.
+# Vendored with small patches (search "zenoh-web patch"); drop once upstream fixes them:
+# - rtc-sctp: RTO_MIN 1 s -> 200 ms, RTO_MAX 60 s -> 3 s (src/association/timer.rs)
+# - rtc: apply the peer's DCEP reliability to channels the peer opens (src/peer_connection/handler/sctp.rs)
 [patch.crates-io]
 rtc-sctp = { path = "vendor/rtc-sctp" }
+rtc = { path = "vendor/rtc" }

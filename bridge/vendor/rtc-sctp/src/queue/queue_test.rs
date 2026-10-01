@@ -1138,3 +1138,36 @@ fn test_reassembly_queue_ssn_overflow_in_forward_tsn_for_ordered() -> Result<()>
 
     Ok(())
 }
+
+// zenoh-web patch: unsent chunks of a reset stream are dropped, others kept, counters stay right
+#[test]
+fn test_pending_queue_remove_stream() {
+    let mut pq = PendingQueue::new();
+    for (tsn, stream_identifier, unordered) in [(0, 5, false), (1, 7, false), (2, 5, true), (3, 7, true)] {
+        let mut chunk = make_data_chunk(tsn, unordered, NO_FRAGMENT);
+        chunk.stream_identifier = stream_identifier;
+        pq.push(chunk);
+    }
+    assert_eq!(pq.remove_stream(5), 20);
+    assert_eq!(pq.len(), 2);
+    assert_eq!(pq.get_num_bytes(), 20);
+    assert_eq!(pq.pop(true, true).map(|c| c.stream_identifier), Some(7));
+    assert_eq!(pq.pop(true, false).map(|c| c.stream_identifier), Some(7));
+    assert!(pq.is_empty());
+}
+
+#[test]
+fn test_pending_queue_remove_stream_clears_selection() {
+    let mut pq = PendingQueue::new();
+    for (tsn, frag) in [(0, FRAG_BEGIN), (1, FRAG_END)] {
+        let mut chunk = make_data_chunk(tsn, false, frag);
+        chunk.stream_identifier = 5;
+        pq.push(chunk);
+    }
+    let mut other = make_data_chunk(2, false, NO_FRAGMENT);
+    other.stream_identifier = 7;
+    pq.push(other);
+    assert!(pq.pop(true, false).is_some(), "first fragment of stream 5 selects the message");
+    pq.remove_stream(5);
+    assert_eq!(pq.pop(true, false).map(|c| c.stream_identifier), Some(7), "selection must not stall the queue");
+}
