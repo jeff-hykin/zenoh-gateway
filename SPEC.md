@@ -38,7 +38,8 @@ const sub = z.subscribe("camera/**", {
     maxQuality: 1.0,
     qualityToHzTradeoff: 0.7,    // 0 = keep quality, drop hz; 1 = keep hz, drop quality
     codec: "ros2-image",         // optional transcoder, see "Codecs"; names not in z.codecs throw
-}, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.depth, msg.points, msg.decoded, msg.video, msg.mediaStream })
+    imageTransport: "video",     // video codecs: "video" (H.264 track) or "jpeg" (JPEG files on the data channel)
+}, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.depth, msg.points, msg.decoded, msg.video, msg.mediaStream, msg.image })
 sub.mediaStream  // video codecs: a MediaStream for a <video> element
 sub.close()
 
@@ -213,6 +214,21 @@ bits per pixel; the encoder's bitrate is that size times the allocated Hz. Keyfr
 frame of every subscription, on PLI/FIR from the browser (`keyframeRequests`), and every 3 s.
 Send-side congestion control: TWCC feedback into GCC (webrtc-rs interceptors), whose target feeds the
 allocator.
+
+### JPEG files (`imageTransport: "jpeg"`)
+
+Any video codec's subscription may ask for JPEG files instead of a track. It runs the same pipeline
+(pick, shared decode overlapping the encode, CPU governor) but encodes each picture as a baseline
+4:2:0 JPEG (`jpeg-encoder`, pure Rust) at the resolution scale `0.25 + 0.75 q` and JPEG quality
+`35 + 55 q`, and sends it as one message on the `sub` channel, with the data path's chunking,
+pacing, backlog window, `maxAge` abandonment and delivery mode (so `"reliable"` is allowed here). No
+transceiver is renegotiated and no metadata frame is sent. Pass-through: when the next picture would
+go at full size (quality 1 after the governor) and the codec's `jpeg(sample)` returns the sample's
+picture as a JPEG file, those bytes are sent without decoding. Price: measured bytes per quality
+bucket (as for data codecs), shaped between buckets by `pixels(q) × (0.25 + q) / 8`; JPEG streams
+count as data streams for the estimators and the video cap. The client decodes each message with
+`createImageBitmap` into `msg.image`, one at a time, a newer picture replacing one still waiting
+(`imagesSkipped`).
 
 ### Depth and point clouds
 

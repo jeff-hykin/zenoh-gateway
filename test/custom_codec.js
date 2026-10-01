@@ -92,6 +92,31 @@ try {
         }
         video.close()
 
+        // the same external video codec as JPEG files on the data channel
+        out.jpeg = await new Promise((resolve) => {
+            const timer = setTimeout(() => resolve({ error: "no picture in 8 s" }), 8000)
+            const subscription = client.subscribe("demo/swatch", { codec: "rgb-swatch", imageTransport: "jpeg" }, (message) => {
+                if (!message.image) {
+                    return
+                }
+                clearTimeout(timer)
+                const canvas = new OffscreenCanvas(message.image.width, message.image.height)
+                const context = canvas.getContext("2d", { willReadFrequently: true })
+                context.drawImage(message.image, 0, 0)
+                const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data
+                const sums = [0, 0, 0]
+                for (let offset = 0; offset < pixels.length; offset += 4) {
+                    sums[0] += pixels[offset]
+                    sums[1] += pixels[offset + 1]
+                    sums[2] += pixels[offset + 2]
+                }
+                message.image.close()
+                subscription.close()
+                resolve({ width: canvas.width, height: canvas.height, jpeg: message.bytes[0] === 0xff && message.bytes[1] === 0xd8, mean: sums.map((sum) => Math.round(sum / (pixels.length / 4))) })
+            })
+            subscription.ready().catch((error) => resolve({ error: error.message }))
+        })
+
         // unknown names: the client lists the bridge's codecs, the bridge refuses one the client let through
         try {
             client.subscribe("demo/text", { codec: "text-lowercase" }, () => {})
@@ -127,6 +152,10 @@ try {
     check(!video.error && video.width === 64 && video.height === 48 && worst <= 20 && video.frames > 0 && video.decodeErrors === 0 && video.codecErrors === 0,
         `video codec (I420 frames): ${video.width}x${video.height}, mean color ${JSON.stringify(video.mean)} within 20 of ${JSON.stringify(swatch)} (${video.frames} frames${video.error ? `, error ${video.error}` : ""})`)
     check(video.metadata?.sourceWidth === 64 && video.metadata?.sourceHeight === 48, `video codec: per-frame metadata (${JSON.stringify(video.metadata)})`)
+    const jpeg = result.jpeg
+    const jpegWorst = jpeg.error ? Infinity : Math.max(...jpeg.mean.map((value, channel) => Math.abs(value - swatch[channel])))
+    check(!jpeg.error && jpeg.jpeg && jpeg.width === 64 && jpeg.height === 48 && jpegWorst <= 20,
+        `external video codec as JPEG files: ${jpeg.width}x${jpeg.height}, mean color ${JSON.stringify(jpeg.mean)} within 20 of ${JSON.stringify(swatch)}${jpeg.error ? ` (error ${jpeg.error})` : ""}`)
     check(result.clientError?.includes("unknown codec") && result.clientError.includes("text-uppercase") && result.clientError.includes("rgb-swatch"), `client: unknown codec names the bridge's codecs (${result.clientError})`)
     check(result.reliableVideoError?.includes("video codec"), `client: reliable delivery with an external video codec throws (${result.reliableVideoError})`)
     const bridgeRefusal = await bridge.output.waitFor((line) => line.includes("unknown codec") && line.includes("text-uppercase"), 3000).catch(() => null)

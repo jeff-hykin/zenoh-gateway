@@ -129,6 +129,39 @@ try {
         `tradeoff 1 keeps Hz, quality drops (${keepHz.videoWidth}px wide, ${keepHz.hz.toFixed(1)} Hz sent, ${keepHz.decodedHz.toFixed(1)} Hz decoded, quality ${keepHz.quality?.toFixed(2)})`)
     check(keepQuality.allocation?.constrained && keepHz.allocation?.constrained && keepQuality.allocation.quality > keepHz.allocation.quality && keepQuality.allocation.hz < keepHz.allocation.hz,
         `allocations: tradeoff 0 -> q ${keepQuality.allocation?.quality} @ ${keepQuality.allocation?.hz?.toFixed(1)} Hz, tradeoff 1 -> q ${keepHz.allocation?.quality} @ ${keepHz.allocation?.hz?.toFixed(1)} Hz`)
+
+    $.logStep(`jpeg files on the data channel, same stream and budget ${videoBudget} B/s`)
+    const jpegStream = await page.evaluate(async (bridgeUrl, key) => {
+        const { connect } = await import("/client/zenoh_web.js")
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+        const client = await connect(bridgeUrl)
+        let measuring = false
+        let images = 0
+        let bytes = 0
+        const widths = new Set()
+        const subscription = client.subscribe(key, { codec: "dimos-image", imageTransport: "jpeg", maxHz: 20, dangerousMinHz: 1, minQuality: 0.2 }, (message) => {
+            if (measuring) {
+                images++
+                bytes += message.bytes.length
+                widths.add(message.image?.width)
+            }
+            message.image?.close()
+        })
+        await subscription.ready()
+        await sleep(4000)
+        measuring = true
+        const seconds = 5
+        await sleep(seconds * 1000)
+        measuring = false
+        await client.pollStats()
+        const result = { hz: images / seconds, bytesPerSec: bytes / seconds, widths: [...widths], allocation: subscription.bridgeStats?.allocation, stats: subscription.bridgeStats?.stats }
+        client.close()
+        await sleep(500)
+        return result
+    }, { args: [videoBridge.url, videoKey] })
+    console.log(JSON.stringify(jpegStream, null, 1))
+    check(jpegStream.allocation?.constrained && jpegStream.allocation.quality < 1 && jpegStream.bytesPerSec <= videoBudget * 1.15 && jpegStream.hz > 0,
+        `jpeg: priced by measured JPEG sizes and held within the budget (${jpegStream.bytesPerSec.toFixed(0)} B/s <= ${videoBudget} + 15%, ${jpegStream.hz.toFixed(1)} Hz, quality ${jpegStream.allocation?.quality}, widths ${jpegStream.widths})`)
 } catch (error) {
     check(false, String(error))
     console.error(error)

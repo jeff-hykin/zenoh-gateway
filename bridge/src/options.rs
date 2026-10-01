@@ -31,6 +31,17 @@ pub enum DeliveryKind {
     Reliable,
 }
 
+/// How a video codec's pictures reach the browser.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageTransport {
+    /// H.264 on a WebRTC video track
+    #[default]
+    Video,
+    /// one JPEG file per frame on the subscription's data channel
+    Jpeg,
+}
+
 /// Present-but-null (what JSON.stringify makes of Infinity) becomes `Some(None)`.
 fn present_or_null<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Option<f64>>, D::Error> {
     Option::<f64>::deserialize(deserializer).map(Some)
@@ -54,6 +65,8 @@ pub struct SubOpts {
     pub max_quality: Option<f64>,
     pub quality_to_hz_tradeoff: Option<f64>,
     pub codec: Option<String>,
+    /// video codecs only: H.264 track (default) or JPEG files on the data channel
+    pub image_transport: Option<ImageTransport>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -137,15 +150,28 @@ impl SubOpts {
         Ok(())
     }
 
-    /// The subscription's codec from `registry` (None = raw); unknown names and video codecs on
-    /// reliable delivery are refused.
+    /// The subscription's codec from `registry` (None = raw); unknown names, video codecs on
+    /// reliable delivery over H.264, and `imageTransport` without a video codec are refused.
     pub fn resolve_codec(&self, registry: &CodecRegistry) -> Result<Option<Arc<dyn Codec>>, String> {
-        let Some(name) = self.codec.as_deref() else { return Ok(None) };
+        let Some(name) = self.codec.as_deref() else {
+            if self.image_transport.is_some() {
+                return Err("imageTransport needs a video codec".into());
+            }
+            return Ok(None);
+        };
         let codec = registry.get(name)?;
-        if codec.output() == CodecOutput::Video && self.delivery == DeliveryKind::Reliable {
-            return Err(format!("{name} is a video codec: frames go over a lossy video track, use delivery \"latest\""));
+        if codec.output() != CodecOutput::Video && self.image_transport.is_some() {
+            return Err(format!("imageTransport applies to video codecs; {name} sends data"));
+        }
+        if codec.output() == CodecOutput::Video && !self.jpeg() && self.delivery == DeliveryKind::Reliable {
+            return Err(format!("{name} is a video codec: frames go over a lossy video track, use delivery \"latest\" (or imageTransport \"jpeg\")"));
         }
         Ok(Some(codec))
+    }
+
+    /// Video codecs' pictures go out as JPEG files on the data channel.
+    pub fn jpeg(&self) -> bool {
+        self.image_transport == Some(ImageTransport::Jpeg)
     }
 
     pub fn quality_range(&self) -> (f64, f64) {
@@ -187,6 +213,7 @@ impl SubOpts {
             "maxQuality": self.max_quality.unwrap_or(1.0),
             "qualityToHzTradeoff": self.quality_to_hz_tradeoff.unwrap_or(0.5),
             "codec": self.codec,
+            "imageTransport": self.image_transport,
         })
     }
 }
@@ -257,6 +284,12 @@ mod tests {
         assert!(resolve(r#"{"codec":"ros2-image","delivery":"reliable"}"#).unwrap_err().contains("video codec"), "video is lossy");
         assert_eq!(resolve(r#"{"codec":"dimos-depth","delivery":"reliable"}"#).unwrap().as_deref(), Some("dimos-depth"));
         assert_eq!(resolve(r#"{}"#).unwrap(), None);
+        assert!(sub(r#"{"imageTransport":"png"}"#).is_err());
+        assert_eq!(resolve(r#"{"codec":"ros2-image","delivery":"reliable","imageTransport":"jpeg"}"#).unwrap().as_deref(), Some("ros2-image"), "jpeg files can be reliable");
+        assert!(resolve(r#"{"codec":"dimos-depth","imageTransport":"jpeg"}"#).unwrap_err().contains("video codecs"));
+        assert!(resolve(r#"{"imageTransport":"jpeg"}"#).unwrap_err().contains("video codec"));
+        assert!(sub(r#"{"codec":"ros2-image","imageTransport":"jpeg"}"#).unwrap().jpeg());
+        assert!(!sub(r#"{"codec":"ros2-image","imageTransport":"video"}"#).unwrap().jpeg());
         let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"dangerousMinHz":1,"minQuality":0.3,"maxQuality":0.9,"qualityToHzTradeoff":0.7}"#).unwrap();
         assert_eq!(full.normalized()["bandwidthPriority"], 2.0);
         assert_eq!(full.min_interval(), Some(Duration::from_millis(50)));

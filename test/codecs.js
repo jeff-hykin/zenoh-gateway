@@ -143,6 +143,117 @@ try {
         check(result.metadata?.width === 320 && result.metadata?.sourceWidth === 320 && result.decodeErrors === 0, `${label}: per-frame metadata (${JSON.stringify(result.metadata)})`)
     }
 
+    $.logStep(`jpeg: the same ${cases.filter((c) => c.kind === "video").length} video subscriptions with imageTransport "jpeg", at maxQuality 1 and 0.5`)
+    const jpeg = await page.evaluate(async (bridgeUrl, cases) => {
+        const { connect } = await import("/client/zenoh_web.js")
+        const client = await connect(bridgeUrl)
+        const firstImage = (key, options) => new Promise((resolve) => {
+            const timer = setTimeout(() => resolve({ error: "no picture in 8 s" }), 8000)
+            let seen = 0
+            const subscription = client.subscribe(key, options, (message) => {
+                // the second picture, so the allocator has measured the stream
+                if (++seen < 2) {
+                    message.image?.close()
+                    return
+                }
+                clearTimeout(timer)
+                resolve({ subscription, message })
+            })
+            subscription.ready().catch((error) => resolve({ error: error.message }))
+        })
+        const results = []
+        for (const testCase of cases) {
+            for (const maxQuality of [1, 0.5]) {
+                const outcome = { file: testCase.file, codec: testCase.codec, maxQuality }
+                const { subscription, message, error } = await firstImage(testCase.key, { codec: testCase.codec, imageTransport: "jpeg", maxHz: 10, maxQuality })
+                if (error) {
+                    results.push({ ...outcome, error })
+                    continue
+                }
+                const image = message.image
+                const canvas = new OffscreenCanvas(image.width, image.height)
+                const context = canvas.getContext("2d", { willReadFrequently: true })
+                context.drawImage(image, 0, 0)
+                const { width, height } = image
+                image.close()
+                const pixels = context.getImageData(0, 0, width, height).data
+                const means = [[0, 0], [1, 0], [0, 1], [1, 1]].map(([column, row]) => {
+                    const sums = [0, 0, 0]
+                    let count = 0
+                    for (let y = Math.round(height * (row * 0.5 + 0.1)); y < Math.round(height * (row * 0.5 + 0.4)); y++) {
+                        for (let x = Math.round(width * (column * 0.5 + 0.1)); x < Math.round(width * (column * 0.5 + 0.4)); x++) {
+                            const offset = (y * width + x) * 4
+                            sums[0] += pixels[offset]
+                            sums[1] += pixels[offset + 1]
+                            sums[2] += pixels[offset + 2]
+                            count++
+                        }
+                    }
+                    return sums.map((sum) => Math.round(sum / Math.max(1, count)))
+                })
+                await client.pollStats()
+                const stats = subscription.bridgeStats?.stats
+                subscription.close()
+                results.push({ ...outcome, width, height, means, bytes: Array.from(message.bytes), hasVideo: subscription.mediaStream !== null, decodeErrors: subscription.decodeErrors, codecErrors: stats?.codecErrors, encodes: stats?.encodes })
+            }
+        }
+        client.close()
+        return results
+    }, { args: [bridge.url, cases.filter((c) => c.kind === "video")] })
+    const contains = (haystack, needle) => {
+        outer: for (let start = 0; start + needle.length <= haystack.length; start++) {
+            for (let index = 0; index < needle.length; index++) {
+                if (haystack[start + index] !== needle[index]) {
+                    continue outer
+                }
+            }
+            return true
+        }
+        return false
+    }
+    for (const result of jpeg) {
+        const testCase = cases.find((c) => c.file === result.file && c.codec === result.codec)
+        const label = `jpeg ${result.codec} ${result.file} maxQuality ${result.maxQuality}`
+        if (result.error) {
+            check(false, `${label}: ${result.error}`)
+            continue
+        }
+        const [width, height] = result.maxQuality === 1 ? [320, 240] : [200, 150]
+        const worst = Math.max(...result.means.flatMap((mean, quadrant) => mean.map((value, channel) => Math.abs(value - testCase.quadrants[quadrant][channel]))))
+        check(result.width === width && result.height === height && worst <= 12 && !result.hasVideo && result.decodeErrors === 0 && result.codecErrors === 0,
+            `${label}: a ${result.width}x${result.height} JPEG file (expected ${width}x${height}), quadrant means ${JSON.stringify(result.means)} within 12 (worst ${worst}), no video track`)
+        const isJpegSource = result.file.includes("jpeg")
+        if (result.maxQuality === 1 && isJpegSource) {
+            const fixture = Deno.readFileSync(fixturesDir.join(result.file).toString())
+            check(contains(fixture, result.bytes), `${label}: the source JPEG is passed through byte for byte (${result.bytes.length} bytes)`)
+        } else if (isJpegSource) {
+            const fixture = Deno.readFileSync(fixturesDir.join(result.file).toString())
+            check(!contains(fixture, result.bytes), `${label}: below full size the JPEG is re-encoded, not passed through`)
+        }
+    }
+
+    $.logStep("jpeg: latest-only delivery to a page that consumes slowly")
+    const slow = await page.evaluate(async (bridgeUrl, key) => {
+        const { connect } = await import("/client/zenoh_web.js")
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+        const client = await connect(bridgeUrl)
+        let images = 0
+        const subscription = client.subscribe(key, { codec: "dimos-image", imageTransport: "jpeg", maxHz: 3 }, (message) => {
+            images++
+            message.image?.close()
+        })
+        await subscription.ready()
+        await sleep(1000)
+        const before = images
+        await sleep(4000)
+        await client.pollStats()
+        const result = { hz: (images - before) / 4, stats: subscription.bridgeStats?.stats }
+        client.close()
+        return result
+    }, { args: [bridge.url, cases.find((c) => c.file === "dimos/image_rgb8.bin").key] })
+    check(slow.hz >= 2 && slow.hz <= 4 && slow.stats?.droppedQueue > 0,
+        `jpeg: maxHz 3 on a 10 Hz source delivers ~3 Hz and the bridge drops the rest from its latest-only queue (${slow.hz.toFixed(1)} Hz, droppedQueue ${slow.stats?.droppedQueue})`)
+
     $.logStep("depth: lossless over the data channel")
     const depthCases = cases.filter((c) => c.kind === "depth")
     const depth = await page.evaluate(async (bridgeUrl, cases) => {

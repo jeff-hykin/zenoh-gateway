@@ -526,7 +526,8 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     let rejected = match label.kind.as_str() {
         "sub" => match SubOpts::parse(&label.opts).and_then(|opts| {
             let codec = opts.resolve_codec(&state.codecs)?;
-            let video = bind_video(&state, codec.as_deref(), &label)?;
+            // JPEG files ride the subscription's own data channel; only H.264 needs a track
+            let video = if opts.jpeg() { None } else { bind_video(&state, codec.as_deref(), &label)? };
             Ok((opts, codec, video))
         }) {
             Ok((opts, codec, video)) => {

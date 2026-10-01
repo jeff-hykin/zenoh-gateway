@@ -105,7 +105,7 @@ pub(crate) fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
     let (luma, chroma) = out.split_at_mut(width * height);
     let (u_plane, v_plane) = chroma.split_at_mut(width * height / 4);
     for (luma_row, rgb_row) in luma.chunks_exact_mut(width).zip(rgb.chunks_exact(width * 3)) {
-        for (value, pixel) in luma_row.iter_mut().zip(rgb_row.chunks_exact(3)) {
+        for (value, pixel) in luma_row.iter_mut().zip(rgb_row.as_chunks::<3>().0) {
             let (r, g, b) = (pixel[0] as i32, pixel[1] as i32, pixel[2] as i32);
             *value = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
         }
@@ -125,13 +125,13 @@ pub(crate) fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
     out
 }
 
-/// The picture scaled to `width × height` (both even) as an I420 buffer for the encoder.
-fn to_yuv(image: &VideoImage, width: u32, height: u32) -> YUVBuffer {
+/// The picture scaled to `width × height` (both even) as planar I420 (BT.601 limited range).
+pub(crate) fn to_i420(image: &VideoImage, width: u32, height: u32) -> Vec<u8> {
     let source = (image.width(), image.height());
     match image.format() {
         PixelFormat::Rgb8 => {
             let pixels = resize_plane(image.data(), source, 3, (width, height));
-            YUVBuffer::from_vec(rgb_to_i420(&pixels, width as usize, height as usize), width as usize, height as usize)
+            rgb_to_i420(&pixels, width as usize, height as usize)
         }
         PixelFormat::I420 => {
             let luma_len = source.0 as usize * source.1 as usize;
@@ -142,9 +142,14 @@ fn to_yuv(image: &VideoImage, width: u32, height: u32) -> YUVBuffer {
             let mut yuv = resize_plane(luma, source, 1, (width, height));
             yuv.extend(resize_plane(u, half_source, 1, half));
             yuv.extend(resize_plane(v, half_source, 1, half));
-            YUVBuffer::from_vec(yuv, width as usize, height as usize)
+            yuv
         }
     }
+}
+
+/// The picture scaled to `width × height` (both even) as an I420 buffer for the encoder.
+fn to_yuv(image: &VideoImage, width: u32, height: u32) -> YUVBuffer {
+    YUVBuffer::from_vec(to_i420(image, width, height), width as usize, height as usize)
 }
 
 pub struct EncodedFrame {
@@ -312,6 +317,7 @@ mod tests {
         for quality in [0.8, 0.6, 0.3, 0.1] {
             let (width, height) = scaled_size(image.width(), image.height(), quality);
             time(&format!("to_yuv q{quality} {width}x{height}"), 10, Box::new(|| drop(to_yuv(&image, width, height))));
+            time(&format!("jpeg (scale + encode) q{quality}"), 10, Box::new(|| drop(crate::codec::jpeg::encode(&image, quality).unwrap())));
             let mut encoder = VideoEncoder::default();
             let mut flip = false;
             time(&format!("encode (to_yuv + h264) q{quality}"), 20, Box::new(|| {

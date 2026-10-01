@@ -147,6 +147,11 @@ export interface Message {
     decoded?: unknown
     video?: VideoFrameInfo
     mediaStream?: MediaStream
+    /**
+     * video codecs with `imageTransport: "jpeg"`: the picture, decoded (`msg.bytes` is the JPEG
+     * file). Draw it, then `close()` it. Absent where `createImageBitmap` is not available.
+     */
+    image?: ImageBitmap
 }
 
 export interface SubscribeOptions {
@@ -162,7 +167,15 @@ export interface SubscribeOptions {
     qualityToHzTradeoff?: number
     /** a built-in codec or any other name the bridge registered (`ZenohWeb.codecs`) */
     codec?: CodecName | (string & Record<never, never>)
+    /**
+     * video codecs: `"video"` (default) streams H.264 on a WebRTC video track (`msg.mediaStream`);
+     * `"jpeg"` sends each picture as a JPEG file on the data channel, decoded into `msg.image`
+     * (lower latency where the browser's video pipeline buffers; any `delivery`).
+     */
+    imageTransport?: ImageTransport
 }
+
+export type ImageTransport = "video" | "jpeg"
 
 export interface PublisherOptions {
     delivery?: Delivery
@@ -295,7 +308,7 @@ const putHeaderBytes = 8
 // incomplete chunked messages kept per subscription before the oldest is dropped
 const maxPartialMessages = 8
 
-const subscribeOptionNames = new Set(["delivery", "priority", "bandwidthPriority", "queueSize", "maxAge", "maxHz", "dangerousMinHz", "minQuality", "maxQuality", "qualityToHzTradeoff", "codec"])
+const subscribeOptionNames = new Set(["delivery", "priority", "bandwidthPriority", "queueSize", "maxAge", "maxHz", "dangerousMinHz", "minQuality", "maxQuality", "qualityToHzTradeoff", "codec", "imageTransport"])
 const publisherOptionNames = new Set(["delivery", "priority", "repeatMs", "latencyLimit"])
 
 function checkNumber(name: string, value: unknown, isValid: (value: number) => boolean, expected: string): void {
@@ -338,14 +351,22 @@ export function validateSubscribeOptions(options: SubscribeOptions, codecs: read
     if ((options.minQuality ?? 0) > (options.maxQuality ?? 1)) {
         throw new RangeError("zenoh-web: minQuality must be <= maxQuality")
     }
+    if (options.imageTransport !== undefined && options.imageTransport !== "video" && options.imageTransport !== "jpeg") {
+        throw new TypeError(`zenoh-web: imageTransport must be "video" or "jpeg", got ${String(options.imageTransport)}`)
+    }
     if (options.codec !== undefined) {
         const codec = codecs.find((info) => info.name === options.codec)
         if (codec === undefined) {
             throw new TypeError(`zenoh-web: unknown codec "${String(options.codec)}" (the bridge has: ${codecs.map((info) => info.name).join(", ")})`)
         }
-        if (codec.output === "video" && options.delivery === "reliable") {
-            throw new TypeError(`zenoh-web: ${options.codec} is a video codec (a lossy video track); use delivery "latest"`)
+        if (codec.output !== "video" && options.imageTransport !== undefined) {
+            throw new TypeError(`zenoh-web: imageTransport applies to video codecs; ${options.codec} sends data`)
         }
+        if (codec.output === "video" && options.imageTransport !== "jpeg" && options.delivery === "reliable") {
+            throw new TypeError(`zenoh-web: ${options.codec} is a video codec (a lossy video track); use delivery "latest" (or imageTransport "jpeg")`)
+        }
+    } else if (options.imageTransport !== undefined) {
+        throw new TypeError("zenoh-web: imageTransport needs a video codec")
     }
 }
 
@@ -657,10 +678,19 @@ export class Subscription extends Endpoint {
     #bytesSinceAck = 0
     #ackTimer: ReturnType<typeof setTimeout> | null = null
     #partials = new Map<number, PartialMessage>()
+    /** a video codec sending JPEG files on the data channel */
+    readonly #jpeg: boolean
+    /** jpeg: the newest message waiting for its picture to decode (older ones are dropped) */
+    #pendingImage: Message | null = null
+    #decodingImage = false
+    /** jpeg: pictures replaced by a newer one before they finished decoding */
+    imagesSkipped = 0
 
     constructor(owner: ZenohWeb, id: number, key: string, readonly options: SubscribeOptions, readonly callback: (message: Message) => void) {
         super(owner, id, key)
-        this.codecKind = options.codec === undefined ? null : owner.codecs.find((info) => info.name === options.codec)?.output ?? "data"
+        const output = options.codec === undefined ? null : owner.codecs.find((info) => info.name === options.codec)?.output ?? "data"
+        this.#jpeg = output === "video" && options.imageTransport === "jpeg"
+        this.codecKind = this.#jpeg ? "data" : output
     }
 
     get state(): SubscriptionState {
@@ -790,6 +820,9 @@ export class Subscription extends Endpoint {
                 message.mediaStream = this.mediaStream ?? undefined
                 return true
             }
+            if (this.#jpeg) {
+                return true
+            }
             const name = String(this.options.codec)
             const decoder = codecDecoders.get(name)
             if (decoder !== undefined) {
@@ -818,11 +851,48 @@ export class Subscription extends Endpoint {
         if (message.seq > this.#maxSeq) {
             this.#maxSeq = message.seq
         }
+        if (this.#jpeg && typeof createImageBitmap === "function") {
+            if (this.#pendingImage !== null) {
+                this.imagesSkipped++
+            }
+            this.#pendingImage = message
+            void this.#decodeImages()
+            return
+        }
+        this.#callback(message)
+    }
+
+    #callback(message: Message): void {
         try {
             this.callback(message)
         } catch (error) {
             console.error(`zenoh-web: subscriber callback for ${this.key} threw`, error)
         }
+    }
+
+    /** One decode at a time, newest first: a picture that arrives during a decode replaces any waiting one. */
+    async #decodeImages(): Promise<void> {
+        if (this.#decodingImage) {
+            return
+        }
+        this.#decodingImage = true
+        while (this.#pendingImage !== null && !this.closed) {
+            const message = this.#pendingImage
+            this.#pendingImage = null
+            try {
+                message.image = await createImageBitmap(new Blob([message.bytes as Uint8Array<ArrayBuffer>], { type: "image/jpeg" }))
+            } catch (error) {
+                this.decodeErrors++
+                console.error(`zenoh-web: JPEG on ${message.key} did not decode`, error)
+                continue
+            }
+            if (this.closed) {
+                message.image.close()
+                break
+            }
+            this.#callback(message)
+        }
+        this.#decodingImage = false
     }
 
     /** Tells the bridge we processed every frame up to frameId: 4 bytes, little endian. */

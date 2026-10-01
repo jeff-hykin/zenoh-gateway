@@ -36,6 +36,7 @@ env_logger = "0.11"
 futures = "0.3"
 # codecs (pure Rust decoders; openh264 + zstd build their C sources, cross-compiled via zig)
 openh264 = "0.9"
+jpeg-encoder = "0.6"
 zstd = "0.13"
 zune-jpeg = "0.5"
 png = "0.18"

@@ -125,7 +125,7 @@ Options are validated in the client (unknown names and out-of-range values throw
 
 | member | |
 |---|---|
-| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, bytes, timestamp, seq, depth?, points?, decoded?, video?, mediaStream? }` |
+| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, bytes, timestamp, seq, depth?, points?, decoded?, video?, mediaStream?, image? }` |
 | `publisher(key, options)` → `Publisher` | |
 | `get(key, { timeoutMs = 5000 })` → `[{ key, bytes, error? }]` | zenoh query |
 | `listTopics(filter = "**", { probeMs = 600 })` → `[{ key, sources }]` | live keys; `sources` ⊂ `subscriber`, `queryable`, `token`, `advancedPublisher`, `sample` (SPEC "Topic enumeration"); `probeMs: 0` skips the `sample` probe, so publishers that only send while matched stay asleep |
@@ -153,6 +153,7 @@ Options are validated in the client (unknown names and out-of-range values throw
 | `minQuality`, `maxQuality` | 0, 1 | quality bounds for codec streams |
 | `qualityToHzTradeoff` | 0.5 | 0 = keep quality, drop Hz; 1 = keep Hz, drop quality |
 | `codec` | none (raw bytes) | a name from `z.codecs` (see "Codecs"); unknown names throw, listing the bridge's codecs |
+| `imageTransport` | `"video"` | video codecs: `"video"` = H.264 on a video track (`sub.mediaStream`); `"jpeg"` = one JPEG file per picture on the data channel, decoded for you into `msg.image` (an `ImageBitmap`; draw it, then `close()` it) |
 
 `Subscription`: `ready()` (resolves when the bridge accepted it and the channel is open, rejects with
 the bridge's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"`), `mediaStream`
@@ -192,6 +193,16 @@ degradation. These are built in; an application embedding the server can add its
 |---|---|---|
 | `ros2-image`, `dimos-image` | `sensor_msgs/Image` (rgb8, bgr8, rgba8, bgra8, mono8, mono16/16UC1 top 8 bits, or jpeg/png data in an Image) | H.264 video track: `sub.mediaStream`, `msg.video` |
 | `ros2-compressed-image`, `dimos-compressed-image` | `sensor_msgs/CompressedImage`: jpeg, png, webp, jxl | H.264 video track |
+
+Every video codec (built-in or your own) can instead send JPEG files: `imageTransport: "jpeg"`. Each
+picture the pacing lets through is scaled for the allocated quality (the same resolution scale as
+H.264) and encoded at JPEG quality `35 + 55 q`; a source that already is a JPEG goes out byte for byte,
+without a decode, while the whole picture may be sent (quality 1). Delivery, drops, maxHz and the
+backlog window are the data channel's, and the allocator prices the stream by the JPEG sizes it
+measures. On the page, `msg.bytes` is the file and `msg.image` the decoded `ImageBitmap` (one decode
+at a time; a picture that arrives meanwhile replaces the one waiting). Choose it where the browser's
+video pipeline (jitter buffer, decoder) costs too much latency; H.264 sends fewer bytes for the same
+picture.
 | `ros2-depth`, `dimos-depth` | `sensor_msgs/Image`: 16UC1, 32FC1, mono16 | lossless depth: `msg.depth` (`Uint16Array` / `Float32Array`) |
 | `ros2-compressed-depth`, `dimos-compressed-depth` | `CompressedImage`: 16-bit png or jxl, ROS `compressedDepth` png | lossless depth |
 | `ros2-pointcloud2`, `dimos-pointcloud2` | `sensor_msgs/PointCloud2`, any field layout | quantized points: `msg.points.positions` (`Float32Array`), `intensity` |
@@ -239,7 +250,8 @@ is already running on a port before starting its own (`zenoh_web::HEALTH_PATH`).
 Implement `zenoh_web::Codec`: decode a zenoh sample (key, payload, encoding) once, then produce
 either **video** (`DecodedFrame::Video(VideoImage::rgb8(..)` or `::i420(..))`: the bridge scales it
 to the allocated quality, encodes H.264 and sends it on a video track, so the page just shows
-`sub.mediaStream`) or **data** (`encode(frame, quality)` returns bytes for the data channel; the
+`sub.mediaStream`, or JPEG files with `imageTransport: "jpeg"`; implement `jpeg(sample)` to let a
+sample that already is a JPEG pass through untouched) or **data** (`encode(frame, quality)` returns bytes for the data channel; the
 page decodes them with `registerCodec`). Decodes are shared across browsers per sample, data encodes
 per (sample, quality). `estimated_bytes(payload_bytes, quality)` is an optional cost model for the
 allocator.
@@ -376,11 +388,16 @@ their own headless Chrome (never the one on port 9222):
 - `test/codecs.js`: every fixture in `test/fixtures/` (made by dimos's own encoder and by rosbags)
   through each built-in codec: depth values exact at full and half resolution, point clouds within the
   documented quantization bound (intensity exact), video by its quadrant colors within ±10 of the
-  pattern (H.264 is lossy), plus unknown-codec errors and encodes shared across frontends.
+  pattern (H.264 is lossy), the same through `imageTransport: "jpeg"` at full and reduced size (JPEG
+  sources passed through byte for byte), latest-only JPEG delivery at `maxHz`, plus unknown-codec
+  errors and encodes shared across frontends.
 - `test/custom_codec.js`: `bridge/examples/custom_codec.rs` (the library with its own zenoh session and
   two external codecs): a data codec's text exact through a `registerCodec` decoder (full and half
   quality), a video codec's I420 frames by their color within ±20, unknown names on both sides.
-- `test/allocation.js`: flex-shrink and the quality/Hz tradeoff under `--max-bandwidth-bytes-per-sec`.
+- `test/allocation.js`: flex-shrink, the quality/Hz tradeoff, and a JPEG stream held within the budget
+  under `--max-bandwidth-bytes-per-sec`.
+- `test/abandoned.js`: a viewer whose browser freezes without closing anything: the bridge drops it and
+  goes idle.
 - `test/latency.js`: a strict-priority stream's p99 under bulk load through a userspace UDP shaper.
 - `test/example.js` (`deno task e2e:example`): the example page served by `--serve examples`, driven
   through its form; checks decoded video frames, drawn points and depth, the raw rate, a control

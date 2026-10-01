@@ -188,6 +188,8 @@ pub struct SubShared {
     closed: AtomicBool,
     /// flips to true on close, so `run` also stops when the channel never reports its own close
     closed_signal: tokio::sync::watch::Sender<bool>,
+    /// a video codec's pictures go out as JPEG files on the data channel (`imageTransport: "jpeg"`)
+    pub jpeg: bool,
 }
 
 pub fn now_unix_ms() -> f64 {
@@ -226,6 +228,7 @@ impl SubShared {
             drained: Notify::new(),
             closed: AtomicBool::new(false),
             closed_signal: tokio::sync::watch::Sender::new(false),
+            jpeg: opts.jpeg(),
         }
     }
 
@@ -283,9 +286,14 @@ impl SubShared {
         }
     }
 
-    /// A video codec's subscription (frames go to a video track, not the data channel).
-    pub fn is_video(&self) -> bool {
+    /// A video codec's subscription, by either transport.
+    pub fn is_image(&self) -> bool {
         self.codec.as_ref().is_some_and(|codec| codec.output() == CodecOutput::Video)
+    }
+
+    /// A video codec's subscription on an H.264 track (not the data channel).
+    pub fn is_video(&self) -> bool {
+        self.is_image() && !self.jpeg
     }
 
     pub fn note_video_source(&self, width: u32, height: u32) {
@@ -313,9 +321,22 @@ impl SubShared {
                 let message_bytes = if state.message_bytes > 0.0 { state.message_bytes } else { payload_bytes + FRAME_OVERHEAD_BYTES };
                 Box::new(move |_| message_bytes)
             }
-            Some(codec) if codec.output() == CodecOutput::Video => {
+            Some(codec) if codec.output() == CodecOutput::Video && !self.jpeg => {
                 let (width, height) = state.video_source.unwrap_or((640, 480));
                 Box::new(move |quality| crate::codec::video::bytes_per_frame(width, height, quality))
+            }
+            Some(_) if self.jpeg => {
+                // JPEG files: measured sizes per quality, scaled between qualities by the JPEG model
+                let (width, height) = state.video_source.unwrap_or((640, 480));
+                let measured: Vec<(f64, f64)> = state.encoded_bytes.iter().map(|(&bucket, &bytes)| (bucket as f64 / 1000.0, bytes)).collect();
+                Box::new(move |quality| {
+                    let estimate = |quality: f64| crate::codec::jpeg::bytes_per_frame(width, height, quality);
+                    let nearest = measured.iter().min_by(|a, b| (a.0 - quality).abs().total_cmp(&(b.0 - quality).abs()));
+                    match nearest {
+                        Some(&(measured_quality, bytes)) => bytes * estimate(quality) / estimate(measured_quality).max(1e-9),
+                        None => estimate(quality) + FRAME_OVERHEAD_BYTES,
+                    }
+                })
             }
             Some(codec) => {
                 // measured sizes, scaled between qualities by the codec's own estimate
@@ -353,7 +374,7 @@ impl SubShared {
         self.data_ready.notify_one();
     }
 
-    fn record_encode(&self, bucket: u16, quality: f64, encoded_len: usize, shared: bool) {
+    pub(crate) fn record_encode(&self, bucket: u16, quality: f64, encoded_len: usize, shared: bool) {
         let mut state = self.state.lock().unwrap();
         let previous = state.encoded_bytes.get(&bucket).copied().unwrap_or(0.0);
         state.encoded_bytes.insert(bucket, ewma(previous, encoded_len as f64 + FRAME_OVERHEAD_BYTES));
@@ -372,6 +393,13 @@ impl SubShared {
             warn!("codec {}: {error}", self.codec.as_ref().map_or("?", |codec| codec.name()));
             state.stats.last_codec_error = Some(error.to_owned());
         }
+    }
+
+    /// The size of the last picture sent as a JPEG file.
+    pub fn record_picture_size(&self, width: u32, height: u32) {
+        let mut state = self.state.lock().unwrap();
+        state.stats.video_width = width;
+        state.stats.video_height = height;
     }
 
     /// The video pipeline's per-frame costs and the CPU governor's quality ceiling.
@@ -558,7 +586,8 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
 
     shared.gate.register(shared.stream_id, dc.clone());
     let sender = match video {
-        Some(track) => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), track)),
+        Some(track) => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), crate::video::Output::Track(track))),
+        None if shared.is_image() => tokio::spawn(crate::video::send_loop(dc.clone(), shared.clone(), crate::video::Output::Jpeg)),
         None => tokio::spawn(send_loop(dc.clone(), shared.clone())),
     };
     // A browser that vanishes (killed, crashed, lid closed) never closes its channels; the peer is
@@ -687,9 +716,7 @@ async fn encode(shared: &SubShared, codec: Arc<dyn Codec>, key: &str, item: &Pen
 }
 
 async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
-    let mut warned_send_error = false;
-    let mut pacer = Pacer { probe_interval: FIRST_PROBE_AFTER, acks_seen: 0 };
-    let mut next_frame_id: u32 = 0;
+    let mut sender = MessageSender::new();
     while !shared.closed.load(Ordering::Relaxed) {
         let (next, wake_at) = shared.pick(Instant::now());
         let Some((key, item)) = next else {
@@ -704,24 +731,51 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             },
             None => Body::Raw(item.payload.to_bytes()),
         };
-        let payload = body.bytes();
+        if sender.send(&dc, &shared, &key, &item, body.bytes()).await == Sent::Closed {
+            return;
+        }
+    }
+}
+
+/// What became of one message.
+#[derive(Debug, PartialEq)]
+pub enum Sent {
+    Whole,
+    /// abandoned part way (outlived maxAge) or a send failed
+    Partial,
+    /// the channel or subscription is gone
+    Closed,
+}
+
+/// Sends whole messages on a subscription's channel: chunking, pacing (token bucket and the
+/// frontend's send gate, or the strict tier), the network/page backlog window, and the stats.
+pub struct MessageSender {
+    pacer: Pacer,
+    next_frame_id: u32,
+    warned_send_error: bool,
+}
+
+impl MessageSender {
+    pub fn new() -> Self {
+        MessageSender { pacer: Pacer { probe_interval: FIRST_PROBE_AFTER, acks_seen: 0 }, next_frame_id: 0, warned_send_error: false }
+    }
+
+    pub async fn send(&mut self, dc: &Arc<dyn DataChannel>, shared: &SubShared, key: &str, item: &Pending, payload: &[u8]) -> Sent {
         // strict: whole message at once, bulk held off meanwhile; bulk: small paced chunks
         let strict_turn = shared.is_strict().then(|| shared.gate.strict_turn());
         let chunk_bytes = if strict_turn.is_some() { frame::CHUNK_BYTES } else { shared.gate.chunk_bytes() };
         let chunk_count = frame::chunk_count(payload.len(), chunk_bytes);
-        let mut completed = true;
         let mut message_bytes = 0usize;
         for chunk_index in 0..chunk_count {
             // a lossy channel stops a chunked message that outlived maxAge; otherwise it finishes
             // what it started, so big messages make progress even when newer ones keep arriving
-            if chunk_index > 0 && !shared.delivery.reliable && shared.expired(&item, Instant::now()) {
+            if chunk_index > 0 && !shared.delivery.reliable && shared.expired(item, Instant::now()) {
                 shared.state.lock().unwrap().stats.abandoned_partial += 1;
-                completed = false;
-                break;
+                return Sent::Partial;
             }
-            let frame_id = next_frame_id;
-            next_frame_id = next_frame_id.wrapping_add(1);
-            let header = frame::FrameHeader { key: &key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index, chunk_count };
+            let frame_id = self.next_frame_id;
+            self.next_frame_id = self.next_frame_id.wrapping_add(1);
+            let header = frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index, chunk_count };
             let frame = frame::encode(&header, frame::chunk(payload, chunk_index, chunk_bytes));
             let frame_len = frame.len();
             if strict_turn.is_none() {
@@ -734,18 +788,17 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             }
             if let Err(error) = dc.send(frame).await {
                 if shared.closed.load(Ordering::Relaxed) {
-                    return;
+                    return Sent::Closed;
                 }
                 shared.state.lock().unwrap().stats.dropped_send_error += 1;
-                if !warned_send_error {
+                if !self.warned_send_error {
                     warn!("send on {key:?} failed ({frame_len} bytes): {error}");
-                    warned_send_error = true;
+                    self.warned_send_error = true;
                 }
                 if matches!(error, webrtc::error::Error::ErrDataChannelClosed) {
-                    return;
+                    return Sent::Closed;
                 }
-                completed = false;
-                break;
+                return Sent::Partial;
             }
             message_bytes += frame_len;
             {
@@ -755,21 +808,20 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
                 state.stats.frames_sent += 1;
                 state.stats.bytes_sent += frame_len as u64;
             }
-            pacer.wait_writable(&dc, &shared).await;
+            self.pacer.wait_writable(dc, shared).await;
             if strict_turn.is_none() {
                 shared.gate.report_outstanding(shared.stream_id, shared.state.lock().unwrap().stats.outstanding_bytes);
             }
             if shared.closed.load(Ordering::Relaxed) {
-                return;
+                return Sent::Closed;
             }
         }
         drop(strict_turn);
-        if completed {
-            let mut state = shared.state.lock().unwrap();
-            state.stats.sent += 1;
-            state.stats.max_send_lag_ms = state.stats.max_send_lag_ms.max(now_unix_ms() - item.timestamp_ms);
-            state.message_bytes = ewma(state.message_bytes, message_bytes as f64);
-        }
+        let mut state = shared.state.lock().unwrap();
+        state.stats.sent += 1;
+        state.stats.max_send_lag_ms = state.stats.max_send_lag_ms.max(now_unix_ms() - item.timestamp_ms);
+        state.message_bytes = ewma(state.message_bytes, message_bytes as f64);
+        Sent::Whole
     }
 }
 
