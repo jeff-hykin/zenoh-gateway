@@ -47,6 +47,12 @@ const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/pl
 /// Video metadata frame on the `sub` channel (SPEC "Wire formats").
 pub const METADATA_LEN: usize = 28;
 
+/// The track format of a payload type the bridge (and the Rust client) offers.
+#[cfg(feature = "client")]
+pub fn format_of_payload_type(payload_type: u8) -> Option<&'static str> {
+    FORMATS.iter().find(|(_, offered)| *offered == payload_type).map(|(mime, _)| *mime)
+}
+
 fn rtp_codec(mime: &str) -> RTCRtpCodec {
     if mime == OPUS {
         return RTCRtpCodec { mime_type: mime.to_owned(), clock_rate: 48_000, channels: 2, sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(), rtcp_feedback: vec![] };

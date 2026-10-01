@@ -41,6 +41,8 @@
 mod allocator;
 mod audio;
 mod auth;
+#[cfg(feature = "client")]
+pub mod client;
 mod codec;
 pub mod fields;
 mod frame;

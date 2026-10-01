@@ -119,6 +119,44 @@ transpiles it (`https://esm.sh/gh/jeff-hykin/zenoh-web@<commit>/client/zenoh_web
 (`deno bundle`, the same esbuild transform; zenoh-web-cli's `deno task build` bundles it with the
 dimos codecs' decoders).
 
+## Rust client
+
+`zenoh_web::client` (cargo feature `client`, so server-only builds don't carry reqwest) connects to a
+server the way the browser client does, for programs with no browser (Deno has no
+RTCPeerConnection or WebCodecs), e.g. a relay that takes a robot's best stream per camera and serves
+it again through its own `Server`. It is a module of this crate rather than a separate crate because
+it shares the wire code: the media engine and interceptors, the frame format, `fields::parse`.
+
+- `Client::connect(url, ClientOptions { token, ice_servers, relay_only, heartbeat_hz, heartbeat_misses })`:
+  the bridge's ICE servers from `GET /zenoh-web/ice` unless given, the same non-trickle `POST /offer`
+  (both with `Authorization: Bearer <token>` when set; a 401 fails the connect), `control` and
+  heartbeat channels, `codecs`, and 5 clock pings before returning; then a ping a second (clock
+  sync, `Degraded` when one fails). `list_topics`, `get`, `stats`, `codecs`, `clock_offset_ms`,
+  `rtt_ms`, `state`, `closed()`, `close()`. Reconnecting is the caller's job: when `closed()`
+  resolves, connect and subscribe again.
+- `subscribe(key, SubscribeOptions)` takes the browser's options (camelCase on the wire, unset ones
+  left out), resolves once the bridge accepted the channel (or fails with its reason), and yields
+  `Message`s (`recv()`, or as a `Stream`):
+  - `Data`: raw or codec bytes, reassembled and zstd-decompressed; fields codecs add the parsed `fields`;
+  - `Video`: an access unit (H.264 Annex B, VP8/VP9 frame, AV1 OBUs) with its format, keyframe flag
+    and RTP timestamp, depacketized from the track (reordered and retransmitted packets included);
+    after a lost frame the client sends a PLI and skips frames until a keyframe, so what it yields
+    always decodes. `request_keyframe()` sends a PLI;
+  - `VideoInfo`: the 28-byte metadata frame (key, size, quality), which travels on the data channel
+    apart from its frame;
+  - `Audio`: Opus packets.
+  Messages are acked once queued (64 per subscription), so a slow consumer slows the bridge instead
+  of piling up. Video and audio renegotiate a recvonly transceiver per codec and reuse a dropped
+  subscription's, as the browser does.
+- `publish(key, PublisherOptions)` → `put` / `put_at(bytes, timestamp_ms)` (`latest` drops a put
+  while 64 KiB are unsent), `repeat_ms`, `set_deadman`, `clear_deadman`, `tripped()`, `wait_tripped()`.
+  `blocked()` says why the bridge drops its puts (another client's lease). `pause_heartbeat(true)`
+  stops beats (to test deadmen).
+- `lease(group, keys, max_seconds)` → `Lease` (`lost()`, `wait_lost()`, `release()`), `expire_lease(group)`;
+  a `closed` event (revoked token) makes the client `Lost`.
+- Nothing is decoded: `examples/relay_sketch.rs` decodes H.264 with openh264 and serves the pictures
+  through a second server's video codec.
+
 ## Server (Rust library)
 
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)

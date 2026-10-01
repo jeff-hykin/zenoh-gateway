@@ -1,0 +1,300 @@
+//! The Rust client against an in-process server (`cargo test --features client`).
+
+#[path = "../examples/relay_sketch.rs"]
+mod relay_sketch;
+
+use anyhow::Result;
+use openh264::formats::YUVSource;
+use std::time::Duration;
+use tokio::time::timeout;
+use zenoh_web::client::{Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions, VideoFrame};
+use zenoh_web::{Codec, CodecOutput, CodecSample, Compress, DecodedFrame, Fields, RunningServer, Server, VideoImage, zenoh};
+
+/// `[r, g, b, width u16, height u16]` → a solid picture.
+struct SolidColor;
+
+impl Codec for SolidColor {
+    fn name(&self) -> &str {
+        "test-solid"
+    }
+
+    fn output(&self) -> CodecOutput {
+        CodecOutput::Video
+    }
+
+    fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame> {
+        let p = sample.payload;
+        let (width, height) = (u16::from_le_bytes([p[3], p[4]]) as u32, u16::from_le_bytes([p[5], p[6]]) as u32);
+        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, p[..3].repeat((width * height) as usize))?))
+    }
+}
+
+/// bytes → `{count, data, name}`
+struct ByteFields;
+
+impl Codec for ByteFields {
+    fn name(&self) -> &str {
+        "test-fields"
+    }
+
+    fn output(&self) -> CodecOutput {
+        CodecOutput::Fields
+    }
+
+    fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame> {
+        Ok(DecodedFrame::data(sample.payload.to_vec()))
+    }
+
+    fn encode(&self, frame: &DecodedFrame, _quality: f64) -> Result<Vec<u8>> {
+        let bytes = frame.downcast::<Vec<u8>>()?;
+        Ok(Fields::new().scalar("count", bytes.len() as u32).array("data", bytes).text("name", "bytes").build())
+    }
+}
+
+fn isolated_config() -> zenoh::Config {
+    let mut config = zenoh::Config::default();
+    config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+    config.insert_json5("listen/endpoints", "[]").unwrap();
+    config
+}
+
+async fn start() -> (RunningServer, zenoh::Session, String) {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let server = Server::builder().session(session.clone()).codec(SolidColor).codec(ByteFields).build().await.unwrap();
+    let running = server.bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", running.local_addr());
+    (running, session, url)
+}
+
+/// Puts `payload` on `key` every 50 ms until dropped (the bridge's subscription starts a moment after it accepts).
+fn keep_putting(session: &zenoh::Session, key: &str, payload: Vec<u8>) -> tokio::task::JoinHandle<()> {
+    let (session, key) = (session.clone(), key.to_owned());
+    tokio::spawn(async move {
+        loop {
+            session.put(&key, payload.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+}
+
+async fn next_video(subscription: &mut zenoh_web::client::Subscription) -> VideoFrame {
+    loop {
+        match timeout(Duration::from_secs(10), subscription.recv()).await.expect("a video frame").expect("subscription open") {
+            Message::Video(frame) => return frame,
+            _ => continue,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_topics_and_get() {
+    let (running, session, url) = start().await;
+    let _token = session.liveliness().declare_token("listed/robot/camera").await.unwrap();
+    let _queryable = session.declare_queryable("answers/42").callback(|query| {
+        tokio::spawn(async move { query.reply("answers/42", "forty-two").await.unwrap() });
+    }).await.unwrap();
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    assert!(client.codecs().iter().any(|codec| codec.name == "test-solid" && codec.output == "video"));
+    let topics = client.list_topics("listed/**", Some(0)).await.unwrap();
+    assert_eq!(topics.len(), 1, "{topics:?}");
+    assert_eq!((topics[0].key.as_str(), topics[0].sources.as_slice()), ("listed/robot/camera", &["token".to_owned()][..]));
+    let replies = client.get("answers/*", Duration::from_secs(2)).await.unwrap();
+    assert_eq!((replies[0].key.as_deref(), replies[0].bytes.as_slice()), (Some("answers/42"), &b"forty-two"[..]));
+    assert!(client.clock_offset_ms().unwrap().abs() < 50.0, "same machine: offset ~0");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_subscribe_is_byte_exact_with_zstd() {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { delivery: Some(Delivery::Reliable), compress: Some(Compress::Zstd), ..Default::default() };
+    let mut subscription = client.subscribe("raw/big", options).await.unwrap();
+    // 300 KB, several chunks, compressible
+    let payload: Vec<u8> = (0..300_000u32).map(|index| (index / 1000) as u8).collect();
+    let _putter = keep_putting(&session, "raw/big", payload.clone());
+    let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
+    assert_eq!(message.key, "raw/big");
+    assert!(message.bytes == payload, "byte-exact after reassembly and zstd ({} bytes)", message.bytes.len());
+    let stats = client.stats().await.unwrap();
+    let sent: f64 = stats["channels"].as_array().unwrap().iter().map(|channel| channel["stats"]["bytesSent"].as_f64().unwrap_or_default()).sum();
+    assert!(sent > 0.0 && sent < 100_000.0, "zstd on the wire: {sent} bytes sent");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fields_subscribe_is_parsed() {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let mut subscription = client.subscribe("fields/x", SubscribeOptions { codec: Some("test-fields".into()), ..Default::default() }).await.unwrap();
+    let _putter = keep_putting(&session, "fields/x", vec![3, 1, 4]);
+    let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
+    let fields = message.fields.expect("fields");
+    assert_eq!(fields["count"].values(), [3.0]);
+    assert_eq!(fields["data"].values(), [3.0, 1.0, 4.0]);
+    assert_eq!(fields["name"].text(), Some("bytes"));
+    let refused = client.subscribe("fields/x", SubscribeOptions { max_hz: Some(-1.0), ..Default::default() }).await;
+    assert!(refused.err().unwrap().to_string().contains("maxHz"), "the bridge's reason");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+/// Decodes H.264 access units in order, returning the last picture's size and mean RGB.
+fn decode_all(frames: &[VideoFrame]) -> ((usize, usize), [f64; 3]) {
+    let mut decoder = openh264::decoder::Decoder::new().unwrap();
+    let mut last = None;
+    for frame in frames {
+        if let Some(picture) = decoder.decode(&frame.data).unwrap() {
+            let (width, height) = picture.dimensions();
+            let mut rgb = vec![0u8; width * height * 3];
+            picture.write_rgb8(&mut rgb);
+            let mut mean = [0.0; 3];
+            for pixel in rgb.as_chunks::<3>().0 {
+                for (sum, value) in mean.iter_mut().zip(pixel) {
+                    *sum += *value as f64 / (width * height) as f64;
+                }
+            }
+            last = Some(((width, height), mean));
+        }
+    }
+    last.expect("a decoded picture")
+}
+
+fn solid(rgb: [u8; 3], width: u16, height: u16) -> Vec<u8> {
+    [&rgb[..], &width.to_le_bytes(), &height.to_le_bytes()].concat()
+}
+
+fn assert_color(mean: [f64; 3], expected: [u8; 3]) {
+    assert!(mean.iter().zip(expected).all(|(got, want)| (got - want as f64).abs() < 12.0), "mean {mean:?}, expected {expected:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { codec: Some("test-solid".into()), min_quality: Some(1.0), max_quality: Some(1.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await.unwrap();
+    let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
+    let mut frames = vec![next_video(&mut camera).await];
+    assert!(frames[0].keyframe, "a stream starts at a keyframe");
+    assert_eq!(frames[0].format, zenoh_web::VideoFormat::H264);
+    while frames.len() < 5 {
+        frames.push(next_video(&mut camera).await);
+    }
+    let (size, mean) = decode_all(&frames);
+    assert_eq!(size, (320, 240));
+    assert_color(mean, [200, 40, 90]);
+    // the bridge's own keyframes come every 3 s; one asked for comes at once
+    while next_video(&mut camera).await.keyframe {}
+    camera.request_keyframe().await.unwrap();
+    let asked = std::time::Instant::now();
+    while !next_video(&mut camera).await.keyframe {}
+    assert!(asked.elapsed() < Duration::from_secs(1), "keyframe after {:?}", asked.elapsed());
+    let stats = client.stats().await.unwrap();
+    assert!(stats["channels"][0]["stats"]["keyframeRequests"].as_u64().unwrap() >= 1, "{}", stats["channels"][0]["stats"]);
+    // a second video subscription after closing the first reuses its track
+    drop(camera);
+    let options = SubscribeOptions { codec: Some("test-solid".into()), min_quality: Some(1.0), max_resolution: Some((160, 120)), ..Default::default() };
+    let mut again = client.subscribe("camera/front", options).await.unwrap();
+    let first = next_video(&mut again).await;
+    assert!(first.keyframe);
+    assert_eq!(decode_all(&[first]).0, (160, 120), "maxResolution reached the bridge");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_arrives_in_zenoh() {
+    let (running, session, url) = start().await;
+    let subscriber = session.declare_subscriber("cmd/vel").await.unwrap();
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let publisher = client.publish("cmd/vel", PublisherOptions { delivery: Some(Delivery::Reliable), latency_limit: Some(500.0), ..Default::default() }).await.unwrap();
+    publisher.put(b"forward").await.unwrap();
+    let sample = timeout(Duration::from_secs(5), subscriber.recv_async()).await.unwrap().unwrap();
+    assert_eq!(sample.payload().to_bytes().as_ref(), b"forward");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deadman_fires_when_heartbeats_stop() {
+    let (running, session, url) = start().await;
+    let subscriber = session.declare_subscriber("cmd/stop").await.unwrap();
+    let client = Client::connect(&url, ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 3, ..Default::default() }).await.unwrap();
+    let publisher = client.publish("cmd/stop", PublisherOptions::default()).await.unwrap();
+    publisher.set_deadman(b"halt").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(subscriber.try_recv().unwrap().is_none(), "nothing while heartbeats flow");
+    client.pause_heartbeat(true);
+    let sample = timeout(Duration::from_secs(3), subscriber.recv_async()).await.unwrap().unwrap();
+    assert_eq!(sample.payload().to_bytes().as_ref(), b"halt");
+    assert_eq!(timeout(Duration::from_secs(2), publisher.wait_tripped()).await.unwrap(), "heartbeat");
+    assert!(publisher.put(b"go").await.is_err(), "a tripped publisher refuses puts");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+/// Frames flow A → client → decode → B → client: the relay example end to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_sketch_reserves_a_camera() {
+    let (source, session, url) = start().await;
+    let _putter = keep_putting(&session, "camera/rear", solid([30, 160, 220], 160, 120));
+    let relay = relay_sketch::relay(&url, "camera/rear", "test-solid", "127.0.0.1:0").await.unwrap();
+    let viewer = Client::connect(&format!("http://{}", relay.local_addr()), ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { codec: Some("relay-rgb".into()), min_quality: Some(1.0), max_quality: Some(1.0), ..Default::default() };
+    let mut camera = viewer.subscribe("relay/camera/rear", options).await.unwrap();
+    let mut frames = Vec::new();
+    while frames.len() < 3 {
+        frames.push(next_video(&mut camera).await);
+    }
+    let (size, mean) = decode_all(&frames);
+    assert_eq!(size, (160, 120));
+    assert_color(mean, [30, 160, 220]);
+    viewer.close().await;
+    relay.shutdown().await.unwrap();
+    source.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_and_leases() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let server = Server::builder()
+        .session(session.clone())
+        .authorize(|token, _headers| if token == Some("good") { Ok(zenoh_web::Grant::all()) } else { Err("unknown token".into()) })
+        .lease_group("drive", ["cmd/**"])
+        .build()
+        .await
+        .unwrap();
+    let running = server.bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", running.local_addr());
+    let refused = Client::connect(&url, ClientOptions { token: Some("bad".into()), ..Default::default() }).await;
+    assert!(refused.err().unwrap().to_string().contains("refused the token"));
+    let options = || ClientOptions { token: Some("good".into()), heartbeat_hz: 10.0, ..Default::default() };
+    let (driver, other) = (Client::connect(&url, options()).await.unwrap(), Client::connect(&url, options()).await.unwrap());
+    let lease = driver.lease("drive", None, None).await.unwrap();
+    assert_eq!(lease.keys, ["cmd/**"]);
+    let subscriber = session.declare_subscriber("cmd/vel").await.unwrap();
+    let blocked = other.publish("cmd/vel", PublisherOptions { delivery: Some(Delivery::Reliable), ..Default::default() }).await.unwrap();
+    blocked.put(b"other").await.unwrap();
+    let mine = driver.publish("cmd/vel", PublisherOptions { delivery: Some(Delivery::Reliable), ..Default::default() }).await.unwrap();
+    mine.put(b"driver").await.unwrap();
+    let sample = timeout(Duration::from_secs(5), subscriber.recv_async()).await.unwrap().unwrap();
+    assert_eq!(sample.payload().to_bytes().as_ref(), b"driver", "the other client's put was dropped");
+    for _ in 0..100 {
+        if blocked.blocked().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(blocked.blocked().unwrap().contains("leased by another client"), "the bridge said why");
+    lease.release().await.unwrap();
+    assert_eq!(lease.lost().as_deref(), Some("released"));
+    blocked.put(b"other again").await.unwrap();
+    let sample = timeout(Duration::from_secs(5), subscriber.recv_async()).await.unwrap().unwrap();
+    assert_eq!(sample.payload().to_bytes().as_ref(), b"other again");
+    driver.close().await;
+    other.close().await;
+    running.shutdown().await.unwrap();
+}

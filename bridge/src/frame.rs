@@ -41,6 +41,17 @@ pub fn encode(header: &FrameHeader, chunk: &[u8]) -> BytesMut {
     frame
 }
 
+/// A frame's header and chunk (what [`encode`] wrote), None if it is malformed.
+#[cfg(any(test, feature = "client"))]
+pub fn decode(frame: &[u8]) -> Option<(FrameHeader<'_>, &[u8])> {
+    let key_len = u16::from_le_bytes(frame.get(..2)?.try_into().ok()?) as usize;
+    let key = std::str::from_utf8(frame.get(2..2 + key_len)?).ok()?;
+    let fixed = frame.get(2 + key_len..HEADER_FIXED_LEN + key_len)?;
+    let word = |at: usize| u32::from_le_bytes(fixed[at..at + 4].try_into().unwrap());
+    let header = FrameHeader { key, timestamp_ms: f64::from_le_bytes(fixed[..8].try_into().unwrap()), seq: word(8), frame_id: word(12), chunk_index: word(16), chunk_count: word(20), flags: fixed[24] };
+    Some((header, &frame[HEADER_FIXED_LEN + key_len..]))
+}
+
 /// The `index`-th chunk of `payload`.
 pub fn chunk(payload: &[u8], index: u32, chunk_bytes: usize) -> &[u8] {
     let start = index as usize * chunk_bytes;
@@ -64,6 +75,9 @@ mod tests {
         assert_eq!(&frame[25..29], &3u32.to_le_bytes());
         assert_eq!(frame[29], ZSTD);
         assert_eq!(&frame[30..], &[9, 9]);
+        let (decoded, chunk) = decode(&frame).unwrap();
+        assert_eq!((decoded.key, decoded.timestamp_ms, decoded.seq, decoded.frame_id, decoded.chunk_index, decoded.chunk_count, decoded.flags, chunk), ("a/b", 1.5, 7, 9, 1, 3, ZSTD, &[9u8, 9][..]));
+        assert!(decode(&frame[..20]).is_none());
     }
 
     #[test]

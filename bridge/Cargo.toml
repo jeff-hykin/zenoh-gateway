@@ -42,8 +42,22 @@ sha1 = "0.10"
 openh264 = "0.9"
 # set_option, to change the bitrate without a keyframe
 openh264-sys2 = "0.9"
+# feature `client`: POST /offer
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+[features]
+# zenoh_web::client: a Rust client that connects to a server as a browser does (e.g. for a relay)
+client = ["dep:reqwest"]
 
 [dev-dependencies]
 # decodes a real camera frame for the ignored bench_stages
 zune-jpeg = "0.5"
+
+[[test]]
+name = "client"
+required-features = ["client"]
+
+[[example]]
+name = "relay_sketch"
+required-features = ["client"]
 

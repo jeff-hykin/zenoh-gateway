@@ -179,6 +179,39 @@ server; then call `server.shutdown()` yourself). `GET /zenoh-web/health` answers
 is already running on a port before starting its own (`zenoh_web::HEALTH_PATH`). API docs:
 `cargo doc --open` in `bridge/`.
 
+### Rust client (feature `client`)
+
+A program with no browser can connect to a server the way a page does, e.g. a relay that takes one
+robot's best stream per camera and serves it again through its own server. Video and audio arrive
+encoded (H.264/VP8/VP9/AV1 access units with a keyframe flag, Opus packets); decode them yourself.
+
+```toml
+zenoh-web = { git = "https://github.com/jeff-hykin/zenoh-web", rev = "<commit>", features = ["client"] }
+```
+
+```rust
+use zenoh_web::client::{Client, ClientOptions, Message, PublisherOptions, SubscribeOptions};
+let client = Client::connect("http://robot.local:7448", ClientOptions { token: None, heartbeat_hz: 5.0, ..Default::default() }).await?;
+let topics = client.list_topics("robot/**", None).await?;
+let mut camera = client.subscribe("camera/front", SubscribeOptions { codec: Some("ros2-image".into()), max_quality: Some(1.0), ..Default::default() }).await?;
+while let Some(message) = camera.recv().await {     // also a futures::Stream
+    match message {
+        Message::Video(frame) => { /* frame.format, frame.data (Annex B), frame.keyframe */ }
+        Message::Data(data) => { /* data.bytes (decompressed), data.fields (fields codecs) */ }
+        _ => {}
+    }
+}
+camera.request_keyframe().await?;                    // RTCP PLI
+let cmd = client.publish("cmd_vel", PublisherOptions::default()).await?;
+cmd.put(b"...").await?;
+cmd.set_deadman(b"stop").await?;                     // needs heartbeat_hz
+let lease = client.lease("drive", None, None).await?; // exclusive publishing (SPEC "Leases")
+client.close().await;                                // reconnecting is the caller's job: watch client.closed()
+```
+
+`examples/relay_sketch.rs` relays a camera from one server to another, decoding with openh264
+(`cargo run --example relay_sketch --features client -- <url> <key> <codec> <port>`). SPEC.md "Rust client".
+
 ### Custom codecs
 
 Implement `zenoh_web::Codec`: decode a zenoh sample (key, payload, encoding) once, then produce
@@ -300,7 +333,7 @@ constrained) is in `z.stats`. Full algorithm and measurements: SPEC.md "Bandwidt
 ## Tests
 
 ```sh
-cd bridge && cargo test && cargo clippy --all-targets && cargo doc --no-deps   # unit + doc tests, lints, API docs
+cd bridge && cargo test --all-features && cargo clippy --all-features --all-targets && cargo doc --no-deps   # unit, client and doc tests, lints, API docs
 deno task check                            # type-check the client
 ```
 
