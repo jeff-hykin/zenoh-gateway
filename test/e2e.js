@@ -150,7 +150,7 @@ try {
     const viewerGone = await bridgeOutput.waitFor((line) => line.includes("peer 1: gone"), 5000).then(() => true, () => false)
     check(viewerGone, "bridge drops the viewer's peer connection after the page navigates away")
     const results = await page.evaluate(async (bridgeUrl) => {
-        const { connect, Priority } = await import("/client/zenoh_web.js")
+        const { connect, Priority, encodePut } = await import("/client/zenoh_web.js")
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
         const decoder = new TextDecoder()
         const out = {}
@@ -172,14 +172,32 @@ try {
 
         const command = client.publisher("test/frombrowser/cmd", { delivery: "reliable", priority: Priority.REAL_TIME })
         command.put("hello-from-browser")
-        const deadman = client.publisher("test/frombrowser/deadman", { delivery: "latest", repeatMs: 100 })
-        await deadman.ready()
-        deadman.put("deadman")
+        const repeater = client.publisher("test/frombrowser/repeat", { delivery: "latest", repeatMs: 100 })
+        await repeater.ready()
+        repeater.put("repeat")
         await sleep(1200)
         await client.pollStats()
-        out.deadman = { sent: deadman.sent, dropped: deadman.dropped }
-        deadman.close()
+        out.repeat = { sent: repeater.sent, dropped: repeater.dropped }
+        repeater.close()
         command.close()
+
+        // options: old names and bad values are rejected; phase-2 fields are carried to the bridge
+        out.optionErrors = []
+        for (const bad of [{ hz: [1, 10] }, { delivery: { queue: 1 } }, { queueSize: 0 }, { minQuality: 0.9, maxQuality: 0.1 }, { qualityToHzTradeoff: 2 }]) {
+            try {
+                client.subscribe("test/jpeg", bad, () => {})
+                out.optionErrors.push(null)
+            } catch (error) {
+                out.optionErrors.push(error.message)
+            }
+        }
+        const carried = client.subscribe("test/jpeg", { bandwidthPriority: 2, maxHz: 20, dangerousMinHz: 1, minQuality: 0.3, maxQuality: 0.9, qualityToHzTradeoff: 0.7 }, () => {})
+        await carried.ready()
+        await sleep(200)
+        await client.pollStats()
+        out.carriedOpts = carried.bridgeStats?.opts
+        carried.close()
+        out.clock = { offsetMs: client.clockOffsetMs, rttMs: client.rttMs, bridge: client.bridgeStats?.clock }
 
         /**
          * Subscribes to test/fast for a while; latency = arrival - publisher send time (same machine clock).
@@ -196,7 +214,7 @@ try {
             const started = performance.now()
             await sleep(durationMs)
             await client.pollStats()
-            const bridgeStats = subscription.bridgeStats
+            const bridgeStats = subscription.bridgeStats?.stats
             const dropped = subscription.dropped
             subscription.close()
             await sleep(300)
@@ -214,7 +232,7 @@ try {
                 p50: quantile(0.5),
                 p90: quantile(0.9),
                 p99: quantile(0.99),
-                medianEarly: window(1000, 2000),
+                medianEarly: window(1000, 3000),
                 medianLate: window(durationMs - 1000, durationMs),
                 slowest: settled.filter((sample) => sample.latencyMs > 50).slice(0, 10).map((sample) => [Math.round(sample.at - started), Math.round(sample.latencyMs)]),
                 bridge: bridgeStats,
@@ -222,10 +240,72 @@ try {
         }
 
         out.latest = await measure({ delivery: "latest" }, 6000)
-        out.maxAge = await measure({ delivery: { queue: 50, maxAgeMs: 10 } }, 4000)
-        out.hzCapped = await measure({ delivery: "latest", hz: [1, 10] }, 3000)
+        out.maxAge = await measure({ queueSize: 50, maxAge: 10 }, 4000)
+        out.hzCapped = await measure({ delivery: "latest", maxHz: 10 }, 3000)
         out.reliable = await measure({ delivery: "reliable" }, 4000)
+
+        // setDeadman without a heartbeat is a usage error
+        const noHeartbeat = client.publisher("test/frombrowser/noheartbeat", { delivery: "reliable" })
+        try {
+            noHeartbeat.setDeadman("x")
+            out.noHeartbeatError = null
+        } catch (error) {
+            out.noHeartbeatError = error.message
+        }
         client.close()
+
+        // latencyLimit: this client's clock runs 30 s ahead; the offset estimate absorbs that,
+        // and a put stamped 1 s in the past (a simulated delay) is dropped
+        const skewed = await connect(bridgeUrl, { clock: () => performance.timeOrigin + performance.now() + 30000 })
+        const limited = skewed.publisher("test/frombrowser/limited", { delivery: "reliable", latencyLimit: 200 })
+        await limited.ready()
+        limited.put("fresh-1")
+        limited.put("stale", { timestamp: skewed.now() - 1000 })
+        limited.put("fresh-2")
+        await sleep(500)
+        await skewed.pollStats()
+        out.latency = { offsetMs: skewed.clockOffsetMs, rttMs: skewed.rttMs, stats: limited.bridgeStats?.stats }
+        skewed.close()
+
+        // deadman via heartbeat: 5 Hz, 10 misses = 2 s of silence
+        const guarded = await connect(bridgeUrl, { heartbeatHz: 5, heartbeatMisses: 10 })
+        const stop = guarded.publisher("test/frombrowser/stop", { delivery: "reliable" })
+        const trips = []
+        stop.onTripped((reason) => trips.push(reason))
+        await stop.setDeadman("STOP-heartbeat")
+        const cleared = guarded.publisher("test/frombrowser/cleared", { delivery: "reliable" })
+        await cleared.setDeadman("STOP-cleared")
+        await cleared.clearDeadman()
+        stop.put("moving")
+        await sleep(2500)
+        stop.put("last-before-pause")
+        await sleep(200)
+        guarded.pauseHeartbeat()
+        await sleep(4000)
+        out.trip = { state: stop.state, trips, clearedState: cleared.state }
+        try {
+            stop.put("after-trip")
+            out.putAfterTrip = null
+        } catch (error) {
+            out.putAfterTrip = error.message
+        }
+        // bypass the client-side check: the bridge must reject it too
+        stop.channel.send(encodePut(new TextEncoder().encode("raw-after-trip"), guarded.now()))
+        await sleep(300)
+        guarded.resumeHeartbeat()
+        await sleep(500)
+        await guarded.pollStats()
+        out.tripStats = stop.bridgeStats?.stats
+        stop.close()
+
+        const recreated = guarded.publisher("test/frombrowser/stop", { delivery: "reliable" })
+        await recreated.ready()
+        recreated.put("recreated-works")
+        await recreated.setDeadman("STOP-close")
+        await cleared.setDeadman("STOP-cleared-close")
+        await cleared.clearDeadman()
+        await sleep(300)
+        out.recreatedState = recreated.state
         return out
     }, { args: [bridgeUrl] })
     console.log(JSON.stringify(results, null, 2))
@@ -236,8 +316,8 @@ try {
     const commandLine = await peerOutput.waitFor((line) => line.startsWith("RECV test/frombrowser/cmd"), 3000).catch(() => null)
     check(commandLine === "RECV test/frombrowser/cmd hello-from-browser", "publisher channel put reaches a zenoh subscriber")
     // headless Chrome timers run late on a loaded machine, so compare against what the client actually sent
-    const deadmanCount = peerOutput.lines.filter((line) => line === "RECV test/frombrowser/deadman deadman").length
-    check(results.deadman.sent >= 5 && deadmanCount === results.deadman.sent, `repeatMs re-sends the last value and every repeat reaches zenoh (sent ${results.deadman.sent}, received ${deadmanCount} in ~1.2s)`)
+    const repeatCount = peerOutput.lines.filter((line) => line === "RECV test/frombrowser/repeat repeat").length
+    check(results.repeat.sent >= 5 && repeatCount === results.repeat.sent, `repeatMs re-sends the last value and every repeat reaches zenoh (sent ${results.repeat.sent}, received ${repeatCount} in ~1.2s)`)
 
     const latest = results.latest
     check(latest.received > 100, `latest: messages arrive (${latest.received})`)
@@ -246,21 +326,62 @@ try {
     console.log(`latest: p50=${latest.p50?.toFixed(1)} p90=${latest.p90?.toFixed(1)} p99=${latest.p99?.toFixed(1)} ms, slowest=${JSON.stringify(latest.slowest)}`)
     check(latest.p50 !== null && latest.p50 < 50, `latest: median latency stays low (${latest.p50?.toFixed(1)} ms)`)
     check(latest.bridge?.maxReceiveLagMs < 100, `latest: upstream zenoh lag into the bridge stays low (${latest.bridge?.maxReceiveLagMs?.toFixed(1)} ms)`)
-    check(latest.medianLate !== null && latest.medianLate < latest.medianEarly + 50, `latest: latency does not grow (${latest.medianEarly?.toFixed(1)} -> ${latest.medianLate?.toFixed(1)} ms)`)
+    check(latest.medianEarly !== null && latest.medianLate !== null && latest.medianLate < latest.medianEarly + 50, `latest: latency does not grow (${latest.medianEarly?.toFixed(1)} -> ${latest.medianLate?.toFixed(1)} ms)`)
     check(latest.bridge?.queued <= 1, `latest: bridge queue stays at <= 1 (${latest.bridge?.queued})`)
 
     const maxAge = results.maxAge
-    check(maxAge.received > 50, `maxAgeMs: messages arrive (${maxAge.received})`)
-    check(maxAge.bridge?.droppedAge > 0, `maxAgeMs: bridge drops samples older than 10 ms (droppedAge=${maxAge.bridge?.droppedAge})`)
-    check(maxAge.p50 !== null && maxAge.p50 < 50, `maxAgeMs: median latency stays low (${maxAge.p50?.toFixed(1)} ms, p90 ${maxAge.p90?.toFixed(1)})`)
+    check(maxAge.received > 50, `maxAge: messages arrive (${maxAge.received})`)
+    check(maxAge.bridge?.droppedAge > 0, `maxAge: bridge drops samples older than 10 ms (droppedAge=${maxAge.bridge?.droppedAge})`)
+    check(maxAge.p50 !== null && maxAge.p50 < 50, `maxAge: median latency stays low (${maxAge.p50?.toFixed(1)} ms, p90 ${maxAge.p90?.toFixed(1)})`)
 
     const hzCapped = results.hzCapped
-    check(hzCapped.ratePerSec <= 11 && hzCapped.ratePerSec >= 7, `hz [1,10]: delivered rate capped (${hzCapped.ratePerSec.toFixed(1)}/s)`)
+    check(hzCapped.ratePerSec <= 11 && hzCapped.ratePerSec >= 7, `maxHz 10: delivered rate capped (${hzCapped.ratePerSec.toFixed(1)}/s)`)
 
     const reliable = results.reliable
     console.log(`reliable (contrast, not asserted beyond delivery): p50=${reliable.p50?.toFixed(1)}ms, early=${reliable.medianEarly?.toFixed(1)} late=${reliable.medianLate?.toFixed(1)} queued=${reliable.bridge?.queued} dropped=${reliable.dropped}`)
     check(reliable.received > 50 && reliable.dropped === 0, `reliable: arrives with no gaps (${reliable.received}, dropped ${reliable.dropped})`)
     check(reliable.medianLate > 10 * Math.max(1, latest.medianLate), `contrast: reliable queues and grows latency where latest does not (${reliable.medianLate?.toFixed(0)} vs ${latest.medianLate?.toFixed(1)} ms)`)
+
+    check(results.optionErrors.every((message) => typeof message === "string"), `bad/old subscribe options throw (${results.optionErrors.map((m) => m?.split(":")[1]?.trim().slice(0, 40)).join(" | ")})`)
+    const carried = results.carriedOpts ?? {}
+    check(carried.bandwidthPriority === 2 && carried.dangerousMinHz === 1 && carried.minQuality === 0.3 && carried.maxQuality === 0.9 && carried.qualityToHzTradeoff === 0.7 && carried.maxHz === 20,
+        `phase-2 options reach the bridge and show in stats (${JSON.stringify(carried)})`)
+    check(Math.abs(results.clock.offsetMs) < 20 && results.clock.rttMs >= 0 && results.clock.bridge?.offsetMs !== null, `clock sync, same machine: offset ${results.clock.offsetMs?.toFixed(2)} ms, rtt ${results.clock.rttMs?.toFixed(2)} ms`)
+
+    const recvCount = (/** @type {string} */ key, /** @type {string} */ payload) => peerOutput.lines.filter((line) => line === `RECV test/frombrowser/${key} ${payload}`).length
+    const latency = results.latency
+    check(Math.abs(latency.offsetMs + 30000) < 50, `clock sync absorbs a +30 s browser clock skew (offset ${latency.offsetMs?.toFixed(1)} ms)`)
+    check(recvCount("limited", "fresh-1") === 1 && recvCount("limited", "fresh-2") === 1, "latencyLimit: fresh puts from a skewed clock pass")
+    check(recvCount("limited", "stale") === 0 && latency.stats?.droppedStale === 1, `latencyLimit: a put 1 s old is dropped and counted (droppedStale=${latency.stats?.droppedStale})`)
+
+    check(results.noHeartbeatError?.includes("needs a heartbeat"), `setDeadman without a heartbeat throws (${results.noHeartbeatError})`)
+    const stopLines = (/** @type {string} */ payload) => peerOutput.lines.findIndex((line) => line === `RECV test/frombrowser/stop ${payload}`)
+    check(recvCount("stop", "STOP-heartbeat") === 1, `deadman fires exactly once when heartbeats stop (${recvCount("stop", "STOP-heartbeat")})`)
+    check(stopLines("STOP-heartbeat") > stopLines("last-before-pause") && stopLines("last-before-pause") >= 0, "deadman did not fire while heartbeats were flowing")
+    check(results.trip.state === "tripped" && results.trip.trips.join() === "heartbeat", `publisher reports tripped + callback (${results.trip.state}, ${results.trip.trips})`)
+    check(results.putAfterTrip?.includes("tripped") && recvCount("stop", "after-trip") === 0, "put after a trip throws in the client")
+    check(recvCount("stop", "raw-after-trip") === 0 && results.tripStats?.rejectedTripped === 1, `bridge rejects puts on a tripped stream (rejectedTripped=${results.tripStats?.rejectedTripped})`)
+    check(recvCount("cleared", "STOP-cleared") === 0 && results.trip.clearedState === "open", "a cleared deadman does not fire on heartbeat loss")
+    check(recvCount("stop", "recreated-works") === 1 && results.recreatedState === "open", "recreated publisher works again")
+
+    $.logStep("closing the page with an armed deadman")
+    await page.close()
+    const closeLine = await peerOutput.waitFor((line) => line === "RECV test/frombrowser/stop STOP-close", 20000).catch(() => null)
+    await $.sleep(1000)
+    check(closeLine !== null && recvCount("stop", "STOP-close") === 1, `deadman fires once on page close (${recvCount("stop", "STOP-close")})`)
+    check(recvCount("cleared", "STOP-cleared-close") === 0, "a cleared deadman does not fire on page close")
+
+    $.logStep("SIGTERM to the bridge with an armed deadman")
+    const lastPage = await browser.newPage(`${bridgeUrl}/test/blank.html`)
+    await lastPage.evaluate(async (bridgeUrl) => {
+        const { connect } = await import("/client/zenoh_web.js")
+        const client = await connect(bridgeUrl, { heartbeatHz: 5, heartbeatMisses: 10 })
+        await client.publisher("test/frombrowser/stop", { delivery: "reliable" }).setDeadman("STOP-sigterm")
+    }, { args: [bridgeUrl] })
+    bridge.kill("SIGTERM")
+    const termLine = await peerOutput.waitFor((line) => line === "RECV test/frombrowser/stop STOP-sigterm", 10000).catch(() => null)
+    await bridgeOutput.waitFor((line) => line.includes("shut down"), 10000).catch(() => null)
+    check(termLine !== null && recvCount("stop", "STOP-sigterm") === 1, `deadman fires once on bridge SIGTERM (${recvCount("stop", "STOP-sigterm")})`)
 } catch (error) {
     failures.push(String(error))
     console.error(error)

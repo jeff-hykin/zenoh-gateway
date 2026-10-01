@@ -64,9 +64,9 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zenoh=warn,zenoh_ext=warn,zenoh_web=info,rtc=warn,webrtc=warn")).init();
     let cli = Cli::parse();
     let session = zenoh::open(zenoh_config(&cli)?).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    let bridge = Bridge::new(session);
+    let bridge = Bridge::new(session.clone());
 
-    let mut app = Router::new().route("/offer", post(offer)).with_state(bridge).layer(CorsLayer::permissive());
+    let mut app = Router::new().route("/offer", post(offer)).with_state(bridge.clone()).layer(CorsLayer::permissive());
     if let Some(dir) = &cli.serve {
         app = app.fallback_service(ServeDir::new(dir));
     }
@@ -75,6 +75,15 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dir) = &cli.serve {
         info!("serving {}", dir.display());
     }
-    axum::serve(listener, app).await?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = axum::serve(listener, app) => result?,
+        _ = tokio::signal::ctrl_c() => info!("SIGINT"),
+        _ = terminate.recv() => info!("SIGTERM"),
+    }
+    // every frontend's deadmen go out (reliably) before the zenoh session closes
+    bridge.shutdown().await;
+    session.close().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    info!("shut down");
     Ok(())
 }

@@ -2,7 +2,7 @@
 //! into the data channel only while it is not backed up.
 
 use crate::frame;
-use crate::options::{Delivery, Label};
+use crate::options::{Delivery, Label, SubOpts};
 use log::{debug, warn};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -95,7 +95,7 @@ pub struct SubShared {
     closed: AtomicBool,
 }
 
-fn now_unix_ms() -> f64 {
+pub fn now_unix_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
 }
 
@@ -108,11 +108,11 @@ fn sample_timestamp_ms(sample: &Sample) -> f64 {
 }
 
 impl SubShared {
-    pub fn new(label: &Label) -> Self {
+    pub fn new(opts: &SubOpts) -> Self {
         SubShared {
-            delivery: label.opts.delivery(),
-            min_interval: label.opts.min_interval(),
-            priority_override: label.opts.zenoh_priority().map(|p| p as u8),
+            delivery: opts.delivery(),
+            min_interval: opts.min_interval(),
+            priority_override: opts.zenoh_priority().map(|p| p as u8),
             state: Mutex::new(SubState::default()),
             data_ready: Notify::new(),
             drained: Notify::new(),
@@ -334,8 +334,7 @@ mod tests {
     use super::*;
 
     fn shared(opts: &str) -> SubShared {
-        let label: Label = serde_json::from_str(&format!(r#"{{"type":"sub","key":"a/**","opts":{opts}}}"#)).unwrap();
-        SubShared::new(&label)
+        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap())
     }
 
     fn pending(seq: u32, priority: u8, arrived: Instant) -> Pending {
@@ -388,7 +387,7 @@ mod tests {
 
     #[test]
     fn max_age_drops() {
-        let shared = shared(r#"{"delivery":{"maxAgeMs":100}}"#);
+        let shared = shared(r#"{"maxAge":100,"queueSize":null}"#);
         let t0 = Instant::now();
         insert(&shared, "a/x", pending(0, 5, t0), None);
         let (next, _) = shared.pick(t0 + Duration::from_millis(500));
@@ -398,7 +397,7 @@ mod tests {
 
     #[test]
     fn hz_cap_defers() {
-        let shared = shared(r#"{"hz":[1,10],"delivery":{"queue":5}}"#);
+        let shared = shared(r#"{"maxHz":10,"queueSize":5}"#);
         let t0 = Instant::now();
         insert(&shared, "a/x", pending(0, 5, t0), None);
         insert(&shared, "a/x", pending(1, 5, t0), None);

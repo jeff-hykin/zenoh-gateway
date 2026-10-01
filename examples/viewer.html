@@ -104,7 +104,7 @@
             stateElement.textContent = state
             stateElement.className = state
         })
-        client.subscribe(keyExpr, { delivery: "latest", hz: [0, 30] }, (message) => {
+        client.subscribe(keyExpr, { delivery: "latest", maxHz: 30 }, (message) => {
             const entry = entryFor(message.key)
             entry.count++
             entry.lastSize = message.bytes.length
