@@ -334,6 +334,53 @@ CSS flex items by `demand / bandwidthPriority` (higher priority keeps more; prio
 streams don't wait behind them. Each subscription's `allocation` (demand, budget, hz, quality,
 constrained) is in `z.stats`. Full algorithm and measurements: SPEC.md "Bandwidth allocation".
 
+## Nix / cross compiling
+
+The flake builds with [crate2nix](https://github.com/nix-community/crate2nix): every crate is its own nix store
+derivation, so crates are built once and shared by every flake that uses `lib.crossRust` (zenoh-web, zenoh-dimos-codecs,
+zenoh-web-encoders, zenoh-web-cli, zenoh-web-relay, your own) instead of each repo's `target/`. Linux binaries are cross
+compiled from a Mac (or the other Linux arch) with zig as the C compiler and linker, for glibc 2.35 (Ubuntu 22.04,
+Jetson L4T 36): no Linux VM, no GCC cross toolchain. C sources (openh264, zstd, ring) cross compile through zig; Opus is
+`unsafe-libopus` (Rust); GStreamer is loaded at runtime, so nothing links it.
+
+```sh
+nix build .#zenoh-web-example                  # native (example/: a loopback server + the Rust client)
+nix build .#zenoh-web-example-aarch64-linux    # ELF aarch64, glibc >= 2.35
+nix build .#zenoh-web-example-x86_64-linux
+```
+
+Your nix may build one derivation at a time (`max-jobs = 1`); with hundreds of crates pass `--max-jobs auto`.
+
+### A crate that depends on zenoh-web
+
+```sh
+nix flake init -t github:jeff-hykin/zenoh-web#downstream   # Cargo.toml, src/main.rs, flake.nix
+cargo generate-lockfile && nix run github:jeff-hykin/zenoh-web#crate2nix -- generate   # Cargo.lock -> Cargo.nix
+git add -A && nix build .#my-app-aarch64-linux --max-jobs auto
+```
+
+The template's `flake.nix` is the whole recipe:
+
+```nix
+{
+    inputs.zenoh-web.url = "github:jeff-hykin/zenoh-web";
+    outputs = { self, zenoh-web }: {
+        packages = zenoh-web.lib.eachSystem (system: zenoh-web.lib.crossRustPackages {
+            name = "my-app";                  # packages my-app, my-app-aarch64-linux, my-app-x86_64-linux
+            inherit system;
+            cargoNix = ./Cargo.nix;           # from `crate2nix generate`; regenerate when Cargo.lock changes
+        });
+    };
+}
+```
+
+`lib.crossRust { system, cargoNix, crate ? null, features ? [ "default" ], crateOverrides ? { }, glibc ? "2.35" }`
+returns `{ native, aarch64-linux, x86_64-linux }` (`crate`: a workspace member, default the root crate; `crateOverrides`:
+buildRustCrate overrides merged over nixpkgs' `defaultCrateOverrides`, e.g. for a `-sys` crate that needs a
+library). `lib.crossRustPackages { name, ... }` names them `<name>`, `<name>-aarch64-linux`, `<name>-x86_64-linux`.
+Builds use zenoh-web's nixpkgs and Rust toolchain pins, which is what lets crates be shared; don't make the input
+follow another nixpkgs. Native macOS binaries link `/usr/lib/libiconv` (not nix's), so they run on Macs without nix.
+
 ## Tests
 
 ```sh
