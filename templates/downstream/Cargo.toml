@@ -5,8 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-zenoh-web = { version = "0.4.0", git = "https://github.com/jeff-hykin/zenoh-web", rev = "fb465e704544008095a00b5416d68b6abc91147c", features = ["client"] }
+zenoh-web = { version = "0.4.1", git = "https://github.com/jeff-hykin/zenoh-web", rev = "63b72ddd507fd31cd91dc1c3cc350336ebe08b89", features = ["client"] }
 # the dimos / ROS 2 codecs and hardware encoders: VideoToolbox on macOS, GStreamer (opened at runtime) on Linux
-zenoh-dimos-codecs = { version = "0.2.0", git = "https://github.com/jeff-hykin/zenoh-dimos-codecs", rev = "89b5762e2acf31c28eeef1fc6d98d53a7d821235", features = ["videotoolbox", "gstreamer"] }
+zenoh-dimos-codecs = { version = "0.2.0", git = "https://github.com/jeff-hykin/zenoh-dimos-codecs", rev = "013142da5ba4777a6d00993acc85148d0fe674ce", features = ["videotoolbox", "gstreamer"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"

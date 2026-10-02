@@ -16374,8 +16374,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/jeff-hykin/zenoh-dimos-codecs";
-          rev = "89b5762e2acf31c28eeef1fc6d98d53a7d821235";
-          sha256 = "0nh2sz88nrx96mk6c3257f1ngvdy6g58aj41wjdqh4xfh9kykfsh";
+          rev = "013142da5ba4777a6d00993acc85148d0fe674ce";
+          sha256 = "1i29b061720y08vlji7z6d0wxwpyfa9rxkw6vz81rsncmxp1wqmh";
         };
         libName = "zenoh_dimos_codecs";
         dependencies = [
@@ -18007,13 +18007,13 @@ rec {
       };
       "zenoh-web" = rec {
         crateName = "zenoh-web";
-        version = "0.4.0";
+        version = "0.4.1";
         edition = "2024";
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/jeff-hykin/zenoh-web";
-          rev = "fb465e704544008095a00b5416d68b6abc91147c";
-          sha256 = "1r78his2wxxiczb8gamghlng6dbn07iafmgqc604drxqa0k14ki6";
+          rev = "63b72ddd507fd31cd91dc1c3cc350336ebe08b89";
+          sha256 = "0frfsc5j8jq0f14cmcidx64mmswf3g5naf71si5gqqbnq4r1bigm";
         };
         libName = "zenoh_web";
         dependencies = [
