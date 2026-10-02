@@ -338,7 +338,10 @@ constrained) is in `z.stats`. Full algorithm and measurements: SPEC.md "Bandwidt
 
 The flake builds with [crate2nix](https://github.com/nix-community/crate2nix): every crate is its own nix store
 derivation, so crates are built once and shared by every flake that uses `lib.crossRust` (zenoh-web, zenoh-dimos-codecs,
-zenoh-web-cli, zenoh-web-relay, your own) instead of each repo's `target/`. Linux binaries are cross
+zenoh-web-cli, zenoh-web-relay, your own) instead of each repo's `target/`. A crate is shared when it resolves to the same
+version and features: Cargo unifies features per project, so e.g. a project with `env_logger` turns on extra
+`portable-atomic`/`regex` features that ripple into zenoh's crates, which then build once per such feature set (tokio,
+rustls, ring, openh264, zstd, libopus, ... stay shared). Linux binaries are cross
 compiled from a Mac (or the other Linux arch) with zig as the C compiler and linker, for glibc 2.35 (Ubuntu 22.04,
 Jetson L4T 36): no Linux VM, no GCC cross toolchain. C sources (openh264, zstd, ring) cross compile through zig; Opus is
 `unsafe-libopus` (Rust); GStreamer is loaded at runtime, so nothing links it.
