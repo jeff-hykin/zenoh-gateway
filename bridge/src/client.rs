@@ -369,6 +369,8 @@ struct Shared {
     gathered: Notify,
     media: Mutex<Vec<Arc<MediaSlot>>>,
     leases: Mutex<HashMap<String, Arc<Ending>>>,
+    /// lease requests awaiting their reply (request id -> group, lease), held as the reply is read so a `leaseLost` right behind it finds them
+    pending_leases: Mutex<HashMap<u64, (String, Arc<Ending>)>>,
 }
 
 impl Shared {
@@ -404,6 +406,11 @@ impl Shared {
         let Ok(message) = serde_json::from_str::<Value>(text) else { return };
         let id = message["id"].as_u64().unwrap_or_default();
         let Some(event) = message["event"].as_str() else {
+            if let Some((group, ending)) = self.pending_leases.lock().unwrap().remove(&id).filter(|_| message["ok"] == true)
+                && let Some(previous) = self.leases.lock().unwrap().insert(group, ending)
+            {
+                previous.end("renewed".into());
+            }
             if let Some(reply) = self.requests.lock().unwrap().remove(&id) {
                 let _ = reply.send(message);
             }
@@ -511,8 +518,12 @@ struct Inner {
 }
 
 impl Inner {
-    async fn request(&self, mut body: Value, timeout: Duration) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    async fn request(&self, body: Value, timeout: Duration) -> Result<Value> {
+        self.request_as(self.next_id.fetch_add(1, Ordering::Relaxed), body, timeout).await
+    }
+
+    /// [`Inner::request`] with the caller's id (taken from `next_id`).
+    async fn request_as(&self, id: u64, mut body: Value, timeout: Duration) -> Result<Value> {
         body["id"] = json!(id);
         let op = body["op"].as_str().unwrap_or_default().to_owned();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -639,7 +650,7 @@ impl Client {
 
     async fn connect_with(signalling: Signalling, options: ClientOptions) -> Result<Client> {
         let (state, _) = watch::channel(ConnectionState::Connecting);
-        let shared = Arc::new(Shared { requests: Mutex::default(), endpoints: Mutex::default(), clock: Mutex::default(), state, gathered: Notify::new(), media: Mutex::default(), leases: Mutex::default() });
+        let shared = Arc::new(Shared { requests: Mutex::default(), endpoints: Mutex::default(), clock: Mutex::default(), state, gathered: Notify::new(), media: Mutex::default(), leases: Mutex::default(), pending_leases: Mutex::default() });
         let ice_servers = match &options.ice_servers {
             Some(servers) => servers.clone(),
             None => signalling.ice_servers(options.token.as_deref()).await?,
@@ -824,11 +835,12 @@ impl Client {
     /// when the heartbeat stops, at `max_seconds`, on disconnect, on [`Lease::release`] or by force-expiry.
     pub async fn lease(&self, group: &str, keys: Option<Vec<String>>, max_seconds: Option<f64>) -> Result<Lease> {
         ensure!(self.inner.options.heartbeat_hz > 0.0, "a lease needs a heartbeat (ClientOptions::heartbeat_hz)");
-        let reply = self.inner.request(json!({"op": "lease", "group": group, "keys": keys, "maxSeconds": max_seconds}), PING_TIMEOUT).await?;
-        let ending = Arc::new(Ending::new());
-        if let Some(previous) = self.inner.shared.leases.lock().unwrap().insert(group.to_owned(), ending.clone()) {
-            previous.end("renewed".into());
-        }
+        let (id, ending) = (self.inner.next_id.fetch_add(1, Ordering::Relaxed), Arc::new(Ending::new()));
+        // registered by the control reader as it reads the reply (renewing a lease held before)
+        self.inner.shared.pending_leases.lock().unwrap().insert(id, (group.to_owned(), ending.clone()));
+        let reply = self.inner.request_as(id, json!({"op": "lease", "group": group, "keys": keys, "maxSeconds": max_seconds}), PING_TIMEOUT).await;
+        self.inner.shared.pending_leases.lock().unwrap().remove(&id);
+        let reply = reply?;
         let keys = serde_json::from_value(reply["keys"].clone())?;
         Ok(Lease { group: group.to_owned(), keys, expires_in_ms: reply["expiresInMs"].as_u64(), ending, client: Arc::downgrade(&self.inner) })
     }

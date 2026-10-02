@@ -1,6 +1,6 @@
 [package]
 name = "zenoh-web"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
 description = "View and drive a zenoh system from a browser over WebRTC (data channels, H.264 video, bandwidth allocation, deadmen): an embeddable server with pluggable codecs"

@@ -410,3 +410,30 @@ async fn key_prefix_subscriptions_and_lease_hooks() {
     client.close().await;
     running.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_lost_right_behind_its_grant() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let server = Server::builder().session(session.clone()).build().await.unwrap();
+    let running = server.clone().bind("127.0.0.1:0").await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions { heartbeat_hz: 5.0, ..Default::default() }).await.unwrap();
+    // ends every lease the moment it's granted, so the leaseLost event lands right behind the lease reply
+    let expirer = {
+        let (server, mut changes) = (server.clone(), server.changes());
+        tokio::spawn(async move {
+            while changes.changed().await.is_ok() {
+                for (group, _) in server.leases() {
+                    server.expire_lease(&group, "taken back").await;
+                }
+            }
+        })
+    };
+    for round in 0..30 {
+        let lease = client.lease("arm", Some(vec!["arm/**".into()]), None).await.unwrap();
+        let lost = timeout(Duration::from_secs(2), lease.wait_lost()).await;
+        assert_eq!(lost.as_deref(), Ok("taken back"), "round {round}: the lease never learned it ended");
+    }
+    expirer.abort();
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
