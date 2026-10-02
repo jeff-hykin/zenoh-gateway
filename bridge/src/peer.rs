@@ -357,7 +357,7 @@ pub struct Bridge {
     allocation: AllocationConfig,
     peers: Mutex<HashMap<u64, PeerEntry>>,
     next_peer: AtomicU64,
-    leases: Arc<Leases>,
+    pub leases: Arc<Leases>,
     pub connect_config: ConnectConfig,
     /// with `udp_ports`: peer id -> its port
     udp_ports_in_use: Mutex<HashMap<u64, u16>>,
@@ -392,6 +392,27 @@ impl Bridge {
         let state = self.peers.lock().unwrap().get(&holder).map(|entry| entry.state.clone());
         if let Some(state) = state {
             state.lease_lost(group, reason).await;
+        }
+    }
+
+    /// Every open subscription: its key expression and codec.
+    pub fn subscriptions(&self) -> Vec<(String, Option<String>)> {
+        let peers = self.peers.lock().unwrap();
+        let channels = peers.values().flat_map(|entry| entry.state.channels.lock().unwrap().values().filter_map(|channel| match &channel.stats {
+            ChannelStats::Sub(shared) => Some((channel.label.key.clone(), shared.codec.as_ref().map(|codec| codec.name().to_owned()))),
+            _ => None,
+        }).collect::<Vec<_>>());
+        channels.collect()
+    }
+
+    /// Ends `group`'s lease, telling its holder `reason`; false when nobody holds it.
+    pub async fn expire_lease(&self, group: &str, reason: &str) -> bool {
+        match self.leases.end(group, |_, _| true) {
+            Some(holder) => {
+                self.lease_lost(holder, group, reason).await;
+                true
+            }
+            None => false,
         }
     }
 
@@ -596,6 +617,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
             Ok((opts, codec, track)) => {
                 let shared = Arc::new(SubShared::new(&opts, codec, state.codecs.clone(), state.gate.clone()));
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
+                state.leases.changed();
                 state.send_accepted(label.id).await;
                 subscription::run(dc.clone(), label.clone(), session, shared, track).await;
                 None
@@ -628,7 +650,9 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
         state.send_event(json!({"event": "rejected", "id": label.id, "reason": error})).await;
         let _ = dc.close().await;
     }
-    state.channels.lock().unwrap().remove(&entry_id);
+    if state.channels.lock().unwrap().remove(&entry_id).is_some_and(|entry| matches!(entry.stats, ChannelStats::Sub(_))) {
+        state.leases.changed();
+    }
     // a publisher stream that goes away takes its deadman with it (the client cleared or closed it)
     if label.kind == "pub"
         && let Some(id) = label.id

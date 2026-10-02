@@ -57,6 +57,8 @@ pub(crate) struct Leases {
     groups: HashMap<String, Vec<String>>,
     held: Mutex<HashMap<String, Held>>,
     serials: AtomicU64,
+    /// bumped when a lease is taken or ends, and when a subscription opens or closes ([`crate::Server::changes`])
+    pub changes: tokio::sync::watch::Sender<u64>,
 }
 
 fn overlaps(a: &[String], b: &[String]) -> bool {
@@ -94,6 +96,7 @@ impl Leases {
         }
         let serial = self.serials.fetch_add(1, Ordering::Relaxed);
         held.insert(group.to_owned(), Held { holder: peer, keys: keys.clone(), expires: expires_in.map(|after| now + after), serial });
+        self.changed();
         Ok((keys, expires_in, serial))
     }
 
@@ -102,6 +105,7 @@ impl Leases {
         let mut held = self.held.lock().unwrap();
         let holder = held.get(group).filter(|lease| which(lease.holder, lease.serial))?.holder;
         held.remove(group);
+        self.changed();
         Some(holder)
     }
 
@@ -110,7 +114,20 @@ impl Leases {
         let mut held = self.held.lock().unwrap();
         let groups: Vec<String> = held.iter().filter(|(_, lease)| lease.holder == peer).map(|(group, _)| group.clone()).collect();
         held.retain(|_, lease| lease.holder != peer);
+        if !groups.is_empty() {
+            self.changed();
+        }
         groups
+    }
+
+    pub fn changed(&self) {
+        self.changes.send_modify(|version| *version += 1);
+    }
+
+    /// The live leases: group and keys.
+    pub fn held(&self) -> Vec<(String, Vec<String>)> {
+        let now = Instant::now();
+        self.held.lock().unwrap().iter().filter(|(_, lease)| lease.expires.is_none_or(|at| at > now)).map(|(group, lease)| (group.clone(), lease.keys.clone())).collect()
     }
 
     /// Why `peer` may not publish on `key` right now: another client's live lease covers it.

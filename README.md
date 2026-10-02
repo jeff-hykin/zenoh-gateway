@@ -209,6 +209,10 @@ let lease = client.lease("drive", None, None).await?; // exclusive publishing (S
 client.close().await;                                // reconnecting is the caller's job: watch client.closed()
 ```
 
+A server with no inbound ports (its zenoh dials out) can also be reached by signalling over that zenoh link:
+`ServerBuilder::zenoh_signalling("robot")` on its side, `Client::connect_zenoh(&session, "robot", options)` on the
+client's (SPEC "Signalling over zenoh"); [zenoh-web-relay](https://github.com/jeff-hykin/zenoh-web-relay) is built on it.
+
 `examples/relay_sketch.rs` relays a camera from one server to another, decoding with openh264
 (`cargo run --example relay_sketch --features client -- <url> <key> <codec> <port>`). SPEC.md "Rust client".
 

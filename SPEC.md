@@ -134,6 +134,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
   sync, `Degraded` when one fails). `list_topics`, `get`, `stats`, `codecs`, `clock_offset_ms`,
   `rtt_ms`, `state`, `closed()`, `close()`. Reconnecting is the caller's job: when `closed()`
   resolves, connect and subscribe again.
+- `Client::connect_zenoh(&session, name, options)`: the same, signalling over zenoh (see "Signalling over zenoh").
 - `subscribe(key, SubscribeOptions)` takes the browser's options (camelCase on the wire, unset ones
   left out), resolves once the bridge accepted the channel (or fails with its reason), and yields
   `Message`s (`recv()`, or as a `Stream`):
@@ -167,7 +168,10 @@ zenoh-web-encoders) and `video_policy` (see "Video"); `build().await` validates 
 `bind(addr)` serves on a background task (`RunningServer::local_addr`, `shutdown()`), `serve(addr)` /
 `serve_with_shutdown(addr, signal)` serve in place, or `router()` returns the axum routes (`POST
 /offer`, `GET /zenoh-web/health`, `GET /zenoh-web/ice`, static files) for the host's own HTTP server.
-`Server::revoke(token)` closes that token's connections (see "Auth"). Shutdown fires every frontend's deadmen
+`Server::revoke(token)` closes that token's connections (see "Auth"). For relays and monitoring:
+`subscriptions()` (every open subscription's key expression and codec), `leases()` (group and keys of each held
+lease), `changes()` (a `watch` counter bumped when either changes) and `expire_lease(group, reason)` (ends a lease
+as a force-expiry does, the holder told `reason`). Shutdown fires every frontend's deadmen
 (reason `"shutdown"`), closes the browser connections, then the session if the server opened it.
 
 zenoh is pinned to 1.6.2: 1.7.0 through 1.10.1 deadlock when the admin space answers a query while a
@@ -210,6 +214,10 @@ Every codec implements one Rust trait (`zenoh_web::Codec`):
   page decodes with the decoder registered for that name (`registerCodec(name, decoder)` →
   `msg.decoded`); without one it gets `msg.bytes` (and a warning). A registered decoder also overrides
   a fields codec's automatic decoding.
+- `key_prefix()`: where the codec's samples live (default none). With `Some(prefix)` a subscription to `key` reads
+  zenoh key `<prefix>/<key>` and its messages carry keys without the prefix, so a codec's input can sit apart from the
+  raw topic: zenoh-web-relay puts its decoded frames under `@relay/<codec>/<key>`, which raw subscribers to `key`
+  (and `**`, which never matches a `@` chunk) don't see.
 - `default_compress()`: compression for the codec's messages when the subscription doesn't set
   `compress` (default none; zenoh-dimos-codecs' depth and point clouds use zstd).
 - video codecs: optionally `video_encoder()` → the codec's own `VideoEncoder` per encode session; default the server's
@@ -504,6 +512,21 @@ per-browser layer on top, with reasons.
   number of simultaneous browsers. webrtc-rs binds sockets per connection, so there is no single
   shared mux port.
 
+## Signalling over zenoh
+
+`ServerBuilder::zenoh_signalling(name)` also answers signalling on two zenoh queryables of the server's session,
+twins of the HTTP routes: `zenoh-web/<name>/offer` (query payload `{"token"?, "offer": <SDP>}`, reply the answer
+SDP) and `zenoh-web/<name>/ice` (payload `{"token"?}`, reply `{"iceServers": [...]}`). Authorization is the same
+hook, with headers holding only `Authorization: Bearer <token>`; a refusal is an error reply `{"status": 401,
+"error": reason}` (400/500 for a bad request or a failed answer). `name` is one key chunk.
+
+It is for a machine with no inbound ports: its zenoh dials out to a router (e.g. zenoh-web-relay's), and a
+client on that router's side calls `zenoh_web::client::Client::connect_zenoh(&session, name, options)`, which
+queries those keys instead of `POST /offer`. Only signalling uses the zenoh link: the media is the usual WebRTC
+connection, and since the server answers with its candidates and also sends connectivity checks to the client's,
+the server's side opens the UDP path (a client on a public address needs no STUN for the server to reach it;
+behind a NAT on both sides, a TURN server). The browser client signals over HTTP only.
+
 ## Clock sync
 
 Per connection, NTP-style: the browser sends `t0` (its clock), the bridge answers with `t1`/`t2` (its
@@ -531,7 +554,7 @@ resolving so the bridge has an offset before the first put.
 
 ## Wire format
 
-- Signaling: `POST /offer` with the browser's SDP offer (non-trickle), returns the answer (401 with a reason when the authorize hook refuses).
+- Signaling: `POST /offer` with the browser's SDP offer (non-trickle), returns the answer (401 with a reason when the authorize hook refuses); or the zenoh queryables of "Signalling over zenoh".
 - `GET /zenoh-web/ice` returns `{"iceServers": [{urls, username?, credential?}]}`, see "ICE and TURN".
 - `GET /zenoh-web/health` returns `{"service": "zenoh-web", "version": "<crate version>"}` (detecting a running server).
 - The bridge can also serve a static directory (`--serve <dir>`, `ServerBuilder::serve_dir`) so the UI is live-editable on disk.

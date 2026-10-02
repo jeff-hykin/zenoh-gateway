@@ -298,3 +298,115 @@ async fn token_and_leases() {
     other.close().await;
     running.shutdown().await.unwrap();
 }
+
+/// A zenoh session listening on a free local port, and that endpoint.
+async fn listening_session() -> (zenoh::Session, String) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let endpoint = format!("tcp/127.0.0.1:{port}");
+    let mut config = isolated_config();
+    config.insert_json5("mode", "\"router\"").unwrap();
+    config.insert_json5("listen/endpoints", &format!("[\"{endpoint}\"]")).unwrap();
+    (zenoh::open(config).await.unwrap(), endpoint)
+}
+
+/// The robot dials out to the relay's zenoh; the relay signals over that link (no HTTP on the robot).
+#[tokio::test(flavor = "multi_thread")]
+async fn signalling_over_zenoh() {
+    let (relay_session, endpoint) = listening_session().await;
+    let mut config = isolated_config();
+    config.insert_json5("connect/endpoints", &format!("[\"{endpoint}\"]")).unwrap();
+    let robot_session = zenoh::open(config).await.unwrap();
+    let robot = Server::builder()
+        .session(robot_session.clone())
+        .zenoh_signalling("robot")
+        .authorize(|token, _headers| if token == Some("good") { Ok(zenoh_web::Grant::all()) } else { Err("unknown token".into()) })
+        .build()
+        .await
+        .unwrap();
+    let options = |token: &str| ClientOptions { token: Some(token.into()), ..Default::default() };
+    // the robot's link to the relay comes up in the background
+    let mut refused = String::new();
+    for _ in 0..50 {
+        refused = Client::connect_zenoh(&relay_session, "robot", options("bad")).await.err().unwrap().to_string();
+        if !refused.contains("no zenoh-web server answered") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(refused.contains("refused the token: unknown token"), "{refused}");
+    let absent = Client::connect_zenoh(&relay_session, "nobody", options("good")).await;
+    assert!(absent.err().unwrap().to_string().contains("no zenoh-web server answered"));
+    let client = Client::connect_zenoh(&relay_session, "robot", options("good")).await.unwrap();
+    let mut subscription = client.subscribe("robot/data", SubscribeOptions::default()).await.unwrap();
+    let _putter = keep_putting(&robot_session, "robot/data", b"over webrtc".to_vec());
+    let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
+    assert_eq!(message.bytes, b"over webrtc");
+    assert_eq!(robot.subscriptions(), [("robot/data".to_owned(), None)]);
+    client.close().await;
+    robot.shutdown().await.unwrap();
+}
+
+/// `fields` under `@relay/test-prefixed`: only its subscribers see those samples, raw ones see the raw topic.
+struct Prefixed;
+
+impl Codec for Prefixed {
+    fn name(&self) -> &str {
+        "test-prefixed"
+    }
+
+    fn output(&self) -> CodecOutput {
+        CodecOutput::Data
+    }
+
+    fn key_prefix(&self) -> Option<&str> {
+        Some("@relay/test-prefixed")
+    }
+
+    fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame> {
+        Ok(DecodedFrame::data(sample.payload.to_vec()))
+    }
+
+    fn encode(&self, frame: &DecodedFrame, _quality: f64) -> Result<Vec<u8>> {
+        Ok(frame.downcast::<Vec<u8>>()?.clone())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn key_prefix_subscriptions_and_lease_hooks() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let server = Server::builder().session(session.clone()).codec(Prefixed).build().await.unwrap();
+    let running = server.clone().bind("127.0.0.1:0").await.unwrap();
+    let mut changes = server.changes();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions { heartbeat_hz: 5.0, ..Default::default() }).await.unwrap();
+    let mut prefixed = client.subscribe("cam/*", SubscribeOptions { codec: Some("test-prefixed".into()), ..Default::default() }).await.unwrap();
+    let mut raw = client.subscribe("cam/*", SubscribeOptions::default()).await.unwrap();
+    assert!(changes.has_changed().unwrap(), "opening subscriptions bumps changes");
+    let mut subscriptions = server.subscriptions();
+    subscriptions.sort();
+    assert_eq!(subscriptions, [("cam/*".to_owned(), None), ("cam/*".to_owned(), Some("test-prefixed".to_owned()))]);
+    let _raw_putter = keep_putting(&session, "cam/a", b"raw".to_vec());
+    let _prefixed_putter = keep_putting(&session, "@relay/test-prefixed/cam/a", b"prefixed".to_vec());
+    for _ in 0..3 {
+        let Message::Data(message) = timeout(Duration::from_secs(10), prefixed.recv()).await.unwrap().unwrap() else { panic!("not data") };
+        assert_eq!((message.key.as_str(), message.bytes.as_slice()), ("cam/a", &b"prefixed"[..]));
+        let Message::Data(message) = timeout(Duration::from_secs(10), raw.recv()).await.unwrap().unwrap() else { panic!("not data") };
+        assert_eq!((message.key.as_str(), message.bytes.as_slice()), ("cam/a", &b"raw"[..]));
+    }
+    changes.mark_unchanged();
+    let lease = client.lease("arm", Some(vec!["arm/**".into()]), None).await.unwrap();
+    assert!(changes.has_changed().unwrap(), "a lease bumps changes");
+    assert_eq!(server.leases(), [("arm".to_owned(), vec!["arm/**".to_owned()])]);
+    assert!(server.expire_lease("arm", "upstream refused").await);
+    assert_eq!(timeout(Duration::from_secs(2), lease.wait_lost()).await.unwrap(), "upstream refused");
+    assert!(server.leases().is_empty());
+    drop((prefixed, raw));
+    for _ in 0..100 {
+        if server.subscriptions().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(server.subscriptions().is_empty(), "closed subscriptions leave the list");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}

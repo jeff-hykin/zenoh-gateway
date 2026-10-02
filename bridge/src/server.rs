@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::ToSocketAddrs;
@@ -35,6 +35,10 @@ pub const HEALTH_PATH: &str = "/zenoh-web/health";
 
 /// `GET` this path for `{"iceServers": [...]}`: the STUN/TURN servers the bridge uses, with TURN credentials minted for the caller.
 pub const ICE_PATH: &str = "/zenoh-web/ice";
+
+/// With [`ServerBuilder::zenoh_signalling`], the key expression prefix of a server's signalling queryables:
+/// `zenoh-web/<name>/offer` and `zenoh-web/<name>/ice`.
+pub const SIGNALLING_PREFIX: &str = "zenoh-web";
 
 /// The authorize hook: the bearer token of `POST /offer` (and `GET` [`ICE_PATH`]) and the request headers in,
 /// a [`Grant`] or the reason for refusing (HTTP 401) out.
@@ -70,6 +74,7 @@ pub struct ServerBuilder {
     connect_config: ConnectConfig,
     video_encoder: Option<VideoEncoderFactory>,
     video_policy: VideoPolicy,
+    zenoh_signalling: Option<String>,
 }
 
 impl Default for ServerBuilder {
@@ -87,6 +92,7 @@ impl Default for ServerBuilder {
             connect_config: ConnectConfig::default(),
             video_encoder: None,
             video_policy: VideoPolicy::default(),
+            zenoh_signalling: None,
         }
     }
 }
@@ -193,6 +199,14 @@ impl ServerBuilder {
         self
     }
 
+    /// Also answers offers over zenoh, on queryables `zenoh-web/<name>/offer` and `zenoh-web/<name>/ice`, so a client with
+    /// a zenoh session that reaches this one (e.g. a relay this side dialled out to) connects without HTTP; see SPEC
+    /// "Signalling over zenoh". `name` is one key chunk. Authorized like HTTP, with the token the query carries.
+    pub fn zenoh_signalling(mut self, name: impl Into<String>) -> Self {
+        self.zenoh_signalling = Some(name.into());
+        self
+    }
+
     /// Validates the options, registers the codecs and opens the zenoh session (unless one was given).
     pub async fn build(self) -> Result<Server> {
         let fraction = self.bandwidth_target_fraction;
@@ -218,7 +232,14 @@ impl ServerBuilder {
         ensure!(self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0), "the UDP port range must be non-empty and above 0");
         let leases = Leases::new(self.lease_groups);
         let bridge = Bridge::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction }, leases, self.connect_config);
-        Ok(Server { inner: Arc::new(Inner { bridge, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false), authorize: self.authorize }) })
+        let inner = Arc::new(Inner { bridge, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
+        if let Some(name) = self.zenoh_signalling {
+            ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");
+            let tasks = signalling::serve(&inner, &name).await?;
+            *inner.signalling.lock().unwrap() = tasks;
+            info!("answering offers over zenoh on {SIGNALLING_PREFIX}/{name}/offer");
+        }
+        Ok(Server { inner })
     }
 }
 
@@ -229,6 +250,8 @@ struct Inner {
     serve_dir: Option<PathBuf>,
     shut_down: AtomicBool,
     authorize: Option<Arc<Authorize>>,
+    /// the zenoh signalling queryables' tasks
+    signalling: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Inner {
@@ -256,6 +279,27 @@ impl Server {
     /// The zenoh session browsers' subscriptions, puts and queries go through.
     pub fn session(&self) -> &zenoh::Session {
         &self.inner.session
+    }
+
+    /// Every open subscription of every connection: its key expression and codec (e.g. for a relay that pulls upstream
+    /// only what its viewers watch). [`changes`](Self::changes) says when this or [`leases`](Self::leases) changed.
+    pub fn subscriptions(&self) -> Vec<(String, Option<String>)> {
+        self.inner.bridge.subscriptions()
+    }
+
+    /// The leases held now: group and keys.
+    pub fn leases(&self) -> Vec<(String, Vec<String>)> {
+        self.inner.bridge.leases.held()
+    }
+
+    /// A counter bumped whenever a subscription opens or closes and a lease is taken or ends.
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.bridge.leases.changes.subscribe()
+    }
+
+    /// Ends `group`'s lease as a force-expiry would, telling its holder `reason`; false when nobody holds it.
+    pub async fn expire_lease(&self, group: &str, reason: &str) -> bool {
+        self.inner.bridge.expire_lease(group, reason).await
     }
 
     /// Closes every live connection made with `token` (deadmen fire with reason `"revoked"`) and returns how many;
@@ -328,6 +372,9 @@ impl Server {
         if self.inner.shut_down.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        for task in self.inner.signalling.lock().unwrap().drain(..) {
+            task.abort();
+        }
         self.inner.bridge.shutdown().await;
         if self.inner.owns_session {
             self.inner.session.close().await.map_err(|error| anyhow!("closing the zenoh session: {error}"))?;
@@ -381,24 +428,81 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn ice_servers(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> Response {
     match inner.authorize(&headers) {
-        Ok(_) => Json(serde_json::json!({"iceServers": ice::mint(&inner.bridge.connect_config.ice_servers, inner.bridge.connect_config.turn_secret.as_ref(), "browser")})).into_response(),
+        Ok(_) => Json(minted_ice_servers(&inner)).into_response(),
         Err(reason) => (StatusCode::UNAUTHORIZED, reason).into_response(),
     }
 }
 
 async fn offer(State(inner): State<Arc<Inner>>, headers: HeaderMap, Json(offer): Json<RTCSessionDescription>) -> Response {
-    let (token, grant) = match inner.authorize(&headers) {
-        Ok(authorized) => authorized,
-        Err(reason) => {
-            info!("offer refused: {reason}");
-            return (StatusCode::UNAUTHORIZED, reason).into_response();
-        }
-    };
-    match inner.bridge.answer(offer, token, grant).await {
+    match answer(&inner, &headers, offer).await {
         Ok(answer) => Json(answer).into_response(),
-        Err(error) => {
-            error!("offer failed: {error:#}");
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        Err((status, reason)) => (status, reason).into_response(),
+    }
+}
+
+/// Authorizes an offer and answers it, or the HTTP status and reason for refusing.
+async fn answer(inner: &Inner, headers: &HeaderMap, offer: RTCSessionDescription) -> Result<RTCSessionDescription, (StatusCode, String)> {
+    let (token, grant) = inner.authorize(headers).map_err(|reason| {
+        info!("offer refused: {reason}");
+        (StatusCode::UNAUTHORIZED, reason)
+    })?;
+    inner.bridge.answer(offer, token, grant).await.map_err(|error| {
+        error!("offer failed: {error:#}");
+        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    })
+}
+
+fn minted_ice_servers(inner: &Inner) -> serde_json::Value {
+    serde_json::json!({"iceServers": ice::mint(&inner.bridge.connect_config.ice_servers, inner.bridge.connect_config.turn_secret.as_ref(), "browser")})
+}
+
+/// Signalling over zenoh: the HTTP routes' twins as queryables (SPEC "Signalling over zenoh").
+mod signalling {
+    use super::*;
+
+    /// A query's payload: `{"token"?, "offer"?}`.
+    #[derive(serde::Deserialize, Default)]
+    struct Request {
+        token: Option<String>,
+        offer: Option<RTCSessionDescription>,
+    }
+
+    pub(super) async fn serve(inner: &Arc<Inner>, name: &str) -> Result<Vec<JoinHandle<()>>> {
+        let mut tasks = Vec::new();
+        for op in ["offer", "ice"] {
+            let queryable = inner.session.declare_queryable(format!("{SIGNALLING_PREFIX}/{name}/{op}")).await.map_err(|error| anyhow!("declaring the signalling queryable: {error}"))?;
+            let inner = Arc::downgrade(inner);
+            tasks.push(tokio::spawn(async move {
+                while let Ok(query) = queryable.recv_async().await {
+                    let Some(inner) = inner.upgrade() else { break };
+                    tokio::spawn(async move {
+                        let reply = respond(&inner, op, query.payload().map(|payload| payload.to_bytes().to_vec()).unwrap_or_default()).await;
+                        let key = query.key_expr().clone();
+                        let sent = match reply {
+                            Ok(body) => query.reply(key, body.to_string()).await,
+                            Err((status, reason)) => query.reply_err(serde_json::json!({"status": status.as_u16(), "error": reason}).to_string()).await,
+                        };
+                        if let Err(error) = sent {
+                            error!("signalling reply failed: {error}");
+                        }
+                    });
+                }
+            }));
+        }
+        Ok(tasks)
+    }
+
+    async fn respond(inner: &Inner, op: &str, payload: Vec<u8>) -> Result<serde_json::Value, (StatusCode, String)> {
+        let request: Request = if payload.is_empty() { Request::default() } else { serde_json::from_slice(&payload).map_err(|error| (StatusCode::BAD_REQUEST, format!("bad signalling request: {error}")))? };
+        let mut headers = HeaderMap::new();
+        if let Some(token) = &request.token {
+            let value = format!("Bearer {token}").parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad token".to_owned()))?;
+            headers.insert(header::AUTHORIZATION, value);
+        }
+        match (op, request.offer) {
+            ("ice", _) => inner.authorize(&headers).map(|_| minted_ice_servers(inner)).map_err(|reason| (StatusCode::UNAUTHORIZED, reason)),
+            (_, Some(offer)) => answer(inner, &headers, offer).await.map(|answer| serde_json::to_value(answer).unwrap_or_default()),
+            (_, None) => Err((StatusCode::BAD_REQUEST, "no offer".to_owned())),
         }
     }
 }

@@ -176,6 +176,8 @@ pub struct SubShared {
     min_interval: Option<Duration>,
     priority_override: Option<u8>,
     pub codec: Option<Arc<dyn Codec>>,
+    /// the codec's key prefix with its trailing `/`
+    key_prefix: Option<String>,
     compress: Compress,
     /// the server's codecs, with the caches that share work across frontends
     pub codecs: Arc<CodecRegistry>,
@@ -220,6 +222,7 @@ impl SubShared {
             delivery: opts.delivery(),
             min_interval: opts.min_interval(),
             priority_override: opts.priority,
+            key_prefix: codec.as_ref().and_then(|codec| codec.key_prefix()).map(|prefix| format!("{}/", prefix.trim_end_matches('/'))),
             codec,
             compress: opts.compress.unwrap_or_default(),
             video_policy: opts.video_policy(codecs.video_policy),
@@ -234,6 +237,11 @@ impl SubShared {
             closed: AtomicBool::new(false),
             closed_signal: tokio::sync::watch::Sender::new(false),
         }
+    }
+
+    /// The zenoh key expression a subscription to `key` reads (see [`Codec::key_prefix`]).
+    fn zenoh_key(&self, key: &str) -> String {
+        format!("{}{key}", self.key_prefix.as_deref().unwrap_or_default())
     }
 
     pub fn stats(&self) -> SubStats {
@@ -439,7 +447,7 @@ impl SubShared {
                 priority: self.priority_override.unwrap_or(sample.priority() as u8),
                 payload: sample.payload().clone(),
             };
-            let key = sample.key_expr().as_str();
+            let key = self.key_prefix.as_ref().and_then(|prefix| sample.key_expr().as_str().strip_prefix(prefix.as_str())).unwrap_or(sample.key_expr().as_str());
             let state = &mut *state;
             let queue = match state.keys.get_mut(key) {
                 Some(queue) => queue,
@@ -547,7 +555,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     let _ = dc.set_buffered_amount_low_threshold((shared.gate.window_bytes() / 2) as u32).await;
     let feed = shared.clone();
     let subscriber = session
-        .declare_subscriber(label.key.clone())
+        .declare_subscriber(shared.zenoh_key(&label.key))
         .callback(move |sample| feed.push(sample))
         .advanced()
         .history(HistoryConfig::default().detect_late_publishers().max_samples(1))

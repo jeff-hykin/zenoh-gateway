@@ -59,7 +59,7 @@ pub use codec::{AudioPcm, Codec, CodecOutput, CodecSample, Compress, DecodedFram
 pub use auth::Grant;
 pub use fields::Fields;
 pub use ice::{IceServer, turn_credentials};
-pub use server::{Authorize, DEFAULT_PORT, HEALTH_PATH, ICE_PATH, RunningServer, Server, ServerBuilder};
+pub use server::{Authorize, DEFAULT_PORT, HEALTH_PATH, ICE_PATH, RunningServer, SIGNALLING_PREFIX, Server, ServerBuilder};
 /// The zenoh version this crate is built against (for [`ServerBuilder::session`] and
 /// [`ServerBuilder::zenoh_config`]).
 pub use zenoh;

@@ -626,21 +626,23 @@ impl Client {
     /// Signals like the browser (non-trickle `POST <url>/offer`), opens `control` (and the heartbeat
     /// channel), fetches the codecs and takes a few clock samples before returning.
     pub async fn connect(url: &str, options: ClientOptions) -> Result<Client> {
+        let signalling = Signalling::Http { url: url.trim_end_matches('/').to_owned(), http: reqwest::Client::new() };
+        Self::connect_with(signalling, options).await
+    }
+
+    /// [`connect`](Self::connect), signalling over zenoh instead of HTTP: queries `zenoh-web/<name>/offer` (and `/ice`)
+    /// through `session`, which must reach a server built with `ServerBuilder::zenoh_signalling(name)` (e.g. a robot
+    /// whose zenoh dialled out to this side). The media then flows over WebRTC as usual (SPEC "Signalling over zenoh").
+    pub async fn connect_zenoh(session: &zenoh::Session, name: &str, options: ClientOptions) -> Result<Client> {
+        Self::connect_with(Signalling::Zenoh { session: session.clone(), name: name.to_owned() }, options).await
+    }
+
+    async fn connect_with(signalling: Signalling, options: ClientOptions) -> Result<Client> {
         let (state, _) = watch::channel(ConnectionState::Connecting);
         let shared = Arc::new(Shared { requests: Mutex::default(), endpoints: Mutex::default(), clock: Mutex::default(), state, gathered: Notify::new(), media: Mutex::default(), leases: Mutex::default() });
-        let url = url.trim_end_matches('/');
-        let http = reqwest::Client::new();
-        let authorized = |request: reqwest::RequestBuilder| match &options.token {
-            Some(token) => request.bearer_auth(token),
-            None => request,
-        };
         let ice_servers = match &options.ice_servers {
             Some(servers) => servers.clone(),
-            None => {
-                let response = refuse_unauthorized(authorized(http.get(format!("{url}{}", crate::ICE_PATH))).send().await.context("GET /zenoh-web/ice")?).await?;
-                // a server without the route (older) has none to offer
-                if response.status().is_success() { serde_json::from_value(response.json::<Value>().await?["iceServers"].take())? } else { Vec::new() }
-            }
+            None => signalling.ice_servers(options.token.as_deref()).await?,
         };
         let ice_servers = ice_servers.into_iter().map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential }).collect();
         let policy = if options.relay_only { RTCIceTransportPolicy::Relay } else { RTCIceTransportPolicy::All };
@@ -670,10 +672,7 @@ impl Client {
             connection.set_local_description(offer).await?;
             let _ = tokio::time::timeout(GATHER_TIMEOUT, shared.gathered.notified()).await;
             let offer = connection.local_description().await.context("no local description")?;
-            let response = refuse_unauthorized(authorized(http.post(format!("{url}/offer")).json(&offer)).send().await.context("POST /offer")?).await?;
-            let status = response.status();
-            ensure!(status.is_success(), "bridge refused the offer: {status} {}", response.text().await.unwrap_or_default());
-            connection.set_remote_description(response.json::<RTCSessionDescription>().await?).await?;
+            connection.set_remote_description(signalling.offer(options.token.as_deref(), &offer).await?).await?;
             tokio::time::timeout(OPEN_TIMEOUT, control_open_rx).await.map_err(|_| anyhow!("control channel open timed out"))?.map_err(|_| anyhow!("control channel closed before opening"))?;
             let mut inner = Inner {
                 connection: connection.clone(),
@@ -1413,6 +1412,70 @@ impl Lease {
             }
         }
         inner.request(json!({"op": "releaseLease", "group": self.group}), PING_TIMEOUT).await.map(drop)
+    }
+}
+
+/// How [`Client`] reaches the server's signalling: HTTP, or zenoh queryables (SPEC "Signalling over zenoh").
+enum Signalling {
+    Http { url: String, http: reqwest::Client },
+    Zenoh { session: zenoh::Session, name: String },
+}
+
+impl Signalling {
+    /// The server's ICE servers (`GET /zenoh-web/ice`, or `zenoh-web/<name>/ice`).
+    async fn ice_servers(&self, token: Option<&str>) -> Result<Vec<IceServer>> {
+        let mut reply = match self {
+            Signalling::Http { url, http } => {
+                let request = http.get(format!("{url}{}", crate::ICE_PATH));
+                let response = refuse_unauthorized(bearer(request, token).send().await.context("GET /zenoh-web/ice")?).await?;
+                // a server without the route (older) has none to offer
+                if !response.status().is_success() {
+                    return Ok(Vec::new());
+                }
+                response.json::<Value>().await?
+            }
+            Signalling::Zenoh { .. } => self.query("ice", json!({"token": token})).await?,
+        };
+        Ok(serde_json::from_value(reply["iceServers"].take())?)
+    }
+
+    /// Sends the offer, returns the answer.
+    async fn offer(&self, token: Option<&str>, offer: &RTCSessionDescription) -> Result<RTCSessionDescription> {
+        match self {
+            Signalling::Http { url, http } => {
+                let response = refuse_unauthorized(bearer(http.post(format!("{url}/offer")).json(offer), token).send().await.context("POST /offer")?).await?;
+                let status = response.status();
+                ensure!(status.is_success(), "bridge refused the offer: {status} {}", response.text().await.unwrap_or_default());
+                Ok(response.json::<RTCSessionDescription>().await?)
+            }
+            Signalling::Zenoh { .. } => Ok(serde_json::from_value(self.query("offer", json!({"token": token, "offer": offer})).await?)?),
+        }
+    }
+
+    /// One query on `zenoh-web/<name>/<op>`: the first reply's JSON; an error reply with status 401 is a refused token.
+    async fn query(&self, op: &str, body: Value) -> Result<Value> {
+        let Signalling::Zenoh { session, name } = self else { unreachable!("zenoh signalling only") };
+        let key = format!("{}/{name}/{op}", crate::SIGNALLING_PREFIX);
+        let replies = session.get(&key).payload(body.to_string()).timeout(OPEN_TIMEOUT).await.map_err(|error| anyhow!("querying {key}: {error}"))?;
+        let reply = replies.recv_async().await.map_err(|_| anyhow!("no zenoh-web server answered on {key} (is it built with zenoh_signalling({name:?}) and reachable over zenoh?)"))?;
+        match reply.result() {
+            Ok(sample) => Ok(serde_json::from_slice(&sample.payload().to_bytes())?),
+            Err(error) => {
+                let error: Value = serde_json::from_slice(&error.payload().to_bytes()).unwrap_or_default();
+                let reason = error["error"].as_str().unwrap_or("error");
+                if error["status"] == 401 {
+                    bail!("bridge refused the token: {reason}");
+                }
+                bail!("bridge refused the {op}: {reason}")
+            }
+        }
+    }
+}
+
+fn bearer(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    match token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
     }
 }
 

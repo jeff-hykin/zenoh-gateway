@@ -290,6 +290,13 @@ pub trait Codec: Send + Sync {
         None
     }
 
+    /// Where this codec's samples live: with `Some(prefix)` a subscription to `key` reads `<prefix>/<key>` and its
+    /// messages carry the keys without the prefix, so a codec's input can sit apart from the raw topic (e.g. a
+    /// relay's decoded frames under `@relay/<codec>`, which raw subscribers to `key` never see). Default `None`.
+    fn key_prefix(&self) -> Option<&str> {
+        None
+    }
+
     /// Data-channel codecs: compression used when the subscription doesn't set `compress`
     /// (e.g. [`Compress::Zstd`] for output that compresses well). Ignored for video.
     fn default_compress(&self) -> Compress {
