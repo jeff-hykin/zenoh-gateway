@@ -93,6 +93,21 @@ rec {
     #   inject test dependencies into the build
 
     crates = {
+      "adler2" = rec {
+        crateName = "adler2";
+        version = "2.0.1";
+        edition = "2021";
+        sha256 = "1ymy18s9hs7ya1pjc9864l30wk8p2qfqdi7mhhcc5nfakxbij09j";
+        authors = [
+          "Jonas Schievink <jonasschievink@gmail.com>"
+          "oyvindln <oyvindln@users.noreply.github.com>"
+        ];
+        features = {
+          "core" = [ "dep:core" ];
+          "default" = [ "std" ];
+          "rustc-dep-of-std" = [ "core" ];
+        };
+      };
       "aead" = rec {
         crateName = "aead";
         version = "0.5.2";
@@ -232,6 +247,39 @@ rec {
           "std" = [ "memchr?/std" ];
         };
         resolvedDefaultFeatures = [ "std" ];
+      };
+      "alloc-no-stdlib" = rec {
+        crateName = "alloc-no-stdlib";
+        version = "2.0.4";
+        edition = "2015";
+        crateBin = [];
+        sha256 = "1cy6r2sfv5y5cigv86vms7n5nlwhx1rbyxwcraqnmm1rxiib2yyc";
+        libName = "alloc_no_stdlib";
+        authors = [
+          "Daniel Reiter Horn <danielrh@dropbox.com>"
+        ];
+        features = {
+        };
+      };
+      "alloc-stdlib" = rec {
+        crateName = "alloc-stdlib";
+        version = "0.2.4";
+        edition = "2015";
+        crateBin = [];
+        sha256 = "159iyap790nflvdhl1gbkxp9l5w4x7qp5ybg01wx490jx4cs0xhf";
+        libName = "alloc_stdlib";
+        authors = [
+          "Daniel Reiter Horn <danielrh@dropbox.com>"
+        ];
+        dependencies = [
+          {
+            name = "alloc-no-stdlib";
+            packageId = "alloc-no-stdlib";
+          }
+        ];
+        features = {
+          "unsafe" = [ "alloc-no-stdlib/unsafe" ];
+        };
       };
       "allocator-api2" = rec {
         crateName = "allocator-api2";
@@ -1030,6 +1078,37 @@ rec {
         ];
 
       };
+      "brotli-decompressor" = rec {
+        crateName = "brotli-decompressor";
+        version = "5.0.3";
+        edition = "2015";
+        crateBin = [];
+        sha256 = "10rm4pyqnznh192nzsjl4dh6bjgzglsadcl676y6f6gy2nnaqcis";
+        libName = "brotli_decompressor";
+        authors = [
+          "Daniel Reiter Horn <danielrh@dropbox.com>"
+          "The Brotli Authors"
+        ];
+        dependencies = [
+          {
+            name = "alloc-no-stdlib";
+            packageId = "alloc-no-stdlib";
+          }
+          {
+            name = "alloc-stdlib";
+            packageId = "alloc-stdlib";
+            optional = true;
+          }
+        ];
+        features = {
+          "alloc-stdlib" = [ "dep:alloc-stdlib" ];
+          "default" = [ "std" ];
+          "seccomp" = [ "alloc-no-stdlib/unsafe" ];
+          "std" = [ "alloc-stdlib" ];
+          "unsafe" = [ "alloc-no-stdlib/unsafe" "alloc-stdlib/unsafe" ];
+        };
+        resolvedDefaultFeatures = [ "alloc-stdlib" "default" "std" ];
+      };
       "bs58" = rec {
         crateName = "bs58";
         version = "0.5.1";
@@ -1171,6 +1250,17 @@ rec {
         authors = [
           "Andrew Gallant <jamslam@gmail.com>"
         ];
+        features = {
+          "default" = [ "std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
+      };
+      "byteorder-lite" = rec {
+        crateName = "byteorder-lite";
+        version = "0.1.0";
+        edition = "2021";
+        sha256 = "15alafmz4b9az56z6x7glcbcb6a8bfgyd109qc3bvx07zx4fj7wg";
+        libName = "byteorder_lite";
         features = {
           "default" = [ "std" ];
         };
@@ -1728,6 +1818,26 @@ rec {
         ];
 
       };
+      "crc32fast" = rec {
+        crateName = "crc32fast";
+        version = "1.5.2";
+        edition = "2021";
+        sha256 = "0y0f955n2hr5a8rd9nw9sr23nhjc42ddx3bjc47dnlmqssgpk9q1";
+        authors = [
+          "Sam Rijs <srijs@airpost.net>"
+          "Alex Crichton <alex@alexcrichton.com>"
+        ];
+        dependencies = [
+          {
+            name = "cfg-if";
+            packageId = "cfg-if";
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
+      };
       "crossbeam" = rec {
         crateName = "crossbeam";
         version = "0.8.5";
@@ -1817,7 +1927,7 @@ rec {
           "default" = [ "std" ];
           "std" = [ "crossbeam-epoch/std" "crossbeam-utils/std" ];
         };
-        resolvedDefaultFeatures = [ "std" ];
+        resolvedDefaultFeatures = [ "default" "std" ];
       };
       "crossbeam-epoch" = rec {
         crateName = "crossbeam-epoch";
@@ -2581,6 +2691,22 @@ rec {
           "std" = [ "alloc" ];
         };
       };
+      "fdeflate" = rec {
+        crateName = "fdeflate";
+        version = "0.3.7";
+        edition = "2021";
+        sha256 = "130ga18vyxbb5idbgi07njymdaavvk6j08yh1dfarm294ssm6s0y";
+        authors = [
+          "The image-rs Developers"
+        ];
+        dependencies = [
+          {
+            name = "simd-adler32";
+            packageId = "simd-adler32";
+          }
+        ];
+
+      };
       "find-msvc-tools" = rec {
         crateName = "find-msvc-tools";
         version = "0.1.14";
@@ -2601,6 +2727,56 @@ rec {
           "default" = [ "std" ];
           "serde" = [ "dep:serde" ];
         };
+      };
+      "flate2" = rec {
+        crateName = "flate2";
+        version = "1.1.10";
+        edition = "2018";
+        sha256 = "1jvd2cl8j5hyf8imi62y1x7gwzz1hajirni0801yxhds1qp4wqvf";
+        authors = [
+          "Alex Crichton <alex@alexcrichton.com>"
+          "Josh Triplett <josh@joshtriplett.org>"
+        ];
+        dependencies = [
+          {
+            name = "crc32fast";
+            packageId = "crc32fast";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "miniz_oxide";
+            packageId = "miniz_oxide 0.9.1";
+            optional = true;
+            features = [ "simd" ];
+          }
+          {
+            name = "zlib-rs";
+            packageId = "zlib-rs";
+            optional = true;
+            usesDefaultFeatures = false;
+            features = [ "rust-allocator" ];
+          }
+        ];
+        features = {
+          "any_c_zlib" = [ "any_zlib" ];
+          "any_zlib" = [ "any_impl" ];
+          "cloudflare_zlib" = [ "zlib" ];
+          "default" = [ "rust_backend" "runtime_detection" ];
+          "document-features" = [ "dep:document-features" ];
+          "libz-ng-sys" = [ "dep:libz-ng-sys" ];
+          "libz-sys" = [ "dep:libz-sys" ];
+          "miniz-sys" = [ "rust_backend" ];
+          "miniz_oxide" = [ "any_impl" "dep:miniz_oxide" "dep:crc32fast" ];
+          "runtime_detection" = [ "zlib-rs?/std" "crc32fast?/std" ];
+          "rust_backend" = [ "miniz_oxide" "any_impl" ];
+          "zlib" = [ "any_c_zlib" "libz-sys" "dep:crc32fast" ];
+          "zlib-default" = [ "any_c_zlib" "libz-sys/default" "dep:crc32fast" ];
+          "zlib-ng" = [ "any_c_zlib" "libz-ng-sys" "dep:crc32fast" ];
+          "zlib-ng-compat" = [ "zlib" "libz-sys/zlib-ng" "dep:crc32fast" ];
+          "zlib-rs" = [ "any_zlib" "dep:zlib-rs" ];
+        };
+        resolvedDefaultFeatures = [ "any_impl" "default" "miniz_oxide" "runtime_detection" "rust_backend" ];
       };
       "flume" = rec {
         crateName = "flume";
@@ -4369,6 +4545,25 @@ rec {
         };
         resolvedDefaultFeatures = [ "compiled_data" ];
       };
+      "image-webp" = rec {
+        crateName = "image-webp";
+        version = "0.2.4";
+        edition = "2021";
+        sha256 = "1hz814csyi9283vinzlkix6qpnd6hs3fkw7xl6z2zgm4w7rrypjj";
+        libName = "image_webp";
+        dependencies = [
+          {
+            name = "byteorder-lite";
+            packageId = "byteorder-lite";
+          }
+          {
+            name = "quick-error";
+            packageId = "quick-error";
+          }
+        ];
+        features = {
+        };
+      };
       "indexmap 1.9.3" = rec {
         crateName = "indexmap";
         version = "1.9.3";
@@ -4945,6 +5140,508 @@ rec {
         ];
 
       };
+      "jxl-bitstream" = rec {
+        crateName = "jxl-bitstream";
+        version = "1.1.0";
+        edition = "2024";
+        sha256 = "1zkqlfcfs345lm5za24cwxpnb14vga44d5gnai0fnaby4x9fg05l";
+        libName = "jxl_bitstream";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
+      "jxl-coding" = rec {
+        crateName = "jxl-coding";
+        version = "1.0.1";
+        edition = "2024";
+        sha256 = "0g4spm38k3wndirn833pqahraq4mkzim1b21n8g6yxsy2b6jp5yd";
+        libName = "jxl_coding";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
+      "jxl-color" = rec {
+        crateName = "jxl-color";
+        version = "0.11.0";
+        edition = "2024";
+        sha256 = "1cl0vs10fi0klnkqhc13jvki5b8x99fcps787rdpa48pihsv25pk";
+        libName = "jxl_color";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+          {
+            name = "jxl-coding";
+            packageId = "jxl-coding";
+          }
+          {
+            name = "jxl-grid";
+            packageId = "jxl-grid";
+          }
+          {
+            name = "jxl-image";
+            packageId = "jxl-image";
+          }
+          {
+            name = "jxl-oxide-common";
+            packageId = "jxl-oxide-common";
+          }
+          {
+            name = "jxl-threadpool";
+            packageId = "jxl-threadpool";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
+      "jxl-frame" = rec {
+        crateName = "jxl-frame";
+        version = "0.13.3";
+        edition = "2024";
+        sha256 = "1cy2jyh00xpi96sriz3gn13gv0ps6n42s0mmc08c1iv9srppr5id";
+        libName = "jxl_frame";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+          {
+            name = "jxl-coding";
+            packageId = "jxl-coding";
+          }
+          {
+            name = "jxl-grid";
+            packageId = "jxl-grid";
+          }
+          {
+            name = "jxl-image";
+            packageId = "jxl-image";
+          }
+          {
+            name = "jxl-modular";
+            packageId = "jxl-modular";
+          }
+          {
+            name = "jxl-oxide-common";
+            packageId = "jxl-oxide-common";
+          }
+          {
+            name = "jxl-threadpool";
+            packageId = "jxl-threadpool";
+          }
+          {
+            name = "jxl-vardct";
+            packageId = "jxl-vardct";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
+      "jxl-grid" = rec {
+        crateName = "jxl-grid";
+        version = "0.6.2";
+        edition = "2024";
+        sha256 = "1ywkyx26hns51f1k6z9s7w5pgjhsji5pis76abx3n0wshw3i6rq1";
+        libName = "jxl_grid";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
+      "jxl-image" = rec {
+        crateName = "jxl-image";
+        version = "0.13.0";
+        edition = "2024";
+        sha256 = "0rg5zwrwy3mlcijdb978763bb37hr92l1kmv9nlh5ivp4pb55xy5";
+        libName = "jxl_image";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+          {
+            name = "jxl-grid";
+            packageId = "jxl-grid";
+          }
+          {
+            name = "jxl-oxide-common";
+            packageId = "jxl-oxide-common";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
+      "jxl-jbr" = rec {
+        crateName = "jxl-jbr";
+        version = "0.2.1";
+        edition = "2024";
+        sha256 = "0ilf443xrilsdngpyddq8kyx4xjpdwng8zsj51w68q66rqmh6pg3";
+        libName = "jxl_jbr";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "brotli-decompressor";
+            packageId = "brotli-decompressor";
+          }
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+          {
+            name = "jxl-frame";
+            packageId = "jxl-frame";
+          }
+          {
+            name = "jxl-grid";
+            packageId = "jxl-grid";
+          }
+          {
+            name = "jxl-image";
+            packageId = "jxl-image";
+          }
+          {
+            name = "jxl-modular";
+            packageId = "jxl-modular";
+          }
+          {
+            name = "jxl-oxide-common";
+            packageId = "jxl-oxide-common";
+          }
+          {
+            name = "jxl-threadpool";
+            packageId = "jxl-threadpool";
+          }
+          {
+            name = "jxl-vardct";
+            packageId = "jxl-vardct";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
+      "jxl-modular" = rec {
+        crateName = "jxl-modular";
+        version = "0.11.3";
+        edition = "2024";
+        sha256 = "0daj45zw9wbvnba1nrwaw0d744mm29akigl2sj8xsf674idh8bra";
+        libName = "jxl_modular";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+          {
+            name = "jxl-coding";
+            packageId = "jxl-coding";
+          }
+          {
+            name = "jxl-grid";
+            packageId = "jxl-grid";
+          }
+          {
+            name = "jxl-oxide-common";
+            packageId = "jxl-oxide-common";
+          }
+          {
+            name = "jxl-threadpool";
+            packageId = "jxl-threadpool";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
+      "jxl-oxide" = rec {
+        crateName = "jxl-oxide";
+        version = "0.12.6";
+        edition = "2024";
+        sha256 = "1wzfmd40fickvrxqq9qd86dkmyw31mybrwqi0a48cxgl4clncv6k";
+        libName = "jxl_oxide";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "brotli-decompressor";
+            packageId = "brotli-decompressor";
+          }
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+          {
+            name = "jxl-color";
+            packageId = "jxl-color";
+          }
+          {
+            name = "jxl-frame";
+            packageId = "jxl-frame";
+          }
+          {
+            name = "jxl-grid";
+            packageId = "jxl-grid";
+          }
+          {
+            name = "jxl-image";
+            packageId = "jxl-image";
+          }
+          {
+            name = "jxl-jbr";
+            packageId = "jxl-jbr";
+          }
+          {
+            name = "jxl-oxide-common";
+            packageId = "jxl-oxide-common";
+          }
+          {
+            name = "jxl-render";
+            packageId = "jxl-render";
+          }
+          {
+            name = "jxl-threadpool";
+            packageId = "jxl-threadpool";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+        features = {
+          "__examples" = [ "image?/png" ];
+          "default" = [ "rayon" ];
+          "image" = [ "dep:bytemuck" "dep:image" ];
+          "lcms2" = [ "dep:bytemuck" "dep:lcms2" ];
+          "moxcms" = [ "dep:moxcms" ];
+          "rayon" = [ "jxl-threadpool/rayon" ];
+        };
+        resolvedDefaultFeatures = [ "default" "rayon" ];
+      };
+      "jxl-oxide-common" = rec {
+        crateName = "jxl-oxide-common";
+        version = "1.0.0";
+        edition = "2024";
+        sha256 = "0yqmnh6kk7dhsgv3jv4lr68900axanfn6bdv1mz9wfhv0b2r88xn";
+        libName = "jxl_oxide_common";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+        ];
+
+      };
+      "jxl-render" = rec {
+        crateName = "jxl-render";
+        version = "0.12.4";
+        edition = "2024";
+        sha256 = "06dgzkiwq3v4d6xkk35f64n44dymfpab9gn91jiva6bavfzqchyk";
+        libName = "jxl_render";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "bytemuck";
+            packageId = "bytemuck";
+          }
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+          {
+            name = "jxl-coding";
+            packageId = "jxl-coding";
+          }
+          {
+            name = "jxl-color";
+            packageId = "jxl-color";
+          }
+          {
+            name = "jxl-frame";
+            packageId = "jxl-frame";
+          }
+          {
+            name = "jxl-grid";
+            packageId = "jxl-grid";
+          }
+          {
+            name = "jxl-image";
+            packageId = "jxl-image";
+          }
+          {
+            name = "jxl-modular";
+            packageId = "jxl-modular";
+          }
+          {
+            name = "jxl-oxide-common";
+            packageId = "jxl-oxide-common";
+          }
+          {
+            name = "jxl-threadpool";
+            packageId = "jxl-threadpool";
+          }
+          {
+            name = "jxl-vardct";
+            packageId = "jxl-vardct";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
+      "jxl-threadpool" = rec {
+        crateName = "jxl-threadpool";
+        version = "1.0.0";
+        edition = "2024";
+        sha256 = "1lwrsj6r1cga494vsf81azz6p8k26lajxms827rafxxa62w5xw95";
+        libName = "jxl_threadpool";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "rayon";
+            packageId = "rayon";
+            optional = true;
+          }
+          {
+            name = "rayon-core";
+            packageId = "rayon-core";
+            optional = true;
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+        features = {
+          "rayon" = [ "dep:rayon" "dep:rayon-core" ];
+        };
+        resolvedDefaultFeatures = [ "default" "rayon" ];
+      };
+      "jxl-vardct" = rec {
+        crateName = "jxl-vardct";
+        version = "0.11.1";
+        edition = "2024";
+        sha256 = "04a51f190i1vy1ijc2fpnmk21wjnvcmvwyf4nqm1firsdn6a2wnf";
+        libName = "jxl_vardct";
+        authors = [
+          "Wonwoo Choi <chwo9843@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "jxl-bitstream";
+            packageId = "jxl-bitstream";
+          }
+          {
+            name = "jxl-coding";
+            packageId = "jxl-coding";
+          }
+          {
+            name = "jxl-grid";
+            packageId = "jxl-grid";
+          }
+          {
+            name = "jxl-modular";
+            packageId = "jxl-modular";
+          }
+          {
+            name = "jxl-oxide-common";
+            packageId = "jxl-oxide-common";
+          }
+          {
+            name = "jxl-threadpool";
+            packageId = "jxl-threadpool";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+
+      };
       "keccak" = rec {
         crateName = "keccak";
         version = "0.1.6";
@@ -5030,9 +5727,9 @@ rec {
       };
       "lazy_static" = rec {
         crateName = "lazy_static";
-        version = "1.5.0";
+        version = "1.5.1";
         edition = "2015";
-        sha256 = "1zk6dqqni0193xg6iijh7i3i44sryglwgvx20spdvwk3r6sbrlmv";
+        sha256 = "1yqaqmp510xw2ldpw88mx9b5s5qj8flb4rw0wd9ks1zpk9j0z1r0";
         authors = [
           "Marvin Löbel <loebel.marvin@gmail.com>"
         ];
@@ -5427,6 +6124,75 @@ rec {
         };
         resolvedDefaultFeatures = [ "std" ];
       };
+      "miniz_oxide 0.8.9" = rec {
+        crateName = "miniz_oxide";
+        version = "0.8.9";
+        edition = "2021";
+        sha256 = "05k3pdg8bjjzayq3rf0qhpirq9k37pxnasfn4arbs17phqn6m9qz";
+        authors = [
+          "Frommi <daniil.liferenko@gmail.com>"
+          "oyvindln <oyvindln@users.noreply.github.com>"
+          "Rich Geldreich richgel99@gmail.com"
+        ];
+        dependencies = [
+          {
+            name = "adler2";
+            packageId = "adler2";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "simd-adler32";
+            packageId = "simd-adler32";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "alloc" = [ "dep:alloc" ];
+          "core" = [ "dep:core" ];
+          "default" = [ "with-alloc" ];
+          "rustc-dep-of-std" = [ "core" "alloc" "adler2/rustc-dep-of-std" ];
+          "serde" = [ "dep:serde" ];
+          "simd" = [ "simd-adler32" ];
+          "simd-adler32" = [ "dep:simd-adler32" ];
+        };
+        resolvedDefaultFeatures = [ "default" "simd" "simd-adler32" "with-alloc" ];
+      };
+      "miniz_oxide 0.9.1" = rec {
+        crateName = "miniz_oxide";
+        version = "0.9.1";
+        edition = "2021";
+        sha256 = "0k2bgjzk2sbsynpsv4wizwxbqp6vs7g08y5anbkrh3l6a15bqgxn";
+        authors = [
+          "Frommi <daniil.liferenko@gmail.com>"
+          "oyvindln <oyvindln@users.noreply.github.com>"
+          "Rich Geldreich richgel99@gmail.com"
+        ];
+        dependencies = [
+          {
+            name = "adler2";
+            packageId = "adler2";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "simd-adler32";
+            packageId = "simd-adler32";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "alloc" = [ "dep:alloc" ];
+          "core" = [ "dep:core" ];
+          "default" = [ "with-alloc" ];
+          "rustc-dep-of-std" = [ "core" "alloc" "adler2/rustc-dep-of-std" ];
+          "serde" = [ "dep:serde" ];
+          "simd" = [ "simd-adler32" ];
+          "simd-adler32" = [ "dep:simd-adler32" ];
+          "std" = [ "serde?/std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "simd" "simd-adler32" "with-alloc" ];
+      };
       "mio" = rec {
         crateName = "mio";
         version = "1.2.3";
@@ -5531,14 +6297,14 @@ rec {
             features = [ "macros" "rt-multi-thread" ];
           }
           {
+            name = "zenoh-dimos-codecs";
+            packageId = "zenoh-dimos-codecs";
+            features = [ "videotoolbox" "gstreamer" ];
+          }
+          {
             name = "zenoh-web";
             packageId = "zenoh-web";
             features = [ "client" ];
-          }
-          {
-            name = "zenoh-web-encoders";
-            packageId = "zenoh-web-encoders";
-            features = [ "videotoolbox" "gstreamer" ];
           }
         ];
 
@@ -6816,6 +7582,42 @@ rec {
         ];
 
       };
+      "png" = rec {
+        crateName = "png";
+        version = "0.18.1";
+        edition = "2021";
+        sha256 = "0qca282xp8a6d7mikxrwji3f52mjn4vnqxz2v9iz5adj665rnxk0";
+        authors = [
+          "The image-rs Developers"
+        ];
+        dependencies = [
+          {
+            name = "bitflags";
+            packageId = "bitflags 2.13.2";
+          }
+          {
+            name = "crc32fast";
+            packageId = "crc32fast";
+          }
+          {
+            name = "fdeflate";
+            packageId = "fdeflate";
+          }
+          {
+            name = "flate2";
+            packageId = "flate2";
+          }
+          {
+            name = "miniz_oxide";
+            packageId = "miniz_oxide 0.8.9";
+            features = [ "simd" ];
+          }
+        ];
+        features = {
+          "unstable" = [ "crc32fast/nightly" ];
+          "zlib-rs" = [ "flate2/zlib-rs" ];
+        };
+      };
       "portable-atomic" = rec {
         crateName = "portable-atomic";
         version = "1.15.0";
@@ -7001,6 +7803,18 @@ rec {
             usesDefaultFeatures = false;
             features = [ "clone-impls" "derive" "full" "parsing" "printing" "proc-macro" ];
           }
+        ];
+
+      };
+      "quick-error" = rec {
+        crateName = "quick-error";
+        version = "2.0.1";
+        edition = "2018";
+        sha256 = "18z6r2rcjvvf8cn92xjhm2qc3jpd1ljvcbf12zv0k9p565gmb4x9";
+        libName = "quick_error";
+        authors = [
+          "Paul Colomiets <paul@colomiets.name>"
+          "Colin Kiegel <kiegel@gmx.de>"
         ];
 
       };
@@ -7534,6 +8348,47 @@ rec {
         ];
         features = {
           "serde" = [ "dep:serde" ];
+        };
+      };
+      "rayon" = rec {
+        crateName = "rayon";
+        version = "1.12.0";
+        edition = "2021";
+        sha256 = "0vcj63xgnk72c30vdrak7dhl53snnaqv9x2faf1d94hzg1kb2fgv";
+        dependencies = [
+          {
+            name = "either";
+            packageId = "either";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "rayon-core";
+            packageId = "rayon-core";
+          }
+        ];
+        features = {
+          "web_spin_lock" = [ "dep:wasm_sync" "rayon-core/web_spin_lock" ];
+        };
+      };
+      "rayon-core" = rec {
+        crateName = "rayon-core";
+        version = "1.13.0";
+        edition = "2021";
+        links = "rayon-core";
+        sha256 = "14dbr0sq83a6lf1rfjq5xdpk5r6zgzvmzs5j6110vlv2007qpq92";
+        libName = "rayon_core";
+        dependencies = [
+          {
+            name = "crossbeam-deque";
+            packageId = "crossbeam-deque";
+          }
+          {
+            name = "crossbeam-utils";
+            packageId = "crossbeam-utils";
+          }
+        ];
+        features = {
+          "web_spin_lock" = [ "dep:wasm_sync" ];
         };
       };
       "rcgen" = rec {
@@ -10516,6 +11371,20 @@ rec {
           "std" = [ "alloc" "rand_core?/std" ];
         };
         resolvedDefaultFeatures = [ "alloc" "digest" "rand_core" "std" ];
+      };
+      "simd-adler32" = rec {
+        crateName = "simd-adler32";
+        version = "0.3.10";
+        edition = "2018";
+        sha256 = "1sny4y2qa5mwyxx5x59ln2p02vsdh92004njlslnx98imjc9489s";
+        libName = "simd_adler32";
+        authors = [
+          "Marvin Countryman <me@maar.vin>"
+        ];
+        features = {
+          "default" = [ "std" "const-generics" ];
+        };
+        resolvedDefaultFeatures = [ "const-generics" "default" "std" ];
       };
       "simd_cesu8" = rec {
         crateName = "simd_cesu8";
@@ -15498,6 +16367,57 @@ rec {
         ];
 
       };
+      "zenoh-dimos-codecs" = rec {
+        crateName = "zenoh-dimos-codecs";
+        version = "0.2.0";
+        edition = "2024";
+        workspace_member = null;
+        src = pkgs.fetchgit {
+          url = "https://github.com/jeff-hykin/zenoh-dimos-codecs";
+          rev = "89b5762e2acf31c28eeef1fc6d98d53a7d821235";
+          sha256 = "0nh2sz88nrx96mk6c3257f1ngvdy6g58aj41wjdqh4xfh9kykfsh";
+        };
+        libName = "zenoh_dimos_codecs";
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "image-webp";
+            packageId = "image-webp";
+          }
+          {
+            name = "jxl-oxide";
+            packageId = "jxl-oxide";
+          }
+          {
+            name = "libloading";
+            packageId = "libloading 0.9.0";
+            optional = true;
+          }
+          {
+            name = "log";
+            packageId = "log";
+          }
+          {
+            name = "png";
+            packageId = "png";
+          }
+          {
+            name = "zenoh-web";
+            packageId = "zenoh-web";
+          }
+          {
+            name = "zune-jpeg";
+            packageId = "zune-jpeg";
+          }
+        ];
+        features = {
+          "gstreamer" = [ "dep:libloading" ];
+        };
+        resolvedDefaultFeatures = [ "default" "gstreamer" "videotoolbox" ];
+      };
       "zenoh-ext" = rec {
         crateName = "zenoh-ext";
         version = "1.6.2";
@@ -17200,41 +18120,6 @@ rec {
         };
         resolvedDefaultFeatures = [ "client" ];
       };
-      "zenoh-web-encoders" = rec {
-        crateName = "zenoh-web-encoders";
-        version = "0.1.0";
-        edition = "2024";
-        workspace_member = null;
-        src = pkgs.fetchgit {
-          url = "https://github.com/jeff-hykin/zenoh-web-encoders";
-          rev = "af0cffa3d67876f7c39e5386f6776b3b17212901";
-          sha256 = "03y2x92kgfvxjr3shh33ai32a1k78z54d2qfydhw183jxqayij6v";
-        };
-        libName = "zenoh_web_encoders";
-        dependencies = [
-          {
-            name = "anyhow";
-            packageId = "anyhow";
-          }
-          {
-            name = "libloading";
-            packageId = "libloading 0.9.0";
-            optional = true;
-          }
-          {
-            name = "log";
-            packageId = "log";
-          }
-          {
-            name = "zenoh-web";
-            packageId = "zenoh-web";
-          }
-        ];
-        features = {
-          "gstreamer" = [ "dep:libloading" ];
-        };
-        resolvedDefaultFeatures = [ "default" "gstreamer" "videotoolbox" ];
-      };
       "zenoh-web-rtc" = rec {
         crateName = "zenoh-web-rtc";
         version = "0.21.0-zw.2";
@@ -17790,6 +18675,23 @@ rec {
         ];
 
       };
+      "zlib-rs" = rec {
+        crateName = "zlib-rs";
+        version = "0.6.8";
+        edition = "2021";
+        sha256 = "04j158293bx73kv5pj1i89ai411q7fxc9zwk3wkpqgb9gj7fas5j";
+        libName = "zlib_rs";
+        features = {
+          "__internal-fuzz" = [ "arbitrary" ];
+          "__internal-test" = [ "quickcheck" ];
+          "arbitrary" = [ "dep:arbitrary" ];
+          "avx512" = [ "vpclmulqdq" ];
+          "default" = [ "std" "c-allocator" ];
+          "quickcheck" = [ "dep:quickcheck" ];
+          "std" = [ "rust-allocator" ];
+        };
+        resolvedDefaultFeatures = [ "rust-allocator" "std" ];
+      };
       "zmij" = rec {
         crateName = "zmij";
         version = "1.0.23";
@@ -17896,6 +18798,40 @@ rec {
           "default" = [ "legacy" "zdict_builder" ];
         };
         resolvedDefaultFeatures = [ "legacy" "std" "zdict_builder" ];
+      };
+      "zune-core" = rec {
+        crateName = "zune-core";
+        version = "0.5.3";
+        edition = "2021";
+        sha256 = "12v5zdwcmjwzlfz61ajchzdaab75cxasqnmwf2hq929n8vypfqym";
+        libName = "zune_core";
+        features = {
+          "log" = [ "dep:log" ];
+          "serde" = [ "dep:serde" ];
+        };
+        resolvedDefaultFeatures = [ "std" ];
+      };
+      "zune-jpeg" = rec {
+        crateName = "zune-jpeg";
+        version = "0.5.15";
+        edition = "2021";
+        sha256 = "15kjpn6pywxlwb8w5irfd68x31wi3mb4y1da8bqh7havh5drvg17";
+        libName = "zune_jpeg";
+        authors = [
+          "caleb <etemesicaleb@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "zune-core";
+            packageId = "zune-core";
+          }
+        ];
+        features = {
+          "default" = [ "x86" "neon" "std" ];
+          "log" = [ "zune-core/log" ];
+          "std" = [ "zune-core/std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "neon" "std" "x86" ];
       };
     };
 

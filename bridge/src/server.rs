@@ -186,7 +186,7 @@ impl ServerBuilder {
     }
 
     /// Makes the encoder of every video codec that has none of its own ([`Codec::video_encoder`]), e.g. a hardware one
-    /// (zenoh-web-encoders); called once per encode session. Default: software H.264 (openh264).
+    /// (zenoh-dimos-codecs' encoders); called once per encode session. Default: software H.264 (openh264).
     pub fn video_encoder(mut self, factory: impl Fn() -> Box<dyn VideoEncoder> + Send + Sync + 'static) -> Self {
         self.video_encoder = Some(Arc::new(factory));
         self

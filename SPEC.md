@@ -164,7 +164,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
 `bandwidth_target_fraction`, `codec`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `udp_ports`,
 `video_encoder` (a factory for every video codec without its own encoder, e.g. a hardware one from
-zenoh-web-encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
+zenoh-dimos-codecs' encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
 `bind(addr)` serves on a background task (`RunningServer::local_addr`, `shutdown()`), `serve(addr)` /
 `serve_with_shutdown(addr, signal)` serve in place, or `router()` returns the axum routes (`POST
 /offer`, `GET /zenoh-web/health`, `GET /zenoh-web/ice`, static files) for the host's own HTTP server.
@@ -292,7 +292,7 @@ packetizes (webrtc-rs payloaders), paces (GCC), measures the frames for the allo
 per-frame metadata. `H264Encoder` (openh264, constrained baseline) is the default.
 
 A hardware encoder plugs in for every video codec as `ServerBuilder::video_encoder(factory)`, or for one codec as
-its `video_encoder()` (which wins). [zenoh-web-encoders](https://github.com/jeff-hykin/zenoh-web-encoders) has
+its `video_encoder()` (which wins). [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)' `encoders` module has
 VideoToolbox (macOS) and GStreamer (`nvv4l2h264enc` on a Jetson, `nvh264enc`, `vah264enc` / `vaapih264enc`, loaded at
 runtime) backends, probed by encoding a test frame and wrapped in a fallback to openh264; zenoh-web-cli uses it
 (`--video-encoder auto|software|videotoolbox|gstreamer`). Any encoder is fed from

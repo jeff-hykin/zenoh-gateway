@@ -1,4 +1,4 @@
 {
-  "git+https://github.com/jeff-hykin/zenoh-web-encoders?rev=af0cffa3d67876f7c39e5386f6776b3b17212901#0.1.0": "03y2x92kgfvxjr3shh33ai32a1k78z54d2qfydhw183jxqayij6v",
+  "git+https://github.com/jeff-hykin/zenoh-dimos-codecs?rev=89b5762e2acf31c28eeef1fc6d98d53a7d821235#0.2.0": "0nh2sz88nrx96mk6c3257f1ngvdy6g58aj41wjdqh4xfh9kykfsh",
   "git+https://github.com/jeff-hykin/zenoh-web?rev=fb465e704544008095a00b5416d68b6abc91147c#0.4.0": "1r78his2wxxiczb8gamghlng6dbn07iafmgqc604drxqa0k14ki6"
 }

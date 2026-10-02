@@ -138,7 +138,7 @@ Picked explicitly per subscription; there is no auto-detection and none is built
 knows no message types. No codec = raw bytes, rate is the only degradation. A **video** codec hands
 the bridge frames for its `VideoEncoder`: by default pictures, which the bridge encodes as H.264 at the bitrate the
 allocator grants (full size unless that is under 0.05 bit/pixel); the server can use a hardware encoder for every
-codec (`ServerBuilder::video_encoder`, e.g. from [zenoh-web-encoders](https://github.com/jeff-hykin/zenoh-web-encoders):
+codec (`ServerBuilder::video_encoder`, e.g. from [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)' encoders:
 VideoToolbox, or GStreamer on a Jetson / NVENC / VAAPI), a codec can bring its own (H.264, VP8, VP9 or AV1), and the
 bridge negotiates, packetizes and paces it on a video track
 (`sub.mediaStream`, `msg.video`). An **audio** codec hands it PCM, sent as Opus on an audio track
@@ -338,7 +338,7 @@ constrained) is in `z.stats`. Full algorithm and measurements: SPEC.md "Bandwidt
 
 The flake builds with [crate2nix](https://github.com/nix-community/crate2nix): every crate is its own nix store
 derivation, so crates are built once and shared by every flake that uses `lib.crossRust` (zenoh-web, zenoh-dimos-codecs,
-zenoh-web-encoders, zenoh-web-cli, zenoh-web-relay, your own) instead of each repo's `target/`. Linux binaries are cross
+zenoh-web-cli, zenoh-web-relay, your own) instead of each repo's `target/`. Linux binaries are cross
 compiled from a Mac (or the other Linux arch) with zig as the C compiler and linker, for glibc 2.35 (Ubuntu 22.04,
 Jetson L4T 36): no Linux VM, no GCC cross toolchain. C sources (openh264, zstd, ring) cross compile through zig; Opus is
 `unsafe-libopus` (Rust); GStreamer is loaded at runtime, so nothing links it.

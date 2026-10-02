@@ -41,7 +41,7 @@
 
             templates.downstream = {
                 path = ./templates/downstream;
-                description = "a crate using zenoh-web (client) and zenoh-web-encoders, built natively and for aarch64 Linux with crate2nix + zig";
+                description = "a crate using zenoh-web (client) and zenoh-dimos-codecs (codecs + hardware encoders), built natively and for aarch64 / x86_64 Linux with crate2nix + zig";
             };
         };
 }
