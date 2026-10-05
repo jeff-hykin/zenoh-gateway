@@ -507,3 +507,26 @@ async fn cloudflare_turn_carries_a_relay_only_connection() {
     client.close().await;
     running.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_policy_in_the_ice_reply_makes_the_connection_relay_only() {
+    use axum::{Json, Router, routing::get};
+    // a host app answering /zenoh-web/ice itself, the rest from zenoh-web's routes; no TURN, so relay-only can't connect
+    async fn host(policy: Option<&'static str>) -> String {
+        let session = zenoh::open(isolated_config()).await.unwrap();
+        let server = Server::builder().session(session).build().await.unwrap();
+        let ice = move || async move { Json(serde_json::json!({"iceServers": [], "iceTransportPolicy": policy})) };
+        let app = Router::new().route(zenoh_web::ICE_PATH, get(ice)).fallback_service(server.router());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+    let all = host(None).await;
+    let client = timeout(Duration::from_secs(15), Client::connect(&all, ClientOptions::default())).await.unwrap().unwrap();
+    client.close().await;
+    let relay = host(Some("relay")).await;
+    let refused = timeout(Duration::from_secs(20), Client::connect(&relay, ClientOptions::default())).await;
+    let error = match refused { Ok(Ok(_)) => panic!("relay-only with no TURN server must not connect"), Ok(Err(error)) => format!("{error:#}"), Err(_) => "timed out".to_owned() };
+    assert!(error.contains("Relay-only"), "refused for the relay policy: {error}");
+}

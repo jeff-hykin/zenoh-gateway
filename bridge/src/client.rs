@@ -78,7 +78,8 @@ pub struct ClientOptions {
     pub token: Option<String>,
     /// STUN/TURN servers; None (default) asks the bridge (`GET /zenoh-web/ice`, TURN credentials minted for this client)
     pub ice_servers: Option<Vec<IceServer>>,
-    /// send everything through TURN (ICE transport policy "relay")
+    /// send everything through TURN (ICE transport policy "relay"); also on when the bridge's ICE reply says
+    /// `"iceTransportPolicy": "relay"`
     pub relay_only: bool,
     /// heartbeats per second, 0 (default) for none; deadmen need them
     pub heartbeat_hz: f64,
@@ -651,12 +652,12 @@ impl Client {
     async fn connect_with(signalling: Signalling, options: ClientOptions) -> Result<Client> {
         let (state, _) = watch::channel(ConnectionState::Connecting);
         let shared = Arc::new(Shared { requests: Mutex::default(), endpoints: Mutex::default(), clock: Mutex::default(), state, gathered: Notify::new(), media: Mutex::default(), leases: Mutex::default(), pending_leases: Mutex::default() });
-        let ice_servers = match &options.ice_servers {
-            Some(servers) => servers.clone(),
+        let (ice_servers, server_relay_only) = match &options.ice_servers {
+            Some(servers) => (servers.clone(), false),
             None => signalling.ice_servers(options.token.as_deref()).await?,
         };
         let ice_servers = ice_servers.into_iter().map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential }).collect();
-        let policy = if options.relay_only { RTCIceTransportPolicy::Relay } else { RTCIceTransportPolicy::All };
+        let policy = if options.relay_only || server_relay_only { RTCIceTransportPolicy::Relay } else { RTCIceTransportPolicy::All };
         let (media_engine, interceptors, _) = media::media_setup()?;
         let connection: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
@@ -1434,21 +1435,22 @@ enum Signalling {
 }
 
 impl Signalling {
-    /// The server's ICE servers (`GET /zenoh-web/ice`, or `zenoh-web/<name>/ice`).
-    async fn ice_servers(&self, token: Option<&str>) -> Result<Vec<IceServer>> {
+    /// The server's ICE servers (`GET /zenoh-web/ice`, or `zenoh-web/<name>/ice`), and whether it asks for relay only.
+    async fn ice_servers(&self, token: Option<&str>) -> Result<(Vec<IceServer>, bool)> {
         let mut reply = match self {
             Signalling::Http { url, http } => {
                 let request = http.get(format!("{url}{}", crate::ICE_PATH));
                 let response = refuse_unauthorized(bearer(request, token).send().await.context("GET /zenoh-web/ice")?).await?;
                 // a server without the route (older) has none to offer
                 if !response.status().is_success() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), false));
                 }
                 response.json::<Value>().await?
             }
             Signalling::Zenoh { .. } => self.query("ice", json!({"token": token})).await?,
         };
-        Ok(serde_json::from_value(reply["iceServers"].take())?)
+        let relay_only = reply["iceTransportPolicy"] == "relay";
+        Ok((serde_json::from_value(reply["iceServers"].take())?, relay_only))
     }
 
     /// Sends the offer, returns the answer.

@@ -111,7 +111,7 @@ export interface PublisherOptions {
 export interface ConnectOptions {
     /** default: the bridge's (`GET /zenoh-web/ice`, TURN credentials minted for this client) */
     iceServers?: RTCIceServer[]
-    /** "relay" forces every byte through TURN */
+    /** "relay" forces every byte through TURN; default: the `/zenoh-web/ice` reply's `iceTransportPolicy`, else "all" */
     iceTransportPolicy?: RTCIceTransportPolicy
     /** sent as `Authorization: Bearer <token>`; the bridge's authorize hook turns it into a grant */
     token?: string
@@ -1073,13 +1073,17 @@ export class ZenohWeb {
         }
         const auth: Record<string, string> = this.options.token === undefined ? {} : { authorization: `Bearer ${this.options.token}` }
         let iceServers = this.options.iceServers
+        let iceTransportPolicy = this.options.iceTransportPolicy
         if (iceServers === undefined) {
             const response = await fetch(`${this.url}/zenoh-web/ice`, { headers: auth }).catch(() => null)
             await this.#refuseIfUnauthorized(response)
-            iceServers = response?.ok ? (await response.json()).iceServers as RTCIceServer[] : []
+            const ice = response?.ok ? await response.json() : {}
+            iceServers = (ice.iceServers ?? []) as RTCIceServer[]
+            // a server may ask for relay-only; the caller's own policy wins
+            iceTransportPolicy ??= ice.iceTransportPolicy as RTCIceTransportPolicy | undefined
         }
         this.iceServers = iceServers
-        const peer = new RTCPeerConnection({ iceServers, iceTransportPolicy: this.options.iceTransportPolicy ?? "all" })
+        const peer = new RTCPeerConnection({ iceServers, iceTransportPolicy: iceTransportPolicy ?? "all" })
         const control = peer.createDataChannel("control", { ordered: true })
         this.#peer = peer
         this.#control = control

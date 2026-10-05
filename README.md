@@ -60,7 +60,7 @@ The bridge checks options: an unknown name or a bad value rejects the subscripti
 | `heartbeatMisses` | 3 | silence of `misses / hz` seconds = this page is gone |
 | `token` | none | sent as `Authorization: Bearer <token>` (see [Auth](#auth)); a refused token rejects `connect` and stops reconnecting |
 | `iceServers` | the bridge's | `RTCIceServer[]`; by default fetched from the bridge (`GET /zenoh-web/ice`, TURN credentials minted per client), `[]` on a bridge without any |
-| `iceTransportPolicy` | `"all"` | `"relay"` sends everything through TURN |
+| `iceTransportPolicy` | the `/zenoh-web/ice` reply's, else `"all"` | `"relay"` sends everything through TURN |
 | `reconnect` | `true` | re-open the connection and every live channel after a loss |
 | `statsIntervalMs` | 1000 | how often `z.stats` / `z.bridgeStats` refresh |
 | `clock` | `performance.timeOrigin + performance.now()` | the page's clock in ms (put timestamps, clock sync) |

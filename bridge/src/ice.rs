@@ -32,12 +32,16 @@ pub fn turn_credentials(secret: &str, user: &str, ttl: Duration, now: SystemTime
     (username, base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
+fn is_turn(server: &IceServer) -> bool {
+    server.urls.iter().any(|url| url.starts_with("turn"))
+}
+
 /// The servers with credentials minted for `user` on every TURN entry that has none, when a secret is set.
 pub(crate) fn mint(servers: &[IceServer], secret: Option<&(String, Duration)>, user: &str) -> Vec<IceServer> {
     servers
         .iter()
         .map(|server| match secret {
-            Some((secret, ttl)) if server.username.is_empty() && server.urls.iter().any(|url| url.starts_with("turn")) => {
+            Some((secret, ttl)) if server.username.is_empty() && is_turn(server) => {
                 let (username, credential) = turn_credentials(secret, user, *ttl, SystemTime::now());
                 IceServer { username, credential, ..server.clone() }
             }
@@ -90,7 +94,14 @@ pub(crate) async fn servers(statics: &[IceServer], secret: Option<&(String, Dura
     let mut servers = mint(statics, secret, user);
     if let Some(IceHook(hook)) = hook {
         match tokio::time::timeout(ICE_HOOK_TIMEOUT, hook(request)).await {
-            Ok(Ok(minted)) => servers.extend(minted),
+            Ok(Ok(minted)) => {
+                // a browser refuses the whole connection over one TURN entry without credentials
+                let (usable, unusable): (Vec<_>, Vec<_>) = minted.into_iter().partition(|server| !is_turn(server) || (!server.username.is_empty() && !server.credential.is_empty()));
+                if !unusable.is_empty() {
+                    warn!("ICE servers hook: dropped {} TURN server(s) without a username and credential", unusable.len());
+                }
+                servers.extend(usable)
+            }
             Ok(Err(error)) => warn!("ICE servers hook failed, using the static servers: {error:#}"),
             Err(_) => warn!("ICE servers hook gave no answer in {ICE_HOOK_TIMEOUT:?}, using the static servers"),
         }
@@ -339,6 +350,8 @@ mod tests {
         let request = IceRequest { side: IceSide::Bridge, token: Some("t".into()) };
         assert_eq!(servers(&statics, None, Some(&good), request).await, vec![statics[0].clone(), extra]);
         assert_eq!(seen.lock().unwrap().as_slice(), &[(IceSide::Bridge, Some("t".to_owned()))]);
+        let bare_turn = IceHook(Arc::new(|_| Box::pin(async { Ok(vec![IceServer { urls: vec!["turn:t:3478".into()], ..Default::default() }]) })));
+        assert_eq!(servers(&statics, None, Some(&bare_turn), IceRequest { side: IceSide::Browser, token: None }).await, statics, "a TURN entry without credentials is dropped");
         let failing = IceHook(Arc::new(|_| Box::pin(async { anyhow::bail!("down") })));
         assert_eq!(servers(&statics, None, Some(&failing), IceRequest { side: IceSide::Browser, token: None }).await, statics);
     }

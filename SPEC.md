@@ -501,7 +501,9 @@ per-browser layer on top, with reasons.
 - `ServerBuilder::ice_servers([IceServer { urls, username, credential }])` configures the bridge's own
   side of every connection, and `GET /zenoh-web/ice` (authorized like an offer) hands the same list to
   browsers as `{"iceServers": [...]}`. The client fetches it on every (re)connect unless `connect` was
-  given `iceServers` (an older bridge's 404 means none), and exposes it as `z.iceServers`.
+  given `iceServers` (an older bridge's 404 means none), and exposes it as `z.iceServers`. A reply with
+  `"iceTransportPolicy": "relay"` (e.g. from a host app serving its own `/zenoh-web/ice`) makes the connection
+  relay-only unless `connect` was given `iceTransportPolicy` (the Rust client: `relay_only` or the reply).
 - `turn_secret(secret, ttl)`: coturn's TURN REST API (`use-auth-secret`, `static-auth-secret`). Every
   TURN entry without a username gets credentials minted per connection and per caller: username
   `"<unix expiry>:<user>"` (`bridge` for its own side, `browser` for `/zenoh-web/ice`), credential
@@ -510,7 +512,8 @@ per-browser layer on top, with reasons.
 - `ice_servers_fn(hook)`: `async fn(IceRequest { side, token }) -> Result<Vec<IceServer>>`, called for
   every `/zenoh-web/ice` (and zenoh `ice` query; side `Browser`) and every offer the bridge answers (side
   `Bridge`), with the connection's bearer token. Its servers come after the static (and minted) ones; an
-  error, or no answer within `ICE_HOOK_TIMEOUT` (5 s), is logged and that end gets only the static ones.
+  error, or no answer within `ICE_HOOK_TIMEOUT` (5 s), is logged and that end gets only the static ones. TURN
+  entries it returns without a username and credential are dropped (a browser refuses the whole connection over one).
 - `cloudflare_turn(CloudflareTurn)` (feature `cloudflare`) is that hook over Cloudflare's API: `POST
   https://rtc.live.cloudflare.com/v1/turn/keys/<key id>/credentials/generate-ice-servers`, `Authorization:
   Bearer <api token>`, body `{"ttl": seconds}`; the reply's `iceServers` (a list, or the older `generate`
