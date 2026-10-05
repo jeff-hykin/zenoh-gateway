@@ -46,7 +46,7 @@ const RTT_BASELINE_WINDOW: Duration = Duration::from_secs(30);
 /// The send window covers the highest RTT over this window.
 const WINDOW_RTT_WINDOW: Duration = Duration::from_secs(10);
 
-/// Bridge-wide allocation settings (builder options / command-line flags).
+/// Gateway-wide allocation settings (builder options / command-line flags).
 #[derive(Debug, Clone, Copy)]
 pub struct AllocationConfig {
     /// cap on each frontend's budget, bytes/s
@@ -55,7 +55,7 @@ pub struct AllocationConfig {
     pub target_fraction: f64,
 }
 
-/// How the bridge's side of each connection reaches browsers (builder options / command-line flags).
+/// How the gateway's side of each connection reaches browsers (builder options / command-line flags).
 #[derive(Debug, Clone, Default)]
 pub struct ConnectConfig {
     pub ice_servers: Vec<IceServer>,
@@ -133,7 +133,7 @@ struct PeerState {
     channels: Mutex<HashMap<u64, ChannelEntry>>,
     next_channel: AtomicU64,
     connection_state: Mutex<Option<RTCPeerConnectionState>>,
-    /// bridge clock minus browser clock, as estimated (and reported) by the browser
+    /// gateway clock minus browser clock, as estimated (and reported) by the browser
     clock_offset_ms: Arc<Mutex<Option<f64>>>,
     rtt_ms: Mutex<Option<f64>>,
     /// keyed by the publisher's label id
@@ -154,7 +154,7 @@ struct PeerState {
     estimator: Mutex<Estimator>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
-    bridge: Weak<Bridge>,
+    gateway: Weak<Gateway>,
     /// the bearer token it connected with, and what it may do
     token: Option<String>,
     grant: Grant,
@@ -162,16 +162,16 @@ struct PeerState {
 }
 
 impl PeerState {
-    fn new(peer_id: u64, bridge: &Arc<Bridge>, video_target_bps: Arc<AtomicU64>, token: Option<String>, grant: Grant) -> Self {
-        let config = bridge.allocation;
+    fn new(peer_id: u64, gateway: &Arc<Gateway>, video_target_bps: Arc<AtomicU64>, token: Option<String>, grant: Grant) -> Self {
+        let config = gateway.allocation;
         PeerState {
-            bridge: Arc::downgrade(bridge),
+            gateway: Arc::downgrade(gateway),
             token,
             grant,
-            leases: bridge.leases.clone(),
+            leases: gateway.leases.clone(),
             peer_id,
-            session: bridge.session.clone(),
-            codecs: bridge.codecs.clone(),
+            session: gateway.session.clone(),
+            codecs: gateway.codecs.clone(),
             channels: Mutex::new(HashMap::new()),
             next_channel: AtomicU64::new(0),
             connection_state: Mutex::new(None),
@@ -353,7 +353,7 @@ struct PeerEntry {
 }
 
 /// Every connected browser, and what they share: the zenoh session and the encodings.
-pub struct Bridge {
+pub struct Gateway {
     session: zenoh::Session,
     codecs: Arc<EncodingRegistry>,
     allocation: AllocationConfig,
@@ -365,9 +365,9 @@ pub struct Bridge {
     udp_ports_in_use: Mutex<HashMap<u64, u16>>,
 }
 
-impl Bridge {
+impl Gateway {
     pub fn new(session: zenoh::Session, codecs: EncodingRegistry, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
-        Arc::new(Bridge {
+        Arc::new(Gateway {
             session,
             codecs: Arc::new(codecs),
             allocation,
@@ -438,7 +438,7 @@ impl Bridge {
     }
 
     async fn answer_as(self: &Arc<Self>, peer_id: u64, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
-        let request = ice::IceRequest { side: ice::IceSide::Bridge, token: token.clone() };
+        let request = ice::IceRequest { side: ice::IceSide::Gateway, token: token.clone() };
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
         let (media_engine, interceptors, video_target_bps) = media::media_setup()?;
         let state = Arc::new(PeerState::new(peer_id, self, video_target_bps, token, grant));
@@ -449,7 +449,7 @@ impl Bridge {
             .into_iter()
             .map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential })
             .collect();
-        let handler = Arc::new(Handler { bridge: Arc::downgrade(self), peer_id, gathered_tx, state: state.clone() });
+        let handler = Arc::new(Handler { gateway: Arc::downgrade(self), peer_id, gathered_tx, state: state.clone() });
         let setting_engine = SettingEngineBuilder::new()
             .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
             .build();
@@ -543,7 +543,7 @@ async fn run_allocator(state: Weak<PeerState>) {
 }
 
 struct Handler {
-    bridge: std::sync::Weak<Bridge>,
+    gateway: std::sync::Weak<Gateway>,
     peer_id: u64,
     gathered_tx: mpsc::Sender<()>,
     state: Arc<PeerState>,
@@ -562,18 +562,18 @@ impl PeerConnectionEventHandler for Handler {
         *self.state.connection_state.lock().unwrap() = Some(state);
         match state {
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
-                if let Some(bridge) = self.bridge.upgrade() {
-                    bridge.drop_peer(self.peer_id, "disconnected");
+                if let Some(gateway) = self.gateway.upgrade() {
+                    gateway.drop_peer(self.peer_id, "disconnected");
                 }
             }
             // ICE may sit in `disconnected` without ever reaching `failed`
             RTCPeerConnectionState::Disconnected => {
-                let (bridge, state, peer_id) = (self.bridge.clone(), self.state.clone(), self.peer_id);
+                let (gateway, state, peer_id) = (self.gateway.clone(), self.state.clone(), self.peer_id);
                 tokio::spawn(async move {
                     tokio::time::sleep(DISCONNECTED_GRACE).await;
                     let still_down = *state.connection_state.lock().unwrap() != Some(RTCPeerConnectionState::Connected);
-                    if still_down && let Some(bridge) = bridge.upgrade() {
-                        bridge.drop_peer(peer_id, "disconnected");
+                    if still_down && let Some(gateway) = gateway.upgrade() {
+                        gateway.drop_peer(peer_id, "disconnected");
                     }
                 });
             }
@@ -583,11 +583,11 @@ impl PeerConnectionEventHandler for Handler {
 
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
         // Must not block here: the driver waits for this to return.
-        tokio::spawn(run_channel(dc, self.bridge.clone(), self.state.clone()));
+        tokio::spawn(run_channel(dc, self.gateway.clone(), self.state.clone()));
     }
 }
 
-async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, state: Arc<PeerState>) {
+async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>, state: Arc<PeerState>) {
     let peer_id = state.peer_id;
     let raw_label = dc.label().await.unwrap_or_default();
     if raw_label == "control" {
@@ -595,8 +595,8 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
         run_control(dc, state.clone()).await;
         *state.control.lock().unwrap() = None;
         // the client keeps `control` open for its whole life, so its close means the browser left
-        if let Some(bridge) = bridge.upgrade() {
-            bridge.drop_peer(peer_id, "disconnected");
+        if let Some(gateway) = gateway.upgrade() {
+            gateway.drop_peer(peer_id, "disconnected");
         }
         return;
     }
@@ -714,7 +714,7 @@ struct ClockSample {
 }
 
 /// Heartbeat channel (unordered, no retransmits). Each beat is also a clock-sync ping:
-/// `{t0, offsetMs?, rttMs?}` in, `{t0, t1, t2}` (bridge receive/send times) out.
+/// `{t0, offsetMs?, rttMs?}` in, `{t0, t1, t2}` (gateway receive/send times) out.
 async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc<PeerState>) {
     let already_configured = {
         let mut heartbeat = state.heartbeat.lock().unwrap();
@@ -906,13 +906,13 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
     match state.leases.take(state.peer_id, &state.grant, &group, request.keys.clone(), request.max_seconds) {
         Ok((keys, expires_in, serial)) => {
             if let Some(after) = expires_in {
-                let (bridge, group) = (state.bridge.clone(), group.clone());
+                let (gateway, group) = (state.gateway.clone(), group.clone());
                 tokio::spawn(async move {
                     tokio::time::sleep(after).await;
-                    if let Some(bridge) = bridge.upgrade()
-                        && let Some(holder) = bridge.leases.end(&group, |_, lease_serial| lease_serial == serial)
+                    if let Some(gateway) = gateway.upgrade()
+                        && let Some(holder) = gateway.leases.end(&group, |_, lease_serial| lease_serial == serial)
                     {
-                        bridge.lease_lost(holder, &group, "maxSeconds").await;
+                        gateway.lease_lost(holder, &group, "maxSeconds").await;
                     }
                 });
             }
@@ -929,10 +929,10 @@ async fn expire_lease(state: &PeerState, request: &ControlRequest) -> Value {
     if !state.grant.force_expire {
         return fail(&request.id, format!("not authorized to force-expire lease {group:?}"));
     }
-    let Some(bridge) = state.bridge.upgrade() else { return fail(&request.id, "shutting down") };
-    match bridge.leases.end(group, |_, _| true) {
+    let Some(gateway) = state.gateway.upgrade() else { return fail(&request.id, "shutting down") };
+    match gateway.leases.end(group, |_, _| true) {
         Some(holder) => {
-            bridge.lease_lost(holder, group, &format!("force-expired by peer {}", state.peer_id)).await;
+            gateway.lease_lost(holder, group, &format!("force-expired by peer {}", state.peer_id)).await;
             ok(&request.id, json!({}))
         }
         None => fail(&request.id, format!("no lease {group:?} is held")),
@@ -966,7 +966,7 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
     ok(&request.id, json!({}))
 }
 
-/// Every key the bridge can find live under `filter`, with where it was seen:
+/// Every key the gateway can find live under `filter`, with where it was seen:
 /// - `advancedPublisher`: liveliness tokens of zenoh-ext AdvancedPublishers with publisher_detection
 /// - `token`: any other liveliness token
 /// - `sample`: data seen on a `filter` subscription during `probe` (catches undeclared publishers);
@@ -1104,7 +1104,7 @@ mod tests {
                     tasks.push(tokio::spawn(async move {
                         while Instant::now() < deadline {
                             list_topics(&session, "**", Duration::ZERO).await.unwrap();
-                            // what listTopics used to ask: the bridge's own declarations, from the admin space
+                            // what listTopics used to ask: the gateway's own declarations, from the admin space
                             let replies = session.get("@/*/*/subscriber/**").timeout(Duration::from_secs(1)).await.unwrap();
                             while replies.recv_async().await.is_ok() {}
                         }

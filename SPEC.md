@@ -1,18 +1,18 @@
 # zenoh-web spec
 
-A browser UI that views and drives a zenoh system over a squeezed network, without a heavy bridge.
+A browser UI that views and drives a zenoh system over a squeezed network, through a light gateway.
 
 ## Shape
 
 ```
 zenoh peers (publishers we don't control)
         │  zenoh
-   zenoh-web bridge (Rust library inside an application, e.g. the zenoh-web command of zenoh-web-cli)
+   zenoh-web gateway (Rust library inside an application, e.g. the zenoh-web command of zenoh-web-cli)
         │  WebRTC data channels (UDP) + one HTTP endpoint for signaling
    browser page (plain JS client, live-editable)
 ```
 
-The bridge is a dumb pipe: one data channel ↔ one zenoh key expression. It never parses payloads,
+The gateway passes data through as is by default: one data channel ↔ one zenoh key expression. It never parses payloads,
 except when a subscription explicitly picks one of its message encodings (see "Encodings and channels").
 
 ## JS API
@@ -24,7 +24,7 @@ const z = await connect("http://robot.local:7448", {
     heartbeatHz: 5,         // 0 (default) = no heartbeat; needed for deadmen and leases
     heartbeatMisses: 3,     // silence of misses/heartbeatHz seconds = frontend gone
     token: "s3cret",        // optional: `Authorization: Bearer`, see "Auth"
-    iceServers: [],         // optional: default the bridge's (GET /zenoh-web/ice), see "ICE and TURN"
+    iceServers: [],         // optional: default the gateway's (GET /zenoh-web/ice), see "ICE and TURN"
     iceTransportPolicy: "relay", // optional: everything through TURN
 })
 
@@ -32,11 +32,11 @@ const sub = z.subscribe("camera/**", {
     delivery: "latest",          // or "reliable"
     priority: Priority.DATA_LOW, // optional; defaults to the priority the message was published with
     maxAge: 500,                 // ms; drop anything older
-    maxHz: 20,                   // bridge never sends a key faster than this
+    maxHz: 20,                   // gateway never sends a key faster than this
     bandwidthPriority: 1,        // when bandwidth is short, higher keeps more (0 gives up everything first)
     minQuality: 0.3,             // 0-1, encoded streams only
     qualityToHzTradeoff: 0.7,    // 0 = keep quality, drop hz; 1 = keep hz, drop quality
-    encoding: "ros2_image",      // optional message encoding the bridge registered (z.encodings), see "Encodings and channels"
+    encoding: "ros2_image",      // optional message encoding the gateway registered (z.encodings), see "Encodings and channels"
     channel: "video-h264",       // what it travels on (default: from the encoding's output); video-vp8/vp9/av1, audio-opus, data
     encodeOptions: { quality: 1.0 },  // passed to the encoding; quality = the most the allocator may pick (default 1)
     compress: "zstd",            // or "none"; default: the encoding's (none without one), see "Compression"
@@ -51,14 +51,14 @@ const cmd = z.publisher("cmd_vel", {
     delivery: "latest",
     priority: Priority.REAL_TIME,
     repeatMs: 100,          // client-side: re-send the last value on a timer
-    latencyLimit: 300,      // ms; the bridge drops puts older than this (clock-corrected). default: none
+    latencyLimit: 300,      // ms; the gateway drops puts older than this (clock-corrected). default: none
 })
 cmd.put(bytes)                    // or cmd.put(bytes, { timestamp: z.now() - delay })
 await cmd.setDeadman(stopBytes)   // throws if connect() had no heartbeat
 await cmd.clearDeadman()
 cmd.state                         // "connecting" | "open" | "tripped" | "rejected" | "closed"
 cmd.onTripped((reason) => {})     // "heartbeat" | "disconnected" | "shutdown" | "revoked"
-cmd.blocked                       // why the bridge drops this publisher's puts now (another client's lease), else null
+cmd.blocked                       // why the gateway drops this publisher's puts now (another client's lease), else null
 cmd.close()
 
 const lease = await z.lease("arm", { maxSeconds: 60 })  // or { keys: ["robot/arm/**"] } for a group the server doesn't define; see "Leases"
@@ -69,45 +69,45 @@ await z.expireLease("arm")        // end another client's lease (needs the grant
 const replies = await z.get("some/key/**")   // zenoh query, returns [{ key, bytes }]
 const topics = await z.listTopics("robot/**")  // [{ key, sources }], see "Topic enumeration"
 
-await sub.ready()      // resolves when the bridge accepted the channel, rejects with its reason
+await sub.ready()      // resolves when the gateway accepted the channel, rejects with its reason
 sub.state              // "connecting" | "open" | "rejected" | "closed" (publishers add "tripped")
 
-z.stats          // per-key: received, dropped, backlogBytes, rttMs, bridge (normalized options, stats, allocation)
-z.bridgeStats.bandwidth  // this frontend's estimate, cap, budget, demand (see "Bandwidth allocation")
-z.clockOffsetMs  // bridge clock - browser clock
+z.stats          // per-key: received, dropped, backlogBytes, rttMs, gateway (normalized options, stats, allocation)
+z.gatewayStats.bandwidth  // this frontend's estimate, cap, budget, demand (see "Bandwidth allocation")
+z.clockOffsetMs  // gateway clock - browser clock
 z.rttMs
 z.onState(fn)    // "connecting" | "connected" | "degraded" | "lost"
-z.encodings      // [{ name, output: "video" | "audio" | "fields" | "data" }]: the bridge's encodings, fetched on connect
+z.encodings      // [{ name, output: "video" | "audio" | "fields" | "data" }]: the gateway's encodings, fetched on connect
 
 registerEncoding("text_uppercase", (bytes, msg) => new TextDecoder().decode(bytes))  // browser side of a data encoding: msg.decoded
 ```
 
 - `Priority` mirrors zenoh / zenoh-ts: REAL_TIME=1, INTERACTIVE_HIGH=2, INTERACTIVE_LOW=3, DATA_HIGH=4, DATA=5, DATA_LOW=6, BACKGROUND=7 (lower = more important).
-- Options are checked by the bridge: an unknown name or a bad value rejects the channel (`rejected`
+- Options are checked by the gateway: an unknown name or a bad value rejects the channel (`rejected`
   event with the reason: `state` becomes `"rejected"`, `ready()` rejects).
 - `bandwidthPriority` (default 1), `minQuality` (0), `encodeOptions.quality` (1), `qualityToHzTradeoff` (0.5) drive the
   per-frontend allocator ("Bandwidth allocation"); stats show them with defaults filled in. `maxBitrate`,
   `minResolutionScale` and `maxResolution` override the server's video policy ("Video"); on a non-video channel they
   reject the channel.
-- No `latched` flag: the bridge always subscribes with zenoh-ext AdvancedSubscriber history (max 1 sample per publisher), so publishers with a cache (e.g. rmw_zenoh transient_local like tf_static) replay their last message.
+- No `latched` flag: the gateway always subscribes with zenoh-ext AdvancedSubscriber history (max 1 sample per publisher), so publishers with a cache (e.g. rmw_zenoh transient_local like tf_static) replay their last message.
 
 ## Delivery → transport mapping
 
-| options | data channel init | bridge behavior when the channel is backed up |
+| options | data channel init | gateway behavior when the channel is backed up |
 |---|---|---|
 | `delivery: "reliable"` | ordered, fully reliable | queue every sample |
 | `delivery: "latest"` | unordered, maxRetransmits 0 | keep only the newest sample per key |
 | `+ maxAge: M` | latest: unordered, maxPacketLifeTime M | also drop anything older than M |
 
 "Backed up" = the channel's unacknowledged bytes are above its send window, or the page has not yet
-consumed the larger of ~256 KB and two windows the bridge sent. The window is twice the frontend's
+consumed the larger of ~256 KB and two windows the gateway sent. The window is twice the frontend's
 budget × its highest RTT of the last 10 s (at most the minimum RTT + 500 ms), between 64 KB and 4 MB
 (`windowBytes` in stats); sending resumes at half of it. A fixed 64 KB capped a channel at 64 KB per
 round trip, ~150 KB/s on a Wi-Fi path whose RTT swings to 400 ms, and SCTP's congestion window only
 grows while data waits for it, so it stayed there too. (The page acks consumption with a 4-byte `u32 seq` message on each `sub`
 channel, because browsers queue received messages for the page without limit; on lossy channels a
 sender blocked only by that window sends one probe frame after 50 ms, doubling to 1 s, so a lost tail
-can't wedge it). The bridge drains
+can't wedge it). The gateway drains
 its own queue on bufferedAmountLow / acks. Nothing piles up in kernel/wifi buffers or the browser,
 so a slow phone sees fewer frames instead of stale ones.
 
@@ -129,7 +129,7 @@ it again through its own `Server`. It is a module of this crate rather than a se
 it shares the wire code: the media engine and interceptors, the frame format, `fields::parse`.
 
 - `Client::connect(url, ClientOptions { token, ice_servers, relay_only, heartbeat_hz, heartbeat_misses })`:
-  the bridge's ICE servers from `GET /zenoh-web/ice` unless given, the same non-trickle `POST /offer`
+  the gateway's ICE servers from `GET /zenoh-web/ice` unless given, the same non-trickle `POST /offer`
   (both with `Authorization: Bearer <token>` when set; a 401 fails the connect), `control` and
   heartbeat channels, `encodings`, and 5 clock pings before returning; then a ping a second (clock
   sync, `Degraded` when one fails). `list_topics`, `get`, `stats`, `encodings`, `clock_offset_ms`,
@@ -137,7 +137,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
   resolves, connect and subscribe again.
 - `Client::connect_zenoh(&session, name, options)`: the same, signalling over zenoh (see "Signalling over zenoh").
 - `subscribe(key, SubscribeOptions)` takes the browser's options (camelCase on the wire, unset ones
-  left out), resolves once the bridge accepted the channel (or fails with its reason), and yields
+  left out), resolves once the gateway accepted the channel (or fails with its reason), and yields
   `Message`s (`recv()`, or as a `Stream`):
   - `Data`: raw or encoded bytes, reassembled and zstd-decompressed; fields messages add the parsed `fields`;
   - `Video`: an access unit (H.264 Annex B, VP8/VP9 frame, AV1 OBUs) with its format, keyframe flag
@@ -147,12 +147,12 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
   - `VideoInfo`: the 28-byte metadata frame (key, size, quality), which travels on the data channel
     apart from its frame;
   - `Audio`: Opus packets.
-  Messages are acked once queued (64 per subscription), so a slow consumer slows the bridge instead
+  Messages are acked once queued (64 per subscription), so a slow consumer slows the gateway instead
   of piling up. Video and audio renegotiate a recvonly transceiver per channel and reuse a dropped
   subscription's, as the browser does.
 - `publish(key, PublisherOptions)` → `put` / `put_at(bytes, timestamp_ms)` (`latest` drops a put
   while 64 KiB are unsent), `repeat_ms`, `set_deadman`, `clear_deadman`, `tripped()`, `wait_tripped()`.
-  `blocked()` says why the bridge drops its puts (another client's lease). `pause_heartbeat(true)`
+  `blocked()` says why the gateway drops its puts (another client's lease). `pause_heartbeat(true)`
   stops beats (to test deadmen).
 - `lease(group, keys, max_seconds)` → `Lease` (`lost()`, `wait_lost()`, `release()`), `expire_lease(group)`;
   a `closed` event (revoked token) makes the client `Lost`.
@@ -177,17 +177,17 @@ as a force-expiry does, the holder told `reason`). Shutdown fires every frontend
 
 zenoh is pinned to 1.6.2: 1.7.0 through 1.10.1 deadlock when the admin space answers a query while a
 declaration waits for the routing tables (fixed upstream on branch `bugfix/routing-deadlock`, not
-released). The webrtc-rs fixes the bridge relies on (see "Delivery → transport mapping", "Large
+released). The webrtc-rs fixes the gateway relies on (see "Delivery → transport mapping", "Large
 messages") are published as renamed crates (`zenoh-web-webrtc` → `zenoh-web-rtc` →
 `zenoh-web-rtc-datachannel`, `zenoh-web-rtc-sctp`; github.com/jeff-hykin/webrtc-rs-zenoh-web), so
 crates that depend on zenoh-web build the fixed code.
 
 ## Large messages
 
-Any size: the bridge splits a message into 64 KiB chunks (one frame each, sharing the message's `seq`)
+Any size: the gateway splits a message into 64 KiB chunks (one frame each, sharing the message's `seq`)
 and the client reassembles. The page acks frames, not messages, so a big message never deadlocks the
 consumption window. On `latest`, a message that can't arrive whole is dropped whole, never delivered
-partially: the bridge finishes a chunked message it started (so big messages make progress even when
+partially: the gateway finishes a chunked message it started (so big messages make progress even when
 newer ones keep arriving) unless it outlives `maxAge` (`abandonedPartial`); SCTP drops lost chunks
 (`maxRetransmits: 0` / `maxPacketLifeTime`); and the client discards incomplete messages once a newer
 one completes or more than 8 are pending (`partialDropped`).
@@ -196,12 +196,12 @@ one completes or more than 8 are pending (`partialDropped`).
 
 A subscription names a message **encoding** (`encoding`), the **channel** its output travels on (`channel`), and the
 **options** the encoding gets (`encodeOptions`). No `encoding` = raw passthrough on the data channel (Hz is the only
-degradation). There is no auto-detection and no encoding is built in: the application embedding the bridge registers
+degradation). There is no auto-detection and no encoding is built in: the application embedding the gateway registers
 them by name (`ServerBuilder::encoding`; a name registered twice fails the build), e.g. the robotics encodings of
 [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs), one per message type, named after its file. The
 core knows no message types: its only special paths are video and audio tracks. The client fetches the registry on
 connect (`control` op `encodings` → `{encodings: [{name, output}]}`, output on the default channel `"video"`,
-`"audio"`, `"fields"` or `"data"`, as `z.encodings`); the bridge refuses an unknown name (`rejected` event, listing the
+`"audio"`, `"fields"` or `"data"`, as `z.encodings`); the gateway refuses an unknown name (`rejected` event, listing the
 known names).
 
 Channels: `video-h264`, `video-vp8`, `video-vp9`, `video-av1` (a WebRTC video track of that format, `sub.mediaStream`),
@@ -239,7 +239,7 @@ Every encoding implements one Rust trait (`zenoh_web::MessageEncoding`):
   (default none; zenoh-dimos-codecs' depth and point clouds use zstd).
 - video: optionally `video_encoder(format)` → its own `VideoEncoder` of that format per encode session (e.g. passing
   through frames that arrive already encoded); default the server's, else the built-in one (see "Video encoders").
-- audio: PCM, which the bridge encodes to Opus on an audio track (see "Audio").
+- audio: PCM, which the gateway encodes to Opus on an audio track (see "Audio").
 - `estimated_bytes(payloadBytes, &EncodeOptions)`: optional cost model for the data channel (bytes per message), the
   allocator's prior until sizes are measured and its shape between measured qualities (default: 10–100 % of the
   payload, linear in quality). Video is priced by the video policy (see "Video").
@@ -258,7 +258,7 @@ good as BT.709 through openh264 and ~0.5 dB better through VideoToolbox. H.264 o
   `decodeMs`, `encodeMs`, `cpuScaleCap`.
 
 Work happens lazily and on send: only messages the pacing/queues let through are transcoded, on
-tokio's blocking pool. Work is shared across frontends through two small caches per bridge: decoded
+tokio's blocking pool. Work is shared across frontends through two small caches per gateway: decoded
 frames keyed by (encoding, channel kind, key + payload hash), and data-channel encodes keyed by (encoding, quality in
 1/1000 steps, options, key + payload hash, compression). Identical requests compute once (`encodes` vs `sharedEncodes` in
 stats). Video encodes are shared through encode sessions: the viewers of one stream (encoding, format, key and video
@@ -289,7 +289,7 @@ zero padding | count × components values`.
 ### Compression
 
 Subscribe option `compress`: `"zstd"` or `"none"`; unset, the encoding's `default_compress()` (none
-without one). It applies to raw topics and to every data-channel encoding: the bridge compresses each
+without one). It applies to raw topics and to every data-channel encoding: the gateway compresses each
 message (zstd level 3, on tokio's blocking pool, shared across frontends with the encode) and the
 client decompresses it before decoding or handing it on, so `msg.bytes` is always uncompressed. A
 message zstd would not shrink is sent as is; each frame's `flags` says which. The price model learns
@@ -304,7 +304,7 @@ on one is rejected, `"none"` accepted, the encoding's default ignored.
 pipelined encoder has nothing out yet. `target` carries the granted bitrate (encode at it) and frame rate, the even
 output size the video policy and CPU governor picked, the allocator's quality, and whether this frame must be a
 keyframe (a viewer joined or sent PLI/FIR). `VideoTarget::new(width, height, bitrate, fps)` makes one to try an
-encoder. The bridge negotiates the format (it offers all four),
+encoder. The gateway negotiates the format (it offers all four),
 packetizes (webrtc-rs payloaders), paces (GCC), measures the frames for the allocator and sends the
 per-frame metadata. Built in: `H264Encoder` (openh264, constrained baseline) for `video-h264`, and with feature `av1`
 (default) rav1e for `video-av1` (speed 10, low latency, tiles across up to 8 cores; rav1e still holds 3 frames, so its
@@ -325,7 +325,7 @@ come from the source). zenoh-web-cli's `examples/custom_codec.rs` has an encodin
 ### Audio
 
 An audio encoding decodes each sample to `AudioPcm` (interleaved i16, 8/12/16/24/48 kHz, mono or
-stereo). The bridge encodes it with libopus (`unsafe-libopus`, libopus transpiled to Rust, so it
+stereo). The gateway encodes it with libopus (`unsafe-libopus`, libopus transpiled to Rust, so it
 builds for every target without a C toolchain) in 20 ms packets, carrying any remainder into the
 next sample, and writes them to an Opus track (the client adds a recvonly audio transceiver and
 renegotiates for `audio-opus`, as for video). The browser's jitter buffer smooths arrival;
@@ -335,11 +335,11 @@ channel, so the callback runs per message.
 
 Microphone (browser → zenoh), not implemented, fits without redesign:
 - the page needs a secure context for `getUserMedia` (HTTPS, or `http://localhost`), so a robot's
-  bridge would be served over TLS (a reverse proxy, or `ServerBuilder` behind one);
+  gateway would be served over TLS (a reverse proxy, or `ServerBuilder` behind one);
 - the client adds a `sendonly` audio transceiver with the mic track and renegotiates
   (`{op: "renegotiate", publish: "<encoding>", sdp}`), and opens a `pub` channel naming that mid, as a
   video subscription names its track's;
-- the bridge's `on_track` reads the Opus RTP, decodes it with libopus (`opus_decode`) to PCM and
+- the gateway's `on_track` reads the Opus RTP, decodes it with libopus (`opus_decode`) to PCM and
   hands it to the encoding's inverse of `decode` (e.g. `encode_pcm(&AudioPcm) -> Vec<u8>`, a new
   `MessageEncoding` method with a default error), whose bytes are put on the key like any `pub` channel's,
   with the same latency limit and deadman rules. Only the Opus decode and the `on_track` handler are
@@ -348,11 +348,11 @@ Microphone (browser → zenoh), not implemented, fits without redesign:
 ### Video
 
 The client adds a recvonly video (or audio) transceiver and renegotiates over `control`
-(`{op: "renegotiate", channel, sdp}` → `{sdp, mid}`); the bridge adds a track of that channel's format
+(`{op: "renegotiate", channel, sdp}` → `{sdp, mid}`); the gateway adds a track of that channel's format
 (H.264 is constrained baseline, `profile-level-id=42e01f`; VP9 profile 0; Opus 48 kHz) that pairs
-with the new m-line, then the `sub` channel's label names that `mid` (the bridge refuses a track of
+with the new m-line, then the `sub` channel's label names that `mid` (the gateway refuses a track of
 another format). Renegotiations run one at a time. A closed subscription's transceiver (and the
-bridge's track) is reused by the next one of the same channel instead of renegotiating again.
+gateway's track) is reused by the next one of the same channel instead of renegotiating again.
 Each video frame also sends a 28-byte metadata frame on the `sub` channel (`msg.video`).
 Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden per subscription):
 - A stream asks the allocator for at most `maxBitrate` bits/s (default: `max_bits_per_pixel` × the source's pixels ×
@@ -378,7 +378,7 @@ also sets `jitterBufferTarget = 0`). Locally that took receive -> shown from ~22
 
 All of a frontend's streams share one path (wifi queue, UDP, one SCTP association), so throttling
 "on average" isn't enough: a burst or an overshoot builds a queue that every stream waits in. The
-bridge keeps the path's queues short and lets urgent streams skip what queue remains:
+gateway keeps the path's queues short and lets urgent streams skip what queue remains:
 
 - **Strict-priority tier.** A subscription whose priority (its `priority` option, else the published
   priority of its samples) is INTERACTIVE_HIGH (2) or more urgent bypasses allocation and pacing: its
@@ -404,8 +404,8 @@ bridge keeps the path's queues short and lets urgent streams skip what queue rem
   start). No loss is needed to react.
 
 Measured by `test/latency.js` through real queueing: a userspace UDP shaper (in the test process)
-sits between Chrome and the bridge, 2 MB/s bridge→browser with a 1 MB drop-tail queue and 5 ms each
-way (browser→bridge is delayed, not rate limited); a signaling proxy rewrites the SDP so ICE can only
+sits between Chrome and the gateway, 2 MB/s gateway→browser with a 1 MB drop-tail queue and 5 ms each
+way (browser→gateway is delayed, not rate limited); a signaling proxy rewrites the SDP so ICE can only
 use the shaper. A strict-priority 200 B stream at 50 Hz, alone: p99 ≈ 7.7 ms; with five 200 KB × 10 Hz
 bulk streams (10 MB/s wanted) the bulk gets ~1.7 MB/s and the strict p99 is ≈ 17 ms (+9 ms). The same
 stream without strict priority under that load: p99 ≈ 0.4–0.5 s.
@@ -450,7 +450,7 @@ Stats: each subscription's `allocation` (`demandBytesPerSec`,
 
 ## Topic enumeration
 
-`z.listTopics(filter = "**", { probeMs = 600 })` merges what the bridge can see, each key tagged with its sources:
+`z.listTopics(filter = "**", { probeMs = 600 })` merges what the gateway can see, each key tagged with its sources:
 
 | source | what it sees |
 |---|---|
@@ -462,14 +462,14 @@ Stats: each subscription's `allocation` (`demandBytesPerSec`,
 only sends while it has a matching subscriber (a zenoh matching listener) isn't woken by a listing.
 
 It can't see plain publishers, subscribers and queryables that hold no token (a publisher that puts
-during the probe is still seen): zenoh's admin space would list the bridge's routing tables, but
+during the probe is still seen): zenoh's admin space would list the gateway's routing tables, but
 answering it deadlocks zenoh 1.7.0 through 1.10.1, and remote publishers only reach it once interest
 is declared. rmw_zenoh liveliness tokens (`@ros2_lv/...`) only appear when the filter names them;
 they're returned raw.
 
 ## Access control
 
-The `access_control` section of the bridge's zenoh config applies to browsers' puts, subscriptions and
+The `access_control` section of the gateway's zenoh config applies to browsers' puts, subscriptions and
 queries like to any other traffic of its session: zenoh drops what it denies, silently. "Auth" is the
 per-browser layer on top, with reasons.
 
@@ -478,7 +478,7 @@ per-browser layer on top, with reasons.
 - `ServerBuilder::authorize(|token: Option<&str>, headers| -> Result<Grant, String>)` runs on every
   `POST /offer` and `GET /zenoh-web/ice`, with the `Authorization: Bearer <token>` the client sends
   (`connect(url, { token })`). `Err(reason)` answers HTTP 401 with the reason; the client then stops
-  reconnecting (`connect` rejects with `bridge refused the token: <reason>`, state `"lost"`). Without a
+  reconnecting (`connect` rejects with `gateway refused the token: <reason>`, state `"lost"`). Without a
   hook every connection gets `Grant::all()`, the behaviour before auth existed.
 - A `Grant` (serde, camelCase) holds key-expression lists: `subscribe`, `publish` (and deadmen), `query`
   (`get`), `listTopics` (which keys a listing shows), and the lease rights `leaseGroups` (names, `"*"` =
@@ -495,42 +495,42 @@ per-browser layer on top, with reasons.
 ## Leases
 
 - A lease is one client's exclusive right to publish on a group of key expressions, among the clients
-  of this bridge. Groups are defined on the server (`ServerBuilder::lease_group(name, keys)`, or the
+  of this gateway. Groups are defined on the server (`ServerBuilder::lease_group(name, keys)`, or the
   cli's auth file), or by the client (`z.lease(group, { keys })`) when the server doesn't define that
   name. The grant must allow the group name, and `publish` must include every key of the group.
 - `z.lease(group, { maxSeconds })` needs a heartbeat (`connect(url, { heartbeatHz })`) and returns a
   `Lease` (`keys`, `expiresInMs`, `release()`, `onLost`). Leasing a group you hold renews it (the old
   handle is lost with `"renewed"`). A group whose keys intersect another client's lease is refused
   (`conflicts with "<group>", held by another client`). `maxSeconds` is capped by `maxLeaseSecs`.
-- While held, every other client's puts on keys intersecting the lease are dropped by the bridge
-  (`rejectedLeased` in that publisher's stats). The publisher is told why on its own channel: the bridge
+- While held, every other client's puts on keys intersecting the lease are dropped by the gateway
+  (`rejectedLeased` in that publisher's stats). The publisher is told why on its own channel: the gateway
   sends `{"blocked": "<key> is leased by another client (group \"<group>\")"}` when its first put is
   dropped and `{"blocked": null}` when puts go through again; the client keeps it in `publisher.blocked`.
   Other clients' deadmen on those keys don't fire either.
 - It ends when the holder's heartbeat misses (`"heartbeat"`, the same deadline as deadmen), at
   `maxSeconds`, when the holder disconnects or is revoked, on `release()`, or when a client whose grant
-  has `forceExpire` calls `z.expireLease(group)`. The bridge tells the holder with
+  has `forceExpire` calls `z.expireLease(group)`. The gateway tells the holder with
   `{event: "leaseLost", group, reason}` on `control`, and the client calls `onLost`. Leases are not
   re-taken after a reconnect.
-- **It binds only clients of this bridge.** Native zenoh publishers, and other bridges, publish
+- **It binds only clients of this gateway.** Native zenoh publishers, and other gateways, publish
   regardless; zenoh's `access_control` is the tool for those.
 
 ## ICE and TURN
 
-- `ServerBuilder::ice_servers([IceServer { urls, username, credential }])` configures the bridge's own
+- `ServerBuilder::ice_servers([IceServer { urls, username, credential }])` configures the gateway's own
   side of every connection, and `GET /zenoh-web/ice` (authorized like an offer) hands the same list to
   browsers as `{"iceServers": [...]}`. The client fetches it on every (re)connect unless `connect` was
-  given `iceServers` (an older bridge's 404 means none), and exposes it as `z.iceServers`. A reply with
+  given `iceServers` (an older gateway's 404 means none), and exposes it as `z.iceServers`. A reply with
   `"iceTransportPolicy": "relay"` (e.g. from a host app serving its own `/zenoh-web/ice`) makes the connection
   relay-only unless `connect` was given `iceTransportPolicy` (the Rust client: `relay_only` or the reply).
 - `turn_secret(secret, ttl)`: coturn's TURN REST API (`use-auth-secret`, `static-auth-secret`). Every
   TURN entry without a username gets credentials minted per connection and per caller: username
-  `"<unix expiry>:<user>"` (`bridge` for its own side, `browser` for `/zenoh-web/ice`), credential
+  `"<unix expiry>:<user>"` (`gateway` for its own side, `browser` for `/zenoh-web/ice`), credential
   `base64(HMAC-SHA1(secret, username))`. The ttl must outlast a connection (TURN refreshes use them).
   `zenoh_web::turn_credentials` computes them.
 - `ice_servers_fn(hook)`: `async fn(IceRequest { side, token }) -> Result<Vec<IceServer>>`, called for
-  every `/zenoh-web/ice` (and zenoh `ice` query; side `Browser`) and every offer the bridge answers (side
-  `Bridge`), with the connection's bearer token. Its servers come after the static (and minted) ones; an
+  every `/zenoh-web/ice` (and zenoh `ice` query; side `Browser`) and every offer the gateway answers (side
+  `Gateway`), with the connection's bearer token. Its servers come after the static (and minted) ones; an
   error, or no answer within `ICE_HOOK_TIMEOUT` (5 s), is logged and that end gets only the static ones. TURN
   entries it returns without a username and credential are dropped (a browser refuses the whole connection over one).
 - `cloudflare_turn(CloudflareTurn)` (feature `cloudflare`) is that hook over Cloudflare's API: `POST
@@ -561,24 +561,24 @@ behind a NAT on both sides, a TURN server). The browser client signals over HTTP
 
 ## Clock sync
 
-Per connection, NTP-style: the browser sends `t0` (its clock), the bridge answers with `t1`/`t2` (its
+Per connection, NTP-style: the browser sends `t0` (its clock), the gateway answers with `t1`/`t2` (its
 receive/send times), the browser notes `t3`. `offset = ((t1-t0)+(t2-t3))/2`, `rtt = (t3-t0)-(t2-t1)`.
 The browser keeps the 16 most recent samples, uses the offset of the lowest-RTT one, and reports
-that estimate to the bridge on every subsequent ping. Samples come from heartbeats when configured,
+that estimate to the gateway on every subsequent ping. Samples come from heartbeats when configured,
 otherwise from the control-channel stats ping (every second); `connect()` takes a few samples before
-resolving so the bridge has an offset before the first put.
+resolving so the gateway has an offset before the first put.
 
 ## Heartbeat and deadman
 
 - At most one heartbeat per frontend: its own data channel (unordered, maxRetransmits 0), sending
   `heartbeatHz` beats; every beat is also a clock-sync ping.
-- `publisher.setDeadman(bytes)` stores (at most) one deadman per publisher stream per frontend on the bridge.
+- `publisher.setDeadman(bytes)` stores (at most) one deadman per publisher stream per frontend on the gateway.
 - When that frontend's heartbeat misses `heartbeatMisses` beats, when it disconnects (control channel
-  closes, connection fails, or stays disconnected 15 s), or when the bridge shuts down (SIGINT/SIGTERM,
+  closes, connection fails, or stays disconnected 15 s), or when the gateway shuts down (SIGINT/SIGTERM,
   or the embedding application's `shutdown()`), the
-  bridge publishes every armed deadman of that frontend **once**, at REAL_TIME with CongestionControl
+  gateway publishes every armed deadman of that frontend **once**, at REAL_TIME with CongestionControl
   Block (reliable), before anything else on that stream.
-- No re-arm: the stream is then *tripped*. The bridge rejects further puts on it (counted as
+- No re-arm: the stream is then *tripped*. The gateway rejects further puts on it (counted as
   `rejectedTripped`), notifies the client over `control` (`{event:"tripped", id, reason}`), and the
   client publisher goes to state `"tripped"`, calls `onTripped` listeners and throws on `put`. The
   frontend must create a new publisher.
@@ -589,22 +589,22 @@ resolving so the bridge has an offset before the first put.
 - Signaling: `POST /offer` with the browser's SDP offer (non-trickle), returns the answer (401 with a reason when the authorize hook refuses); or the zenoh queryables of "Signalling over zenoh".
 - `GET /zenoh-web/ice` returns `{"iceServers": [{urls, username?, credential?}]}`, see "ICE and TURN".
 - `GET /zenoh-web/health` returns `{"service": "zenoh-web", "version": "<crate version>"}` (detecting a running server).
-- The bridge can also serve a static directory (`--serve <dir>`, `ServerBuilder::serve_dir`) so the UI is live-editable on disk.
+- The gateway can also serve a static directory (`--serve <dir>`, `ServerBuilder::serve_dir`) so the UI is live-editable on disk.
 - Each subscribe/publisher is its own data channel. Its label is JSON: `{"type":"sub"|"pub", "key":..., "id":n, "opts":{...}}`.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.
 - One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
   `encodings`, `renegotiate`, `setDeadman`, `clearDeadman`, `lease {group, keys?, maxSeconds?}`,
   `releaseLease {group}`, `expireLease {group}`) and events: `accepted` / `rejected` (per sub/pub
   channel, by label id), `tripped` and `leaseLost {group, reason}`.
-- Bridge → browser on a `pub` channel: `{"blocked": reason | null}` (JSON text), see "Leases".
-- Bridge → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk`,
+- Gateway → browser on a `pub` channel: `{"blocked": reason | null}` (JSON text), see "Leases".
+- Gateway → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk`,
   little endian. `seq` numbers messages per channel, `frameId` numbers frames; the page acks the highest
   `frameId` it has processed with a 4-byte `u32` message on the same channel. `flags` bit0: the
   message (its chunks joined) is zstd-compressed; bit1: it is a Fields message (the client decodes it).
 - All chunks of one message have the same size, at most 64 KiB (bulk streams use smaller ones, see
   "Bandwidth allocation").
-- Browser → bridge put: `f64 sentAtMs (browser clock) | payload`, little endian.
-- Heartbeat: browser sends `{"t0", "offsetMs", "rttMs"}` (JSON), bridge answers `{"t0", "t1", "t2"}`.
+- Browser → gateway put: `f64 sentAtMs (browser clock) | payload`, little endian.
+- Heartbeat: browser sends `{"t0", "offsetMs", "rttMs"}` (JSON), gateway answers `{"t0", "t1", "t2"}`.
 - Video `sub` label: adds `"mid"`. Video metadata frame (little endian): `u8 version=1 | u8 flags
   (bit0 keyframe) | u16 0 | u32 width | u32 height | u32 sourceWidth | u32 sourceHeight | f32 quality |
   u32 encodedBytes`. A fields message is "Fields", any other data-channel encoding's its own format.

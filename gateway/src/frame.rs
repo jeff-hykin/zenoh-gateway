@@ -1,4 +1,4 @@
-//! Bridge -> browser frame, little endian:
+//! Gateway -> browser frame, little endian:
 //! `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk bytes`.
 //! `seq` numbers messages per channel; a message larger than one chunk is split across frames
 //! that share its `seq` (chunk size is per message, at most `CHUNK_BYTES`). `frameId` numbers frames per channel; the page acks frameIds.

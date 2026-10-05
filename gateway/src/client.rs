@@ -1,6 +1,6 @@
 //! A Rust client for a zenoh-web server (cargo feature `client`). It connects the way the browser
 //! client (`client/zenoh_web.ts`) does, so a program with no browser can subscribe, publish and
-//! query through a bridge: e.g. a relay that takes one robot's best stream per camera and re-serves
+//! query through a gateway: e.g. a relay that takes one robot's best stream per camera and re-serves
 //! it through its own [`Server`](crate::Server). Video and audio arrive encoded (H.264/VP8/VP9/AV1
 //! access units, Opus packets); the client decodes nothing.
 //!
@@ -58,7 +58,7 @@ const PING_TIMEOUT: Duration = Duration::from_secs(3);
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 const INITIAL_CLOCK_PINGS: usize = 5;
 const CLOCK_WINDOW: usize = 16;
-/// the bridge's limit too (peer.rs)
+/// the gateway's limit too (peer.rs)
 const MAX_MESSAGE_SIZE: u32 = 256 * 1024;
 /// consumption acks: at least this often in bytes, else after `ACK_DELAY`
 const ACK_EVERY_BYTES: usize = 16 * 1024;
@@ -76,9 +76,9 @@ const QUEUE: usize = 64;
 pub struct ClientOptions {
     /// sent as `Authorization: Bearer <token>` on `POST /offer`, for a server with an authorize hook
     pub token: Option<String>,
-    /// STUN/TURN servers; None (default) asks the bridge (`GET /zenoh-web/ice`, TURN credentials minted for this client)
+    /// STUN/TURN servers; None (default) asks the gateway (`GET /zenoh-web/ice`, TURN credentials minted for this client)
     pub ice_servers: Option<Vec<IceServer>>,
-    /// send everything through TURN (ICE transport policy "relay"); also on when the bridge's ICE reply says
+    /// send everything through TURN (ICE transport policy "relay"); also on when the gateway's ICE reply says
     /// `"iceTransportPolicy": "relay"`
     pub relay_only: bool,
     /// heartbeats per second, 0 (default) for none; deadmen need them
@@ -104,7 +104,7 @@ pub enum Delivery {
     Reliable,
 }
 
-/// The browser client's subscribe options; unset ones take the bridge's defaults, and the bridge
+/// The browser client's subscribe options; unset ones take the gateway's defaults, and the gateway
 /// checks them (a bad one makes [`Client::subscribe`] fail with its reason).
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,7 +115,7 @@ pub struct SubscribeOptions {
     pub priority: Option<u8>,
     /// ms; drop anything older
     pub max_age: Option<f64>,
-    /// the bridge never sends a key faster than this
+    /// the gateway never sends a key faster than this
     pub max_hz: Option<f64>,
     /// when bandwidth is short, higher keeps more (default 1; 0 gives up everything first)
     pub bandwidth_priority: Option<f64>,
@@ -123,7 +123,7 @@ pub struct SubscribeOptions {
     pub min_quality: Option<f64>,
     /// 0 keeps quality and drops Hz, 1 keeps Hz and drops quality (default 0.5)
     pub quality_to_hz_tradeoff: Option<f64>,
-    /// a message encoding the bridge registered ([`Client::encodings`])
+    /// a message encoding the gateway registered ([`Client::encodings`])
     pub encoding: Option<String>,
     /// `video-h264`, `video-vp8`, `video-vp9`, `video-av1`, `audio-opus` or `data` (default: where the encoding's
     /// output goes)
@@ -148,7 +148,7 @@ pub struct PublisherOptions {
     pub delivery: Option<Delivery>,
     /// zenoh priority 1..7
     pub priority: Option<u8>,
-    /// ms; the bridge drops puts older than this (clock-corrected)
+    /// ms; the gateway drops puts older than this (clock-corrected)
     pub latency_limit: Option<f64>,
     /// re-send the last value this often (client side)
     #[serde(skip)]
@@ -176,7 +176,7 @@ pub struct DataMessage {
     pub key: String,
     /// the payload: raw sample bytes, or the encoding's output
     pub bytes: Vec<u8>,
-    /// when the bridge received the sample (unix ms, bridge clock)
+    /// when the gateway received the sample (unix ms, gateway clock)
     pub timestamp_ms: f64,
     /// numbers messages per subscription (gaps are drops)
     pub seq: u32,
@@ -184,7 +184,7 @@ pub struct DataMessage {
     pub fields: Option<BTreeMap<String, Field>>,
 }
 
-/// An encoded video frame as the bridge's encoder produced it.
+/// An encoded video frame as the gateway's encoder produced it.
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
     /// the negotiated codec
@@ -199,12 +199,12 @@ pub struct VideoFrame {
     pub received_at: Instant,
 }
 
-/// The 28-byte metadata frame the bridge sends per video frame (SPEC "Wire format").
+/// The 28-byte metadata frame the gateway sends per video frame (SPEC "Wire format").
 #[derive(Debug, Clone)]
 pub struct VideoFrameInfo {
     /// the sample's key
     pub key: String,
-    /// when the bridge received the sample (unix ms, bridge clock)
+    /// when the gateway received the sample (unix ms, gateway clock)
     pub timestamp_ms: f64,
     /// numbers messages per subscription
     pub seq: u32,
@@ -233,7 +233,7 @@ pub struct AudioPacket {
     pub rtp_timestamp: u32,
 }
 
-/// A message encoding the bridge registered.
+/// A message encoding the gateway registered.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EncodingInfo {
     /// what `encoding` names
@@ -247,7 +247,7 @@ pub struct EncodingInfo {
 pub struct Topic {
     /// the key
     pub key: String,
-    /// how the bridge saw it (SPEC "Topic enumeration")
+    /// how the gateway saw it (SPEC "Topic enumeration")
     pub sources: Vec<String>,
 }
 
@@ -329,7 +329,7 @@ struct PubState {
     tripped: Ending,
     deadman_armed: AtomicBool,
     last: Mutex<Option<Vec<u8>>>,
-    /// why the bridge drops this publisher's puts (another client's lease)
+    /// why the gateway drops this publisher's puts (another client's lease)
     blocked: Mutex<Option<String>>,
 }
 
@@ -346,7 +346,7 @@ struct Endpoint {
     publisher: Option<Arc<PubState>>,
 }
 
-/// A recvonly transceiver and the bridge track bound to it; reused by later subscriptions of its channel.
+/// A recvonly transceiver and the gateway track bound to it; reused by later subscriptions of its channel.
 struct MediaSlot {
     mid: String,
     codec: String,
@@ -389,7 +389,7 @@ impl Shared {
     }
 
     /// Gone for good: pending requests fail, and publishers with an armed deadman trip ("disconnected"),
-    /// as the bridge fires their deadmen when it loses us.
+    /// as the gateway fires their deadmen when it loses us.
     fn lost(&self) {
         if *self.state.borrow() == ConnectionState::Lost {
             return;
@@ -536,11 +536,11 @@ impl Inner {
         let reply = tokio::time::timeout(timeout, reply_rx).await;
         self.shared.requests.lock().unwrap().remove(&id);
         let reply = reply.map_err(|_| anyhow!("{op} timed out"))?.map_err(|_| anyhow!("{op}: connection lost"))?;
-        ensure!(reply["ok"] == true, "zenoh-web bridge: {}", reply["error"].as_str().unwrap_or("error"));
+        ensure!(reply["ok"] == true, "zenoh-web gateway: {}", reply["error"].as_str().unwrap_or("error"));
         Ok(reply)
     }
 
-    /// Clock-sync ping over `control`, which also reports our estimate to the bridge.
+    /// Clock-sync ping over `control`, which also reports our estimate to the gateway.
     async fn ping(&self) -> Result<()> {
         let (offset, rtt) = {
             let clock = self.shared.clock.lock().unwrap();
@@ -552,7 +552,7 @@ impl Inner {
         Ok(())
     }
 
-    /// A recvonly transceiver bound to a bridge track of `codec` (a channel name): a free one, or a new one
+    /// A recvonly transceiver bound to a gateway track of `codec` (a channel name): a free one, or a new one
     /// renegotiated over `control` (SPEC "Video").
     async fn media_slot(&self, codec: &str, kind: RtpCodecKind, reuse: bool) -> Result<Arc<MediaSlot>> {
         let free = reuse.then(|| {
@@ -571,14 +571,14 @@ impl Inner {
         let reply = self.request(json!({"op": "renegotiate", "channel": codec, "sdp": offer}), OPEN_TIMEOUT).await?;
         self.connection.set_remote_description(serde_json::from_value(reply["sdp"].clone())?).await?;
         let mid = transceiver.mid().await?.context("the transceiver has no mid")?;
-        ensure!(reply["mid"] == mid.as_str(), "bridge bound mid {}, expected {mid}", reply["mid"]);
+        ensure!(reply["mid"] == mid.as_str(), "gateway bound mid {}, expected {mid}", reply["mid"]);
         let slot = Arc::new(MediaSlot { mid, codec: codec.to_owned(), transceiver, track: OnceLock::new(), ssrc: AtomicU32::new(0), sink: Mutex::new(None) });
         self.shared.media.lock().unwrap().push(slot.clone());
         Ok(slot)
     }
 
-    /// Opens a `sub`/`pub` channel, runs `task` on its events, and waits until the bridge accepted
-    /// it and it is open here (the bridge's `accepted` can beat the channel's own open).
+    /// Opens a `sub`/`pub` channel, runs `task` on its events, and waits until the gateway accepted
+    /// it and it is open here (the gateway's `accepted` can beat the channel's own open).
     async fn open_endpoint<F>(&self, label: Value, init: RTCDataChannelInit, publisher: Option<Arc<PubState>>, task: impl FnOnce(Arc<dyn DataChannel>, oneshot::Sender<()>) -> F) -> Result<Arc<dyn DataChannel>>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -593,7 +593,7 @@ impl Inner {
             let ready = async {
                 match accepted_rx.await {
                     Ok(Ok(())) => {}
-                    Ok(Err(reason)) => bail!("bridge rejected {key}: {reason}"),
+                    Ok(Err(reason)) => bail!("gateway rejected {key}: {reason}"),
                     Err(_) => bail!("connection lost"),
                 }
                 opened_rx.await.map_err(|_| anyhow!("{key}: channel closed before opening"))
@@ -701,7 +701,7 @@ impl Client {
                 heartbeat_paused,
             };
             inner.encodings = serde_json::from_value(inner.request(json!({"op": "encodings"}), PING_TIMEOUT).await?["encodings"].take())?;
-            // the bridge needs a clock offset before the first put
+            // the gateway needs a clock offset before the first put
             for _ in 0..INITIAL_CLOCK_PINGS {
                 inner.ping().await?;
             }
@@ -719,7 +719,7 @@ impl Client {
         Ok(Client { inner })
     }
 
-    /// The message encodings the bridge runs.
+    /// The message encodings the gateway runs.
     pub fn encodings(&self) -> &[EncodingInfo] {
         &self.inner.encodings
     }
@@ -734,12 +734,12 @@ impl Client {
         let _ = self.inner.shared.state.subscribe().wait_for(|state| *state == ConnectionState::Lost).await;
     }
 
-    /// Bridge clock minus this client's (unix ms), from the lowest-RTT recent sample.
+    /// Gateway clock minus this client's (unix ms), from the lowest-RTT recent sample.
     pub fn clock_offset_ms(&self) -> Option<f64> {
         self.inner.shared.clock.lock().unwrap().offset_ms
     }
 
-    /// The latest round trip to the bridge.
+    /// The latest round trip to the gateway.
     pub fn rtt_ms(&self) -> Option<f64> {
         self.inner.shared.clock.lock().unwrap().rtt_ms
     }
@@ -752,7 +752,7 @@ impl Client {
         Ok(serde_json::from_value(reply["topics"].take())?)
     }
 
-    /// A zenoh query through the bridge.
+    /// A zenoh query through the gateway.
     pub async fn get(&self, key: &str, timeout: Duration) -> Result<Vec<GetReply>> {
         let timeout_ms = timeout.as_millis() as u64;
         let reply = self.inner.request(json!({"op": "get", "key": key, "timeoutMs": timeout_ms}), timeout + Duration::from_secs(2)).await?;
@@ -767,17 +767,17 @@ impl Client {
             .collect()
     }
 
-    /// The bridge's stats for this connection (`channels`, `clock`, `heartbeat`, `bandwidth`; SPEC "Bandwidth allocation").
+    /// The gateway's stats for this connection (`channels`, `clock`, `heartbeat`, `bandwidth`; SPEC "Bandwidth allocation").
     pub async fn stats(&self) -> Result<Value> {
         self.inner.request(json!({"op": "stats"}), PING_TIMEOUT).await
     }
 
-    /// Stops (or resumes) sending heartbeats, so the bridge fires this client's deadmen; for testing deadman wiring.
+    /// Stops (or resumes) sending heartbeats, so the gateway fires this client's deadmen; for testing deadman wiring.
     pub fn pause_heartbeat(&self, paused: bool) {
         self.inner.heartbeat_paused.store(paused, Ordering::Relaxed);
     }
 
-    /// Subscribes to `key`, returning once the bridge accepted the channel (or with its reason for
+    /// Subscribes to `key`, returning once the gateway accepted the channel (or with its reason for
     /// refusing). Video and audio channels first renegotiate a track (or reuse a closed subscription's).
     pub async fn subscribe(&self, key: &str, options: SubscribeOptions) -> Result<Subscription> {
         let inner = &self.inner;
@@ -795,7 +795,7 @@ impl Client {
             None
         };
         let kind = media_kind.map(|kind| if kind == RtpCodecKind::Video { "video" } else { "audio" }.to_owned());
-        // a reused track can still be held by the bridge for a moment after its last subscription closed
+        // a reused track can still be held by the gateway for a moment after its last subscription closed
         for reuse in [true, false] {
             let slot = match media_kind {
                 Some(media_kind) => Some(inner.media_slot(&channel, media_kind, reuse).await?),
@@ -829,7 +829,7 @@ impl Client {
         }
     }
 
-    /// A publisher on `key`, returned once the bridge accepted it.
+    /// A publisher on `key`, returned once the gateway accepted it.
     pub async fn publish(&self, key: &str, options: PublisherOptions) -> Result<Publisher> {
         let inner = &self.inner;
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
@@ -842,7 +842,7 @@ impl Client {
         Ok(Publisher { key: key.to_owned(), id, channel, state, delivery, repeat, client: Arc::downgrade(inner) })
     }
 
-    /// Takes (or renews) the exclusive right to publish on `group`'s keys among the bridge's clients: the
+    /// Takes (or renews) the exclusive right to publish on `group`'s keys among the gateway's clients: the
     /// server's group, or `keys` for one it doesn't define (SPEC "Leases"). Needs a heartbeat; it ends
     /// when the heartbeat stops, at `max_seconds`, on disconnect, on [`Lease::release`] or by force-expiry.
     pub async fn lease(&self, group: &str, keys: Option<Vec<String>>, max_seconds: Option<f64>) -> Result<Lease> {
@@ -862,14 +862,14 @@ impl Client {
         self.inner.request(json!({"op": "expireLease", "group": group}), PING_TIMEOUT).await.map(drop)
     }
 
-    /// Closes the connection: the bridge fires this client's armed deadmen ("disconnected").
+    /// Closes the connection: the gateway fires this client's armed deadmen ("disconnected").
     pub async fn close(&self) {
         self.inner.shared.lost();
         let _ = self.inner.connection.close().await;
     }
 }
 
-/// The options as the bridge reads them: camelCase, unset ones left out.
+/// The options as the gateway reads them: camelCase, unset ones left out.
 fn options_json(options: &impl Serialize) -> Value {
     let mut value = serde_json::to_value(options).unwrap_or_default();
     if let Value::Object(map) = &mut value {
@@ -931,7 +931,7 @@ async fn run_heartbeat(channel: Arc<dyn DataChannel>, shared: Arc<Shared>, pause
     }
 }
 
-/// Clock sync (and the bridge's RTT samples) every second while connected; a failed ping is `Degraded`.
+/// Clock sync (and the gateway's RTT samples) every second while connected; a failed ping is `Degraded`.
 async fn run_pinger(inner: Weak<Inner>) {
     let mut ticker = tokio::time::interval(STATS_INTERVAL);
     ticker.tick().await;
@@ -948,7 +948,7 @@ async fn run_pinger(inner: Weak<Inner>) {
     }
 }
 
-/// A publisher's channel: its open, `{"blocked": reason | null}` from the bridge, its close.
+/// A publisher's channel: its open, `{"blocked": reason | null}` from the gateway, its close.
 async fn run_publisher_channel(channel: Arc<dyn DataChannel>, opened: oneshot::Sender<()>, state: Arc<PubState>) {
     let mut opened = Some(opened);
     while let Some(event) = channel.poll().await {
@@ -967,7 +967,7 @@ async fn run_publisher_channel(channel: Arc<dyn DataChannel>, opened: oneshot::S
     }
 }
 
-/// A subscription: its messages arrive with [`recv`](Self::recv) (or as a `Stream`). The bridge
+/// A subscription: its messages arrive with [`recv`](Self::recv) (or as a `Stream`). The gateway
 /// stops sending while they are not consumed (64 queued here, then the consumption window). Dropping
 /// it closes the channel; a video or audio subscription's track is kept for the next one of its codec.
 pub struct Subscription {
@@ -990,7 +990,7 @@ impl Subscription {
         self.messages.recv().await
     }
 
-    /// Video codecs: asks the bridge for a keyframe (an RTCP PLI on the track, as a browser sends
+    /// Video codecs: asks the gateway for a keyframe (an RTCP PLI on the track, as a browser sends
     /// after loss; the client also sends one itself when it drops a frame). Fails before any video arrived.
     pub async fn request_keyframe(&self) -> Result<()> {
         self.slot.as_ref().context("not a video subscription")?.request_keyframe().await
@@ -1105,7 +1105,7 @@ impl SubscriptionTask {
                 let _ = self.messages.send(message).await;
             }
         }
-        // the bridge has let go of the track once the channel closed
+        // the gateway has let go of the track once the channel closed
         if let (Some(slot), Some(inner)) = (self.slot.take(), self.client.upgrade()) {
             inner.release_slot(slot);
         }
@@ -1287,7 +1287,7 @@ fn is_keyframe(format: VideoFormat, data: &[u8]) -> bool {
 }
 
 /// Puts on one key (SPEC "Heartbeat and deadman" for the deadman). Dropping it closes the channel,
-/// which also clears its deadman on the bridge.
+/// which also clears its deadman on the gateway.
 pub struct Publisher {
     key: String,
     id: u64,
@@ -1351,8 +1351,8 @@ impl Publisher {
         send_put(&self.channel, self.delivery, bytes.as_ref(), timestamp_ms).await
     }
 
-    /// Stores `bytes` on the bridge, published once (REAL_TIME, reliable) if this client's heartbeat
-    /// stops, it disconnects, or the bridge shuts down; then this publisher is tripped.
+    /// Stores `bytes` on the gateway, published once (REAL_TIME, reliable) if this client's heartbeat
+    /// stops, it disconnects, or the gateway shuts down; then this publisher is tripped.
     pub async fn set_deadman(&self, bytes: impl AsRef<[u8]>) -> Result<()> {
         let inner = self.client.upgrade().context("the client is gone")?;
         ensure!(inner.options.heartbeat_hz > 0.0, "set_deadman needs a heartbeat (ClientOptions::heartbeat_hz)");
@@ -1376,7 +1376,7 @@ impl Publisher {
         self.state.tripped.reason()
     }
 
-    /// Why the bridge is dropping this publisher's puts right now (another client's lease), None while it isn't.
+    /// Why the gateway is dropping this publisher's puts right now (another client's lease), None while it isn't.
     pub fn blocked(&self) -> Option<String> {
         self.state.blocked.lock().unwrap().clone()
     }
@@ -1399,7 +1399,7 @@ impl Drop for Publisher {
     }
 }
 
-/// An exclusive right to publish on a group of keys among the bridge's clients ([`Client::lease`]).
+/// An exclusive right to publish on a group of keys among the gateway's clients ([`Client::lease`]).
 pub struct Lease {
     /// the group
     pub group: String,
@@ -1470,7 +1470,7 @@ impl Signalling {
             Signalling::Http { url, http } => {
                 let response = refuse_unauthorized(bearer(http.post(format!("{url}/offer")).json(offer), token).send().await.context("POST /offer")?).await?;
                 let status = response.status();
-                ensure!(status.is_success(), "bridge refused the offer: {status} {}", response.text().await.unwrap_or_default());
+                ensure!(status.is_success(), "gateway refused the offer: {status} {}", response.text().await.unwrap_or_default());
                 Ok(response.json::<RTCSessionDescription>().await?)
             }
             Signalling::Zenoh { .. } => Ok(serde_json::from_value(self.query("offer", json!({"token": token, "offer": offer})).await?)?),
@@ -1489,9 +1489,9 @@ impl Signalling {
                 let error: Value = serde_json::from_slice(&error.payload().to_bytes()).unwrap_or_default();
                 let reason = error["error"].as_str().unwrap_or("error");
                 if error["status"] == 401 {
-                    bail!("bridge refused the token: {reason}");
+                    bail!("gateway refused the token: {reason}");
                 }
-                bail!("bridge refused the {op}: {reason}")
+                bail!("gateway refused the {op}: {reason}")
             }
         }
     }
@@ -1507,7 +1507,7 @@ fn bearer(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::Req
 /// A 401 is final: the token is refused (or was revoked).
 async fn refuse_unauthorized(response: reqwest::Response) -> Result<reqwest::Response> {
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        bail!("bridge refused the token: {}", response.text().await.unwrap_or_default());
+        bail!("gateway refused the token: {}", response.text().await.unwrap_or_default());
     }
     Ok(response)
 }

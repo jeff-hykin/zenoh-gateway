@@ -1,6 +1,6 @@
 //! zenoh-web: view and drive a [zenoh](https://zenoh.io) system from a browser over WebRTC.
 //!
-//! One process bridges zenoh key expressions to browser data channels (one per subscription or
+//! One process gateways zenoh key expressions to browser data channels (one per subscription or
 //! publisher) and H.264 video tracks, with a per-browser bandwidth allocator, heartbeats and
 //! deadmen. The browser side is `client/zenoh_web.ts` in the repository.
 //!
@@ -31,7 +31,7 @@
 //! (`channel`) and options for it (`encodeOptions`). The server has none built in: implement [`MessageEncoding`] and pass
 //! it to [`ServerBuilder::encoding`] (e.g. the robotics ones of
 //! [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)). An encoding produces [`VideoImage`]s, which
-//! the bridge encodes (H.264 or AV1 built in, others through [`ServerBuilder::video_encoder`]) on a video track (no
+//! the gateway encodes (H.264 or AV1 built in, others through [`ServerBuilder::video_encoder`]) on a video track (no
 //! browser code needed), PCM for an Opus track, or bytes for the data channel: a [`Fields`] message the client decodes
 //! by itself, or its own format, which the page decodes with a decoder registered through the client's
 //! `registerEncoding(name, decoder)`. Data channel messages can be zstd-compressed per subscription

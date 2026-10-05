@@ -55,8 +55,8 @@ pub(crate) fn mint(servers: &[IceServer], secret: Option<&(String, Duration)>, u
 pub enum IceSide {
     /// a browser or client, through `GET` [`ICE_PATH`](crate::ICE_PATH) or the zenoh `ice` queryable
     Browser,
-    /// the bridge's own end of a connection it is answering
-    Bridge,
+    /// the gateway's own end of a connection it is answering
+    Gateway,
 }
 
 /// What an [`IceServersFn`] is asked for: one end of one connection.
@@ -89,7 +89,7 @@ impl std::fmt::Debug for IceHook {
 pub(crate) async fn servers(statics: &[IceServer], secret: Option<&(String, Duration)>, hook: Option<&IceHook>, request: IceRequest) -> Vec<IceServer> {
     let user = match request.side {
         IceSide::Browser => "browser",
-        IceSide::Bridge => "bridge",
+        IceSide::Gateway => "gateway",
     };
     let mut servers = mint(statics, secret, user);
     if let Some(IceHook(hook)) = hook {
@@ -347,9 +347,9 @@ mod tests {
             let extra = extra_in.clone();
             Box::pin(async move { Ok(vec![extra]) }) as BoxFuture<'static, anyhow::Result<Vec<IceServer>>>
         }));
-        let request = IceRequest { side: IceSide::Bridge, token: Some("t".into()) };
+        let request = IceRequest { side: IceSide::Gateway, token: Some("t".into()) };
         assert_eq!(servers(&statics, None, Some(&good), request).await, vec![statics[0].clone(), extra]);
-        assert_eq!(seen.lock().unwrap().as_slice(), &[(IceSide::Bridge, Some("t".to_owned()))]);
+        assert_eq!(seen.lock().unwrap().as_slice(), &[(IceSide::Gateway, Some("t".to_owned()))]);
         let bare_turn = IceHook(Arc::new(|_| Box::pin(async { Ok(vec![IceServer { urls: vec!["turn:t:3478".into()], ..Default::default() }]) })));
         assert_eq!(servers(&statics, None, Some(&bare_turn), IceRequest { side: IceSide::Browser, token: None }).await, statics, "a TURN entry without credentials is dropped");
         let failing = IceHook(Arc::new(|_| Box::pin(async { anyhow::bail!("down") })));

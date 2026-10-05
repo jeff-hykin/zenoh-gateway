@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use zenoh::qos::{CongestionControl, Priority};
 
-/// Browser -> bridge put header: the browser's send time, in the browser's clock.
+/// Browser -> gateway put header: the browser's send time, in the browser's clock.
 pub const PUT_HEADER_LEN: usize = 8;
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -51,9 +51,9 @@ fn is_express(priority: Priority) -> bool {
     (priority as u8) <= (Priority::InteractiveHigh as u8)
 }
 
-/// Bridge-clock age of a put stamped `sent_at_ms` in the browser clock; `offset_ms` = bridge - browser.
-fn age_ms(sent_at_ms: f64, offset_ms: f64, bridge_now_ms: f64) -> f64 {
-    bridge_now_ms - (sent_at_ms + offset_ms)
+/// Gateway-clock age of a put stamped `sent_at_ms` in the browser clock; `offset_ms` = gateway - browser.
+fn age_ms(sent_at_ms: f64, offset_ms: f64, gateway_now_ms: f64) -> f64 {
+    gateway_now_ms - (sent_at_ms + offset_ms)
 }
 
 /// `blocker` says why a put may not go out now (another client's lease); the browser hears
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn age_uses_offset() {
-        // browser clock runs 30 s ahead of the bridge: offset = bridge - browser = -30000
+        // browser clock runs 30 s ahead of the gateway: offset = gateway - browser = -30000
         assert_eq!(age_ms(31_000.0, -30_000.0, 1_100.0), 100.0);
     }
 }

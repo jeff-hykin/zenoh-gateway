@@ -17029,7 +17029,7 @@ rec {
         crateName = "zenoh-web";
         version = "0.4.1";
         edition = "2024";
-        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../bridge; };
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../gateway; };
         libName = "zenoh_web";
         dependencies = [
           {

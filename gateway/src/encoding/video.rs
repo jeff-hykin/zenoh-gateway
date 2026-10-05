@@ -183,7 +183,7 @@ pub(crate) fn to_i420(image: &VideoImage, width: u32, height: u32) -> Vec<u8> {
     }
 }
 
-/// The video format a [`VideoEncoder`] produces; the bridge negotiates it and packetizes its frames.
+/// The video format a [`VideoEncoder`] produces; the gateway negotiates it and packetizes its frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoFormat {
     /// H.264 constrained baseline, Annex B access units.
@@ -208,7 +208,7 @@ impl VideoFormat {
     }
 }
 
-/// What the bridge asks of the next frame: the bitrate and rate the allocator granted, the size the [`VideoPolicy`]
+/// What the gateway asks of the next frame: the bitrate and rate the allocator granted, the size the [`VideoPolicy`]
 /// and CPU governor picked for them, and whether a viewer needs a keyframe.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -247,7 +247,7 @@ pub struct EncodedVideo {
     pub keyframe: bool,
 }
 
-/// Turns an encoding's decoded frames into one video format's frames. The bridge makes one per encode session (the
+/// Turns an encoding's decoded frames into one video format's frames. The gateway makes one per encode session (the
 /// viewers of a stream at one target share it) with [`MessageEncoding::video_encoder`](crate::MessageEncoding::video_encoder), else the
 /// server's [`ServerBuilder::video_encoder`](crate::ServerBuilder::video_encoder), else [`H264Encoder`], and calls it on
 /// tokio's blocking pool; it negotiates [`format`](Self::format), packetizes and paces the frames and measures them for

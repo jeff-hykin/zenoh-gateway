@@ -1,6 +1,6 @@
 //! Media subscriptions: frames decoded by a message encoding, encoded (a `VideoEncoder` of the channel's format, or Opus
 //! in `audio`) and written to a WebRTC track. The browser adds a recvonly transceiver and renegotiates over `control`
-//! naming the channel; the bridge answers with a track of that channel's format bound to the transceiver's mid, which the
+//! naming the channel; the gateway answers with a track of that channel's format bound to the transceiver's mid, which the
 //! `sub` channel's label names (it then carries a small frame per media frame). Later subscriptions reuse the track.
 
 use crate::encoding::registry::{self, EncodingRegistry};
@@ -30,7 +30,7 @@ use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
 use webrtc::peer_connection::{PeerConnection, RTCSessionDescription};
 use webrtc::rtp_transceiver::RtpSender;
 
-/// Every format a track can have, with the payload type the bridge offers it at.
+/// Every format a track can have, with the payload type the gateway offers it at.
 const FORMATS: [(&str, u8); 5] = [("video/H264", 102), ("video/VP8", 96), ("video/VP9", 98), ("video/AV1", 45), (OPUS, 111)];
 const OPUS: &str = "audio/opus";
 /// Google Congestion Control bounds, bits/s. It starts where the data-channel estimator starts
@@ -47,7 +47,7 @@ const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/pl
 /// Video metadata frame on the `sub` channel (SPEC "Wire formats").
 pub const METADATA_LEN: usize = 28;
 
-/// The track format of a payload type the bridge (and the Rust client) offers.
+/// The track format of a payload type the gateway (and the Rust client) offers.
 #[cfg(feature = "client")]
 pub fn format_of_payload_type(payload_type: u8) -> Option<&'static str> {
     FORMATS.iter().find(|(_, offered)| *offered == payload_type).map(|(mime, _)| *mime)

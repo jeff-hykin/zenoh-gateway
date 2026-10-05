@@ -28,7 +28,7 @@ export type EncodingOutput = "video" | "audio" | "data" | "fields"
 /** What a subscription's messages travel on: a video track of one format, the Opus audio track, or the data channel. */
 export type Channel = "video-h264" | "video-vp8" | "video-vp9" | "video-av1" | "audio-opus" | "data"
 
-/** A message encoding the bridge has registered. */
+/** A message encoding the gateway has registered. */
 export interface EncodingInfo {
     name: string
     output: EncodingOutput
@@ -40,7 +40,7 @@ export type EncodingDecoder = (bytes: Uint8Array, message: Message) => unknown
 const encodingDecoders = new Map<string, EncodingDecoder>()
 
 /**
- * Registers the browser decoder for a data-channel encoding the bridge runs (a Rust encoding the host application
+ * Registers the browser decoder for a data-channel encoding the gateway runs (a Rust encoding the host application
  * added with `ServerBuilder::encoding`). Messages of subscriptions using that encoding on the data channel get
  * `msg.decoded = decoder(msg.bytes, msg)` (fields messages decode by themselves). Video and audio need no decoder.
  * Registering a different decoder under a name that already has one throws.
@@ -103,7 +103,7 @@ export interface SubscribeOptions {
     maxHz?: number
     minQuality?: number
     qualityToHzTradeoff?: number
-    /** a message encoding the bridge registered (`ZenohWeb.encodings`); none = raw bytes */
+    /** a message encoding the gateway registered (`ZenohWeb.encodings`); none = raw bytes */
     encoding?: string
     /** what the messages travel on (default: where the encoding's output goes: pictures on video-h264, sound on audio-opus, else data) */
     channel?: Channel
@@ -127,11 +127,11 @@ export interface PublisherOptions {
 }
 
 export interface ConnectOptions {
-    /** default: the bridge's (`GET /zenoh-web/ice`, TURN credentials minted for this client) */
+    /** default: the gateway's (`GET /zenoh-web/ice`, TURN credentials minted for this client) */
     iceServers?: RTCIceServer[]
     /** "relay" forces every byte through TURN; default: the `/zenoh-web/ice` reply's `iceTransportPolicy`, else "all" */
     iceTransportPolicy?: RTCIceTransportPolicy
-    /** sent as `Authorization: Bearer <token>`; the bridge's authorize hook turns it into a grant */
+    /** sent as `Authorization: Bearer <token>`; the gateway's authorize hook turns it into a grant */
     token?: string
     reconnect?: boolean
     statsIntervalMs?: number
@@ -145,11 +145,11 @@ export interface KeyStats {
     dropped: number
     backlogBytes: number
     rttMs: number | null
-    bridge: BridgeChannelStats | null
+    gateway: GatewayChannelStats | null
 }
 
-/** One channel as the bridge reports it in `stats`. */
-export interface BridgeChannelStats {
+/** One channel as the gateway reports it in `stats`. */
+export interface GatewayChannelStats {
     id: number | null
     type: string
     key: string
@@ -159,8 +159,8 @@ export interface BridgeChannelStats {
     allocation: Record<string, number | boolean | null> | null
 }
 
-/** The bridge's `clock`, `heartbeat` and `bandwidth` stats (SPEC "Stats"). */
-export type BridgeStats = Record<string, Record<string, unknown> | null>
+/** The gateway's `clock`, `heartbeat` and `bandwidth` stats (SPEC "Stats"). */
+export type GatewayStats = Record<string, Record<string, unknown> | null>
 
 export interface GetReply {
     key: string | null
@@ -212,7 +212,7 @@ const gatherTimeoutMs = 3000
 const openTimeoutMs = 10000
 const pingTimeoutMs = 3000
 const reconnectDelayMs = 1000
-// consumption acks let the bridge stop sending while this page's JS is behind
+// consumption acks let the gateway stop sending while this page's JS is behind
 const ackEveryBytes = 16 * 1024
 const ackDelayMs = 5
 // clock sync keeps the lowest-RTT sample among the most recent ones
@@ -282,7 +282,7 @@ const zstdFlag = 1
 const fieldsFlag = 2
 
 /**
- * Bridge frame (little endian):
+ * Gateway frame (little endian):
  * u16 keyLen | key | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk
  */
 export function decodeFrame(buffer: ArrayBuffer): Frame {
@@ -366,7 +366,7 @@ export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
     }
 }
 
-/** Browser -> bridge put: f64 sentAtMs (browser clock) | payload (little endian). */
+/** Browser -> gateway put: f64 sentAtMs (browser clock) | payload (little endian). */
 export function encodePut(payload: Uint8Array, sentAtMs: number): Uint8Array<ArrayBuffer> {
     const frame = new Uint8Array(putHeaderBytes + payload.length)
     new DataView(frame.buffer).setFloat64(0, sentAtMs, true)
@@ -414,15 +414,15 @@ function waitIceGathering(peer: RTCPeerConnection): Promise<void> {
 }
 
 /**
- * Settles once the channel is usable: the bridge accepted it AND it is open in this browser.
- * Both are needed because the bridge's `accepted` (control channel) can arrive before this
- * channel's own open (its DCEP ack travels on a different SCTP stream). Rejects if the bridge
+ * Settles once the channel is usable: the gateway accepted it AND it is open in this browser.
+ * Both are needed because the gateway's `accepted` (control channel) can arrive before this
+ * channel's own open (its DCEP ack travels on a different SCTP stream). Rejects if the gateway
  * rejects it or it fails to open.
  */
 class Acceptance {
     promise: Promise<void>
     settled = false
-    #bridgeAccepted = false
+    #gatewayAccepted = false
     #channelOpen = false
     #resolve: () => void = () => {}
     #reject: (error: Error) => void = () => {}
@@ -435,8 +435,8 @@ class Acceptance {
         this.promise.catch(() => {})
     }
 
-    bridgeAccepted(): void {
-        this.#bridgeAccepted = true
+    gatewayAccepted(): void {
+        this.#gatewayAccepted = true
         this.#settleIfReady()
     }
 
@@ -446,7 +446,7 @@ class Acceptance {
     }
 
     #settleIfReady(): void {
-        if (!this.settled && this.#bridgeAccepted && this.#channelOpen) {
+        if (!this.settled && this.#gatewayAccepted && this.#channelOpen) {
             this.settled = true
             this.#resolve()
         }
@@ -460,19 +460,19 @@ class Acceptance {
     }
 }
 
-/** Common to subscriptions and publishers: a channel the bridge accepts or rejects. */
+/** Common to subscriptions and publishers: a channel the gateway accepts or rejects. */
 abstract class Endpoint {
     channel: RTCDataChannel | null = null
     closed = false
     rejectionReason: string | null = null
-    bridgeStats: BridgeChannelStats | null = null
+    gatewayStats: GatewayChannelStats | null = null
     protected acceptance = new Acceptance()
 
     constructor(readonly owner: ZenohWeb, readonly id: number, readonly key: string) {}
 
     abstract attach(peer: RTCPeerConnection): void
 
-    /** Resolves once the bridge accepted this channel; rejects with the bridge's reason otherwise. */
+    /** Resolves once the gateway accepted this channel; rejects with the gateway's reason otherwise. */
     ready(): Promise<void> {
         return this.acceptance.promise
     }
@@ -488,12 +488,12 @@ abstract class Endpoint {
     }
 
     _accepted(): void {
-        this.acceptance.bridgeAccepted()
+        this.acceptance.gatewayAccepted()
     }
 
     _rejected(reason: string): void {
         this.rejectionReason = reason
-        this.acceptance.reject(new Error(`zenoh-web: bridge rejected ${this.key}: ${reason}`))
+        this.acceptance.reject(new Error(`zenoh-web: gateway rejected ${this.key}: ${reason}`))
         this.owner._forget(this)
     }
 
@@ -544,7 +544,7 @@ export class Subscription extends Endpoint {
         return this.acceptance.settled ? "open" : "connecting"
     }
 
-    /** messages the bridge accepted for us but we never got whole (queue, age, maxHz, network) */
+    /** messages the gateway accepted for us but we never got whole (queue, age, maxHz, network) */
     get dropped(): number {
         const span = this.#maxSeq < 0 ? 0 : this.#maxSeq - this.#firstSeq + 1
         return this.#droppedBefore + Math.max(0, span - this.#receivedOnChannel)
@@ -564,7 +564,7 @@ export class Subscription extends Endpoint {
             this.#openChannel(peer, acceptance, null)
             return
         }
-        // a recvonly transceiver (renegotiated with the bridge for this channel's format) carries the frames
+        // a recvonly transceiver (renegotiated with the gateway for this channel's format) carries the frames
         this.#transceiver = null
         const kind = channelName === "audio-opus" ? "audio" : "video"
         const mime = channelMimes[channelName]
@@ -716,7 +716,7 @@ export class Subscription extends Endpoint {
         }
     }
 
-    /** Tells the bridge we processed every frame up to frameId: 4 bytes, little endian. */
+    /** Tells the gateway we processed every frame up to frameId: 4 bytes, little endian. */
     #consumed(channel: RTCDataChannel, frameId: number, byteLength: number): void {
         if (frameId > this.#highestConsumedFrame) {
             this.#highestConsumedFrame = frameId
@@ -750,7 +750,7 @@ export class Publisher extends Endpoint {
     /** why the deadman fired: "heartbeat" | "disconnected" | "shutdown" */
     tripReason: string | null = null
     deadmanArmed = false
-    /** why the bridge is dropping this publisher's puts right now (another client's lease), else null */
+    /** why the gateway is dropping this publisher's puts right now (another client's lease), else null */
     blocked: string | null = null
     #last: Uint8Array | null = null
     /** stamped frames waiting for the channel (reliable: all, latest: only the newest) */
@@ -802,7 +802,7 @@ export class Publisher extends Endpoint {
         }
         this.channel = channel
         this.watchChannel(channel, acceptance)
-        // puts made before the bridge accepted the channel wait for it
+        // puts made before the gateway accepted the channel wait for it
         this.acceptance.promise.then(() => this.#flush(), () => {})
     }
 
@@ -811,7 +811,7 @@ export class Publisher extends Endpoint {
             throw new Error(`zenoh-web: publisher ${this.key} is closed`)
         }
         if (this.rejectionReason !== null) {
-            throw new Error(`zenoh-web: publisher ${this.key} was rejected by the bridge: ${this.rejectionReason}`)
+            throw new Error(`zenoh-web: publisher ${this.key} was rejected by the gateway: ${this.rejectionReason}`)
         }
         if (this.tripped) {
             throw new Error(`zenoh-web: publisher ${this.key} is tripped (deadman fired: ${this.tripReason}); create a new publisher`)
@@ -850,8 +850,8 @@ export class Publisher extends Endpoint {
     }
 
     /**
-     * Stores `value` on the bridge; it is published once (REAL_TIME, reliable) if this frontend's
-     * heartbeat stops, it disconnects, or the bridge shuts down. Then this publisher is tripped.
+     * Stores `value` on the gateway; it is published once (REAL_TIME, reliable) if this frontend's
+     * heartbeat stops, it disconnects, or the gateway shuts down. Then this publisher is tripped.
      */
     setDeadman(value: Bytesish): Promise<void> {
         if (!this.owner.options.heartbeatHz) {
@@ -882,7 +882,7 @@ export class Publisher extends Endpoint {
         if (this.#repeatTimer) {
             clearInterval(this.#repeatTimer)
         }
-        // a tripped stream is never re-opened; the channel stays until close() so the bridge keeps rejecting it
+        // a tripped stream is never re-opened; the channel stays until close() so the gateway keeps rejecting it
         this.owner._forget(this)
         for (const listener of this.#tripListeners) {
             try {
@@ -909,7 +909,7 @@ export class Publisher extends Endpoint {
     }
 }
 
-/** An exclusive right to publish on a group of keys among this bridge's clients (SPEC "Leases"). */
+/** An exclusive right to publish on a group of keys among this gateway's clients (SPEC "Leases"). */
 export class Lease {
     /** why it ended: "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" */
     lost: string | null = null
@@ -953,15 +953,15 @@ export class ZenohWeb {
     state: ConnectionState = "connecting"
     /** per subscribed/published key expression */
     stats: Record<string, KeyStats> = {}
-    /** latest round trip to the bridge (heartbeat, else control ping) */
+    /** latest round trip to the gateway (heartbeat, else control ping) */
     rttMs: number | null = null
-    /** bridge clock minus this client's clock, from the lowest-RTT recent sample */
+    /** gateway clock minus this client's clock, from the lowest-RTT recent sample */
     clockOffsetMs: number | null = null
-    /** bridge-side heartbeat, clock and bandwidth stats */
-    bridgeStats: BridgeStats | null = null
-    /** the message encodings the bridge runs, fetched on connect */
+    /** gateway-side heartbeat, clock and bandwidth stats */
+    gatewayStats: GatewayStats | null = null
+    /** the message encodings the gateway runs, fetched on connect */
     encodings: readonly EncodingInfo[] = []
-    /** the ICE servers in use (the bridge's unless given) */
+    /** the ICE servers in use (the gateway's unless given) */
     iceServers: RTCIceServer[] = []
     /** leases held, by group */
     readonly _leases = new Map<string, Lease>()
@@ -976,7 +976,7 @@ export class ZenohWeb {
     #heartbeatPaused = false
     #clockSamples: ClockSample[] = []
     #endpoints = new Set<Subscription | Publisher>()
-    /** every endpoint by id, including tripped/rejected ones the bridge may still talk about */
+    /** every endpoint by id, including tripped/rejected ones the gateway may still talk about */
     #endpointsById = new Map<number, Subscription | Publisher>()
     #requests = new Map<number, PendingRequest>()
     #stateListeners = new Set<(state: ConnectionState) => void>()
@@ -1020,7 +1020,7 @@ export class ZenohWeb {
         }
     }
 
-    /** NTP-style sample: t0/t3 in our clock, t1/t2 bridge receive/send in its clock. */
+    /** NTP-style sample: t0/t3 in our clock, t1/t2 gateway receive/send in its clock. */
     #addClockSample(t0: number, t1: number, t2: number, t3: number): void {
         const rttMs = (t3 - t0) - (t2 - t1)
         const offsetMs = ((t1 - t0) + (t2 - t3)) / 2
@@ -1036,7 +1036,7 @@ export class ZenohWeb {
         this.rttMs = rttMs
     }
 
-    /** Clock-sync ping over control; also reports our current estimate to the bridge. */
+    /** Clock-sync ping over control; also reports our current estimate to the gateway. */
     async #controlPing(): Promise<void> {
         const t0 = this.now()
         const response = await this._request({ op: "ping", t0, offsetMs: this.clockOffsetMs, rttMs: this.rttMs }, pingTimeoutMs)
@@ -1049,8 +1049,8 @@ export class ZenohWeb {
     }
 
     /**
-     * A recvonly transceiver bound to a bridge track of `channel`'s format: a free one, or a new one
-     * added through a renegotiation over `control` (the bridge answers with a track for the new m-line).
+     * A recvonly transceiver bound to a gateway track of `channel`'s format: a free one, or a new one
+     * added through a renegotiation over `control` (the gateway answers with a track for the new m-line).
      */
     _acquireTransceiver(peer: RTCPeerConnection, kind: "video" | "audio", channel: Channel): Promise<RTCRtpTransceiver> {
         const free = this.#freeTransceivers.get(peer)?.get(channel)?.pop()
@@ -1063,7 +1063,7 @@ export class ZenohWeb {
                 throw new Error("connection replaced")
             }
             const transceiver = peer.addTransceiver(kind, { direction: "recvonly" })
-            // video shows frames as soon as they decode (the bridge also asks for zero playout delay); audio keeps its jitter buffer
+            // video shows frames as soon as they decode (the gateway also asks for zero playout delay); audio keeps its jitter buffer
             const receiver = transceiver.receiver as unknown as { jitterBufferTarget?: number | null, playoutDelayHint?: number }
             if (kind === "video" && "jitterBufferTarget" in receiver) {
                 receiver.jitterBufferTarget = 0
@@ -1075,7 +1075,7 @@ export class ZenohWeb {
             const response = await this._request({ op: "renegotiate", channel, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
             await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
             if (response.mid !== transceiver.mid) {
-                throw new Error(`bridge bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
+                throw new Error(`gateway bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
             }
             return transceiver
         }
@@ -1149,12 +1149,12 @@ export class ZenohWeb {
             })
             await this.#refuseIfUnauthorized(response, peer)
             if (!response.ok) {
-                throw new Error(`bridge refused offer: ${response.status} ${await response.text()}`)
+                throw new Error(`gateway refused offer: ${response.status} ${await response.text()}`)
             }
             await peer.setRemoteDescription(await response.json())
             await waitOpen(control, openTimeoutMs)
             this.encodings = Object.freeze((await this._request({ op: "encodings" }, pingTimeoutMs)).encodings as EncodingInfo[])
-            // a few quick samples so the bridge knows the clock offset before the first put
+            // a few quick samples so the gateway knows the clock offset before the first put
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()
             }
@@ -1166,12 +1166,12 @@ export class ZenohWeb {
         this.#markConnected()
     }
 
-    /** A 401 is final: no reconnecting with a token the bridge refuses (or revoked). */
+    /** A 401 is final: no reconnecting with a token the gateway refuses (or revoked). */
     async #refuseIfUnauthorized(response: Response | null, peer?: RTCPeerConnection): Promise<void> {
         if (response?.status === 401) {
             peer?.close()
             this.close()
-            throw new Error(`zenoh-web: bridge refused the token: ${await response.text()}`)
+            throw new Error(`zenoh-web: gateway refused the token: ${await response.text()}`)
         }
     }
 
@@ -1198,7 +1198,7 @@ export class ZenohWeb {
         }
     }
 
-    /** Stops sending heartbeats (the bridge then fires this frontend's deadmen); for testing deadman wiring. */
+    /** Stops sending heartbeats (the gateway then fires this frontend's deadmen); for testing deadman wiring. */
     pauseHeartbeat(): void {
         this.#heartbeatPaused = true
     }
@@ -1220,7 +1220,7 @@ export class ZenohWeb {
             return
         }
         this.#setState("lost")
-        // the bridge fires this frontend's deadmen when it loses us
+        // the gateway fires this frontend's deadmen when it loses us
         this.#tripArmedPublishers("disconnected")
         for (const lease of [...this._leases.values()]) {
             lease._lose("disconnected")
@@ -1277,7 +1277,7 @@ export class ZenohWeb {
         if (response.ok) {
             request.resolve(response)
         } else {
-            request.reject(new Error(`zenoh-web bridge: ${response.error ?? "error"}`))
+            request.reject(new Error(`zenoh-web gateway: ${response.error ?? "error"}`))
         }
     }
 
@@ -1297,7 +1297,7 @@ export class ZenohWeb {
         })
     }
 
-    /** Options are checked by the bridge: a bad one rejects the subscription (`state`, `ready()`). */
+    /** Options are checked by the gateway: a bad one rejects the subscription (`state`, `ready()`). */
     subscribe(key: string, options: SubscribeOptions, callback: (message: Message) => void): Subscription {
         const subscription = new Subscription(this, this.#nextId++, key, { ...options }, callback)
         this.#addEndpoint(subscription)
@@ -1350,7 +1350,7 @@ export class ZenohWeb {
     }
 
     /**
-     * Takes (or renews) the exclusive right to publish on `group`'s keys among this bridge's clients: the
+     * Takes (or renews) the exclusive right to publish on `group`'s keys among this gateway's clients: the
      * server's group, or `keys` for one it doesn't define. Needs a heartbeat; it ends when the heartbeat
      * stops, at `maxSeconds`, on disconnect, by `release()` or by force-expiry (`onLost` says which).
      */
@@ -1370,7 +1370,7 @@ export class ZenohWeb {
         await this._request({ op: "expireLease", group }, pingTimeoutMs)
     }
 
-    /** Polls bridge stats (and, without a heartbeat, clock sync) once; also runs on a timer while connected. */
+    /** Polls gateway stats (and, without a heartbeat, clock sync) once; also runs on a timer while connected. */
     async pollStats(): Promise<void> {
         try {
             await this.#controlPing()
@@ -1385,30 +1385,30 @@ export class ZenohWeb {
         }
         const response = await this._request({ op: "stats" }, pingTimeoutMs).catch(() => null)
         if (response) {
-            this.bridgeStats = { clock: response.clock, heartbeat: response.heartbeat, bandwidth: response.bandwidth ?? null } as BridgeStats
+            this.gatewayStats = { clock: response.clock, heartbeat: response.heartbeat, bandwidth: response.bandwidth ?? null } as GatewayStats
         }
-        this.#refreshStats((response?.channels as BridgeChannelStats[] | undefined) ?? null)
+        this.#refreshStats((response?.channels as GatewayChannelStats[] | undefined) ?? null)
     }
 
-    #refreshStats(bridgeChannels: BridgeChannelStats[] | null): void {
-        if (bridgeChannels) {
-            const byId = new Map(bridgeChannels.map((channel) => [channel.id, channel]))
+    #refreshStats(gatewayChannels: GatewayChannelStats[] | null): void {
+        if (gatewayChannels) {
+            const byId = new Map(gatewayChannels.map((channel) => [channel.id, channel]))
             for (const endpoint of this.#endpointsById.values()) {
-                endpoint.bridgeStats = byId.get(endpoint.id) ?? null
+                endpoint.gatewayStats = byId.get(endpoint.id) ?? null
             }
         }
         const stats: Record<string, KeyStats> = {}
         for (const endpoint of this.#endpoints) {
-            const entry = stats[endpoint.key] ??= { received: 0, dropped: 0, backlogBytes: 0, rttMs: this.rttMs, bridge: null }
-            const bridge = endpoint.bridgeStats
-            entry.bridge = bridge
+            const entry = stats[endpoint.key] ??= { received: 0, dropped: 0, backlogBytes: 0, rttMs: this.rttMs, gateway: null }
+            const gateway = endpoint.gatewayStats
+            entry.gateway = gateway
             if (endpoint instanceof Subscription) {
                 entry.received += endpoint.received
                 entry.dropped += endpoint.dropped
-                entry.backlogBytes += bridge ? Number(bridge.stats.queuedBytes) + Number(bridge.stats.outstandingBytes) : 0
+                entry.backlogBytes += gateway ? Number(gateway.stats.queuedBytes) + Number(gateway.stats.outstandingBytes) : 0
             } else {
                 entry.received += endpoint.sent
-                entry.dropped += endpoint.dropped + (bridge ? Number(bridge.stats.droppedStale) : 0)
+                entry.dropped += endpoint.dropped + (gateway ? Number(gateway.stats.droppedStale) : 0)
                 entry.backlogBytes += endpoint.channel?.bufferedAmount ?? 0
             }
         }
@@ -1440,7 +1440,7 @@ export class ZenohWeb {
     }
 }
 
-/** Connects to a zenoh-web bridge, e.g. `await connect("http://robot.local:7448")`. */
+/** Connects to a zenoh-web gateway, e.g. `await connect("http://robot.local:7448")`. */
 export async function connect(url: string, options: ConnectOptions = {}): Promise<ZenohWeb> {
     const client = new ZenohWeb(url, options)
     await client._open()

@@ -4,7 +4,7 @@ use crate::auth::{Grant, Leases};
 use crate::encoding::registry::{EncodingRegistry, VideoEncoderFactory};
 use crate::encoding::{MessageEncoding, VideoEncoder, VideoFormat, VideoPolicy};
 use crate::ice::{self, IceHook, IceRequest, IceServer, IceSide};
-use crate::peer::{AllocationConfig, Bridge, ConnectConfig};
+use crate::peer::{AllocationConfig, Gateway, ConnectConfig};
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -33,7 +33,7 @@ pub const DEFAULT_PORT: u16 = 7448;
 /// `GET` this path for `{"service": "zenoh-web", "version": "<crate version>"}`, to check a zenoh-web server is listening.
 pub const HEALTH_PATH: &str = "/zenoh-web/health";
 
-/// `GET` this path for `{"iceServers": [...]}`: the STUN/TURN servers the bridge uses, with TURN credentials minted for the caller.
+/// `GET` this path for `{"iceServers": [...]}`: the STUN/TURN servers the gateway uses, with TURN credentials minted for the caller.
 pub const ICE_PATH: &str = "/zenoh-web/ice";
 
 /// With [`ServerBuilder::zenoh_signalling`], the key expression prefix of a server's signalling queryables:
@@ -162,13 +162,13 @@ impl ServerBuilder {
         self
     }
 
-    /// Defines a lease group: while a client holds it, other clients of this bridge can't publish on these keys.
+    /// Defines a lease group: while a client holds it, other clients of this gateway can't publish on these keys.
     pub fn lease_group(mut self, name: impl Into<String>, keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.lease_groups.insert(name.into(), keys.into_iter().map(Into::into).collect());
         self
     }
 
-    /// STUN/TURN servers for the bridge's side of every connection, also handed to browsers at [`ICE_PATH`].
+    /// STUN/TURN servers for the gateway's side of every connection, also handed to browsers at [`ICE_PATH`].
     pub fn ice_servers(mut self, servers: impl IntoIterator<Item = IceServer>) -> Self {
         self.connect_config.ice_servers = servers.into_iter().collect();
         self
@@ -181,7 +181,7 @@ impl ServerBuilder {
     }
 
     /// Mints STUN/TURN servers for each end of each connection (e.g. a TURN provider's short-lived credentials), added
-    /// after [`ice_servers`](Self::ice_servers); called for every `GET` [`ICE_PATH`] and every offer the bridge answers.
+    /// after [`ice_servers`](Self::ice_servers); called for every `GET` [`ICE_PATH`] and every offer the gateway answers.
     /// When it fails, or takes over [`ICE_HOOK_TIMEOUT`](crate::ICE_HOOK_TIMEOUT), that end gets only the static servers.
     pub fn ice_servers_fn<F, Fut>(mut self, hook: F) -> Self
     where
@@ -259,8 +259,8 @@ impl ServerBuilder {
         };
         ensure!(self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0), "the UDP port range must be non-empty and above 0");
         let leases = Leases::new(self.lease_groups);
-        let bridge = Bridge::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction }, leases, self.connect_config);
-        let inner = Arc::new(Inner { bridge, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
+        let gateway = Gateway::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction }, leases, self.connect_config);
+        let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {
             ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");
             let tasks = signalling::serve(&inner, &name).await?;
@@ -272,7 +272,7 @@ impl ServerBuilder {
 }
 
 struct Inner {
-    bridge: Arc<Bridge>,
+    gateway: Arc<Gateway>,
     session: zenoh::Session,
     owns_session: bool,
     serve_dir: Option<PathBuf>,
@@ -312,28 +312,28 @@ impl Server {
     /// Every open subscription of every connection: its key expression and encoding (e.g. for a relay that pulls upstream
     /// only what its viewers watch). [`changes`](Self::changes) says when this or [`leases`](Self::leases) changed.
     pub fn subscriptions(&self) -> Vec<(String, Option<String>)> {
-        self.inner.bridge.subscriptions()
+        self.inner.gateway.subscriptions()
     }
 
     /// The leases held now: group and keys.
     pub fn leases(&self) -> Vec<(String, Vec<String>)> {
-        self.inner.bridge.leases.held()
+        self.inner.gateway.leases.held()
     }
 
     /// A counter bumped whenever a subscription opens or closes and a lease is taken or ends.
     pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.inner.bridge.leases.changes.subscribe()
+        self.inner.gateway.leases.changes.subscribe()
     }
 
     /// Ends `group`'s lease as a force-expiry would, telling its holder `reason`; false when nobody holds it.
     pub async fn expire_lease(&self, group: &str, reason: &str) -> bool {
-        self.inner.bridge.expire_lease(group, reason).await
+        self.inner.gateway.expire_lease(group, reason).await
     }
 
     /// Closes every live connection made with `token` (deadmen fire with reason `"revoked"`) and returns how many;
     /// the authorize hook decides whether the token may connect again.
     pub fn revoke(&self, token: &str) -> usize {
-        self.inner.bridge.revoke(token)
+        self.inner.gateway.revoke(token)
     }
 
     /// The HTTP routes: `POST /offer` (WebRTC signaling, CORS-permissive), `GET` [`HEALTH_PATH`] and [`ICE_PATH`] and, with
@@ -403,7 +403,7 @@ impl Server {
         for task in self.inner.signalling.lock().unwrap().drain(..) {
             task.abort();
         }
-        self.inner.bridge.shutdown().await;
+        self.inner.gateway.shutdown().await;
         if self.inner.owns_session {
             self.inner.session.close().await.map_err(|error| anyhow!("closing the zenoh session: {error}"))?;
         }
@@ -474,7 +474,7 @@ async fn answer(inner: &Inner, headers: &HeaderMap, offer: RTCSessionDescription
         info!("offer refused: {reason}");
         (StatusCode::UNAUTHORIZED, reason)
     })?;
-    inner.bridge.answer(offer, token, grant).await.map_err(|error| {
+    inner.gateway.answer(offer, token, grant).await.map_err(|error| {
         error!("offer failed: {error:#}");
         (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
     })
@@ -482,7 +482,7 @@ async fn answer(inner: &Inner, headers: &HeaderMap, offer: RTCSessionDescription
 
 /// `{"iceServers": [...]}` for a browser connecting with `token`.
 async fn minted_ice_servers(inner: &Inner, token: Option<String>) -> serde_json::Value {
-    let config = &inner.bridge.connect_config;
+    let config = &inner.gateway.connect_config;
     let servers = ice::servers(&config.ice_servers, config.turn_secret.as_ref(), config.ice_servers_fn.as_ref(), IceRequest { side: IceSide::Browser, token }).await;
     serde_json::json!({"iceServers": servers})
 }

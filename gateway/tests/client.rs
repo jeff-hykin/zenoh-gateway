@@ -66,7 +66,7 @@ async fn start() -> (RunningServer, zenoh::Session, String) {
     (running, session, url)
 }
 
-/// Puts `payload` on `key` every 50 ms until dropped (the bridge's subscription starts a moment after it accepts).
+/// Puts `payload` on `key` every 50 ms until dropped (the gateway's subscription starts a moment after it accepts).
 fn keep_putting(session: &zenoh::Session, key: &str, payload: Vec<u8>) -> tokio::task::JoinHandle<()> {
     let (session, key) = (session.clone(), key.to_owned());
     tokio::spawn(async move {
@@ -136,7 +136,7 @@ async fn fields_subscribe_is_parsed() {
     assert_eq!(fields["data"].values(), [3.0, 1.0, 4.0]);
     assert_eq!(fields["name"].text(), Some("bytes"));
     let refused = client.subscribe("fields/x", SubscribeOptions { max_hz: Some(-1.0), ..Default::default() }).await;
-    assert!(refused.err().unwrap().to_string().contains("maxHz"), "the bridge's reason");
+    assert!(refused.err().unwrap().to_string().contains("maxHz"), "the gateway's reason");
     client.close().await;
     running.shutdown().await.unwrap();
 }
@@ -186,7 +186,7 @@ async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
     let (size, mean) = decode_all(&frames);
     assert_eq!(size, (320, 240));
     assert_color(mean, [200, 40, 90]);
-    // the bridge's own keyframes come every 3 s; one asked for comes at once
+    // the gateway's own keyframes come every 3 s; one asked for comes at once
     while next_video(&mut camera).await.keyframe {}
     camera.request_keyframe().await.unwrap();
     let asked = std::time::Instant::now();
@@ -200,7 +200,7 @@ async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
     let mut again = client.subscribe("camera/front", options).await.unwrap();
     let first = next_video(&mut again).await;
     assert!(first.keyframe);
-    assert_eq!(decode_all(&[first]).0, (160, 120), "maxResolution reached the bridge");
+    assert_eq!(decode_all(&[first]).0, (160, 120), "maxResolution reached the gateway");
     client.close().await;
     running.shutdown().await.unwrap();
 }
@@ -288,7 +288,7 @@ async fn token_and_leases() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(blocked.blocked().unwrap().contains("leased by another client"), "the bridge said why");
+    assert!(blocked.blocked().unwrap().contains("leased by another client"), "the gateway said why");
     lease.release().await.unwrap();
     assert_eq!(lease.lost().as_deref(), Some("released"));
     blocked.put(b"other again").await.unwrap();
@@ -475,7 +475,7 @@ async fn ice_hook_adds_servers_for_both_ends_and_a_failure_leaves_the_static_one
     assert_eq!(browser_ice_servers(&url, Some("broken")).await, vec![stun.clone()]);
     let client = Client::connect(&url, ClientOptions { token: Some("t2".into()), ..Default::default() }).await.unwrap();
     let asked = asked.lock().unwrap().clone();
-    assert!(asked.contains(&(IceSide::Bridge, Some("t2".into()))) && asked.contains(&(IceSide::Browser, Some("t2".into()))), "{asked:?}");
+    assert!(asked.contains(&(IceSide::Gateway, Some("t2".into()))) && asked.contains(&(IceSide::Browser, Some("t2".into()))), "{asked:?}");
     client.close().await;
     running.shutdown().await.unwrap();
 }

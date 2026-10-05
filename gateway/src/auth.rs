@@ -1,5 +1,5 @@
 //! Authorization (a host's hook turns a token into a [`Grant`]) and leases (one client's exclusive
-//! right to publish on a group of key expressions, among this bridge's clients).
+//! right to publish on a group of key expressions, among this gateway's clients).
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -50,7 +50,7 @@ struct Held {
     serial: u64,
 }
 
-/// The bridge's leases, shared by every frontend.
+/// The gateway's leases, shared by every frontend.
 #[derive(Default)]
 pub(crate) struct Leases {
     /// groups the server defines (builder or auth file): name -> keys

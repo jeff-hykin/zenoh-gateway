@@ -1,4 +1,4 @@
-//! A relay: connect to bridge A as a client, take one camera at full quality, decode it, and serve it
+//! A relay: connect to gateway A as a client, take one camera at full quality, decode it, and serve it
 //! again through this process's own zenoh-web server B (whose allocator then adapts it to B's viewers).
 //!
 //! `cargo run --example relay_sketch --features client -- http://robot.local:7448 camera/front ros2-image 7449`,
@@ -79,7 +79,7 @@ pub async fn relay(source_url: &str, camera_key: &str, codec: &str, bind: &str) 
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [source, camera, codec, port] = &args[..] else {
-        anyhow::bail!("usage: relay_sketch <bridge A url> <camera key> <A's video encoding> <port for B>");
+        anyhow::bail!("usage: relay_sketch <gateway A url> <camera key> <A's video encoding> <port for B>");
     };
     let running = relay(source, camera, codec, &format!("0.0.0.0:{port}")).await.context("starting the relay")?;
     println!("relaying {camera} on http://{} as relay/{camera} (encoding relay-rgb)", running.local_addr());

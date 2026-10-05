@@ -69,7 +69,7 @@ pub struct SubStats {
     pub blocked_on_page_ms: f64,
     /// time a bulk sender waited on its token bucket and the frontend's send gate
     pub paced_ms: f64,
-    /// Bridge receive time minus sample timestamp (upstream lag), largest seen.
+    /// Gateway receive time minus sample timestamp (upstream lag), largest seen.
     pub max_receive_lag_ms: f64,
     /// Time a message's last frame was handed to SCTP minus its sample timestamp, largest seen.
     pub max_send_lag_ms: f64,

@@ -5,7 +5,7 @@
 //! [`name`](MessageEncoding::name). An encoding decodes a zenoh sample into a [`DecodedFrame`] for its [`Channel`]:
 //! - `video-h264`, `video-vp8`, `video-vp9`, `video-av1` ([`Channel::Video`]): pictures for a [`VideoEncoder`] of that
 //!   format (the encoding's own, the server's, or a built-in one), sent on a WebRTC video track;
-//! - `audio-opus` ([`Channel::Audio`]): PCM, which the bridge encodes to Opus on an audio track;
+//! - `audio-opus` ([`Channel::Audio`]): PCM, which the gateway encodes to Opus on an audio track;
 //! - `data` ([`Channel::Data`]): bytes from [`MessageEncoding::encode`] for the subscription's data channel, at the
 //!   quality the bandwidth allocator picked (at most `encodeOptions.quality`): [`Fields`](crate::Fields), which the
 //!   browser client decodes by itself ([`EncodingOutput::Fields`]), or any other bytes ([`EncodingOutput::Data`]).
@@ -30,10 +30,10 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EncodingOutput {
     /// Frames for a [`VideoEncoder`] (by default [`DecodedFrame::Video`] pictures, which
-    /// the bridge scales to the allocated quality and encodes to H.264), sent on a WebRTC video
+    /// the gateway scales to the allocated quality and encodes to H.264), sent on a WebRTC video
     /// track (the page gets `sub.mediaStream`). The subscription must use `delivery: "latest"`.
     Video,
-    /// [`DecodedFrame::Audio`] PCM, which the bridge encodes to Opus in 20 ms packets and sends on a
+    /// [`DecodedFrame::Audio`] PCM, which the gateway encodes to Opus in 20 ms packets and sends on a
     /// WebRTC audio track (the page gets `sub.mediaStream`). Never paced or thinned by the allocator.
     Audio,
     /// Bytes from [`MessageEncoding::encode`], sent on the subscription's data channel. In the browser,
@@ -173,7 +173,7 @@ pub struct EncodingSample<'a> {
 }
 
 impl<'a> EncodingSample<'a> {
-    /// A sample from its parts (the bridge builds these; tests of an encoding can too).
+    /// A sample from its parts (the gateway builds these; tests of an encoding can too).
     pub fn new(key: &'a str, payload: &'a [u8], encoding: &'a zenoh::bytes::Encoding) -> Self {
         EncodingSample { key, payload, encoding }
     }
@@ -184,12 +184,12 @@ impl<'a> EncodingSample<'a> {
 pub enum PixelFormat {
     /// Packed 8-bit RGB, row-major, no padding: `width × height × 3` bytes.
     Rgb8,
-    /// Planar YUV 4:2:0 (BT.601 limited range, what the bridge's encoders signal): the Y plane
+    /// Planar YUV 4:2:0 (BT.601 limited range, what the gateway's encoders signal): the Y plane
     /// (`width × height`), then U and V (`width/2 × height/2` each). Width and height must be even.
     I420,
 }
 
-/// An uncompressed picture that a video encoding hands to the bridge's video encoders.
+/// An uncompressed picture that a video encoding hands to the gateway's video encoders.
 #[derive(Clone, PartialEq, Eq)]
 pub struct VideoImage {
     width: u32,
@@ -247,7 +247,7 @@ impl VideoImage {
     }
 }
 
-/// Interleaved signed 16-bit PCM that an audio encoding hands to the bridge's Opus path.
+/// Interleaved signed 16-bit PCM that an audio encoding hands to the gateway's Opus path.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AudioPcm {
     sample_rate: u32,
@@ -289,9 +289,9 @@ impl AudioPcm {
 /// What [`MessageEncoding::decode`] produced from one sample. Decoded frames are cached and shared by every
 /// frontend that subscribes to the same key with the same encoding.
 pub enum DecodedFrame {
-    /// A picture for the bridge's software H.264 encoder ([`EncodingOutput::Video`]).
+    /// A picture for the gateway's software H.264 encoder ([`EncodingOutput::Video`]).
     Video(VideoImage),
-    /// PCM for the bridge's Opus encoder ([`EncodingOutput::Audio`]).
+    /// PCM for the gateway's Opus encoder ([`EncodingOutput::Audio`]).
     Audio(AudioPcm),
     /// Anything the encoding's own [`encode`](MessageEncoding::encode) understands (data-channel
     /// encodings); build it with [`DecodedFrame::data`], read it back with [`DecodedFrame::downcast`].
@@ -326,7 +326,7 @@ impl DecodedFrame {
 
 /// A message encoding a subscription picks by name (subscribe option `encoding`).
 ///
-/// Implementations must be cheap to call from several threads at once: the bridge calls
+/// Implementations must be cheap to call from several threads at once: the gateway calls
 /// [`decode`](MessageEncoding::decode) and [`encode`](MessageEncoding::encode) on tokio's blocking pool, for many
 /// frontends and subscriptions concurrently. Keep per-call state in the frames, not in `self`.
 ///
@@ -420,7 +420,7 @@ pub trait MessageEncoding: Send + Sync {
     /// any compression) with `options` (at `options.quality`), for a sample of `payload_bytes`. Used until sizes are measured, and after
     /// that as the shape between measured qualities (so it should be monotone in `quality`).
     /// The default assumes the output scales linearly from 10% to 100% of the payload. Video is
-    /// priced by the bridge from its [`VideoPolicy`] instead, audio by what it sends.
+    /// priced by the gateway from its [`VideoPolicy`] instead, audio by what it sends.
     fn estimated_bytes(&self, payload_bytes: usize, options: &EncodeOptions) -> f64 {
         payload_bytes as f64 * (0.1 + 0.9 * options.quality.clamp(0.0, 1.0))
     }
