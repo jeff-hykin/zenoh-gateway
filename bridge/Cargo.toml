@@ -1,6 +1,6 @@
 [package]
 name = "zenoh-web"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 description = "View and drive a zenoh system from a browser over WebRTC (data channels, H.264 video, bandwidth allocation, deadmen): an embeddable server with pluggable codecs"
@@ -42,10 +42,15 @@ sha1 = "0.10"
 openh264 = "0.9"
 # set_option, to change the bitrate without a keyframe
 openh264-sys2 = "0.9"
+# feature `av1`: the built-in AV1 encoder
+rav1e = { version = "0.8", default-features = false, features = ["threading"], optional = true }
 # feature `client`: POST /offer
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 [features]
+default = ["av1"]
+# channel video-av1 out of the box: rav1e, pure Rust
+av1 = ["dep:rav1e"]
 # zenoh_web::client: a Rust client that connects to a server as a browser does (e.g. for a relay)
 client = ["dep:reqwest"]
 # zenoh_web::CloudflareTurn: TURN credentials from Cloudflare's API

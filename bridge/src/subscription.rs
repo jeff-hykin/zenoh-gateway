@@ -2,8 +2,8 @@
 //! into the data channel only while it is not backed up.
 
 use crate::allocator::{Allocation, Demand};
-use crate::codec::registry::{self, CodecRegistry};
-use crate::codec::{Codec, CodecOutput, CodecSample, Compress, VideoPolicy};
+use crate::encoding::registry::{self, EncodingRegistry, Resolved};
+use crate::encoding::{Channel, Compress, EncodeOptions, EncodingOutput, EncodingSample, MessageEncoding, VideoPolicy};
 use crate::frame;
 use crate::options::{Delivery, Label, SubOpts};
 use crate::pacing::{PACING_SLACK, SendGate, TokenBucket};
@@ -79,8 +79,8 @@ pub struct SubStats {
     /// viewer's subscription encoded in the shared encode session)
     pub encodes: u64,
     pub shared_encodes: u64,
-    pub codec_errors: u64,
-    pub last_codec_error: Option<String>,
+    pub encoding_errors: u64,
+    pub last_encoding_error: Option<String>,
     /// quality of the last transcoded message
     pub quality: Option<f64>,
     pub keyframes: u64,
@@ -175,18 +175,23 @@ pub struct SubShared {
     delivery: Delivery,
     min_interval: Option<Duration>,
     priority_override: Option<u8>,
-    pub codec: Option<Arc<dyn Codec>>,
-    /// the codec's key prefix with its trailing `/`
+    pub codec: Option<Arc<dyn MessageEncoding>>,
+    /// what the frames travel on, and what the encoding sends there
+    pub channel: Channel,
+    pub output: EncodingOutput,
+    /// `encodeOptions` without `quality`
+    encode_options: serde_json::Map<String, serde_json::Value>,
+    /// the encoding's key prefix with its trailing `/`
     key_prefix: Option<String>,
     compress: Compress,
-    /// the server's codecs, with the caches that share work across frontends
-    pub codecs: Arc<CodecRegistry>,
+    /// the server's encodings, with the caches that share work across frontends
+    pub codecs: Arc<EncodingRegistry>,
     max_hz: Option<f64>,
     /// bandwidthPriority: higher keeps more when bandwidth is short
     bandwidth_priority: f64,
     quality_range: (f64, f64),
     tradeoff: f64,
-    /// video codecs: the server's policy with this subscription's overrides
+    /// video channels: the server's policy with this subscription's overrides
     pub video_policy: VideoPolicy,
     /// this frontend's shared send gate, and this stream's id in it
     gate: Arc<SendGate>,
@@ -212,7 +217,8 @@ fn sample_timestamp_ms(sample: &Sample) -> f64 {
 }
 
 impl SubShared {
-    pub fn new(opts: &SubOpts, codec: Option<Arc<dyn Codec>>, codecs: Arc<CodecRegistry>, gate: Arc<SendGate>) -> Self {
+    pub fn new(opts: &SubOpts, resolved: Resolved, codecs: Arc<EncodingRegistry>, gate: Arc<SendGate>) -> Self {
+        let Resolved { encoding: codec, channel, output } = resolved;
         static NEXT_STREAM: AtomicUsize = AtomicUsize::new(0);
         SubShared {
             gate,
@@ -224,6 +230,9 @@ impl SubShared {
             priority_override: opts.priority,
             key_prefix: codec.as_ref().and_then(|codec| codec.key_prefix()).map(|prefix| format!("{}/", prefix.trim_end_matches('/'))),
             codec,
+            channel,
+            output,
+            encode_options: opts.encoding_options(),
             compress: opts.compress.unwrap_or_default(),
             video_policy: opts.video_policy(codecs.video_policy),
             codecs,
@@ -239,7 +248,7 @@ impl SubShared {
         }
     }
 
-    /// The zenoh key expression a subscription to `key` reads (see [`Codec::key_prefix`]).
+    /// The zenoh key expression a subscription to `key` reads (see [`MessageEncoding::key_prefix`]).
     fn zenoh_key(&self, key: &str) -> String {
         format!("{}{key}", self.key_prefix.as_deref().unwrap_or_default())
     }
@@ -306,14 +315,19 @@ impl SubShared {
         }
     }
 
-    /// A video or audio codec's subscription (frames on an RTP track).
+    /// A video or audio channel's subscription (frames on an RTP track).
     pub fn on_track(&self) -> bool {
-        self.codec.as_ref().is_some_and(|codec| matches!(codec.output(), CodecOutput::Video | CodecOutput::Audio))
+        self.channel != Channel::Data
+    }
+
+    /// What the encoding's `encode` gets at `quality`.
+    pub fn encode_options(&self, quality: f64) -> EncodeOptions {
+        EncodeOptions { quality, options: self.encode_options.clone() }
     }
 
     /// Reserved at its measured rate, never paced or shrunk: reliable, strict-priority and audio streams.
     fn reserved(&self) -> bool {
-        self.delivery.reliable || self.is_strict() || self.codec.as_ref().is_some_and(|codec| codec.output() == CodecOutput::Audio)
+        self.delivery.reliable || self.is_strict() || self.channel == Channel::Audio
     }
 
     pub fn note_video_source(&self, width: u32, height: u32) {
@@ -339,16 +353,16 @@ impl SubShared {
                 let message_bytes = if state.message_bytes > 0.0 { state.message_bytes } else { payload_bytes + FRAME_OVERHEAD_BYTES };
                 Box::new(move |_| message_bytes)
             }
-            Some(codec) if codec.output() == CodecOutput::Video => {
+            Some(_) if matches!(self.channel, Channel::Video(_)) => {
                 let source = state.video_source.unwrap_or(DEFAULT_VIDEO_SOURCE);
                 let keys = state.keys.values().filter(|queue| queue.rate_hz > 0.0).count().max(1);
                 let (policy, frame_hz) = (self.video_policy, max_hz / keys as f64);
                 Box::new(move |quality| policy.frame_bytes(source, frame_hz, quality))
             }
             Some(codec) => {
-                // measured sizes per quality, scaled between qualities by the codec's own estimate
-                let (codec, payload_len) = (codec.clone(), payload_bytes.round() as usize);
-                let model = move |quality: f64| codec.estimated_bytes(payload_len, quality).max(0.0);
+                // measured sizes per quality, scaled between qualities by the encoding's own estimate
+                let (codec, payload_len, options) = (codec.clone(), payload_bytes.round() as usize, self.encode_options.clone());
+                let model = move |quality: f64| codec.estimated_bytes(payload_len, &EncodeOptions { quality, options: options.clone() }).max(0.0);
                 let measured: Vec<(f64, f64)> = state.encoded_bytes.iter().map(|(&bucket, &bytes)| (bucket as f64 / 1000.0, bytes)).collect();
                 Box::new(move |quality| {
                     let nearest = measured.iter().min_by(|a, b| (a.0 - quality).abs().total_cmp(&(b.0 - quality).abs()));
@@ -387,12 +401,12 @@ impl SubShared {
         *if shared { &mut state.stats.shared_encodes } else { &mut state.stats.encodes } += 1;
     }
 
-    pub fn record_codec_error(&self, error: &str) {
+    pub fn record_encoding_error(&self, error: &str) {
         let mut state = self.state.lock().unwrap();
-        state.stats.codec_errors += 1;
-        if state.stats.last_codec_error.as_deref() != Some(error) {
-            warn!("codec {}: {error}", self.codec.as_ref().map_or("?", |codec| codec.name()));
-            state.stats.last_codec_error = Some(error.to_owned());
+        state.stats.encoding_errors += 1;
+        if state.stats.last_encoding_error.as_deref() != Some(error) {
+            warn!("encoding {}: {error}", self.codec.as_ref().map_or("?", |codec| codec.name()));
+            state.stats.last_encoding_error = Some(error.to_owned());
         }
     }
 
@@ -550,7 +564,7 @@ impl SubShared {
     }
 }
 
-/// Runs a `sub` channel until it closes. Video and audio codecs send frames to `track` instead of `dc`.
+/// Runs a `sub` channel until it closes. Video and audio channels send frames to `track` instead of `dc`.
 pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>, track: Option<Arc<crate::media::MediaTrack>>) {
     let _ = dc.set_buffered_amount_low_threshold((shared.gate.window_bytes() / 2) as u32).await;
     let feed = shared.clone();
@@ -708,13 +722,14 @@ async fn raw_body(compress: Compress, item: &Pending) -> Body<'_> {
 }
 
 /// Transcodes off the async runtime (shared with other frontends asking for the same encode).
-async fn encode(shared: &SubShared, codec: Arc<dyn Codec>, key: &str, item: &Pending) -> Option<Arc<registry::Encoded>> {
+async fn encode(shared: &SubShared, codec: Arc<dyn MessageEncoding>, key: &str, item: &Pending) -> Option<Arc<registry::Encoded>> {
     let quality = shared.current_quality();
+    let options = shared.encode_options(quality);
     let payload = item.payload.to_bytes().into_owned();
     let (key, encoding, codecs, compress) = (key.to_owned(), item.encoding.clone(), shared.codecs.clone(), shared.compress);
     let outcome = tokio::task::spawn_blocking(move || {
-        let sample = CodecSample::new(&key, &payload, &encoding);
-        codecs.encode_shared(&*codec, &sample, registry::sample_hash(&sample), quality, compress)
+        let sample = EncodingSample::new(&key, &payload, &encoding);
+        codecs.encode_shared(&*codec, &sample, registry::sample_hash(&sample), &options, compress)
     })
     .await;
     let error = match outcome {
@@ -726,7 +741,7 @@ async fn encode(shared: &SubShared, codec: Arc<dyn Codec>, key: &str, item: &Pen
         Ok((Err(error), _)) => error,
         Err(error) => format!("encoder task failed: {error}"),
     };
-    shared.record_codec_error(&error);
+    shared.record_encoding_error(&error);
     None
 }
 
@@ -746,7 +761,8 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
             },
             None => raw_body(shared.compress, &item).await,
         };
-        if sender.send(&dc, &shared, &key, &item, body.bytes(), body.flags()).await == Sent::Closed {
+        let flags = body.flags() | if shared.output == EncodingOutput::Fields { frame::FIELDS } else { 0 };
+        if sender.send(&dc, &shared, &key, &item, body.bytes(), flags).await == Sent::Closed {
             return;
         }
     }
@@ -849,8 +865,8 @@ mod tests {
     use super::*;
 
     fn shared(opts: &str) -> SubShared {
-        let registry = Arc::new(CodecRegistry::new([]).unwrap());
-        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), None, registry, Arc::default())
+        let registry = Arc::new(EncodingRegistry::new([]).unwrap());
+        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default())
     }
 
     #[test]

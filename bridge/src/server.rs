@@ -1,8 +1,8 @@
 //! The embeddable server: [`Server::builder`] → [`ServerBuilder::build`] → [`Server::bind`] (or [`Server::serve`], or [`Server::router`]).
 
 use crate::auth::{Grant, Leases};
-use crate::codec::registry::{CodecRegistry, VideoEncoderFactory};
-use crate::codec::{Codec, VideoEncoder, VideoPolicy};
+use crate::encoding::registry::{EncodingRegistry, VideoEncoderFactory};
+use crate::encoding::{MessageEncoding, VideoEncoder, VideoFormat, VideoPolicy};
 use crate::ice::{self, IceHook, IceRequest, IceServer, IceSide};
 use crate::peer::{AllocationConfig, Bridge, ConnectConfig};
 use anyhow::{Context, Result, anyhow, ensure};
@@ -68,11 +68,11 @@ pub struct ServerBuilder {
     serve_dir: Option<PathBuf>,
     max_bandwidth_bytes_per_sec: Option<f64>,
     bandwidth_target_fraction: f64,
-    codecs: Vec<Arc<dyn Codec>>,
+    encodings: Vec<Arc<dyn MessageEncoding>>,
     authorize: Option<Arc<Authorize>>,
     lease_groups: HashMap<String, Vec<String>>,
     connect_config: ConnectConfig,
-    video_encoder: Option<VideoEncoderFactory>,
+    video_encoders: Vec<(VideoFormat, VideoEncoderFactory)>,
     video_policy: VideoPolicy,
     zenoh_signalling: Option<String>,
 }
@@ -86,11 +86,11 @@ impl Default for ServerBuilder {
             serve_dir: None,
             max_bandwidth_bytes_per_sec: None,
             bandwidth_target_fraction: 0.75,
-            codecs: Vec::new(),
+            encodings: Vec::new(),
             authorize: None,
             lease_groups: HashMap::new(),
             connect_config: ConnectConfig::default(),
-            video_encoder: None,
+            video_encoders: Vec::new(),
             video_policy: VideoPolicy::default(),
             zenoh_signalling: None,
         }
@@ -143,14 +143,15 @@ impl ServerBuilder {
         self
     }
 
-    /// Registers a codec. A name that is already registered makes [`build`](Self::build) fail.
-    pub fn codec(self, codec: impl Codec + 'static) -> Self {
-        self.shared_codec(Arc::new(codec))
+    /// Registers a message encoding (what subscriptions name with `encoding`). A name that is already registered makes
+    /// [`build`](Self::build) fail.
+    pub fn encoding(self, encoding: impl MessageEncoding + 'static) -> Self {
+        self.shared_encoding(Arc::new(encoding))
     }
 
-    /// [`codec`](Self::codec) for a codec that is already shared.
-    pub fn shared_codec(mut self, codec: Arc<dyn Codec>) -> Self {
-        self.codecs.push(codec);
+    /// [`encoding`](Self::encoding) for one that is already shared.
+    pub fn shared_encoding(mut self, encoding: Arc<dyn MessageEncoding>) -> Self {
+        self.encodings.push(encoding);
         self
     }
 
@@ -207,10 +208,15 @@ impl ServerBuilder {
         self
     }
 
-    /// Makes the encoder of every video codec that has none of its own ([`Codec::video_encoder`]), e.g. a hardware one
-    /// (zenoh-dimos-codecs' encoders); called once per encode session. Default: software H.264 (openh264).
+    /// Makes the video encoders of the format the factory's encoders report ([`VideoEncoder::format`]; it is called
+    /// once here to ask), for every encoding without its own ([`MessageEncoding::video_encoder`]), e.g. a hardware
+    /// one (zenoh-dimos-codecs' encoders); then once per encode session. Call it once per format; a later call for
+    /// the same format replaces the earlier one. Without one: the built-in encoders (H.264: openh264; AV1: rav1e,
+    /// feature `av1`); `video-vp8` and `video-vp9` need one.
     pub fn video_encoder(mut self, factory: impl Fn() -> Box<dyn VideoEncoder> + Send + Sync + 'static) -> Self {
-        self.video_encoder = Some(Arc::new(factory));
+        let format = factory().format();
+        self.video_encoders.retain(|(registered, _)| *registered != format);
+        self.video_encoders.push((format, Arc::new(factory)));
         self
     }
 
@@ -229,7 +235,7 @@ impl ServerBuilder {
         self
     }
 
-    /// Validates the options, registers the codecs and opens the zenoh session (unless one was given).
+    /// Validates the options, registers the encodings and opens the zenoh session (unless one was given).
     pub async fn build(self) -> Result<Server> {
         let fraction = self.bandwidth_target_fraction;
         ensure!(fraction > 0.0 && fraction <= 1.0, "bandwidth target fraction must be within (0, 1], got {fraction}");
@@ -237,7 +243,7 @@ impl ServerBuilder {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
         self.video_policy.validate()?;
-        let codecs = CodecRegistry::new(self.codecs)?.with_video(self.video_encoder, self.video_policy);
+        let codecs = EncodingRegistry::new(self.encodings)?.with_video(self.video_encoders, self.video_policy);
         let mut config = self.zenoh_config.unwrap_or_default();
         let (session, owns_session) = match self.session {
             Some(session) => {
@@ -303,7 +309,7 @@ impl Server {
         &self.inner.session
     }
 
-    /// Every open subscription of every connection: its key expression and codec (e.g. for a relay that pulls upstream
+    /// Every open subscription of every connection: its key expression and encoding (e.g. for a relay that pulls upstream
     /// only what its viewers watch). [`changes`](Self::changes) says when this or [`leases`](Self::leases) changed.
     pub fn subscriptions(&self) -> Vec<(String, Option<String>)> {
         self.inner.bridge.subscriptions()

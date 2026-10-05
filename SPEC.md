@@ -13,12 +13,12 @@ zenoh peers (publishers we don't control)
 ```
 
 The bridge is a dumb pipe: one data channel ↔ one zenoh key expression. It never parses payloads,
-except when a subscription explicitly picks one of its codecs (see "Codecs").
+except when a subscription explicitly picks one of its message encodings (see "Encodings and channels").
 
 ## JS API
 
 ```js
-import { connect, Priority, registerCodec } from "./zenoh_web.ts"   // via esm.sh, or bundled: see "Client"
+import { connect, Priority, registerEncoding } from "./zenoh_web.ts"   // via esm.sh, or bundled: see "Client"
 
 const z = await connect("http://robot.local:7448", {
     heartbeatHz: 5,         // 0 (default) = no heartbeat; needed for deadmen and leases
@@ -34,16 +34,17 @@ const sub = z.subscribe("camera/**", {
     maxAge: 500,                 // ms; drop anything older
     maxHz: 20,                   // bridge never sends a key faster than this
     bandwidthPriority: 1,        // when bandwidth is short, higher keeps more (0 gives up everything first)
-    minQuality: 0.3,             // 0-1, transcoded streams only
-    maxQuality: 1.0,
+    minQuality: 0.3,             // 0-1, encoded streams only
     qualityToHzTradeoff: 0.7,    // 0 = keep quality, drop hz; 1 = keep hz, drop quality
-    codec: "ros2-image",         // optional transcoder the bridge registered (z.codecs), see "Codecs"
-    compress: "zstd",            // or "none"; default: the codec's (none without one), see "Compression"
-    maxBitrate: 8e6,             // video codecs: most bits/s asked for (default: the server's), see "Video"
-    minResolutionScale: 0.5,     // video codecs: the picture never shrinks below this share of the source's size
-    maxResolution: [1280, 720],  // video codecs: box the picture is fitted into
+    encoding: "ros2_image",      // optional message encoding the bridge registered (z.encodings), see "Encodings and channels"
+    channel: "video-h264",       // what it travels on (default: from the encoding's output); video-vp8/vp9/av1, audio-opus, data
+    encodeOptions: { quality: 1.0 },  // passed to the encoding; quality = the most the allocator may pick (default 1)
+    compress: "zstd",            // or "none"; default: the encoding's (none without one), see "Compression"
+    maxBitrate: 8e6,             // video channels: most bits/s asked for (default: the server's), see "Video"
+    minResolutionScale: 0.5,     // video channels: the picture never shrinks below this share of the source's size
+    maxResolution: [1280, 720],  // video channels: box the picture is fitted into
 }, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.decoded, msg.video, msg.mediaStream })
-sub.mediaStream  // video codecs: a MediaStream for a <video> element
+sub.mediaStream  // video and audio channels: a MediaStream for a <video> / <audio> element
 sub.close()
 
 const cmd = z.publisher("cmd_vel", {
@@ -76,17 +77,18 @@ z.bridgeStats.bandwidth  // this frontend's estimate, cap, budget, demand (see "
 z.clockOffsetMs  // bridge clock - browser clock
 z.rttMs
 z.onState(fn)    // "connecting" | "connected" | "degraded" | "lost"
-z.codecs         // [{ name, output: "video" | "data" }]: the bridge's codecs, fetched on connect
+z.encodings      // [{ name, output: "video" | "audio" | "fields" | "data" }]: the bridge's encodings, fetched on connect
 
-registerCodec("text-uppercase", (bytes, msg) => new TextDecoder().decode(bytes))  // browser side of a data codec: msg.decoded
+registerEncoding("text_uppercase", (bytes, msg) => new TextDecoder().decode(bytes))  // browser side of a data encoding: msg.decoded
 ```
 
 - `Priority` mirrors zenoh / zenoh-ts: REAL_TIME=1, INTERACTIVE_HIGH=2, INTERACTIVE_LOW=3, DATA_HIGH=4, DATA=5, DATA_LOW=6, BACKGROUND=7 (lower = more important).
 - Options are checked by the bridge: an unknown name or a bad value rejects the channel (`rejected`
   event with the reason: `state` becomes `"rejected"`, `ready()` rejects).
-- `bandwidthPriority` (default 1), `minQuality` (0), `maxQuality` (1), `qualityToHzTradeoff` (0.5) drive the per-frontend
-  allocator ("Bandwidth allocation"); stats show them with defaults filled in. `maxBitrate`, `minResolutionScale` and
-  `maxResolution` override the server's video policy ("Video"); on a non-video codec they reject the channel.
+- `bandwidthPriority` (default 1), `minQuality` (0), `encodeOptions.quality` (1), `qualityToHzTradeoff` (0.5) drive the
+  per-frontend allocator ("Bandwidth allocation"); stats show them with defaults filled in. `maxBitrate`,
+  `minResolutionScale` and `maxResolution` override the server's video policy ("Video"); on a non-video channel they
+  reject the channel.
 - No `latched` flag: the bridge always subscribes with zenoh-ext AdvancedSubscriber history (max 1 sample per publisher), so publishers with a cache (e.g. rmw_zenoh transient_local like tf_static) replay their last message.
 
 ## Delivery → transport mapping
@@ -116,8 +118,7 @@ Drop otherwise, express for priority ≤ INTERACTIVE_HIGH.
 
 `client/zenoh_web.ts` (strict TypeScript, no dependencies). Browsers load it from esm.sh, which
 transpiles it (`https://esm.sh/gh/jeff-hykin/zenoh-web@<commit>/client/zenoh_web.ts`), or bundle it
-(`deno bundle`, the same esbuild transform; zenoh-web-cli's `deno task build` bundles it with the
-dimos codecs' decoders).
+(`deno bundle`, the same esbuild transform; zenoh-web-cli's `deno task build` bundles it).
 
 ## Rust client
 
@@ -130,15 +131,15 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
 - `Client::connect(url, ClientOptions { token, ice_servers, relay_only, heartbeat_hz, heartbeat_misses })`:
   the bridge's ICE servers from `GET /zenoh-web/ice` unless given, the same non-trickle `POST /offer`
   (both with `Authorization: Bearer <token>` when set; a 401 fails the connect), `control` and
-  heartbeat channels, `codecs`, and 5 clock pings before returning; then a ping a second (clock
-  sync, `Degraded` when one fails). `list_topics`, `get`, `stats`, `codecs`, `clock_offset_ms`,
+  heartbeat channels, `encodings`, and 5 clock pings before returning; then a ping a second (clock
+  sync, `Degraded` when one fails). `list_topics`, `get`, `stats`, `encodings`, `clock_offset_ms`,
   `rtt_ms`, `state`, `closed()`, `close()`. Reconnecting is the caller's job: when `closed()`
   resolves, connect and subscribe again.
 - `Client::connect_zenoh(&session, name, options)`: the same, signalling over zenoh (see "Signalling over zenoh").
 - `subscribe(key, SubscribeOptions)` takes the browser's options (camelCase on the wire, unset ones
   left out), resolves once the bridge accepted the channel (or fails with its reason), and yields
   `Message`s (`recv()`, or as a `Stream`):
-  - `Data`: raw or codec bytes, reassembled and zstd-decompressed; fields codecs add the parsed `fields`;
+  - `Data`: raw or encoded bytes, reassembled and zstd-decompressed; fields messages add the parsed `fields`;
   - `Video`: an access unit (H.264 Annex B, VP8/VP9 frame, AV1 OBUs) with its format, keyframe flag
     and RTP timestamp, depacketized from the track (reordered and retransmitted packets included);
     after a lost frame the client sends a PLI and skips frames until a keyframe, so what it yields
@@ -147,7 +148,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
     apart from its frame;
   - `Audio`: Opus packets.
   Messages are acked once queued (64 per subscription), so a slow consumer slows the bridge instead
-  of piling up. Video and audio renegotiate a recvonly transceiver per codec and reuse a dropped
+  of piling up. Video and audio renegotiate a recvonly transceiver per channel and reuse a dropped
   subscription's, as the browser does.
 - `publish(key, PublisherOptions)` → `put` / `put_at(bytes, timestamp_ms)` (`latest` drops a put
   while 64 KiB are unsent), `repeat_ms`, `set_deadman`, `clear_deadman`, `tripped()`, `wait_tripped()`.
@@ -156,20 +157,20 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
 - `lease(group, keys, max_seconds)` → `Lease` (`lost()`, `wait_lost()`, `release()`), `expire_lease(group)`;
   a `closed` event (revoked token) makes the client `Lost`.
 - Nothing is decoded: `examples/relay_sketch.rs` decodes H.264 with openh264 and serves the pictures
-  through a second server's video codec.
+  through a second server's video encoding.
 
 ## Server (Rust library)
 
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
-`bandwidth_target_fraction`, `codec`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `ice_servers_fn`, `cloudflare_turn`, `udp_ports`,
-`video_encoder` (a factory for every video codec without its own encoder, e.g. a hardware one from
+`bandwidth_target_fraction`, `encoding`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `ice_servers_fn`, `cloudflare_turn`, `udp_ports`,
+`video_encoder` (a factory per video format for every encoding without its own encoder, e.g. a hardware one from
 zenoh-dimos-codecs' encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
 `bind(addr)` serves on a background task (`RunningServer::local_addr`, `shutdown()`), `serve(addr)` /
 `serve_with_shutdown(addr, signal)` serve in place, or `router()` returns the axum routes (`POST
 /offer`, `GET /zenoh-web/health`, `GET /zenoh-web/ice`, static files) for the host's own HTTP server.
 `Server::revoke(token)` closes that token's connections (see "Auth"). For relays and monitoring:
-`subscriptions()` (every open subscription's key expression and codec), `leases()` (group and keys of each held
+`subscriptions()` (every open subscription's key expression and encoding), `leases()` (group and keys of each held
 lease), `changes()` (a `watch` counter bumped when either changes) and `expire_lease(group, reason)` (ends a lease
 as a force-expiry does, the holder told `reason`). Shutdown fires every frontend's deadmen
 (reason `"shutdown"`), closes the browser connections, then the session if the server opened it.
@@ -191,42 +192,57 @@ newer ones keep arriving) unless it outlives `maxAge` (`abandonedPartial`); SCTP
 (`maxRetransmits: 0` / `maxPacketLifeTime`); and the client discards incomplete messages once a newer
 one completes or more than 8 are pending (`partialDropped`).
 
-## Codecs
+## Encodings and channels
 
-Picked explicitly per subscription with `codec`. No `codec` = raw passthrough (Hz is the only
-degradation). There is no auto-detection and none is built in: the application embedding the bridge
-registers codecs by name (`ServerBuilder::codec`; a name registered twice fails the build), e.g. the
-robotics codecs of [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs). The core
-knows no message types: its only special paths are video and audio tracks. The client fetches the
-registry on connect (`control` op `codecs` → `{codecs: [{name, output}]}`, output `"video"`,
-`"audio"`, `"fields"` or `"data"`, as `z.codecs`), which is how a page learns which codecs need a
-track; the bridge refuses an unknown name (`rejected` event, listing the known names).
+A subscription names a message **encoding** (`encoding`), the **channel** its output travels on (`channel`), and the
+**options** the encoding gets (`encodeOptions`). No `encoding` = raw passthrough on the data channel (Hz is the only
+degradation). There is no auto-detection and no encoding is built in: the application embedding the bridge registers
+them by name (`ServerBuilder::encoding`; a name registered twice fails the build), e.g. the robotics encodings of
+[zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs), one per message type, named after its file. The
+core knows no message types: its only special paths are video and audio tracks. The client fetches the registry on
+connect (`control` op `encodings` → `{encodings: [{name, output}]}`, output on the default channel `"video"`,
+`"audio"`, `"fields"` or `"data"`, as `z.encodings`); the bridge refuses an unknown name (`rejected` event, listing the
+known names).
 
-Every codec implements one Rust trait (`zenoh_web::Codec`):
+Channels: `video-h264`, `video-vp8`, `video-vp9`, `video-av1` (a WebRTC video track of that format, `sub.mediaStream`),
+`audio-opus` (an Opus audio track), `data` (the subscription's data channel). Unset, the encoding's output decides:
+pictures on `video-h264`, sound on `audio-opus`, anything else on `data`. A video channel needs an encoder of its
+format: the encoding's own, the server's (`ServerBuilder::video_encoder`), or a built-in one (H.264: openh264; AV1:
+rav1e, feature `av1`, on by default); `video-vp8` and `video-vp9` have no built-in one. A server without one refuses the
+subscription; the client refuses a channel its browser can't play (`RTCRtpReceiver.getCapabilities`). Video and audio
+channels require `delivery: "latest"` and no `compress`.
 
-- `name()`, and `output()`: **video**, **audio**, or data (**fields** or **data**).
-- `decode(sample)`: the sample's key, payload and zenoh encoding → a decoded frame: a picture (packed
-  RGB8 or planar I420, any size) for the default video encoder, anything a codec's own video encoder
-  takes, PCM for audio, any value for data codecs.
-- fields and data codecs: `encode(frame, quality)` → the bytes sent on the data channel (quality
-  0..1, from the allocator). A **fields** codec builds them with `zenoh_web::Fields` (see "Fields") and
-  the client decodes them into `msg.decoded` by itself. A **data** codec uses its own format, which the
-  page decodes with the decoder registered for that name (`registerCodec(name, decoder)` →
-  `msg.decoded`); without one it gets `msg.bytes` (and a warning). A registered decoder also overrides
-  a fields codec's automatic decoding.
-- `key_prefix()`: where the codec's samples live (default none). With `Some(prefix)` a subscription to `key` reads
-  zenoh key `<prefix>/<key>` and its messages carry keys without the prefix, so a codec's input can sit apart from the
-  raw topic: zenoh-web-relay puts its decoded frames under `@relay/<codec>/<key>`, which raw subscribers to `key`
+`encodeOptions` goes to the encoding (an object; the encoding validates it), except `quality` (0..1, default 1): the
+most the bandwidth allocator may pick for the subscription, which it lowers when the link is squeezed (down to
+`minQuality`). The encoding sees the quality picked for each message (`EncodeOptions { quality, options }`).
+
+Every encoding implements one Rust trait (`zenoh_web::MessageEncoding`):
+
+- `name()`, and `output()`: what it produces on its default channel: **video**, **audio**, or data (**fields** or
+  **data**).
+- `output_on(channel, options)`: what it produces for a subscription on `channel` with these `encodeOptions` (without
+  `quality`), or why it refuses them; checked when the subscription opens. Default: its own channel kind only (any
+  video format), with no options. An encoding that offers more (e.g. a compressed image passed through on `data`, or
+  converted) overrides it.
+- `decode(sample, channel)`: the sample's key, payload and zenoh encoding → a decoded frame for that channel: a picture
+  (packed RGB8 or planar I420, any size) for the built-in video encoders, anything its own video encoder takes, PCM for
+  audio, any value its `encode` takes for data. Shared by every frontend on the same kind of channel.
+- data channel: `encode(frame, &EncodeOptions { quality, options })` → the bytes sent. When `output_on` said
+  **fields**, they are a `zenoh_web::Fields` message (see "Fields"), flagged in the frame, and the client decodes them
+  into `msg.decoded` by itself. Any other bytes are the encoding's own format, which the page decodes with the decoder
+  registered for that name (`registerEncoding(name, decoder)` → `msg.decoded`); without one it gets `msg.bytes`.
+- `key_prefix()`: where the encoding's samples live (default none). With `Some(prefix)` a subscription to `key` reads
+  zenoh key `<prefix>/<key>` and its messages carry keys without the prefix, so an encoding's input can sit apart from
+  the raw topic: zenoh-web-relay puts its decoded frames under `@relay/<encoding>/<key>`, which raw subscribers to `key`
   (and `**`, which never matches a `@` chunk) don't see.
-- `default_compress()`: compression for the codec's messages when the subscription doesn't set
-  `compress` (default none; zenoh-dimos-codecs' depth and point clouds use zstd).
-- video codecs: optionally `video_encoder()` → the codec's own `VideoEncoder` per encode session; default the server's
-  (`ServerBuilder::video_encoder`), else the bridge's software H.264 (see "Video encoders"); its frames go on the
-  subscription's video track (see "Video"); the page needs no codec code. They require `delivery: "latest"`.
-- audio codecs: PCM, which the bridge encodes to Opus on an audio track (see "Audio").
-- `estimated_bytes(payloadBytes, quality)`: optional cost model for data codecs (bytes per message),
-  the allocator's prior until sizes are measured and its shape between measured qualities (default:
-  10–100 % of the payload, linear in quality). Video is priced by the video policy (see "Video").
+- `default_compress()`: compression for its data-channel messages when the subscription doesn't set `compress`
+  (default none; zenoh-dimos-codecs' depth and point clouds use zstd).
+- video: optionally `video_encoder(format)` → its own `VideoEncoder` of that format per encode session (e.g. passing
+  through frames that arrive already encoded); default the server's, else the built-in one (see "Video encoders").
+- audio: PCM, which the bridge encodes to Opus on an audio track (see "Audio").
+- `estimated_bytes(payloadBytes, &EncodeOptions)`: optional cost model for the data channel (bytes per message), the
+  allocator's prior until sizes are measured and its shape between measured qualities (default: 10–100 % of the
+  payload, linear in quality). Video is priced by the video policy (see "Video").
 
 Video: scaling is a box filter, RGB → I420 integer BT.601 limited range, tagged in the stream (BT.601 matrix, BT.709
 primaries and transfer). Chrome reads untagged HD video as BT.709, which cost ~2.7 dB of PSNR; tagged BT.601 measured as
@@ -243,9 +259,10 @@ good as BT.709 through openh264 and ~0.5 dB better through VideoToolbox. H.264 o
 
 Work happens lazily and on send: only messages the pacing/queues let through are transcoded, on
 tokio's blocking pool. Work is shared across frontends through two small caches per bridge: decoded
-frames keyed by (codec, key + payload hash), and data-channel encodes keyed by (codec, quality in
-1/1000 steps, key + payload hash, compression). Identical requests compute once (`encodes` vs `sharedEncodes` in
-stats). Video encodes are shared through encode sessions: the viewers of one stream (codec, key and video policy)
+frames keyed by (encoding, channel kind, key + payload hash), and data-channel encodes keyed by (encoding, quality in
+1/1000 steps, options, key + payload hash, compression). Identical requests compute once (`encodes` vs `sharedEncodes` in
+stats). Video encodes are shared through encode sessions: the viewers of one stream (encoding, format, key and video
+policy)
 whose grants are within 1.25× of each other share one encoder, which runs at the lowest of their grants. Every member
 sends every frame of its session in order (so one reference chain serves them all), starting from a keyframe; a member
 whose grant moves out of range moves to another session (a keyframe), a member that fell behind the session's last 8
@@ -254,7 +271,7 @@ others send the result (`sharedEncodes`). Each subscription keeps its own Opus e
 
 ### Fields
 
-The format of **fields** codecs: named numbers, text and arrays the client turns into a plain object.
+The format of **fields** output: named numbers, text and arrays the client turns into a plain object.
 Little endian: `u8 version=1 | u8 fieldCount`, then per field `u8 nameLen | name utf8 | u8 dtype |
 u8 components (1..4) | u8 flags | u32 count | [scaled: f64 offset[components] | f64 scale[components]] |
 zero padding | count × components values`.
@@ -271,45 +288,47 @@ zero padding | count × components values`.
 
 ### Compression
 
-Subscribe option `compress`: `"zstd"` or `"none"`; unset, the codec's `default_compress()` (none
-without a codec). It applies to raw topics and to fields and data codecs: the bridge compresses each
+Subscribe option `compress`: `"zstd"` or `"none"`; unset, the encoding's `default_compress()` (none
+without one). It applies to raw topics and to every data-channel encoding: the bridge compresses each
 message (zstd level 3, on tokio's blocking pool, shared across frontends with the encode) and the
 client decompresses it before decoding or handing it on, so `msg.bytes` is always uncompressed. A
 message zstd would not shrink is sent as is; each frame's `flags` says which. The price model learns
-the compressed sizes from what is sent. Video codecs are already compressed (H.264): `compress: "zstd"`
-on one is rejected, `"none"` accepted, their default ignored.
+the compressed sizes from what is sent. Video and audio channels are already compressed: `compress: "zstd"`
+on one is rejected, `"none"` accepted, the encoding's default ignored.
 
 ### Video encoders
 
-`zenoh_web::VideoEncoder` turns a video codec's decoded frames into one WebRTC codec's frames:
-`format()` declares the codec (`VideoFormat::H264`, `Vp8`, `Vp9` or `Av1`) and
+`zenoh_web::VideoEncoder` turns an encoding's decoded frames into one video format's frames:
+`format()` declares it (`VideoFormat::H264`, `Vp8`, `Vp9` or `Av1`) and
 `encode(frame, target)` returns an `EncodedVideo` (bitstream, size, keyframe) or `None` while a
 pipelined encoder has nothing out yet. `target` carries the granted bitrate (encode at it) and frame rate, the even
 output size the video policy and CPU governor picked, the allocator's quality, and whether this frame must be a
 keyframe (a viewer joined or sent PLI/FIR). `VideoTarget::new(width, height, bitrate, fps)` makes one to try an
 encoder. The bridge negotiates the format (it offers all four),
 packetizes (webrtc-rs payloaders), paces (GCC), measures the frames for the allocator and sends the
-per-frame metadata. `H264Encoder` (openh264, constrained baseline) is the default.
+per-frame metadata. Built in: `H264Encoder` (openh264, constrained baseline) for `video-h264`, and with feature `av1`
+(default) rav1e for `video-av1` (speed 10, low latency, tiles across up to 8 cores; rav1e still holds 3 frames, so its
+frames come ~100 ms late at 30 Hz).
 
-A hardware encoder plugs in for every video codec as `ServerBuilder::video_encoder(factory)`, or for one codec as
-its `video_encoder()` (which wins). [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)' `encoders` module has
+A hardware encoder plugs in for its format as `ServerBuilder::video_encoder(factory)` (called once to ask the format;
+one per format), or for one encoding as its `video_encoder(format)` (which wins). [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)' `encoders` module has
 VideoToolbox (macOS) and GStreamer (`nvv4l2h264enc` on a Jetson, `nvh264enc`, `vah264enc` / `vaapih264enc`, loaded at
 runtime) backends, probed by encoding a test frame and wrapped in a fallback to openh264; zenoh-web-cli uses it
 (`--video-encoder auto|software|videotoolbox|gstreamer`). Any encoder is fed from
 `VideoImage::to_i420(target.width, target.height)`
-(or the codec's own frames, e.g. GPU buffers decoded into `DecodedFrame::Data`, which the encoder
+(or the encoding's own frames, e.g. GPU buffers decoded into `DecodedFrame::Data`, which the encoder
 downcasts), returning access units. A camera that already sends H.264 can be passed through the
-same way: the codec's decode keeps the access unit and its encoder returns it (keyframes then
-come from the source). zenoh-web-cli's `examples/custom_codec.rs` has an AV1 encoder (rav1e) that
+same way: the encoding's decode keeps the access unit and its encoder returns it (keyframes then
+come from the source). zenoh-web-cli's `examples/custom_codec.rs` has an encoding with its own AV1 encoder that
 `test/custom_codec.js` shows in Chrome.
 
 ### Audio
 
-An audio codec decodes each sample to `AudioPcm` (interleaved i16, 8/12/16/24/48 kHz, mono or
+An audio encoding decodes each sample to `AudioPcm` (interleaved i16, 8/12/16/24/48 kHz, mono or
 stereo). The bridge encodes it with libopus (`unsafe-libopus`, libopus transpiled to Rust, so it
 builds for every target without a C toolchain) in 20 ms packets, carrying any remainder into the
 next sample, and writes them to an Opus track (the client adds a recvonly audio transceiver and
-renegotiates with the codec's name, as for video). The browser's jitter buffer smooths arrival;
+renegotiates for `audio-opus`, as for video). The browser's jitter buffer smooths arrival;
 `sub.mediaStream` plays in an `<audio>` element. Audio streams are reserved at their measured rate
 like reliable ones (never paced or thinned). Each sample also sends an empty frame on the `sub`
 channel, so the callback runs per message.
@@ -318,22 +337,22 @@ Microphone (browser → zenoh), not implemented, fits without redesign:
 - the page needs a secure context for `getUserMedia` (HTTPS, or `http://localhost`), so a robot's
   bridge would be served over TLS (a reverse proxy, or `ServerBuilder` behind one);
 - the client adds a `sendonly` audio transceiver with the mic track and renegotiates
-  (`{op: "renegotiate", publish: "<codec>", sdp}`), and opens a `pub` channel naming that mid, as a
+  (`{op: "renegotiate", publish: "<encoding>", sdp}`), and opens a `pub` channel naming that mid, as a
   video subscription names its track's;
 - the bridge's `on_track` reads the Opus RTP, decodes it with libopus (`opus_decode`) to PCM and
-  hands it to the codec's inverse of `decode` (e.g. `encode_pcm(&AudioPcm) -> Vec<u8>`, a new
-  `Codec` method with a default error), whose bytes are put on the key like any `pub` channel's,
+  hands it to the encoding's inverse of `decode` (e.g. `encode_pcm(&AudioPcm) -> Vec<u8>`, a new
+  `MessageEncoding` method with a default error), whose bytes are put on the key like any `pub` channel's,
   with the same latency limit and deadman rules. Only the Opus decode and the `on_track` handler are
-  new; negotiation, codecs and publishing are the existing paths.
+  new; negotiation, encodings and publishing are the existing paths.
 
 ### Video
 
 The client adds a recvonly video (or audio) transceiver and renegotiates over `control`
-(`{op: "renegotiate", codec, sdp}` → `{sdp, mid}`); the bridge adds a track of that codec's format
+(`{op: "renegotiate", channel, sdp}` → `{sdp, mid}`); the bridge adds a track of that channel's format
 (H.264 is constrained baseline, `profile-level-id=42e01f`; VP9 profile 0; Opus 48 kHz) that pairs
 with the new m-line, then the `sub` channel's label names that `mid` (the bridge refuses a track of
 another format). Renegotiations run one at a time. A closed subscription's transceiver (and the
-bridge's track) is reused by the next one of the same codec instead of renegotiating again.
+bridge's track) is reused by the next one of the same channel instead of renegotiating again.
 Each video frame also sends a 28-byte metadata frame on the `sub` channel (`msg.video`).
 Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden per subscription):
 - A stream asks the allocator for at most `maxBitrate` bits/s (default: `max_bits_per_pixel` × the source's pixels ×
@@ -344,7 +363,7 @@ Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden pe
   ~0.03 bit/pixel openh264 overshoots its target even at its coarsest quantizer, while above it a full-size picture
   beat every smaller one at the same bitrate on the bench scene (after upscaling).
 - Quality, for video, is the share of the most bits per frame: 0 is the smallest picture at the bit-per-pixel floor,
-  1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other codecs.
+  1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other encodings.
 - openh264 applies bitrate changes in place (no keyframe); a size change restarts it with one.
 Keyframes: the first frame each viewer gets, on PLI/FIR from the browser (`keyframeRequests`), and every 3 s.
 Send-side congestion control: TWCC feedback into GCC (webrtc-rs interceptors), whose target feeds the
@@ -405,9 +424,9 @@ Per frontend, every 250 ms:
    the video estimate (GCC's target): their bytes leave through
    the GCC-paced track, so data-channel capacity is no use to them (granting it made encoders
    outrun the pacer and queue); data streams are then allocated what remains.
-2. **Demand.** Each subscription wants `price(maxQuality) × Hz`, Hz being each key's measured source
+2. **Demand.** Each subscription wants `price(encodeOptions.quality) × Hz`, Hz being each key's measured source
    rate capped by `maxHz`, summed over its keys. Price = bytes per message: measured for raw streams
-   and data-channel codecs (per quality, scaled by the codec's `estimated_bytes` between measured
+   and data-channel encodings (per quality, scaled by the encoding's `estimated_bytes` between measured
    qualities, which is also the prior before anything was measured), from the video policy for video
    (`maxBitrate` / rate at quality 1, the floor picture at 0). Strict-priority and reliable streams can't drop messages: they are reserved at
    their measured rate and never shrunk.
@@ -574,18 +593,18 @@ resolving so the bridge has an offset before the first put.
 - Each subscribe/publisher is its own data channel. Its label is JSON: `{"type":"sub"|"pub", "key":..., "id":n, "opts":{...}}`.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.
 - One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
-  `codecs`, `renegotiate`, `setDeadman`, `clearDeadman`, `lease {group, keys?, maxSeconds?}`,
+  `encodings`, `renegotiate`, `setDeadman`, `clearDeadman`, `lease {group, keys?, maxSeconds?}`,
   `releaseLease {group}`, `expireLease {group}`) and events: `accepted` / `rejected` (per sub/pub
   channel, by label id), `tripped` and `leaseLost {group, reason}`.
 - Bridge → browser on a `pub` channel: `{"blocked": reason | null}` (JSON text), see "Leases".
 - Bridge → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk`,
   little endian. `seq` numbers messages per channel, `frameId` numbers frames; the page acks the highest
   `frameId` it has processed with a 4-byte `u32` message on the same channel. `flags` bit0: the
-  message (its chunks joined) is zstd-compressed.
+  message (its chunks joined) is zstd-compressed; bit1: it is a Fields message (the client decodes it).
 - All chunks of one message have the same size, at most 64 KiB (bulk streams use smaller ones, see
   "Bandwidth allocation").
 - Browser → bridge put: `f64 sentAtMs (browser clock) | payload`, little endian.
 - Heartbeat: browser sends `{"t0", "offsetMs", "rttMs"}` (JSON), bridge answers `{"t0", "t1", "t2"}`.
 - Video `sub` label: adds `"mid"`. Video metadata frame (little endian): `u8 version=1 | u8 flags
   (bit0 keyframe) | u16 0 | u32 width | u32 height | u32 sourceWidth | u32 sourceHeight | f32 quality |
-  u32 encodedBytes`. A fields codec's payload is "Fields", a data codec's its own format.
+  u32 encodedBytes`. A fields message is "Fields", any other data-channel encoding's its own format.

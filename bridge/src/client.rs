@@ -11,7 +11,7 @@
 //! # async fn run() -> anyhow::Result<()> {
 //! use zenoh_web::client::{Client, ClientOptions, Message, SubscribeOptions};
 //! let client = Client::connect("http://robot.local:7448", ClientOptions::default()).await?;
-//! let mut camera = client.subscribe("camera/front", SubscribeOptions { codec: Some("ros2-image".into()), max_quality: Some(1.0), ..Default::default() }).await?;
+//! let mut camera = client.subscribe("camera/front", SubscribeOptions { encoding: Some("ros2_image".into()), ..Default::default() }).await?;
 //! while let Some(message) = camera.recv().await {
 //!     if let Message::Video(frame) = message {
 //!         println!("{:?} access unit, {} bytes, keyframe {}", frame.format, frame.data.len(), frame.keyframe);
@@ -21,7 +21,7 @@
 //! # }
 //! ```
 
-use crate::codec::{Compress, VideoFormat};
+use crate::encoding::{Compress, VideoFormat};
 use crate::fields::{self, Field};
 use crate::{frame, media};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -119,21 +119,24 @@ pub struct SubscribeOptions {
     pub max_hz: Option<f64>,
     /// when bandwidth is short, higher keeps more (default 1; 0 gives up everything first)
     pub bandwidth_priority: Option<f64>,
-    /// 0..1, transcoded streams only
+    /// 0..1, encoded streams only
     pub min_quality: Option<f64>,
-    /// 0..1, transcoded streams only
-    pub max_quality: Option<f64>,
     /// 0 keeps quality and drops Hz, 1 keeps Hz and drops quality (default 0.5)
     pub quality_to_hz_tradeoff: Option<f64>,
-    /// a codec the bridge registered ([`Client::codecs`])
-    pub codec: Option<String>,
-    /// data-channel compression (default: the codec's); not for video codecs
+    /// a message encoding the bridge registered ([`Client::encodings`])
+    pub encoding: Option<String>,
+    /// `video-h264`, `video-vp8`, `video-vp9`, `video-av1`, `audio-opus` or `data` (default: where the encoding's
+    /// output goes)
+    pub channel: Option<String>,
+    /// passed to the encoding; `quality` there (0..1) is the most the allocator may pick
+    pub encode_options: Option<serde_json::Map<String, Value>>,
+    /// data-channel compression (default: the encoding's); not for video or audio
     pub compress: Option<Compress>,
-    /// video codecs: most bits/s the stream asks for (default: the server's)
+    /// video channels: most bits/s the stream asks for (default: the server's)
     pub max_bitrate: Option<f64>,
-    /// video codecs: smallest share of the source's width and height the picture may shrink to (default 0.25)
+    /// video channels: smallest share of the source's width and height the picture may shrink to (default 0.25)
     pub min_resolution_scale: Option<f64>,
-    /// video codecs: (width, height) box the picture is fitted into
+    /// video channels: (width, height) box the picture is fitted into
     pub max_resolution: Option<(u32, u32)>,
 }
 
@@ -155,7 +158,7 @@ pub struct PublisherOptions {
 /// One thing a subscription received.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// A raw sample, or a data or fields codec's output.
+    /// A raw sample, or a data-channel encoding's output.
     Data(DataMessage),
     /// A video codec's access unit, from the subscription's RTP track.
     Video(VideoFrame),
@@ -171,13 +174,13 @@ pub enum Message {
 pub struct DataMessage {
     /// the sample's key
     pub key: String,
-    /// the payload: raw sample bytes, or the codec's output
+    /// the payload: raw sample bytes, or the encoding's output
     pub bytes: Vec<u8>,
     /// when the bridge received the sample (unix ms, bridge clock)
     pub timestamp_ms: f64,
     /// numbers messages per subscription (gaps are drops)
     pub seq: u32,
-    /// fields codecs: the parsed fields (see [`crate::fields`])
+    /// fields output: the parsed fields (see [`crate::fields`])
     pub fields: Option<BTreeMap<String, Field>>,
 }
 
@@ -230,12 +233,12 @@ pub struct AudioPacket {
     pub rtp_timestamp: u32,
 }
 
-/// A codec the bridge registered.
+/// A message encoding the bridge registered.
 #[derive(Debug, Clone, Deserialize)]
-pub struct CodecInfo {
-    /// what `codec` names
+pub struct EncodingInfo {
+    /// what `encoding` names
     pub name: String,
-    /// `"video"`, `"audio"`, `"fields"` or `"data"`
+    /// on its default channel: `"video"`, `"audio"`, `"fields"` or `"data"`
     pub output: String,
 }
 
@@ -343,7 +346,7 @@ struct Endpoint {
     publisher: Option<Arc<PubState>>,
 }
 
-/// A recvonly transceiver and the bridge track bound to it; reused by later subscriptions of its codec.
+/// A recvonly transceiver and the bridge track bound to it; reused by later subscriptions of its channel.
 struct MediaSlot {
     mid: String,
     codec: String,
@@ -511,7 +514,7 @@ struct Inner {
     control: Arc<dyn DataChannel>,
     shared: Arc<Shared>,
     options: ClientOptions,
-    codecs: Vec<CodecInfo>,
+    encodings: Vec<EncodingInfo>,
     next_id: AtomicU64,
     negotiation: tokio::sync::Mutex<()>,
     free_slots: Mutex<Vec<Arc<MediaSlot>>>,
@@ -549,7 +552,7 @@ impl Inner {
         Ok(())
     }
 
-    /// A recvonly transceiver bound to a bridge track of `codec`'s format: a free one, or a new one
+    /// A recvonly transceiver bound to a bridge track of `codec` (a channel name): a free one, or a new one
     /// renegotiated over `control` (SPEC "Video").
     async fn media_slot(&self, codec: &str, kind: RtpCodecKind, reuse: bool) -> Result<Arc<MediaSlot>> {
         let free = reuse.then(|| {
@@ -565,7 +568,7 @@ impl Inner {
         let offer = self.connection.create_offer(None).await?;
         self.connection.set_local_description(offer).await?;
         let offer = self.connection.local_description().await.context("no local description")?;
-        let reply = self.request(json!({"op": "renegotiate", "codec": codec, "sdp": offer}), OPEN_TIMEOUT).await?;
+        let reply = self.request(json!({"op": "renegotiate", "channel": codec, "sdp": offer}), OPEN_TIMEOUT).await?;
         self.connection.set_remote_description(serde_json::from_value(reply["sdp"].clone())?).await?;
         let mid = transceiver.mid().await?.context("the transceiver has no mid")?;
         ensure!(reply["mid"] == mid.as_str(), "bridge bound mid {}, expected {mid}", reply["mid"]);
@@ -636,7 +639,7 @@ pub struct Client {
 
 impl Client {
     /// Signals like the browser (non-trickle `POST <url>/offer`), opens `control` (and the heartbeat
-    /// channel), fetches the codecs and takes a few clock samples before returning.
+    /// channel), fetches the encodings and takes a few clock samples before returning.
     pub async fn connect(url: &str, options: ClientOptions) -> Result<Client> {
         let signalling = Signalling::Http { url: url.trim_end_matches('/').to_owned(), http: reqwest::Client::new() };
         Self::connect_with(signalling, options).await
@@ -691,13 +694,13 @@ impl Client {
                 control,
                 shared: shared.clone(),
                 options: options.clone(),
-                codecs: Vec::new(),
+                encodings: Vec::new(),
                 next_id: AtomicU64::new(1),
                 negotiation: tokio::sync::Mutex::new(()),
                 free_slots: Mutex::default(),
                 heartbeat_paused,
             };
-            inner.codecs = serde_json::from_value(inner.request(json!({"op": "codecs"}), PING_TIMEOUT).await?["codecs"].take())?;
+            inner.encodings = serde_json::from_value(inner.request(json!({"op": "encodings"}), PING_TIMEOUT).await?["encodings"].take())?;
             // the bridge needs a clock offset before the first put
             for _ in 0..INITIAL_CLOCK_PINGS {
                 inner.ping().await?;
@@ -716,9 +719,9 @@ impl Client {
         Ok(Client { inner })
     }
 
-    /// The codecs the bridge runs.
-    pub fn codecs(&self) -> &[CodecInfo] {
-        &self.inner.codecs
+    /// The message encodings the bridge runs.
+    pub fn encodings(&self) -> &[EncodingInfo] {
+        &self.inner.encodings
     }
 
     /// The connection's state now.
@@ -775,20 +778,28 @@ impl Client {
     }
 
     /// Subscribes to `key`, returning once the bridge accepted the channel (or with its reason for
-    /// refusing). Video and audio codecs first renegotiate a track (or reuse a closed subscription's).
+    /// refusing). Video and audio channels first renegotiate a track (or reuse a closed subscription's).
     pub async fn subscribe(&self, key: &str, options: SubscribeOptions) -> Result<Subscription> {
         let inner = &self.inner;
-        let kind = options.codec.as_ref().map(|codec| inner.codecs.iter().find(|info| &info.name == codec).map_or("data", |info| info.output.as_str()).to_owned());
-        let media_kind = match kind.as_deref() {
-            Some("video") => Some(RtpCodecKind::Video),
-            Some("audio") => Some(RtpCodecKind::Audio),
-            _ => None,
+        let output = options.encoding.as_ref().map(|name| inner.encodings.iter().find(|info| &info.name == name).map_or("data", |info| info.output.as_str()));
+        let channel = options.channel.clone().unwrap_or_else(|| match output {
+            Some("video") => "video-h264".to_owned(),
+            Some("audio") => "audio-opus".to_owned(),
+            _ => "data".to_owned(),
+        });
+        let media_kind = if channel.starts_with("video-") {
+            Some(RtpCodecKind::Video)
+        } else if channel.starts_with("audio-") {
+            Some(RtpCodecKind::Audio)
+        } else {
+            None
         };
+        let kind = media_kind.map(|kind| if kind == RtpCodecKind::Video { "video" } else { "audio" }.to_owned());
         // a reused track can still be held by the bridge for a moment after its last subscription closed
         for reuse in [true, false] {
-            let slot = match (media_kind, &options.codec) {
-                (Some(media_kind), Some(codec)) => Some(inner.media_slot(codec, media_kind, reuse).await?),
-                _ => None,
+            let slot = match media_kind {
+                Some(media_kind) => Some(inner.media_slot(&channel, media_kind, reuse).await?),
+                None => None,
             };
             match self.subscribe_on(key, &options, kind.clone(), slot).await {
                 Err(error) if reuse && media_kind.is_some() && error.to_string().contains("in use") => continue,
@@ -1021,7 +1032,7 @@ struct Partial {
 
 /// Turns one subscription's frames (and track packets) into messages, and acks consumption.
 struct SubscriptionTask {
-    /// the codec's output kind, None without a codec
+    /// `video` or `audio` on a media channel, None on the data channel
     kind: Option<String>,
     slot: Option<Arc<MediaSlot>>,
     messages: mpsc::Sender<Message>,
@@ -1149,7 +1160,7 @@ fn reassemble(partials: &mut BTreeMap<u32, Partial>, header: &frame::FrameHeader
     Some((partial.key, partial.timestamp_ms, partial.flags, partial.chunks.into_iter().flatten().flatten().collect()))
 }
 
-/// A whole data-channel message as what the subscription's codec kind makes of it.
+/// A whole data-channel message as what the subscription's channel makes of it (fields when the frame says so).
 fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flags: u8, bytes: Vec<u8>) -> Result<Option<Message>> {
     let bytes = if flags & frame::ZSTD != 0 { zstd::decode_all(&bytes[..])? } else { bytes };
     Ok(match kind {
@@ -1171,7 +1182,7 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
         }
         // one empty frame per sample, for a browser callback
         Some("audio") => None,
-        Some("fields") => Some(Message::Data(DataMessage { fields: Some(fields::parse(&bytes)?), key, bytes, timestamp_ms, seq })),
+        _ if flags & frame::FIELDS != 0 => Some(Message::Data(DataMessage { fields: Some(fields::parse(&bytes)?), key, bytes, timestamp_ms, seq })),
         _ => Some(Message::Data(DataMessage { key, bytes, timestamp_ms, seq, fields: None })),
     })
 }

@@ -2,13 +2,16 @@
 //! `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk bytes`.
 //! `seq` numbers messages per channel; a message larger than one chunk is split across frames
 //! that share its `seq` (chunk size is per message, at most `CHUNK_BYTES`). `frameId` numbers frames per channel; the page acks frameIds.
-//! `flags` bit0 ([`ZSTD`]): the whole message (all its chunks joined) is zstd-compressed.
+//! `flags` bit0 ([`ZSTD`]): the whole message (all its chunks joined) is zstd-compressed; bit1 ([`FIELDS`]): it is a
+//! zenoh-web fields message, which the client decodes into `msg.decoded`.
 
 use bytes::{BufMut, BytesMut};
 
 pub const HEADER_FIXED_LEN: usize = 2 + 8 + 4 + 4 + 4 + 4 + 1;
 /// `flags` bit: the message is zstd-compressed.
 pub const ZSTD: u8 = 1;
+/// `flags` bit: the message is zenoh-web fields.
+pub const FIELDS: u8 = 2;
 /// Payload bytes per frame; well under the 256 KiB SCTP message limit, small enough to interleave.
 pub const CHUNK_BYTES: usize = 64 * 1024;
 

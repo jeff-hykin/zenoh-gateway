@@ -5,7 +5,7 @@
 //! deadmen. The browser side is `client/zenoh_web.ts` in the repository.
 //!
 //! This crate is the library for embedding the server in an application; the `zenoh-web` command
-//! (with a set of robotics codecs) is [zenoh-web-cli](https://github.com/jeff-hykin/zenoh-web-cli):
+//! (with a set of robotics encodings) is [zenoh-web-cli](https://github.com/jeff-hykin/zenoh-web-cli):
 //!
 //! ```no_run
 //! # async fn run() -> anyhow::Result<()> {
@@ -25,16 +25,17 @@
 //! A host that already has a zenoh session passes it with [`ServerBuilder::session`]; one that
 //! already runs an axum server mounts [`Server::router`].
 //!
-//! # Codecs
+//! # Encodings and channels
 //!
-//! A subscription may pick a transcoder by name (`codec: "<name>"`). The server has none built in:
-//! implement [`Codec`] and pass it to [`ServerBuilder::codec`] (e.g. the robotics ones of
-//! [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)). A codec either produces [`VideoImage`]s, which the bridge turns
-//! into H.264 on a video track (no browser code needed), or bytes for the data channel: a
-//! [`Fields`] message the client decodes by itself, or the codec's own format, which the page
-//! decodes with a decoder registered through the client's `registerCodec(name, decoder)`. Data
-//! channel messages can be zstd-compressed per subscription (`compress: "zstd"`, or the codec's
-//! [`Codec::default_compress`]).
+//! A subscription may pick a message encoding by name (`encoding: "<name>"`), the [`Channel`] its output travels on
+//! (`channel`) and options for it (`encodeOptions`). The server has none built in: implement [`MessageEncoding`] and pass
+//! it to [`ServerBuilder::encoding`] (e.g. the robotics ones of
+//! [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)). An encoding produces [`VideoImage`]s, which
+//! the bridge encodes (H.264 or AV1 built in, others through [`ServerBuilder::video_encoder`]) on a video track (no
+//! browser code needed), PCM for an Opus track, or bytes for the data channel: a [`Fields`] message the client decodes
+//! by itself, or its own format, which the page decodes with a decoder registered through the client's
+//! `registerEncoding(name, decoder)`. Data channel messages can be zstd-compressed per subscription
+//! (`compress: "zstd"`, or the encoding's [`MessageEncoding::default_compress`]).
 
 #![warn(missing_docs)]
 
@@ -43,7 +44,7 @@ mod audio;
 mod auth;
 #[cfg(feature = "client")]
 pub mod client;
-mod codec;
+mod encoding;
 pub mod fields;
 mod frame;
 mod ice;
@@ -55,7 +56,7 @@ mod publisher;
 mod server;
 mod subscription;
 
-pub use codec::{AudioPcm, Codec, CodecOutput, CodecSample, Compress, DecodedFrame, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
+pub use encoding::{AudioPcm, Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
 pub use auth::Grant;
 pub use fields::Fields;
 pub use ice::{ICE_HOOK_TIMEOUT, IceRequest, IceServer, IceServersFn, IceSide, turn_credentials};

@@ -22,39 +22,54 @@ export type ConnectionState = "connecting" | "connected" | "degraded" | "lost"
 export type PublisherState = "connecting" | "open" | "tripped" | "rejected" | "closed"
 export type SubscriptionState = "connecting" | "open" | "rejected" | "closed"
 
-/** Where a codec's output goes: a video or audio track, or bytes on the data channel (`fields`: decoded by this client). */
-export type CodecKind = "video" | "audio" | "data" | "fields"
+/** What a message encoding produces on its default channel: pictures (`video`), sound (`audio`), or bytes on the data channel (`fields`: decoded by this client). */
+export type EncodingOutput = "video" | "audio" | "data" | "fields"
 
-/** A codec the bridge has registered. */
-export interface CodecInfo {
+/** What a subscription's messages travel on: a video track of one format, the Opus audio track, or the data channel. */
+export type Channel = "video-h264" | "video-vp8" | "video-vp9" | "video-av1" | "audio-opus" | "data"
+
+/** A message encoding the bridge has registered. */
+export interface EncodingInfo {
     name: string
-    output: CodecKind
+    output: EncodingOutput
 }
 
-/** Turns a data codec's bytes into what `msg.decoded` carries. */
-export type CodecDecoder = (bytes: Uint8Array, message: Message) => unknown
+/** Turns a data-channel encoding's bytes into what `msg.decoded` carries. */
+export type EncodingDecoder = (bytes: Uint8Array, message: Message) => unknown
 
-const codecDecoders = new Map<string, CodecDecoder>()
+const encodingDecoders = new Map<string, EncodingDecoder>()
 
 /**
- * Registers the browser decoder for a data codec the bridge runs (a Rust codec the host
- * application added with `ServerBuilder::codec`). Messages of subscriptions using that codec get
- * `msg.decoded = decoder(msg.bytes, msg)`. Video codecs need no decoder. Registering a different
- * decoder under a name that already has one throws.
+ * Registers the browser decoder for a data-channel encoding the bridge runs (a Rust encoding the host application
+ * added with `ServerBuilder::encoding`). Messages of subscriptions using that encoding on the data channel get
+ * `msg.decoded = decoder(msg.bytes, msg)` (fields messages decode by themselves). Video and audio need no decoder.
+ * Registering a different decoder under a name that already has one throws.
  */
-export function registerCodec(name: string, decoder: CodecDecoder): void {
+export function registerEncoding(name: string, decoder: EncodingDecoder): void {
     if (typeof name !== "string" || name.length === 0) {
-        throw new TypeError(`zenoh-web: registerCodec needs a codec name, got ${String(name)}`)
+        throw new TypeError(`zenoh-web: registerEncoding needs an encoding name, got ${String(name)}`)
     }
     if (typeof decoder !== "function") {
-        throw new TypeError(`zenoh-web: registerCodec("${name}") needs a decoder function`)
+        throw new TypeError(`zenoh-web: registerEncoding("${name}") needs a decoder function`)
     }
-    const existing = codecDecoders.get(name)
+    const existing = encodingDecoders.get(name)
     if (existing !== undefined && existing !== decoder) {
-        throw new Error(`zenoh-web: a decoder for codec "${name}" is already registered`)
+        throw new Error(`zenoh-web: a decoder for encoding "${name}" is already registered`)
     }
-    codecDecoders.set(name, decoder)
+    encodingDecoders.set(name, decoder)
 }
+
+/** The channel a subscription uses: its own, else where the encoding's output goes by default. */
+function channelOf(options: SubscribeOptions, encodings: readonly EncodingInfo[]): Channel {
+    if (options.channel !== undefined) {
+        return options.channel
+    }
+    const output = options.encoding === undefined ? undefined : encodings.find((info) => info.name === options.encoding)?.output
+    return output === "video" ? "video-h264" : output === "audio" ? "audio-opus" : "data"
+}
+
+/** The RTP mime type a media channel carries. */
+const channelMimes: Record<Exclude<Channel, "data">, string> = { "video-h264": "video/H264", "video-vp8": "video/VP8", "video-vp9": "video/VP9", "video-av1": "video/AV1", "audio-opus": "audio/opus" }
 
 /** Per-frame details of a video subscription; the pixels are on `mediaStream`. */
 export interface VideoFrameInfo {
@@ -69,11 +84,11 @@ export interface VideoFrameInfo {
 
 export interface Message {
     key: string
-    /** the payload (decompressed): raw sample bytes, or the codec's output */
+    /** the payload (decompressed): raw sample bytes, or the encoding's output */
     bytes: Uint8Array
     timestamp: number
     seq: number
-    /** fields codecs: the decoded fields (see `decodeFields`); data codecs: what the codec's registered decoder returned (see `registerCodec`) */
+    /** fields messages: the decoded fields (see `decodeFields`); other data-channel encodings: what the encoding's registered decoder returned (see `registerEncoding`) */
     decoded?: unknown
     video?: VideoFrameInfo
     mediaStream?: MediaStream
@@ -87,17 +102,20 @@ export interface SubscribeOptions {
     maxAge?: number
     maxHz?: number
     minQuality?: number
-    maxQuality?: number
     qualityToHzTradeoff?: number
-    /** a name the bridge registered (`ZenohWeb.codecs`) */
-    codec?: string
-    /** data-channel compression (default: the codec's, none without one); not for video codecs */
+    /** a message encoding the bridge registered (`ZenohWeb.encodings`); none = raw bytes */
+    encoding?: string
+    /** what the messages travel on (default: where the encoding's output goes: pictures on video-h264, sound on audio-opus, else data) */
+    channel?: Channel
+    /** passed to the encoding; `quality` (0..1, default 1) is the most the bandwidth allocator may pick */
+    encodeOptions?: { quality?: number, [option: string]: unknown }
+    /** data-channel compression (default: the encoding's, none without one); not for video or audio */
     compress?: "zstd" | "none"
-    /** video codecs: most bits/s the stream asks for (default: the server's) */
+    /** video channels: most bits/s the stream asks for (default: the server's) */
     maxBitrate?: number
-    /** video codecs: smallest share of the source's width and height the picture may shrink to (default 0.25) */
+    /** video channels: smallest share of the source's width and height the picture may shrink to (default 0.25) */
     minResolutionScale?: number
-    /** video codecs: [width, height] box the picture is fitted into */
+    /** video channels: [width, height] box the picture is fitted into */
     maxResolution?: [number, number]
 }
 
@@ -260,6 +278,8 @@ export interface Frame {
 }
 
 const zstdFlag = 1
+/** frame flag: the message is zenoh-web fields */
+const fieldsFlag = 2
 
 /**
  * Bridge frame (little endian):
@@ -491,12 +511,12 @@ export class Subscription extends Endpoint {
     received = 0
     /** chunked messages dropped incomplete (lost chunk or abandoned for a newer message) */
     partialDropped = 0
-    /** codec payloads that failed to decode in this page */
+    /** encoded payloads that failed to decode in this page */
     decodeErrors = 0
-    /** video and audio codecs: the track (also on each message as `mediaStream`) */
+    /** video and audio channels: the track (also on each message as `mediaStream`) */
     mediaStream: MediaStream | null = null
-    /** where the codec's output arrives (null: no codec, raw bytes) */
-    readonly codecKind: CodecKind | null
+    /** what the messages travel on */
+    readonly channelName: Channel
     #warnedNoDecoder = false
     #transceiver: RTCRtpTransceiver | null = null
     /** drops before the current channel (each new channel restarts seq at 0) */
@@ -511,7 +531,7 @@ export class Subscription extends Endpoint {
 
     constructor(owner: ZenohWeb, id: number, key: string, readonly options: SubscribeOptions, readonly callback: (message: Message) => void) {
         super(owner, id, key)
-        this.codecKind = options.codec === undefined ? null : owner.codecs.find((info) => info.name === options.codec)?.output ?? "data"
+        this.channelName = channelOf(options, owner.encodings)
     }
 
     get state(): SubscriptionState {
@@ -539,22 +559,29 @@ export class Subscription extends Endpoint {
         this.#bytesSinceAck = 0
         this.#partials.clear()
         const acceptance = this.beginAttempt()
-        if (this.codecKind !== "video" && this.codecKind !== "audio") {
+        const channelName = this.channelName
+        if (channelName === "data") {
             this.#openChannel(peer, acceptance, null)
             return
         }
-        // a recvonly transceiver (renegotiated with the bridge for this codec's format) carries the frames
+        // a recvonly transceiver (renegotiated with the bridge for this channel's format) carries the frames
         this.#transceiver = null
-        const codec = String(this.options.codec)
-        this.owner._acquireTransceiver(peer, this.codecKind, codec).then((transceiver) => {
+        const kind = channelName === "audio-opus" ? "audio" : "video"
+        const mime = channelMimes[channelName]
+        const playable = globalThis.RTCRtpReceiver?.getCapabilities?.(kind)?.codecs.some((codec) => codec.mimeType.toLowerCase() === mime.toLowerCase()) ?? true
+        if (!playable) {
+            acceptance.reject(new Error(`zenoh-web: this browser can't play ${channelName} (no ${mime} decoder); pick another channel`))
+            return
+        }
+        this.owner._acquireTransceiver(peer, kind, channelName).then((transceiver) => {
             if (this.closed || acceptance !== this.acceptance) {
-                this.owner._releaseTransceiver(peer, codec, transceiver)
+                this.owner._releaseTransceiver(peer, channelName, transceiver)
                 return
             }
             this.#transceiver = transceiver
             this.mediaStream = new MediaStream([transceiver.receiver.track])
             this.#openChannel(peer, acceptance, transceiver.mid)
-        }, (error: Error) => acceptance.reject(new Error(`zenoh-web: ${this.codecKind} renegotiation for ${this.key} failed: ${error.message}`)))
+        }, (error: Error) => acceptance.reject(new Error(`zenoh-web: ${channelName} renegotiation for ${this.key} failed: ${error.message}`)))
     }
 
     #openChannel(peer: RTCPeerConnection, acceptance: Acceptance, mid: string | null): void {
@@ -577,7 +604,7 @@ export class Subscription extends Endpoint {
         super.close()
         const peer = this.owner._peer
         if (this.#transceiver && peer) {
-            this.owner._releaseTransceiver(peer, String(this.options.codec), this.#transceiver)
+            this.owner._releaseTransceiver(peer, this.channelName, this.#transceiver)
         }
         this.#transceiver = null
     }
@@ -633,26 +660,30 @@ export class Subscription extends Endpoint {
         }
     }
 
-    /** Adds the codec's decoded form; false if it can't be decoded. */
-    #decode(message: Message): boolean {
+    /** Adds the encoding's decoded form; false if it can't be decoded. */
+    #decode(message: Message, flags: number): boolean {
         try {
-            if (this.codecKind === "video" || this.codecKind === "audio") {
-                message.video = this.codecKind === "video" ? decodeVideoFrameInfo(message.bytes) : undefined
+            if (this.channelName !== "data") {
+                message.video = this.channelName.startsWith("video-") ? decodeVideoFrameInfo(message.bytes) : undefined
                 message.mediaStream = this.mediaStream ?? undefined
                 return true
             }
-            const name = String(this.options.codec)
-            const decoder = codecDecoders.get(name) ?? (this.codecKind === "fields" ? decodeFields : undefined)
+            if ((flags & fieldsFlag) !== 0) {
+                message.decoded = decodeFields(message.bytes)
+                return true
+            }
+            const name = String(this.options.encoding)
+            const decoder = encodingDecoders.get(name)
             if (decoder !== undefined) {
                 message.decoded = decoder(message.bytes, message)
             } else if (!this.#warnedNoDecoder) {
                 this.#warnedNoDecoder = true
-                console.warn(`zenoh-web: no decoder registered for codec "${name}" (registerCodec("${name}", decoder)); msg.bytes carries its encoded bytes`)
+                console.info(`zenoh-web: no decoder registered for encoding "${name}" (registerEncoding("${name}", decoder)); msg.bytes carries its bytes`)
             }
             return true
         } catch (error) {
             this.decodeErrors++
-            console.error(`zenoh-web: ${this.options.codec} payload on ${message.key} did not decode`, error)
+            console.error(`zenoh-web: ${this.options.encoding} payload on ${message.key} did not decode`, error)
             return false
         }
     }
@@ -667,7 +698,7 @@ export class Subscription extends Endpoint {
                 return
             }
         }
-        if (this.codecKind !== null && !this.#decode(message)) {
+        if (this.options.encoding !== undefined && !this.#decode(message, flags)) {
             return
         }
         this.received++
@@ -928,8 +959,8 @@ export class ZenohWeb {
     clockOffsetMs: number | null = null
     /** bridge-side heartbeat, clock and bandwidth stats */
     bridgeStats: BridgeStats | null = null
-    /** the codecs the bridge runs, fetched on connect */
-    codecs: readonly CodecInfo[] = []
+    /** the message encodings the bridge runs, fetched on connect */
+    encodings: readonly EncodingInfo[] = []
     /** the ICE servers in use (the bridge's unless given) */
     iceServers: RTCIceServer[] = []
     /** leases held, by group */
@@ -959,7 +990,7 @@ export class ZenohWeb {
     #connected: Promise<void> = new Promise(() => {})
     #markConnected: () => void = () => {}
     /** video transceivers of closed subscriptions, reused before adding new ones */
-    /** per codec: transceivers whose track carries its format, free for the next subscription */
+    /** per channel: transceivers whose track carries its format, free for the next subscription */
     #freeTransceivers = new Map<RTCPeerConnection, Map<string, RTCRtpTransceiver[]>>()
 
     constructor(url: string, options: ConnectOptions = {}) {
@@ -1018,11 +1049,11 @@ export class ZenohWeb {
     }
 
     /**
-     * A recvonly transceiver bound to a bridge track of `codec`'s format: a free one, or a new one
+     * A recvonly transceiver bound to a bridge track of `channel`'s format: a free one, or a new one
      * added through a renegotiation over `control` (the bridge answers with a track for the new m-line).
      */
-    _acquireTransceiver(peer: RTCPeerConnection, kind: "video" | "audio", codec: string): Promise<RTCRtpTransceiver> {
-        const free = this.#freeTransceivers.get(peer)?.get(codec)?.pop()
+    _acquireTransceiver(peer: RTCPeerConnection, kind: "video" | "audio", channel: Channel): Promise<RTCRtpTransceiver> {
+        const free = this.#freeTransceivers.get(peer)?.get(channel)?.pop()
         if (free) {
             return Promise.resolve(free)
         }
@@ -1041,7 +1072,7 @@ export class ZenohWeb {
             }
             await peer.setLocalDescription(await peer.createOffer())
             const offer = peer.localDescription
-            const response = await this._request({ op: "renegotiate", codec, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
+            const response = await this._request({ op: "renegotiate", channel, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
             await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
             if (response.mid !== transceiver.mid) {
                 throw new Error(`bridge bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
@@ -1053,10 +1084,10 @@ export class ZenohWeb {
         return result
     }
 
-    _releaseTransceiver(peer: RTCPeerConnection, codec: string, transceiver: RTCRtpTransceiver): void {
+    _releaseTransceiver(peer: RTCPeerConnection, channel: Channel, transceiver: RTCRtpTransceiver): void {
         if (peer === this.#peer && peer.connectionState !== "closed") {
             const byCodec = this.#freeTransceivers.get(peer) ?? new Map<string, RTCRtpTransceiver[]>()
-            byCodec.set(codec, [...byCodec.get(codec) ?? [], transceiver])
+            byCodec.set(channel, [...byCodec.get(channel) ?? [], transceiver])
             this.#freeTransceivers.set(peer, byCodec)
         }
     }
@@ -1122,7 +1153,7 @@ export class ZenohWeb {
             }
             await peer.setRemoteDescription(await response.json())
             await waitOpen(control, openTimeoutMs)
-            this.codecs = Object.freeze((await this._request({ op: "codecs" }, pingTimeoutMs)).codecs as CodecInfo[])
+            this.encodings = Object.freeze((await this._request({ op: "encodings" }, pingTimeoutMs)).encodings as EncodingInfo[])
             // a few quick samples so the bridge knows the clock offset before the first put
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()

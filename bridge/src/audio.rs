@@ -1,7 +1,7 @@
-//! Audio subscriptions: PCM decoded by an audio codec, Opus-encoded in 20 ms packets and written
+//! Audio subscriptions: PCM decoded by an audio encoding, Opus-encoded in 20 ms packets and written
 //! to a WebRTC audio track (`media` negotiates it). The browser's jitter buffer smooths arrival.
 
-use crate::codec::{AudioPcm, DecodedFrame};
+use crate::encoding::{AudioPcm, DecodedFrame};
 use crate::media::{MediaTrack, start_decode};
 use crate::subscription::{self, SubShared};
 use anyhow::{Result, ensure};
@@ -72,21 +72,21 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         let decoded = match decoding.task.await {
             Ok((Ok((decoded, _)), _, _)) => decoded,
             Ok((Err(error), _, _)) => {
-                shared.record_codec_error(&error);
+                shared.record_encoding_error(&error);
                 continue;
             }
             Err(error) => {
-                shared.record_codec_error(&format!("decoder task failed: {error}"));
+                shared.record_encoding_error(&format!("decoder task failed: {error}"));
                 continue;
             }
         };
         let DecodedFrame::Audio(pcm) = &*decoded else {
-            shared.record_codec_error(&format!("audio codec {:?} decoded to {:?}, not PCM", codec.name(), decoded));
+            shared.record_encoding_error(&format!("audio codec {:?} decoded to {:?}, not PCM", codec.name(), decoded));
             continue;
         };
         match send_pcm(&mut opus, &mut pending, pcm, &track).await {
             Ok(bytes) => shared.record_media_bytes(bytes),
-            Err(error) => shared.record_codec_error(&format!("{error:#}")),
+            Err(error) => shared.record_encoding_error(&format!("{error:#}")),
         }
         if subscription::send_small_frame(&dc, &decoding.key, decoding.item.timestamp_ms, decoding.item.seq, frame_id, &[]).await.is_err() && shared.is_closed() {
             break;

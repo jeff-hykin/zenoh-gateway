@@ -1,5 +1,5 @@
-//! The fields format: named numbers, arrays and text that a [`CodecOutput::Fields`](crate::CodecOutput::Fields)
-//! codec builds with [`Fields`] and the browser client decodes into a plain object (`msg.decoded`).
+//! The fields format: named numbers, arrays and text that a [`EncodingOutput::Fields`](crate::EncodingOutput::Fields)
+//! encoding builds with [`Fields`] and the browser client decodes into a plain object (`msg.decoded`).
 //!
 //! Little endian: `u8 version=1 | u8 fieldCount | per field: u8 nameLen | name utf8 | u8 dtype |
 //! u8 components (1..4) | u8 flags (bit0 scaled, bit1 scalar) | u32 count | [scaled: f64 offset[components] |

@@ -8,21 +8,21 @@ use openh264::formats::YUVSource;
 use std::time::Duration;
 use tokio::time::timeout;
 use zenoh_web::client::{Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions, VideoFrame};
-use zenoh_web::{Codec, CodecOutput, CodecSample, Compress, DecodedFrame, Fields, RunningServer, Server, VideoImage, zenoh};
+use zenoh_web::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, RunningServer, Server, VideoImage, zenoh};
 
 /// `[r, g, b, width u16, height u16]` → a solid picture.
 struct SolidColor;
 
-impl Codec for SolidColor {
+impl MessageEncoding for SolidColor {
     fn name(&self) -> &str {
         "test-solid"
     }
 
-    fn output(&self) -> CodecOutput {
-        CodecOutput::Video
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Video
     }
 
-    fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame> {
+    fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         let p = sample.payload;
         let (width, height) = (u16::from_le_bytes([p[3], p[4]]) as u32, u16::from_le_bytes([p[5], p[6]]) as u32);
         Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, p[..3].repeat((width * height) as usize))?))
@@ -32,20 +32,20 @@ impl Codec for SolidColor {
 /// bytes → `{count, data, name}`
 struct ByteFields;
 
-impl Codec for ByteFields {
+impl MessageEncoding for ByteFields {
     fn name(&self) -> &str {
         "test-fields"
     }
 
-    fn output(&self) -> CodecOutput {
-        CodecOutput::Fields
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Fields
     }
 
-    fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame> {
+    fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         Ok(DecodedFrame::data(sample.payload.to_vec()))
     }
 
-    fn encode(&self, frame: &DecodedFrame, _quality: f64) -> Result<Vec<u8>> {
+    fn encode(&self, frame: &DecodedFrame, _options: &EncodeOptions) -> Result<Vec<u8>> {
         let bytes = frame.downcast::<Vec<u8>>()?;
         Ok(Fields::new().scalar("count", bytes.len() as u32).array("data", bytes).text("name", "bytes").build())
     }
@@ -60,7 +60,7 @@ fn isolated_config() -> zenoh::Config {
 
 async fn start() -> (RunningServer, zenoh::Session, String) {
     let session = zenoh::open(isolated_config()).await.unwrap();
-    let server = Server::builder().session(session.clone()).codec(SolidColor).codec(ByteFields).build().await.unwrap();
+    let server = Server::builder().session(session.clone()).encoding(SolidColor).encoding(ByteFields).build().await.unwrap();
     let running = server.bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", running.local_addr());
     (running, session, url)
@@ -94,7 +94,7 @@ async fn list_topics_and_get() {
         tokio::spawn(async move { query.reply("answers/42", "forty-two").await.unwrap() });
     }).await.unwrap();
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
-    assert!(client.codecs().iter().any(|codec| codec.name == "test-solid" && codec.output == "video"));
+    assert!(client.encodings().iter().any(|encoding| encoding.name == "test-solid" && encoding.output == "video"));
     let topics = client.list_topics("listed/**", Some(0)).await.unwrap();
     assert_eq!(topics.len(), 1, "{topics:?}");
     assert_eq!((topics[0].key.as_str(), topics[0].sources.as_slice()), ("listed/robot/camera", &["token".to_owned()][..]));
@@ -128,7 +128,7 @@ async fn raw_subscribe_is_byte_exact_with_zstd() {
 async fn fields_subscribe_is_parsed() {
     let (running, session, url) = start().await;
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
-    let mut subscription = client.subscribe("fields/x", SubscribeOptions { codec: Some("test-fields".into()), ..Default::default() }).await.unwrap();
+    let mut subscription = client.subscribe("fields/x", SubscribeOptions { encoding: Some("test-fields".into()), ..Default::default() }).await.unwrap();
     let _putter = keep_putting(&session, "fields/x", vec![3, 1, 4]);
     let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
     let fields = message.fields.expect("fields");
@@ -174,7 +174,7 @@ fn assert_color(mean: [f64; 3], expected: [u8; 3]) {
 async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
     let (running, session, url) = start().await;
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
-    let options = SubscribeOptions { codec: Some("test-solid".into()), min_quality: Some(1.0), max_quality: Some(1.0), ..Default::default() };
+    let options = SubscribeOptions { encoding: Some("test-solid".into()), min_quality: Some(1.0), ..Default::default() };
     let mut camera = client.subscribe("camera/front", options).await.unwrap();
     let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
     let mut frames = vec![next_video(&mut camera).await];
@@ -196,7 +196,7 @@ async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
     assert!(stats["channels"][0]["stats"]["keyframeRequests"].as_u64().unwrap() >= 1, "{}", stats["channels"][0]["stats"]);
     // a second video subscription after closing the first reuses its track
     drop(camera);
-    let options = SubscribeOptions { codec: Some("test-solid".into()), min_quality: Some(1.0), max_resolution: Some((160, 120)), ..Default::default() };
+    let options = SubscribeOptions { encoding: Some("test-solid".into()), min_quality: Some(1.0), max_resolution: Some((160, 120)), ..Default::default() };
     let mut again = client.subscribe("camera/front", options).await.unwrap();
     let first = next_video(&mut again).await;
     assert!(first.keyframe);
@@ -243,7 +243,7 @@ async fn relay_sketch_reserves_a_camera() {
     let _putter = keep_putting(&session, "camera/rear", solid([30, 160, 220], 160, 120));
     let relay = relay_sketch::relay(&url, "camera/rear", "test-solid", "127.0.0.1:0").await.unwrap();
     let viewer = Client::connect(&format!("http://{}", relay.local_addr()), ClientOptions::default()).await.unwrap();
-    let options = SubscribeOptions { codec: Some("relay-rgb".into()), min_quality: Some(1.0), max_quality: Some(1.0), ..Default::default() };
+    let options = SubscribeOptions { encoding: Some("relay-rgb".into()), min_quality: Some(1.0), ..Default::default() };
     let mut camera = viewer.subscribe("relay/camera/rear", options).await.unwrap();
     let mut frames = Vec::new();
     while frames.len() < 3 {
@@ -349,24 +349,24 @@ async fn signalling_over_zenoh() {
 /// `fields` under `@relay/test-prefixed`: only its subscribers see those samples, raw ones see the raw topic.
 struct Prefixed;
 
-impl Codec for Prefixed {
+impl MessageEncoding for Prefixed {
     fn name(&self) -> &str {
         "test-prefixed"
     }
 
-    fn output(&self) -> CodecOutput {
-        CodecOutput::Data
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Data
     }
 
     fn key_prefix(&self) -> Option<&str> {
         Some("@relay/test-prefixed")
     }
 
-    fn decode(&self, sample: &CodecSample<'_>) -> Result<DecodedFrame> {
+    fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         Ok(DecodedFrame::data(sample.payload.to_vec()))
     }
 
-    fn encode(&self, frame: &DecodedFrame, _quality: f64) -> Result<Vec<u8>> {
+    fn encode(&self, frame: &DecodedFrame, _options: &EncodeOptions) -> Result<Vec<u8>> {
         Ok(frame.downcast::<Vec<u8>>()?.clone())
     }
 }
@@ -374,11 +374,11 @@ impl Codec for Prefixed {
 #[tokio::test(flavor = "multi_thread")]
 async fn key_prefix_subscriptions_and_lease_hooks() {
     let session = zenoh::open(isolated_config()).await.unwrap();
-    let server = Server::builder().session(session.clone()).codec(Prefixed).build().await.unwrap();
+    let server = Server::builder().session(session.clone()).encoding(Prefixed).build().await.unwrap();
     let running = server.clone().bind("127.0.0.1:0").await.unwrap();
     let mut changes = server.changes();
     let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions { heartbeat_hz: 5.0, ..Default::default() }).await.unwrap();
-    let mut prefixed = client.subscribe("cam/*", SubscribeOptions { codec: Some("test-prefixed".into()), ..Default::default() }).await.unwrap();
+    let mut prefixed = client.subscribe("cam/*", SubscribeOptions { encoding: Some("test-prefixed".into()), ..Default::default() }).await.unwrap();
     let mut raw = client.subscribe("cam/*", SubscribeOptions::default()).await.unwrap();
     assert!(changes.has_changed().unwrap(), "opening subscriptions bumps changes");
     let mut subscriptions = server.subscriptions();
@@ -529,4 +529,71 @@ async fn a_relay_policy_in_the_ice_reply_makes_the_connection_relay_only() {
     let refused = timeout(Duration::from_secs(20), Client::connect(&relay, ClientOptions::default())).await;
     let error = match refused { Ok(Ok(_)) => panic!("relay-only with no TURN server must not connect"), Ok(Err(error)) => format!("{error:#}"), Err(_) => "timed out".to_owned() };
     assert!(error.contains("Relay-only"), "refused for the relay policy: {error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn video_av1_channel_arrives_as_av1_and_vp8_without_an_encoder_is_refused() {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let av1 = SubscribeOptions { encoding: Some("test-solid".into()), channel: Some("video-av1".into()), min_quality: Some(1.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", av1).await.unwrap();
+    let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
+    let frame = next_video(&mut camera).await;
+    assert_eq!((frame.format, frame.keyframe), (zenoh_web::VideoFormat::Av1, true));
+    assert!(!next_video(&mut camera).await.data.is_empty());
+    let vp8 = SubscribeOptions { encoding: Some("test-solid".into()), channel: Some("video-vp8".into()), ..Default::default() };
+    let refused = client.subscribe("camera/front", vp8).await.err().unwrap().to_string();
+    assert!(refused.contains("no video-vp8 encoder"), "{refused}");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+/// Data channel only: echoes `encodeOptions.prefix` and the quality it was given, as fields when `fields` is set.
+struct Echo;
+
+impl MessageEncoding for Echo {
+    fn name(&self) -> &str {
+        "test-echo"
+    }
+
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Data
+    }
+
+    fn output_on(&self, channel: Channel, options: &serde_json::Map<String, serde_json::Value>) -> Result<EncodingOutput, String> {
+        if channel != Channel::Data || options.keys().any(|key| key != "prefix" && key != "fields") {
+            return Err("test-echo: data, with prefix and fields".into());
+        }
+        Ok(if options.get("fields").and_then(|value| value.as_bool()) == Some(true) { EncodingOutput::Fields } else { EncodingOutput::Data })
+    }
+
+    fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
+        Ok(DecodedFrame::data(sample.payload.to_vec()))
+    }
+
+    fn encode(&self, frame: &DecodedFrame, options: &EncodeOptions) -> Result<Vec<u8>> {
+        let text = format!("{}{} q={:.2}", options.str("prefix").unwrap_or(""), String::from_utf8_lossy(frame.downcast::<Vec<u8>>()?), options.quality);
+        Ok(if options.options.contains_key("fields") { Fields::new().text("text", &text).build() } else { text.into_bytes() })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_options_reach_the_encoding_and_quality_caps_it() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let server = Server::builder().session(session.clone()).encoding(Echo).build().await.unwrap();
+    let running = server.bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", running.local_addr());
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let options = |json: serde_json::Value| SubscribeOptions { encoding: Some("test-echo".into()), encode_options: Some(serde_json::from_value(json).unwrap()), ..Default::default() };
+    let mut bytes = client.subscribe("echo/a", options(serde_json::json!({"prefix": ">", "quality": 0.25}))).await.unwrap();
+    let mut fields = client.subscribe("echo/a", options(serde_json::json!({"fields": true}))).await.unwrap();
+    let _putter = keep_putting(&session, "echo/a", b"hi".to_vec());
+    let Message::Data(message) = timeout(Duration::from_secs(5), bytes.recv()).await.unwrap().unwrap() else { panic!("not data") };
+    assert_eq!((message.bytes.as_slice(), message.fields.is_none()), (&b">hi q=0.25"[..], true), "quality capped at encodeOptions.quality");
+    let Message::Data(message) = timeout(Duration::from_secs(5), fields.recv()).await.unwrap().unwrap() else { panic!("not data") };
+    assert_eq!(message.fields.unwrap()["text"].text(), Some("hi q=1.00"), "fields output is decoded by the client");
+    let refused = client.subscribe("echo/a", options(serde_json::json!({"colour": "red"}))).await.err().unwrap().to_string();
+    assert!(refused.contains("prefix and fields"), "the encoding refuses options it doesn't know: {refused}");
+    client.close().await;
+    running.shutdown().await.unwrap();
 }

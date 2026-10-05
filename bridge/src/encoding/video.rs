@@ -5,7 +5,7 @@
 //! its full size unless the grant would leave fewer than `min_bits_per_pixel` there (an encoder at its coarsest
 //! quantizer overshoots below that), then it shrinks just enough, never below `min_resolution_scale`.
 
-use crate::codec::{DecodedFrame, PixelFormat, VideoImage};
+use crate::encoding::{DecodedFrame, PixelFormat, VideoImage};
 use anyhow::{Result, anyhow, ensure};
 use openh264::OpenH264API;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, MatrixCoefficients, Profile, RateControlMode, UsageType, VuiConfig};
@@ -183,7 +183,7 @@ pub(crate) fn to_i420(image: &VideoImage, width: u32, height: u32) -> Vec<u8> {
     }
 }
 
-/// The WebRTC video codec a [`VideoEncoder`] produces; the bridge negotiates it and packetizes its frames.
+/// The video format a [`VideoEncoder`] produces; the bridge negotiates it and packetizes its frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoFormat {
     /// H.264 constrained baseline, Annex B access units.
@@ -247,13 +247,13 @@ pub struct EncodedVideo {
     pub keyframe: bool,
 }
 
-/// Turns a video codec's decoded frames into one WebRTC codec's frames. The bridge makes one per encode session (the
-/// viewers of a stream at one target share it) with [`Codec::video_encoder`](crate::Codec::video_encoder), else the
+/// Turns an encoding's decoded frames into one video format's frames. The bridge makes one per encode session (the
+/// viewers of a stream at one target share it) with [`MessageEncoding::video_encoder`](crate::MessageEncoding::video_encoder), else the
 /// server's [`ServerBuilder::video_encoder`](crate::ServerBuilder::video_encoder), else [`H264Encoder`], and calls it on
 /// tokio's blocking pool; it negotiates [`format`](Self::format), packetizes and paces the frames and measures them for
 /// the allocator. A hardware encoder (VideoToolbox, NVENC, a Jetson's) implements this.
 pub trait VideoEncoder: Send {
-    /// The codec of the frames (fixed for the encoder's life).
+    /// The format of the frames (fixed for the encoder's life).
     fn format(&self) -> VideoFormat;
 
     /// Encodes one decoded frame at `target`; `None` while a pipelined encoder has nothing out yet.

@@ -3,8 +3,8 @@
 use crate::allocator::{self, Estimator};
 use crate::auth::{Grant, Leases};
 use crate::ice::{self, IceServer};
-use crate::codec::registry::CodecRegistry;
-use crate::codec::Codec;
+use crate::encoding::registry::{EncodingRegistry, Resolved};
+use crate::encoding::Channel;
 use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
 use crate::pacing::SendGate;
 use crate::publisher::{self, PubShared};
@@ -129,7 +129,7 @@ struct HeartbeatStats {
 struct PeerState {
     peer_id: u64,
     session: zenoh::Session,
-    codecs: Arc<CodecRegistry>,
+    codecs: Arc<EncodingRegistry>,
     channels: Mutex<HashMap<u64, ChannelEntry>>,
     next_channel: AtomicU64,
     connection_state: Mutex<Option<RTCPeerConnectionState>>,
@@ -352,10 +352,10 @@ struct PeerEntry {
     state: Arc<PeerState>,
 }
 
-/// Every connected browser, and what they share: the zenoh session and the codecs.
+/// Every connected browser, and what they share: the zenoh session and the encodings.
 pub struct Bridge {
     session: zenoh::Session,
-    codecs: Arc<CodecRegistry>,
+    codecs: Arc<EncodingRegistry>,
     allocation: AllocationConfig,
     peers: Mutex<HashMap<u64, PeerEntry>>,
     next_peer: AtomicU64,
@@ -366,7 +366,7 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(session: zenoh::Session, codecs: CodecRegistry, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
+    pub fn new(session: zenoh::Session, codecs: EncodingRegistry, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
         Arc::new(Bridge {
             session,
             codecs: Arc::new(codecs),
@@ -397,7 +397,7 @@ impl Bridge {
         }
     }
 
-    /// Every open subscription: its key expression and codec.
+    /// Every open subscription: its key expression and encoding.
     pub fn subscriptions(&self) -> Vec<(String, Option<String>)> {
         let peers = self.peers.lock().unwrap();
         let channels = peers.values().flat_map(|entry| entry.state.channels.lock().unwrap().values().filter_map(|channel| match &channel.stats {
@@ -615,12 +615,12 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     };
     let rejected = match label.kind.as_str() {
         "sub" => match Grant::check(&state.grant.subscribe, "subscribe", &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
-            let codec = opts.resolve_codec(&state.codecs)?;
-            let track = bind_track(&state, codec.as_deref(), &label)?;
-            Ok((opts, codec, track))
+            let resolved = opts.resolve_encoding(&state.codecs)?;
+            let track = bind_track(&state, &resolved, &label)?;
+            Ok((opts, resolved, track))
         }) {
-            Ok((opts, codec, track)) => {
-                let shared = Arc::new(SubShared::new(&opts, codec, state.codecs.clone(), state.gate.clone()));
+            Ok((opts, resolved, track)) => {
+                let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone()));
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
                 state.leases.changed();
                 state.send_accepted(label.id).await;
@@ -666,13 +666,14 @@ async fn run_channel(dc: Arc<dyn DataChannel>, bridge: std::sync::Weak<Bridge>, 
     }
 }
 
-/// A video or audio codec's subscription claims the track the browser renegotiated for it (by mid).
-fn bind_track(state: &PeerState, codec: Option<&dyn Codec>, label: &Label) -> Result<Option<Arc<MediaTrack>>, String> {
-    let Some((codec, mime)) = codec.and_then(|codec| Some((codec, media::track_mime(&state.codecs, codec)?))) else { return Ok(None) };
-    let mid = label.mid.as_deref().ok_or_else(|| format!("{} is a {} codec: the label needs the mid of a renegotiated transceiver", codec.name(), codec.output().as_str()))?;
-    let track = state.tracks.lock().unwrap().get(mid).cloned().ok_or_else(|| format!("no track for mid {mid:?} (renegotiate with the codec first)"))?;
+/// A video or audio channel's subscription claims the track the browser renegotiated for it (by mid).
+fn bind_track(state: &PeerState, resolved: &Resolved, label: &Label) -> Result<Option<Arc<MediaTrack>>, String> {
+    let Some(mime) = media::track_mime(resolved.channel) else { return Ok(None) };
+    let channel = resolved.channel.as_str();
+    let mid = label.mid.as_deref().ok_or_else(|| format!("channel {channel}: the label needs the mid of a renegotiated transceiver"))?;
+    let track = state.tracks.lock().unwrap().get(mid).cloned().ok_or_else(|| format!("no track for mid {mid:?} (renegotiate with the channel first)"))?;
     if track.mime != mime {
-        return Err(format!("track {mid:?} carries {}, {} needs {mime}", track.mime, codec.name()));
+        return Err(format!("track {mid:?} carries {}, channel {channel} needs {mime}", track.mime));
     }
     if !track.claim() {
         return Err(format!("video track {mid:?} is in use by another subscription"));
@@ -777,8 +778,8 @@ struct ControlRequest {
     probe_ms: Option<u64>,
     bytes: Option<String>,
     sdp: Option<RTCSessionDescription>,
-    /// renegotiate: add a track for this codec's format
-    codec: Option<String>,
+    /// renegotiate: add a track for this channel (`video-h264`, `audio-opus`, ...)
+    channel: Option<String>,
     /// lease ops: the group, its keys (a group the server doesn't define) and maxSeconds
     group: Option<String>,
     keys: Option<Vec<String>>,
@@ -844,9 +845,9 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
-            "codecs" => {
-                let codecs: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
-                ok(&request.id, json!({"codecs": codecs}))
+            "encodings" => {
+                let encodings: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
+                ok(&request.id, json!({"encodings": encodings}))
             }
             "lease" => take_lease(&state, &request),
             "releaseLease" => {
@@ -866,15 +867,15 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
     }
 }
 
-/// Browser-initiated renegotiation (it added a recvonly transceiver): answer, and with `codec` add a
-/// track of that codec's format and report its mid.
+/// Browser-initiated renegotiation (it added a recvonly transceiver): answer, and with `channel` add a
+/// track of that channel's format and report its mid.
 async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Value {
     let Some(offer) = request.sdp.clone() else { return fail(&request.id, "renegotiate needs sdp") };
-    let mime = match request.codec.as_deref().map(|name| state.codecs.get(name)) {
+    let mime = match request.channel.as_deref().map(Channel::parse) {
         None => None,
-        Some(Ok(codec)) => match media::track_mime(&state.codecs, &*codec) {
+        Some(Ok(channel)) => match media::track_mime(channel) {
             Some(mime) => Some(mime),
-            None => return fail(&request.id, format!("{} is not a video or audio codec", codec.name())),
+            None => return fail(&request.id, format!("{} has no track", channel.as_str())),
         },
         Some(Err(error)) => return fail(&request.id, error),
     };
