@@ -1,6 +1,6 @@
 [package]
 name = "zenoh-web"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.88"
 description = "View and drive a zenoh system from a browser over WebRTC (data channels, H.264 video, bandwidth allocation, deadmen): an embeddable server with pluggable codecs"
@@ -48,6 +48,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 [features]
 # zenoh_web::client: a Rust client that connects to a server as a browser does (e.g. for a relay)
 client = ["dep:reqwest"]
+# zenoh_web::CloudflareTurn: TURN credentials from Cloudflare's API
+cloudflare = ["dep:reqwest"]
 
 [dev-dependencies]
 # decodes a real camera frame for the ignored bench_stages

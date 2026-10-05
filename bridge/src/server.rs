@@ -3,7 +3,7 @@
 use crate::auth::{Grant, Leases};
 use crate::codec::registry::{CodecRegistry, VideoEncoderFactory};
 use crate::codec::{Codec, VideoEncoder, VideoPolicy};
-use crate::ice::{self, IceServer};
+use crate::ice::{self, IceHook, IceRequest, IceServer, IceSide};
 use crate::peer::{AllocationConfig, Bridge, ConnectConfig};
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::extract::State;
@@ -177,6 +177,28 @@ impl ServerBuilder {
     pub fn turn_secret(mut self, secret: impl Into<String>, ttl: Duration) -> Self {
         self.connect_config.turn_secret = Some((secret.into(), ttl));
         self
+    }
+
+    /// Mints STUN/TURN servers for each end of each connection (e.g. a TURN provider's short-lived credentials), added
+    /// after [`ice_servers`](Self::ice_servers); called for every `GET` [`ICE_PATH`] and every offer the bridge answers.
+    /// When it fails, or takes over [`ICE_HOOK_TIMEOUT`](crate::ICE_HOOK_TIMEOUT), that end gets only the static servers.
+    pub fn ice_servers_fn<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(IceRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<IceServer>>> + Send + 'static,
+    {
+        self.connect_config.ice_servers_fn = Some(IceHook(Arc::new(move |request| Box::pin(hook(request)))));
+        self
+    }
+
+    /// Cloudflare TURN (feature `cloudflare`): [`ice_servers_fn`](Self::ice_servers_fn) with credentials from its API.
+    #[cfg(feature = "cloudflare")]
+    pub fn cloudflare_turn(self, turn: ice::CloudflareTurn) -> Self {
+        let turn = Arc::new(turn);
+        self.ice_servers_fn(move |_| {
+            let turn = turn.clone();
+            async move { turn.servers().await }
+        })
     }
 
     /// Binds each connection's WebRTC UDP sockets to a port from this range (one port per connection), to firewall a relay easily.
@@ -428,7 +450,7 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn ice_servers(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> Response {
     match inner.authorize(&headers) {
-        Ok(_) => Json(minted_ice_servers(&inner)).into_response(),
+        Ok((token, _)) => Json(minted_ice_servers(&inner, token).await).into_response(),
         Err(reason) => (StatusCode::UNAUTHORIZED, reason).into_response(),
     }
 }
@@ -452,8 +474,11 @@ async fn answer(inner: &Inner, headers: &HeaderMap, offer: RTCSessionDescription
     })
 }
 
-fn minted_ice_servers(inner: &Inner) -> serde_json::Value {
-    serde_json::json!({"iceServers": ice::mint(&inner.bridge.connect_config.ice_servers, inner.bridge.connect_config.turn_secret.as_ref(), "browser")})
+/// `{"iceServers": [...]}` for a browser connecting with `token`.
+async fn minted_ice_servers(inner: &Inner, token: Option<String>) -> serde_json::Value {
+    let config = &inner.bridge.connect_config;
+    let servers = ice::servers(&config.ice_servers, config.turn_secret.as_ref(), config.ice_servers_fn.as_ref(), IceRequest { side: IceSide::Browser, token }).await;
+    serde_json::json!({"iceServers": servers})
 }
 
 /// Signalling over zenoh: the HTTP routes' twins as queryables (SPEC "Signalling over zenoh").
@@ -500,7 +525,10 @@ mod signalling {
             headers.insert(header::AUTHORIZATION, value);
         }
         match (op, request.offer) {
-            ("ice", _) => inner.authorize(&headers).map(|_| minted_ice_servers(inner)).map_err(|reason| (StatusCode::UNAUTHORIZED, reason)),
+            ("ice", _) => {
+                let (token, _) = inner.authorize(&headers).map_err(|reason| (StatusCode::UNAUTHORIZED, reason))?;
+                Ok(minted_ice_servers(inner, token).await)
+            }
             (_, Some(offer)) => answer(inner, &headers, offer).await.map(|answer| serde_json::to_value(answer).unwrap_or_default()),
             (_, None) => Err((StatusCode::BAD_REQUEST, "no offer".to_owned())),
         }

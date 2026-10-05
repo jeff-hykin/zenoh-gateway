@@ -58,7 +58,9 @@ mod subscription;
 pub use codec::{AudioPcm, Codec, CodecOutput, CodecSample, Compress, DecodedFrame, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
 pub use auth::Grant;
 pub use fields::Fields;
-pub use ice::{IceServer, turn_credentials};
+pub use ice::{ICE_HOOK_TIMEOUT, IceRequest, IceServer, IceServersFn, IceSide, turn_credentials};
+#[cfg(feature = "cloudflare")]
+pub use ice::CloudflareTurn;
 pub use server::{Authorize, DEFAULT_PORT, HEALTH_PATH, ICE_PATH, RunningServer, SIGNALLING_PREFIX, Server, ServerBuilder};
 /// The zenoh version this crate is built against (for [`ServerBuilder::session`] and
 /// [`ServerBuilder::zenoh_config`]).

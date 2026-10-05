@@ -312,6 +312,11 @@ passes, it disconnects, calls `lease.release()`, or a client with `forceExpire` 
 configures the bridge's side, and browsers get the same list from `GET /zenoh-web/ice` (the client
 fetches it by itself). With coturn's `use-auth-secret`, `.turn_secret(secret, ttl)` mints
 time-limited credentials per connection (username `"<expiry>:<user>"`, HMAC-SHA1 credential).
+For any other TURN provider, `.ice_servers_fn(|request| async { ... })` mints servers for each end
+of each connection (`request.side`: browser or bridge, `request.token`), added after the static ones; if
+it fails or takes over 5 s, that end gets just the static ones. Cloudflare TURN is built in (feature
+`cloudflare`): `.cloudflare_turn(CloudflareTurn::new(key_id, api_token))`, with `.ttl(..)` (default
+24 h; shared credentials are minted again after half of it) and `.per_connection(true)`.
 `.udp_ports(50000..=50100)` binds each connection's WebRTC sockets to a port from that range, to
 firewall a relay or robot easily. SPEC "ICE and TURN".
 

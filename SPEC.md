@@ -162,7 +162,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
 
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
-`bandwidth_target_fraction`, `codec`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `udp_ports`,
+`bandwidth_target_fraction`, `codec`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `ice_servers_fn`, `cloudflare_turn`, `udp_ports`,
 `video_encoder` (a factory for every video codec without its own encoder, e.g. a hardware one from
 zenoh-dimos-codecs' encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
 `bind(addr)` serves on a background task (`RunningServer::local_addr`, `shutdown()`), `serve(addr)` /
@@ -507,6 +507,16 @@ per-browser layer on top, with reasons.
   `"<unix expiry>:<user>"` (`bridge` for its own side, `browser` for `/zenoh-web/ice`), credential
   `base64(HMAC-SHA1(secret, username))`. The ttl must outlast a connection (TURN refreshes use them).
   `zenoh_web::turn_credentials` computes them.
+- `ice_servers_fn(hook)`: `async fn(IceRequest { side, token }) -> Result<Vec<IceServer>>`, called for
+  every `/zenoh-web/ice` (and zenoh `ice` query; side `Browser`) and every offer the bridge answers (side
+  `Bridge`), with the connection's bearer token. Its servers come after the static (and minted) ones; an
+  error, or no answer within `ICE_HOOK_TIMEOUT` (5 s), is logged and that end gets only the static ones.
+- `cloudflare_turn(CloudflareTurn)` (feature `cloudflare`) is that hook over Cloudflare's API: `POST
+  https://rtc.live.cloudflare.com/v1/turn/keys/<key id>/credentials/generate-ice-servers`, `Authorization:
+  Bearer <api token>`, body `{"ttl": seconds}`; the reply's `iceServers` (a list, or the older `generate`
+  endpoint's single object) minus port-53 URLs, which browsers block. By default one set is shared and minted
+  again once half its ttl has passed (every connection gets at least ttl/2); `per_connection(true)` mints a
+  set per call.
 - `udp_ports(low..=high)`: each connection's WebRTC UDP sockets bind a port from this range (one port
   per connection, on every interface), so a firewall only opens that range; the range bounds the
   number of simultaneous browsers. webrtc-rs binds sockets per connection, so there is no single

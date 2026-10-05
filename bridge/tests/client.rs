@@ -437,3 +437,73 @@ async fn lease_lost_right_behind_its_grant() {
     client.close().await;
     running.shutdown().await.unwrap();
 }
+
+/// `GET /zenoh-web/ice` as a browser would.
+async fn browser_ice_servers(url: &str, token: Option<&str>) -> Vec<zenoh_web::IceServer> {
+    let mut request = reqwest::Client::new().get(format!("{url}{}", zenoh_web::ICE_PATH));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let body: serde_json::Value = request.send().await.unwrap().json().await.unwrap();
+    serde_json::from_value(body["iceServers"].clone()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ice_hook_adds_servers_for_both_ends_and_a_failure_leaves_the_static_ones() {
+    use std::sync::{Arc, Mutex};
+    use zenoh_web::{IceServer, IceSide};
+    let stun = IceServer { urls: vec!["stun:127.0.0.1:3478".into()], ..Default::default() };
+    // the hook's TURN server is unreachable, so the connection must still work on host candidates
+    let minted = IceServer { urls: vec!["turn:127.0.0.1:9?transport=udp".into()], username: "u".into(), credential: "c".into() };
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let (asked_in, minted_in) = (asked.clone(), minted.clone());
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let server = Server::builder()
+        .session(session.clone())
+        .ice_servers([stun.clone()])
+        .ice_servers_fn(move |request| {
+            asked_in.lock().unwrap().push((request.side, request.token.clone()));
+            let minted = minted_in.clone();
+            async move { if request.token.as_deref() == Some("broken") { anyhow::bail!("provider down") } else { Ok(vec![minted]) } }
+        })
+        .build()
+        .await
+        .unwrap();
+    let running = server.bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", running.local_addr());
+    assert_eq!(browser_ice_servers(&url, Some("t1")).await, vec![stun.clone(), minted.clone()]);
+    assert_eq!(browser_ice_servers(&url, Some("broken")).await, vec![stun.clone()]);
+    let client = Client::connect(&url, ClientOptions { token: Some("t2".into()), ..Default::default() }).await.unwrap();
+    let asked = asked.lock().unwrap().clone();
+    assert!(asked.contains(&(IceSide::Bridge, Some("t2".into()))) && asked.contains(&(IceSide::Browser, Some("t2".into()))), "{asked:?}");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+/// Real Cloudflare TURN, relay-only: `CF_TURN_KEY_ID=... CF_TURN_API_TOKEN=... cargo test --features client,cloudflare
+/// --test client cloudflare -- --ignored`.
+#[cfg(feature = "cloudflare")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a Cloudflare TURN key (CF_TURN_KEY_ID, CF_TURN_API_TOKEN) and the internet"]
+async fn cloudflare_turn_carries_a_relay_only_connection() {
+    let key_id = std::env::var("CF_TURN_KEY_ID").expect("CF_TURN_KEY_ID");
+    let api_token = std::env::var("CF_TURN_API_TOKEN").expect("CF_TURN_API_TOKEN");
+    let turn = zenoh_web::CloudflareTurn::new(key_id, api_token).ttl(Duration::from_secs(600));
+    let generated = turn.generate().await.unwrap();
+    assert!(generated.iter().any(|server| server.urls.iter().any(|url| url.starts_with("turn")) && !server.credential.is_empty()), "{generated:?}");
+    assert!(generated.iter().all(|server| server.urls.iter().all(|url| !url.split('?').next().unwrap().ends_with(":53"))), "port 53 dropped");
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let server = Server::builder().session(session.clone()).cloudflare_turn(turn).build().await.unwrap();
+    let running = server.bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", running.local_addr());
+    // relay only: every packet goes through Cloudflare's TURN server, with the credentials the server handed out
+    let client = timeout(Duration::from_secs(30), Client::connect(&url, ClientOptions { relay_only: true, ..Default::default() })).await.unwrap().unwrap();
+    let mut subscription = client.subscribe("turn/data", SubscribeOptions { delivery: Some(Delivery::Reliable), ..Default::default() }).await.unwrap();
+    let _putter = keep_putting(&session, "turn/data", b"through cloudflare".to_vec());
+    for _ in 0..5 {
+        let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
+        assert_eq!(message.bytes, b"through cloudflare");
+    }
+    client.close().await;
+    running.shutdown().await.unwrap();
+}

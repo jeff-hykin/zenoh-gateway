@@ -61,6 +61,8 @@ pub struct ConnectConfig {
     pub ice_servers: Vec<IceServer>,
     /// coturn's static-auth-secret and the minted credentials' lifetime
     pub turn_secret: Option<(String, Duration)>,
+    /// servers minted per connection, after the static ones
+    pub ice_servers_fn: Option<ice::IceHook>,
     pub udp_ports: Option<RangeInclusive<u16>>,
 }
 
@@ -436,11 +438,14 @@ impl Bridge {
     }
 
     async fn answer_as(self: &Arc<Self>, peer_id: u64, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
+        let request = ice::IceRequest { side: ice::IceSide::Bridge, token: token.clone() };
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
         let (media_engine, interceptors, video_target_bps) = media::media_setup()?;
         let state = Arc::new(PeerState::new(peer_id, self, video_target_bps, token, grant));
         let port = self.reserve_udp_port(peer_id)?.unwrap_or(0);
-        let ice_servers = ice::mint(&self.connect_config.ice_servers, self.connect_config.turn_secret.as_ref(), "bridge")
+        let config = &self.connect_config;
+        let ice_servers = ice::servers(&config.ice_servers, config.turn_secret.as_ref(), config.ice_servers_fn.as_ref(), request)
+            .await
             .into_iter()
             .map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential })
             .collect();
