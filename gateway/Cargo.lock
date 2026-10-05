@@ -4940,6 +4940,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenoh-gateway"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "hmac",
+ "log",
+ "openh264",
+ "openh264-sys2",
+ "rav1e",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tokio",
+ "tower-http",
+ "unsafe-libopus",
+ "zenoh",
+ "zenoh-ext",
+ "zenoh-web-rtc",
+ "zenoh-web-webrtc",
+ "zstd",
+ "zune-jpeg",
+]
+
+[[package]]
 name = "zenoh-keyexpr"
 version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5323,36 +5353,6 @@ dependencies = [
  "winapi",
  "zenoh-core",
  "zenoh-result",
-]
-
-[[package]]
-name = "zenoh-web"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bytes",
- "futures",
- "hmac",
- "log",
- "openh264",
- "openh264-sys2",
- "rav1e",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "tokio",
- "tower-http",
- "unsafe-libopus",
- "zenoh",
- "zenoh-ext",
- "zenoh-web-rtc",
- "zenoh-web-webrtc",
- "zstd",
- "zune-jpeg",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-# zenoh-web spec
+# zenoh-gateway spec
 
 A browser UI that views and drives a zenoh system over a squeezed network, through a light gateway.
 
@@ -7,7 +7,7 @@ A browser UI that views and drives a zenoh system over a squeezed network, throu
 ```
 zenoh peers (publishers we don't control)
         │  zenoh
-   zenoh-web gateway (Rust library inside an application, e.g. the zenoh-web command of zenoh-web-cli)
+   zenoh-gateway (Rust library inside an application, e.g. the zenoh-gateway command of zenoh-gateway-cli)
         │  WebRTC data channels (UDP) + one HTTP endpoint for signaling
    browser page (plain JS client, live-editable)
 ```
@@ -18,13 +18,13 @@ except when a subscription explicitly picks one of its message encodings (see "E
 ## JS API
 
 ```js
-import { connect, Priority, registerEncoding } from "./zenoh_web.ts"   // via esm.sh, or bundled: see "Client"
+import { connect, Priority, registerEncoding } from "./zenoh_gateway.ts"   // via esm.sh, or bundled: see "Client"
 
 const z = await connect("http://robot.local:7448", {
     heartbeatHz: 5,         // 0 (default) = no heartbeat; needed for deadmen and leases
     heartbeatMisses: 3,     // silence of misses/heartbeatHz seconds = frontend gone
     token: "s3cret",        // optional: `Authorization: Bearer`, see "Auth"
-    iceServers: [],         // optional: default the gateway's (GET /zenoh-web/ice), see "ICE and TURN"
+    iceServers: [],         // optional: default the gateway's (GET /zenoh-gateway/ice), see "ICE and TURN"
     iceTransportPolicy: "relay", // optional: everything through TURN
 })
 
@@ -116,20 +116,20 @@ Drop otherwise, express for priority ≤ INTERACTIVE_HIGH.
 
 ## Client
 
-`client/zenoh_web.ts` (strict TypeScript, no dependencies). Browsers load it from esm.sh, which
-transpiles it (`https://esm.sh/gh/jeff-hykin/zenoh-web@<commit>/client/zenoh_web.ts`), or bundle it
-(`deno bundle`, the same esbuild transform; zenoh-web-cli's `deno task build` bundles it).
+`client/zenoh_gateway.ts` (strict TypeScript, no dependencies). Browsers load it from esm.sh, which
+transpiles it (`https://esm.sh/gh/jeff-hykin/zenoh-gateway@<commit>/client/zenoh_gateway.ts`), or bundle it
+(`deno bundle`, the same esbuild transform; zenoh-gateway-cli's `deno task build` bundles it).
 
 ## Rust client
 
-`zenoh_web::client` (cargo feature `client`, so server-only builds don't carry reqwest) connects to a
+`zenoh_gateway::client` (cargo feature `client`, so server-only builds don't carry reqwest) connects to a
 server the way the browser client does, for programs with no browser (Deno has no
 RTCPeerConnection or WebCodecs), e.g. a relay that takes a robot's best stream per camera and serves
 it again through its own `Server`. It is a module of this crate rather than a separate crate because
 it shares the wire code: the media engine and interceptors, the frame format, `fields::parse`.
 
 - `Client::connect(url, ClientOptions { token, ice_servers, relay_only, heartbeat_hz, heartbeat_misses })`:
-  the gateway's ICE servers from `GET /zenoh-web/ice` unless given, the same non-trickle `POST /offer`
+  the gateway's ICE servers from `GET /zenoh-gateway/ice` unless given, the same non-trickle `POST /offer`
   (both with `Authorization: Bearer <token>` when set; a 401 fails the connect), `control` and
   heartbeat channels, `encodings`, and 5 clock pings before returning; then a ping a second (clock
   sync, `Degraded` when one fails). `list_topics`, `get`, `stats`, `encodings`, `clock_offset_ms`,
@@ -168,7 +168,7 @@ or an existing `session` (never closed by the server), `serve_dir`, `max_bandwid
 zenoh-dimos-codecs' encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
 `bind(addr)` serves on a background task (`RunningServer::local_addr`, `shutdown()`), `serve(addr)` /
 `serve_with_shutdown(addr, signal)` serve in place, or `router()` returns the axum routes (`POST
-/offer`, `GET /zenoh-web/health`, `GET /zenoh-web/ice`, static files) for the host's own HTTP server.
+/offer`, `GET /zenoh-gateway/health`, `GET /zenoh-gateway/ice`, static files) for the host's own HTTP server.
 `Server::revoke(token)` closes that token's connections (see "Auth"). For relays and monitoring:
 `subscriptions()` (every open subscription's key expression and encoding), `leases()` (group and keys of each held
 lease), `changes()` (a `watch` counter bumped when either changes) and `expire_lease(group, reason)` (ends a lease
@@ -180,7 +180,7 @@ declaration waits for the routing tables (fixed upstream on branch `bugfix/routi
 released). The webrtc-rs fixes the gateway relies on (see "Delivery → transport mapping", "Large
 messages") are published as renamed crates (`zenoh-web-webrtc` → `zenoh-web-rtc` →
 `zenoh-web-rtc-datachannel`, `zenoh-web-rtc-sctp`; github.com/jeff-hykin/webrtc-rs-zenoh-web), so
-crates that depend on zenoh-web build the fixed code.
+crates that depend on zenoh-gateway build the fixed code.
 
 ## Large messages
 
@@ -216,7 +216,7 @@ channels require `delivery: "latest"` and no `compress`.
 most the bandwidth allocator may pick for the subscription, which it lowers when the link is squeezed (down to
 `minQuality`). The encoding sees the quality picked for each message (`EncodeOptions { quality, options }`).
 
-Every encoding implements one Rust trait (`zenoh_web::MessageEncoding`):
+Every encoding implements one Rust trait (`zenoh_gateway::MessageEncoding`):
 
 - `name()`, and `output()`: what it produces on its default channel: **video**, **audio**, or data (**fields** or
   **data**).
@@ -228,12 +228,12 @@ Every encoding implements one Rust trait (`zenoh_web::MessageEncoding`):
   (packed RGB8 or planar I420, any size) for the built-in video encoders, anything its own video encoder takes, PCM for
   audio, any value its `encode` takes for data. Shared by every frontend on the same kind of channel.
 - data channel: `encode(frame, &EncodeOptions { quality, options })` → the bytes sent. When `output_on` said
-  **fields**, they are a `zenoh_web::Fields` message (see "Fields"), flagged in the frame, and the client decodes them
+  **fields**, they are a `zenoh_gateway::Fields` message (see "Fields"), flagged in the frame, and the client decodes them
   into `msg.decoded` by itself. Any other bytes are the encoding's own format, which the page decodes with the decoder
   registered for that name (`registerEncoding(name, decoder)` → `msg.decoded`); without one it gets `msg.bytes`.
 - `key_prefix()`: where the encoding's samples live (default none). With `Some(prefix)` a subscription to `key` reads
   zenoh key `<prefix>/<key>` and its messages carry keys without the prefix, so an encoding's input can sit apart from
-  the raw topic: zenoh-web-relay puts its decoded frames under `@relay/<encoding>/<key>`, which raw subscribers to `key`
+  the raw topic: zenoh-gateway-relay puts its decoded frames under `@relay/<encoding>/<key>`, which raw subscribers to `key`
   (and `**`, which never matches a `@` chunk) don't see.
 - `default_compress()`: compression for its data-channel messages when the subscription doesn't set `compress`
   (default none; zenoh-dimos-codecs' depth and point clouds use zstd).
@@ -284,7 +284,7 @@ zero padding | count × components values`.
   (`Uint8Array` … `Float64Array`), components interleaved.
 - Rust: `Fields::new().scalar("width", w).array("data", &values).vectors("origin", 3, &xyz)
   .scaled("positions", &origin, &scale, &quantized).text("encoding", "16UC1").build()`;
-  `zenoh_web::fields::parse` reads one back.
+  `zenoh_gateway::fields::parse` reads one back.
 
 ### Compression
 
@@ -298,7 +298,7 @@ on one is rejected, `"none"` accepted, the encoding's default ignored.
 
 ### Video encoders
 
-`zenoh_web::VideoEncoder` turns an encoding's decoded frames into one video format's frames:
+`zenoh_gateway::VideoEncoder` turns an encoding's decoded frames into one video format's frames:
 `format()` declares it (`VideoFormat::H264`, `Vp8`, `Vp9` or `Av1`) and
 `encode(frame, target)` returns an `EncodedVideo` (bitstream, size, keyframe) or `None` while a
 pipelined encoder has nothing out yet. `target` carries the granted bitrate (encode at it) and frame rate, the even
@@ -313,13 +313,13 @@ frames come ~100 ms late at 30 Hz).
 A hardware encoder plugs in for its format as `ServerBuilder::video_encoder(factory)` (called once to ask the format;
 one per format), or for one encoding as its `video_encoder(format)` (which wins). [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)' `encoders` module has
 VideoToolbox (macOS) and GStreamer (`nvv4l2h264enc` on a Jetson, `nvh264enc`, `vah264enc` / `vaapih264enc`, loaded at
-runtime) backends, probed by encoding a test frame and wrapped in a fallback to openh264; zenoh-web-cli uses it
+runtime) backends, probed by encoding a test frame and wrapped in a fallback to openh264; zenoh-gateway-cli uses it
 (`--video-encoder auto|software|videotoolbox|gstreamer`). Any encoder is fed from
 `VideoImage::to_i420(target.width, target.height)`
 (or the encoding's own frames, e.g. GPU buffers decoded into `DecodedFrame::Data`, which the encoder
 downcasts), returning access units. A camera that already sends H.264 can be passed through the
 same way: the encoding's decode keeps the access unit and its encoder returns it (keyframes then
-come from the source). zenoh-web-cli's `examples/custom_codec.rs` has an encoding with its own AV1 encoder that
+come from the source). zenoh-gateway-cli's `examples/custom_codec.rs` has an encoding with its own AV1 encoder that
 `test/custom_codec.js` shows in Chrome.
 
 ### Audio
@@ -476,7 +476,7 @@ per-browser layer on top, with reasons.
 ## Auth
 
 - `ServerBuilder::authorize(|token: Option<&str>, headers| -> Result<Grant, String>)` runs on every
-  `POST /offer` and `GET /zenoh-web/ice`, with the `Authorization: Bearer <token>` the client sends
+  `POST /offer` and `GET /zenoh-gateway/ice`, with the `Authorization: Bearer <token>` the client sends
   (`connect(url, { token })`). `Err(reason)` answers HTTP 401 with the reason; the client then stops
   reconnecting (`connect` rejects with `gateway refused the token: <reason>`, state `"lost"`). Without a
   hook every connection gets `Grant::all()`, the behaviour before auth existed.
@@ -488,7 +488,7 @@ per-browser layer on top, with reasons.
   refused `get` fails the same way; `listTopics` leaves the keys out.
 - `Server::revoke(token)` closes every live connection made with that token (deadmen fire with reason
   `"revoked"`, leases end); whether it can come back is the hook's call, since it runs on every offer.
-- Token issuance is the host's business (no store, no JWT in core). zenoh-web-cli's `--auth-file` is a
+- Token issuance is the host's business (no store, no JWT in core). zenoh-gateway-cli's `--auth-file` is a
   small example: a json5 map of token → `read` / `write` / `lease` / a grant object, re-read when it
   changes, revoking tokens removed or changed there.
 
@@ -518,18 +518,18 @@ per-browser layer on top, with reasons.
 ## ICE and TURN
 
 - `ServerBuilder::ice_servers([IceServer { urls, username, credential }])` configures the gateway's own
-  side of every connection, and `GET /zenoh-web/ice` (authorized like an offer) hands the same list to
+  side of every connection, and `GET /zenoh-gateway/ice` (authorized like an offer) hands the same list to
   browsers as `{"iceServers": [...]}`. The client fetches it on every (re)connect unless `connect` was
   given `iceServers` (an older gateway's 404 means none), and exposes it as `z.iceServers`. A reply with
-  `"iceTransportPolicy": "relay"` (e.g. from a host app serving its own `/zenoh-web/ice`) makes the connection
+  `"iceTransportPolicy": "relay"` (e.g. from a host app serving its own `/zenoh-gateway/ice`) makes the connection
   relay-only unless `connect` was given `iceTransportPolicy` (the Rust client: `relay_only` or the reply).
 - `turn_secret(secret, ttl)`: coturn's TURN REST API (`use-auth-secret`, `static-auth-secret`). Every
   TURN entry without a username gets credentials minted per connection and per caller: username
-  `"<unix expiry>:<user>"` (`gateway` for its own side, `browser` for `/zenoh-web/ice`), credential
+  `"<unix expiry>:<user>"` (`gateway` for its own side, `browser` for `/zenoh-gateway/ice`), credential
   `base64(HMAC-SHA1(secret, username))`. The ttl must outlast a connection (TURN refreshes use them).
-  `zenoh_web::turn_credentials` computes them.
+  `zenoh_gateway::turn_credentials` computes them.
 - `ice_servers_fn(hook)`: `async fn(IceRequest { side, token }) -> Result<Vec<IceServer>>`, called for
-  every `/zenoh-web/ice` (and zenoh `ice` query; side `Browser`) and every offer the gateway answers (side
+  every `/zenoh-gateway/ice` (and zenoh `ice` query; side `Browser`) and every offer the gateway answers (side
   `Gateway`), with the connection's bearer token. Its servers come after the static (and minted) ones; an
   error, or no answer within `ICE_HOOK_TIMEOUT` (5 s), is logged and that end gets only the static ones. TURN
   entries it returns without a username and credential are dropped (a browser refuses the whole connection over one).
@@ -547,13 +547,13 @@ per-browser layer on top, with reasons.
 ## Signalling over zenoh
 
 `ServerBuilder::zenoh_signalling(name)` also answers signalling on two zenoh queryables of the server's session,
-twins of the HTTP routes: `zenoh-web/<name>/offer` (query payload `{"token"?, "offer": <SDP>}`, reply the answer
-SDP) and `zenoh-web/<name>/ice` (payload `{"token"?}`, reply `{"iceServers": [...]}`). Authorization is the same
+twins of the HTTP routes: `zenoh-gateway/<name>/offer` (query payload `{"token"?, "offer": <SDP>}`, reply the answer
+SDP) and `zenoh-gateway/<name>/ice` (payload `{"token"?}`, reply `{"iceServers": [...]}`). Authorization is the same
 hook, with headers holding only `Authorization: Bearer <token>`; a refusal is an error reply `{"status": 401,
 "error": reason}` (400/500 for a bad request or a failed answer). `name` is one key chunk.
 
-It is for a machine with no inbound ports: its zenoh dials out to a router (e.g. zenoh-web-relay's), and a
-client on that router's side calls `zenoh_web::client::Client::connect_zenoh(&session, name, options)`, which
+It is for a machine with no inbound ports: its zenoh dials out to a router (e.g. zenoh-gateway-relay's), and a
+client on that router's side calls `zenoh_gateway::client::Client::connect_zenoh(&session, name, options)`, which
 queries those keys instead of `POST /offer`. Only signalling uses the zenoh link: the media is the usual WebRTC
 connection, and since the server answers with its candidates and also sends connectivity checks to the client's,
 the server's side opens the UDP path (a client on a public address needs no STUN for the server to reach it;
@@ -587,8 +587,8 @@ resolving so the gateway has an offset before the first put.
 ## Wire format
 
 - Signaling: `POST /offer` with the browser's SDP offer (non-trickle), returns the answer (401 with a reason when the authorize hook refuses); or the zenoh queryables of "Signalling over zenoh".
-- `GET /zenoh-web/ice` returns `{"iceServers": [{urls, username?, credential?}]}`, see "ICE and TURN".
-- `GET /zenoh-web/health` returns `{"service": "zenoh-web", "version": "<crate version>"}` (detecting a running server).
+- `GET /zenoh-gateway/ice` returns `{"iceServers": [{urls, username?, credential?}]}`, see "ICE and TURN".
+- `GET /zenoh-gateway/health` returns `{"service": "zenoh-gateway", "version": "<crate version>"}` (detecting a running server).
 - The gateway can also serve a static directory (`--serve <dir>`, `ServerBuilder::serve_dir`) so the UI is live-editable on disk.
 - Each subscribe/publisher is its own data channel. Its label is JSON: `{"type":"sub"|"pub", "key":..., "id":n, "opts":{...}}`.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.

@@ -1,11 +1,11 @@
 [package]
-name = "zenoh-web-example"
+name = "zenoh-gateway-example"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Smoke test for the nix builds: an isolated zenoh-web server on loopback and a Rust client that lists its topics"
+description = "Smoke test for the nix builds: an isolated zenoh-gateway server on loopback and a Rust client that lists its topics"
 
 [dependencies]
-zenoh-web = { path = "../gateway", features = ["client"] }
+zenoh-gateway = { path = "../gateway", features = ["client"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"

@@ -2,7 +2,7 @@
 /// <reference lib="dom" />
 /// <reference lib="dom.iterable" />
 /// <reference lib="esnext" />
-// zenoh-web browser client: one WebRTC data channel per subscription/publisher, see SPEC.md
+// zenoh-gateway browser client: one WebRTC data channel per subscription/publisher, see SPEC.md
 
 import { decompress as zstdDecompress } from "./vendor/fzstd.ts"
 
@@ -47,14 +47,14 @@ const encodingDecoders = new Map<string, EncodingDecoder>()
  */
 export function registerEncoding(name: string, decoder: EncodingDecoder): void {
     if (typeof name !== "string" || name.length === 0) {
-        throw new TypeError(`zenoh-web: registerEncoding needs an encoding name, got ${String(name)}`)
+        throw new TypeError(`zenoh-gateway: registerEncoding needs an encoding name, got ${String(name)}`)
     }
     if (typeof decoder !== "function") {
-        throw new TypeError(`zenoh-web: registerEncoding("${name}") needs a decoder function`)
+        throw new TypeError(`zenoh-gateway: registerEncoding("${name}") needs a decoder function`)
     }
     const existing = encodingDecoders.get(name)
     if (existing !== undefined && existing !== decoder) {
-        throw new Error(`zenoh-web: a decoder for encoding "${name}" is already registered`)
+        throw new Error(`zenoh-gateway: a decoder for encoding "${name}" is already registered`)
     }
     encodingDecoders.set(name, decoder)
 }
@@ -103,7 +103,7 @@ export interface SubscribeOptions {
     maxHz?: number
     minQuality?: number
     qualityToHzTradeoff?: number
-    /** a message encoding the gateway registered (`ZenohWeb.encodings`); none = raw bytes */
+    /** a message encoding the gateway registered (`ZenohGateway.encodings`); none = raw bytes */
     encoding?: string
     /** what the messages travel on (default: where the encoding's output goes: pictures on video-h264, sound on audio-opus, else data) */
     channel?: Channel
@@ -127,9 +127,9 @@ export interface PublisherOptions {
 }
 
 export interface ConnectOptions {
-    /** default: the gateway's (`GET /zenoh-web/ice`, TURN credentials minted for this client) */
+    /** default: the gateway's (`GET /zenoh-gateway/ice`, TURN credentials minted for this client) */
     iceServers?: RTCIceServer[]
-    /** "relay" forces every byte through TURN; default: the `/zenoh-web/ice` reply's `iceTransportPolicy`, else "all" */
+    /** "relay" forces every byte through TURN; default: the `/zenoh-gateway/ice` reply's `iceTransportPolicy`, else "all" */
     iceTransportPolicy?: RTCIceTransportPolicy
     /** sent as `Authorization: Bearer <token>`; the gateway's authorize hook turns it into a grant */
     token?: string
@@ -278,7 +278,7 @@ export interface Frame {
 }
 
 const zstdFlag = 1
-/** frame flag: the message is zenoh-web fields */
+/** frame flag: the message is zenoh-gateway fields */
 const fieldsFlag = 2
 
 /**
@@ -315,7 +315,7 @@ export function decodeFields(message: Uint8Array): Record<string, FieldValue> {
     const bytes = message.byteOffset % 8 === 0 ? message : message.slice()
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
     if (bytes[0] !== 1) {
-        throw new Error(`zenoh-web: unknown fields format version ${bytes[0]}`)
+        throw new Error(`zenoh-gateway: unknown fields format version ${bytes[0]}`)
     }
     const fields: Record<string, FieldValue> = {}
     let offset = 2
@@ -332,7 +332,7 @@ export function decodeFields(message: Uint8Array): Record<string, FieldValue> {
         }
         const TypedArray = fieldArrays[dtype]
         if (TypedArray === undefined) {
-            throw new Error(`zenoh-web: field ${name} has unknown dtype ${dtype}`)
+            throw new Error(`zenoh-gateway: field ${name} has unknown dtype ${dtype}`)
         }
         const scaling = (flags & 1) === 1 ? Array.from({ length: 2 * components }, (_, index) => view.getFloat64(offset + 8 * index, true)) : null
         offset += scaling === null ? 0 : 16 * components
@@ -468,7 +468,7 @@ abstract class Endpoint {
     gatewayStats: GatewayChannelStats | null = null
     protected acceptance = new Acceptance()
 
-    constructor(readonly owner: ZenohWeb, readonly id: number, readonly key: string) {}
+    constructor(readonly owner: ZenohGateway, readonly id: number, readonly key: string) {}
 
     abstract attach(peer: RTCPeerConnection): void
 
@@ -493,7 +493,7 @@ abstract class Endpoint {
 
     _rejected(reason: string): void {
         this.rejectionReason = reason
-        this.acceptance.reject(new Error(`zenoh-web: gateway rejected ${this.key}: ${reason}`))
+        this.acceptance.reject(new Error(`zenoh-gateway: gateway rejected ${this.key}: ${reason}`))
         this.owner._forget(this)
     }
 
@@ -529,7 +529,7 @@ export class Subscription extends Endpoint {
     #ackTimer: ReturnType<typeof setTimeout> | null = null
     #partials = new Map<number, PartialMessage>()
 
-    constructor(owner: ZenohWeb, id: number, key: string, readonly options: SubscribeOptions, readonly callback: (message: Message) => void) {
+    constructor(owner: ZenohGateway, id: number, key: string, readonly options: SubscribeOptions, readonly callback: (message: Message) => void) {
         super(owner, id, key)
         this.channelName = channelOf(options, owner.encodings)
     }
@@ -570,7 +570,7 @@ export class Subscription extends Endpoint {
         const mime = channelMimes[channelName]
         const playable = globalThis.RTCRtpReceiver?.getCapabilities?.(kind)?.codecs.some((codec) => codec.mimeType.toLowerCase() === mime.toLowerCase()) ?? true
         if (!playable) {
-            acceptance.reject(new Error(`zenoh-web: this browser can't play ${channelName} (no ${mime} decoder); pick another channel`))
+            acceptance.reject(new Error(`zenoh-gateway: this browser can't play ${channelName} (no ${mime} decoder); pick another channel`))
             return
         }
         this.owner._acquireTransceiver(peer, kind, channelName).then((transceiver) => {
@@ -581,7 +581,7 @@ export class Subscription extends Endpoint {
             this.#transceiver = transceiver
             this.mediaStream = new MediaStream([transceiver.receiver.track])
             this.#openChannel(peer, acceptance, transceiver.mid)
-        }, (error: Error) => acceptance.reject(new Error(`zenoh-web: ${channelName} renegotiation for ${this.key} failed: ${error.message}`)))
+        }, (error: Error) => acceptance.reject(new Error(`zenoh-gateway: ${channelName} renegotiation for ${this.key} failed: ${error.message}`)))
     }
 
     #openChannel(peer: RTCPeerConnection, acceptance: Acceptance, mid: string | null): void {
@@ -678,12 +678,12 @@ export class Subscription extends Endpoint {
                 message.decoded = decoder(message.bytes, message)
             } else if (!this.#warnedNoDecoder) {
                 this.#warnedNoDecoder = true
-                console.info(`zenoh-web: no decoder registered for encoding "${name}" (registerEncoding("${name}", decoder)); msg.bytes carries its bytes`)
+                console.info(`zenoh-gateway: no decoder registered for encoding "${name}" (registerEncoding("${name}", decoder)); msg.bytes carries its bytes`)
             }
             return true
         } catch (error) {
             this.decodeErrors++
-            console.error(`zenoh-web: ${this.options.encoding} payload on ${message.key} did not decode`, error)
+            console.error(`zenoh-gateway: ${this.options.encoding} payload on ${message.key} did not decode`, error)
             return false
         }
     }
@@ -694,7 +694,7 @@ export class Subscription extends Endpoint {
                 message.bytes = zstdDecompress(message.bytes) as Uint8Array
             } catch (error) {
                 this.decodeErrors++
-                console.error(`zenoh-web: zstd message on ${message.key} did not decompress`, error)
+                console.error(`zenoh-gateway: zstd message on ${message.key} did not decompress`, error)
                 return
             }
         }
@@ -712,7 +712,7 @@ export class Subscription extends Endpoint {
         try {
             this.callback(message)
         } catch (error) {
-            console.error(`zenoh-web: subscriber callback for ${this.key} threw`, error)
+            console.error(`zenoh-gateway: subscriber callback for ${this.key} threw`, error)
         }
     }
 
@@ -758,7 +758,7 @@ export class Publisher extends Endpoint {
     #repeatTimer: ReturnType<typeof setInterval> | null = null
     #tripListeners = new Set<(reason: string) => void>()
 
-    constructor(owner: ZenohWeb, id: number, key: string, readonly options: PublisherOptions) {
+    constructor(owner: ZenohGateway, id: number, key: string, readonly options: PublisherOptions) {
         super(owner, id, key)
         if (options.repeatMs) {
             this.#repeatTimer = setInterval(() => {
@@ -808,13 +808,13 @@ export class Publisher extends Endpoint {
 
     #checkUsable(): void {
         if (this.closed) {
-            throw new Error(`zenoh-web: publisher ${this.key} is closed`)
+            throw new Error(`zenoh-gateway: publisher ${this.key} is closed`)
         }
         if (this.rejectionReason !== null) {
-            throw new Error(`zenoh-web: publisher ${this.key} was rejected by the gateway: ${this.rejectionReason}`)
+            throw new Error(`zenoh-gateway: publisher ${this.key} was rejected by the gateway: ${this.rejectionReason}`)
         }
         if (this.tripped) {
-            throw new Error(`zenoh-web: publisher ${this.key} is tripped (deadman fired: ${this.tripReason}); create a new publisher`)
+            throw new Error(`zenoh-gateway: publisher ${this.key} is tripped (deadman fired: ${this.tripReason}); create a new publisher`)
         }
     }
 
@@ -855,7 +855,7 @@ export class Publisher extends Endpoint {
      */
     setDeadman(value: Bytesish): Promise<void> {
         if (!this.owner.options.heartbeatHz) {
-            throw new Error("zenoh-web: setDeadman needs a heartbeat; connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })")
+            throw new Error("zenoh-gateway: setDeadman needs a heartbeat; connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })")
         }
         this.#checkUsable()
         const bytes = toBytes(value)
@@ -888,7 +888,7 @@ export class Publisher extends Endpoint {
             try {
                 listener(reason)
             } catch (error) {
-                console.error("zenoh-web: onTripped listener threw", error)
+                console.error("zenoh-gateway: onTripped listener threw", error)
             }
         }
     }
@@ -915,7 +915,7 @@ export class Lease {
     lost: string | null = null
     #listeners = new Set<(reason: string) => void>()
 
-    constructor(readonly owner: ZenohWeb, readonly group: string, readonly keys: string[], readonly expiresInMs: number | null) {}
+    constructor(readonly owner: ZenohGateway, readonly group: string, readonly keys: string[], readonly expiresInMs: number | null) {}
 
     onLost(listener: (reason: string) => void): () => void {
         this.#listeners.add(listener)
@@ -941,7 +941,7 @@ export class Lease {
             try {
                 listener(reason)
             } catch (error) {
-                console.error("zenoh-web: onLost listener threw", error)
+                console.error("zenoh-gateway: onLost listener threw", error)
             }
         }
     }
@@ -949,7 +949,7 @@ export class Lease {
 
 type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token">
 
-export class ZenohWeb {
+export class ZenohGateway {
     state: ConnectionState = "connecting"
     /** per subscribed/published key expression */
     stats: Record<string, KeyStats> = {}
@@ -1015,7 +1015,7 @@ export class ZenohWeb {
             try {
                 listener(state)
             } catch (error) {
-                console.error("zenoh-web: state listener threw", error)
+                console.error("zenoh-gateway: state listener threw", error)
             }
         }
     }
@@ -1106,7 +1106,7 @@ export class ZenohWeb {
         let iceServers = this.options.iceServers
         let iceTransportPolicy = this.options.iceTransportPolicy
         if (iceServers === undefined) {
-            const response = await fetch(`${this.url}/zenoh-web/ice`, { headers: auth }).catch(() => null)
+            const response = await fetch(`${this.url}/zenoh-gateway/ice`, { headers: auth }).catch(() => null)
             await this.#refuseIfUnauthorized(response)
             const ice = response?.ok ? await response.json() : {}
             iceServers = (ice.iceServers ?? []) as RTCIceServer[]
@@ -1171,7 +1171,7 @@ export class ZenohWeb {
         if (response?.status === 401) {
             peer?.close()
             this.close()
-            throw new Error(`zenoh-web: gateway refused the token: ${await response.text()}`)
+            throw new Error(`zenoh-gateway: gateway refused the token: ${await response.text()}`)
         }
     }
 
@@ -1238,7 +1238,7 @@ export class ZenohWeb {
                         await this._open()
                         return
                     } catch (error) {
-                        console.warn("zenoh-web: reconnect failed", error)
+                        console.warn("zenoh-gateway: reconnect failed", error)
                         await sleep(reconnectDelayMs)
                     }
                 }
@@ -1277,7 +1277,7 @@ export class ZenohWeb {
         if (response.ok) {
             request.resolve(response)
         } else {
-            request.reject(new Error(`zenoh-web gateway: ${response.error ?? "error"}`))
+            request.reject(new Error(`zenoh-gateway: ${response.error ?? "error"}`))
         }
     }
 
@@ -1356,7 +1356,7 @@ export class ZenohWeb {
      */
     async lease(group: string, { keys, maxSeconds }: { keys?: string[], maxSeconds?: number } = {}): Promise<Lease> {
         if (!this.options.heartbeatHz) {
-            throw new Error("zenoh-web: a lease needs a heartbeat; connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })")
+            throw new Error("zenoh-gateway: a lease needs a heartbeat; connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })")
         }
         const response = await this._request({ op: "lease", group, keys, maxSeconds }, pingTimeoutMs)
         const lease = new Lease(this, group, response.keys as string[], (response.expiresInMs as number | null) ?? null)
@@ -1440,9 +1440,9 @@ export class ZenohWeb {
     }
 }
 
-/** Connects to a zenoh-web gateway, e.g. `await connect("http://robot.local:7448")`. */
-export async function connect(url: string, options: ConnectOptions = {}): Promise<ZenohWeb> {
-    const client = new ZenohWeb(url, options)
+/** Connects to a zenoh-gateway server, e.g. `await connect("http://robot.local:7448")`. */
+export async function connect(url: string, options: ConnectOptions = {}): Promise<ZenohGateway> {
+    const client = new ZenohGateway(url, options)
     await client._open()
     client._startStats()
     return client

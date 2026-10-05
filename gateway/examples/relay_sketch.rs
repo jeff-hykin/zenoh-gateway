@@ -1,5 +1,5 @@
 //! A relay: connect to gateway A as a client, take one camera at full quality, decode it, and serve it
-//! again through this process's own zenoh-web server B (whose allocator then adapts it to B's viewers).
+//! again through this process's own zenoh-gateway server B (whose allocator then adapts it to B's viewers).
 //!
 //! `cargo run --example relay_sketch --features client -- http://robot.local:7448 camera/front ros2-image 7449`,
 //! then subscribe on B to `relay/camera/front` with encoding `relay-rgb`.
@@ -8,8 +8,8 @@
 //! would instead give B an encoding whose `video_encoder` returns the access units it was handed.
 
 use anyhow::{Context, Result};
-use zenoh_web::client::{Client, ClientOptions, Message, SubscribeOptions};
-use zenoh_web::{Channel, MessageEncoding, EncodingOutput, EncodingSample, DecodedFrame, RunningServer, Server, VideoImage};
+use zenoh_gateway::client::{Client, ClientOptions, Message, SubscribeOptions};
+use zenoh_gateway::{Channel, MessageEncoding, EncodingOutput, EncodingSample, DecodedFrame, RunningServer, Server, VideoImage};
 
 /// B's encoding: `u32 width | u32 height | RGB8` → a picture for B's H.264 encoder.
 pub struct RelayRgb;
@@ -34,7 +34,7 @@ pub async fn relay(source_url: &str, camera_key: &str, codec: &str, bind: &str) 
     let source = Client::connect(source_url, ClientOptions::default()).await?;
     let options = SubscribeOptions { encoding: Some(codec.to_owned()), ..Default::default() };
     let mut camera = source.subscribe(camera_key, options).await?;
-    let mut config = zenoh_web::zenoh::Config::default();
+    let mut config = zenoh_gateway::zenoh::Config::default();
     config.insert_json5("scouting/multicast/enabled", "false").map_err(|error| anyhow::anyhow!("{error}"))?;
     let server = Server::builder().zenoh_config(config).encoding(RelayRgb).build().await?;
     let session = server.session().clone();

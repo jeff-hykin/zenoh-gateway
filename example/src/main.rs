@@ -1,16 +1,16 @@
-//! `zenoh-web-example [seconds]`: an isolated zenoh session (no scouting, no listeners), a zenoh-web server on
+//! `zenoh-gateway-example [seconds]`: an isolated zenoh session (no scouting, no listeners), a zenoh-gateway server on
 //! 127.0.0.1, a Rust client that lists the topics, then it serves for `seconds` (default 0) and shuts down.
 
 use anyhow::Result;
 use std::time::Duration;
-use zenoh_web::client::{Client, ClientOptions};
-use zenoh_web::{Server, zenoh};
+use zenoh_gateway::client::{Client, ClientOptions};
+use zenoh_gateway::{Server, zenoh};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let argument = std::env::args().nth(1);
     if matches!(argument.as_deref(), Some("-h" | "--help")) {
-        println!("usage: zenoh-web-example [seconds]  (loopback zenoh-web server + Rust client smoke test)");
+        println!("usage: zenoh-gateway-example [seconds]  (loopback zenoh-gateway server + Rust client smoke test)");
         return Ok(());
     }
     let seconds: u64 = argument.map(|text| text.parse()).transpose()?.unwrap_or(0);

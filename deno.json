@@ -1,5 +1,5 @@
 {
     "tasks": {
-        "check": "deno check client/zenoh_web.ts"
+        "check": "deno check client/zenoh_gateway.ts"
     }
 }

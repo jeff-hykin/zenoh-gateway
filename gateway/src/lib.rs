@@ -1,15 +1,15 @@
-//! zenoh-web: view and drive a [zenoh](https://zenoh.io) system from a browser over WebRTC.
+//! zenoh-gateway: view and drive a [zenoh](https://zenoh.io) system from a browser over WebRTC.
 //!
 //! One process gateways zenoh key expressions to browser data channels (one per subscription or
 //! publisher) and H.264 video tracks, with a per-browser bandwidth allocator, heartbeats and
-//! deadmen. The browser side is `client/zenoh_web.ts` in the repository.
+//! deadmen. The browser side is `client/zenoh_gateway.ts` in the repository.
 //!
-//! This crate is the library for embedding the server in an application; the `zenoh-web` command
-//! (with a set of robotics encodings) is [zenoh-web-cli](https://github.com/jeff-hykin/zenoh-web-cli):
+//! This crate is the library for embedding the server in an application; the `zenoh-gateway` command
+//! (with a set of robotics encodings) is [zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli):
 //!
 //! ```no_run
 //! # async fn run() -> anyhow::Result<()> {
-//! let server = zenoh_web::Server::builder()
+//! let server = zenoh_gateway::Server::builder()
 //!     .connect("tcp/127.0.0.1:7447")
 //!     .serve_dir("examples")
 //!     .build()

@@ -27,18 +27,18 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use webrtc::peer_connection::RTCSessionDescription;
 
-/// Default HTTP port of the `zenoh-web` command.
+/// Default HTTP port of the `zenoh-gateway` command.
 pub const DEFAULT_PORT: u16 = 7448;
 
-/// `GET` this path for `{"service": "zenoh-web", "version": "<crate version>"}`, to check a zenoh-web server is listening.
-pub const HEALTH_PATH: &str = "/zenoh-web/health";
+/// `GET` this path for `{"service": "zenoh-gateway", "version": "<crate version>"}`, to check a zenoh-gateway server is listening.
+pub const HEALTH_PATH: &str = "/zenoh-gateway/health";
 
 /// `GET` this path for `{"iceServers": [...]}`: the STUN/TURN servers the gateway uses, with TURN credentials minted for the caller.
-pub const ICE_PATH: &str = "/zenoh-web/ice";
+pub const ICE_PATH: &str = "/zenoh-gateway/ice";
 
 /// With [`ServerBuilder::zenoh_signalling`], the key expression prefix of a server's signalling queryables:
-/// `zenoh-web/<name>/offer` and `zenoh-web/<name>/ice`.
-pub const SIGNALLING_PREFIX: &str = "zenoh-web";
+/// `zenoh-gateway/<name>/offer` and `zenoh-gateway/<name>/ice`.
+pub const SIGNALLING_PREFIX: &str = "zenoh-gateway";
 
 /// The authorize hook: the bearer token of `POST /offer` (and `GET` [`ICE_PATH`]) and the request headers in,
 /// a [`Grant`] or the reason for refusing (HTTP 401) out.
@@ -48,7 +48,7 @@ pub type Authorize = dyn Fn(Option<&str>, &HeaderMap) -> Result<Grant, String> +
 ///
 /// ```no_run
 /// # async fn run() -> anyhow::Result<()> {
-/// let server = zenoh_web::Server::builder()
+/// let server = zenoh_gateway::Server::builder()
 ///     .connect("tcp/192.168.1.2:7447")
 ///     .serve_dir("examples")
 ///     .bandwidth_target_fraction(0.75)
@@ -227,7 +227,7 @@ impl ServerBuilder {
         self
     }
 
-    /// Also answers offers over zenoh, on queryables `zenoh-web/<name>/offer` and `zenoh-web/<name>/ice`, so a client with
+    /// Also answers offers over zenoh, on queryables `zenoh-gateway/<name>/offer` and `zenoh-gateway/<name>/ice`, so a client with
     /// a zenoh session that reaches this one (e.g. a relay this side dialled out to) connects without HTTP; see SPEC
     /// "Signalling over zenoh". `name` is one key chunk. Authorized like HTTP, with the token the query carries.
     pub fn zenoh_signalling(mut self, name: impl Into<String>) -> Self {
@@ -247,7 +247,7 @@ impl ServerBuilder {
         let mut config = self.zenoh_config.unwrap_or_default();
         let (session, owns_session) = match self.session {
             Some(session) => {
-                ensure!(self.connect.is_empty(), "connect endpoints only apply to a session zenoh-web opens; configure them on the session you pass instead");
+                ensure!(self.connect.is_empty(), "connect endpoints only apply to a session zenoh-gateway opens; configure them on the session you pass instead");
                 (session, false)
             }
             None => {
@@ -291,7 +291,7 @@ impl Inner {
     }
 }
 
-/// A configured zenoh-web server: the zenoh side is live, browsers connect once it is bound ([`bind`](Self::bind),
+/// A configured zenoh-gateway server: the zenoh side is live, browsers connect once it is bound ([`bind`](Self::bind),
 /// [`serve`](Self::serve)) or mounted in a host's router ([`router`](Self::router)). Clones share everything.
 #[derive(Clone)]
 pub struct Server {
@@ -355,7 +355,7 @@ impl Server {
     pub async fn bind(self, addr: impl ToSocketAddrs) -> Result<RunningServer> {
         let listener = tokio::net::TcpListener::bind(addr).await.context("binding the HTTP listener")?;
         let local_addr = listener.local_addr()?;
-        info!("zenoh-web listening on http://{local_addr}");
+        info!("zenoh-gateway listening on http://{local_addr}");
         if let Some(dir) = &self.inner.serve_dir {
             info!("serving {}", dir.display());
         }
@@ -451,7 +451,7 @@ impl RunningServer {
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"service": "zenoh-web", "version": env!("CARGO_PKG_VERSION")}))
+    Json(serde_json::json!({"service": "zenoh-gateway", "version": env!("CARGO_PKG_VERSION")}))
 }
 
 async fn ice_servers(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> Response {

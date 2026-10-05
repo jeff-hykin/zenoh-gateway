@@ -1,5 +1,5 @@
-//! A Rust client for a zenoh-web server (cargo feature `client`). It connects the way the browser
-//! client (`client/zenoh_web.ts`) does, so a program with no browser can subscribe, publish and
+//! A Rust client for a zenoh-gateway server (cargo feature `client`). It connects the way the browser
+//! client (`client/zenoh_gateway.ts`) does, so a program with no browser can subscribe, publish and
 //! query through a gateway: e.g. a relay that takes one robot's best stream per camera and re-serves
 //! it through its own [`Server`](crate::Server). Video and audio arrive encoded (H.264/VP8/VP9/AV1
 //! access units, Opus packets); the client decodes nothing.
@@ -9,7 +9,7 @@
 //!
 //! ```no_run
 //! # async fn run() -> anyhow::Result<()> {
-//! use zenoh_web::client::{Client, ClientOptions, Message, SubscribeOptions};
+//! use zenoh_gateway::client::{Client, ClientOptions, Message, SubscribeOptions};
 //! let client = Client::connect("http://robot.local:7448", ClientOptions::default()).await?;
 //! let mut camera = client.subscribe("camera/front", SubscribeOptions { encoding: Some("ros2_image".into()), ..Default::default() }).await?;
 //! while let Some(message) = camera.recv().await {
@@ -76,7 +76,7 @@ const QUEUE: usize = 64;
 pub struct ClientOptions {
     /// sent as `Authorization: Bearer <token>` on `POST /offer`, for a server with an authorize hook
     pub token: Option<String>,
-    /// STUN/TURN servers; None (default) asks the gateway (`GET /zenoh-web/ice`, TURN credentials minted for this client)
+    /// STUN/TURN servers; None (default) asks the gateway (`GET /zenoh-gateway/ice`, TURN credentials minted for this client)
     pub ice_servers: Option<Vec<IceServer>>,
     /// send everything through TURN (ICE transport policy "relay"); also on when the gateway's ICE reply says
     /// `"iceTransportPolicy": "relay"`
@@ -495,7 +495,7 @@ async fn route_track(shared: Arc<Shared>, track: Arc<dyn TrackRemote>) {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let Some(slot) = found else { return warn!("zenoh-web client: a track arrived on no known transceiver") };
+    let Some(slot) = found else { return warn!("zenoh-gateway client: a track arrived on no known transceiver") };
     let _ = slot.track.set(track.clone());
     while let Some(event) = track.poll().await {
         if let TrackRemoteEvent::OnRtpPacket(packet) = event {
@@ -536,7 +536,7 @@ impl Inner {
         let reply = tokio::time::timeout(timeout, reply_rx).await;
         self.shared.requests.lock().unwrap().remove(&id);
         let reply = reply.map_err(|_| anyhow!("{op} timed out"))?.map_err(|_| anyhow!("{op}: connection lost"))?;
-        ensure!(reply["ok"] == true, "zenoh-web gateway: {}", reply["error"].as_str().unwrap_or("error"));
+        ensure!(reply["ok"] == true, "zenoh-gateway: {}", reply["error"].as_str().unwrap_or("error"));
         Ok(reply)
     }
 
@@ -631,7 +631,7 @@ impl Drop for Inner {
     }
 }
 
-/// A connection to a zenoh-web server. Clones share it; [`close`](Self::close) ends it for all.
+/// A connection to a zenoh-gateway server. Clones share it; [`close`](Self::close) ends it for all.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
@@ -645,7 +645,7 @@ impl Client {
         Self::connect_with(signalling, options).await
     }
 
-    /// [`connect`](Self::connect), signalling over zenoh instead of HTTP: queries `zenoh-web/<name>/offer` (and `/ice`)
+    /// [`connect`](Self::connect), signalling over zenoh instead of HTTP: queries `zenoh-gateway/<name>/offer` (and `/ice`)
     /// through `session`, which must reach a server built with `ServerBuilder::zenoh_signalling(name)` (e.g. a robot
     /// whose zenoh dialled out to this side). The media then flows over WebRTC as usual (SPEC "Signalling over zenoh").
     pub async fn connect_zenoh(session: &zenoh::Session, name: &str, options: ClientOptions) -> Result<Client> {
@@ -1082,7 +1082,7 @@ impl SubscriptionTask {
                     let Some((header, chunk)) = frame::decode(&data) else { continue };
                     let message = reassemble(&mut partials, &header, chunk).and_then(|(key, timestamp_ms, flags, bytes)| {
                         to_message(self.kind.as_deref(), key, timestamp_ms, header.seq, flags, bytes).unwrap_or_else(|error| {
-                            warn!("zenoh-web client: a message on {} did not decode: {error:#}", header.key);
+                            warn!("zenoh-gateway client: a message on {} did not decode: {error:#}", header.key);
                             None
                         })
                     });
@@ -1446,12 +1446,12 @@ enum Signalling {
 }
 
 impl Signalling {
-    /// The server's ICE servers (`GET /zenoh-web/ice`, or `zenoh-web/<name>/ice`), and whether it asks for relay only.
+    /// The server's ICE servers (`GET /zenoh-gateway/ice`, or `zenoh-gateway/<name>/ice`), and whether it asks for relay only.
     async fn ice_servers(&self, token: Option<&str>) -> Result<(Vec<IceServer>, bool)> {
         let mut reply = match self {
             Signalling::Http { url, http } => {
                 let request = http.get(format!("{url}{}", crate::ICE_PATH));
-                let response = refuse_unauthorized(bearer(request, token).send().await.context("GET /zenoh-web/ice")?).await?;
+                let response = refuse_unauthorized(bearer(request, token).send().await.context("GET /zenoh-gateway/ice")?).await?;
                 // a server without the route (older) has none to offer
                 if !response.status().is_success() {
                     return Ok((Vec::new(), false));
@@ -1477,12 +1477,12 @@ impl Signalling {
         }
     }
 
-    /// One query on `zenoh-web/<name>/<op>`: the first reply's JSON; an error reply with status 401 is a refused token.
+    /// One query on `zenoh-gateway/<name>/<op>`: the first reply's JSON; an error reply with status 401 is a refused token.
     async fn query(&self, op: &str, body: Value) -> Result<Value> {
         let Signalling::Zenoh { session, name } = self else { unreachable!("zenoh signalling only") };
         let key = format!("{}/{name}/{op}", crate::SIGNALLING_PREFIX);
         let replies = session.get(&key).payload(body.to_string()).timeout(OPEN_TIMEOUT).await.map_err(|error| anyhow!("querying {key}: {error}"))?;
-        let reply = replies.recv_async().await.map_err(|_| anyhow!("no zenoh-web server answered on {key} (is it built with zenoh_signalling({name:?}) and reachable over zenoh?)"))?;
+        let reply = replies.recv_async().await.map_err(|_| anyhow!("no zenoh-gateway server answered on {key} (is it built with zenoh_signalling({name:?}) and reachable over zenoh?)"))?;
         match reply.result() {
             Ok(sample) => Ok(serde_json::from_slice(&sample.payload().to_bytes())?),
             Err(error) => {

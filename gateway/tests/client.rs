@@ -7,8 +7,8 @@ use anyhow::Result;
 use openh264::formats::YUVSource;
 use std::time::Duration;
 use tokio::time::timeout;
-use zenoh_web::client::{Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions, VideoFrame};
-use zenoh_web::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, RunningServer, Server, VideoImage, zenoh};
+use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions, VideoFrame};
+use zenoh_gateway::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, RunningServer, Server, VideoImage, zenoh};
 
 /// `[r, g, b, width u16, height u16]` → a solid picture.
 struct SolidColor;
@@ -77,7 +77,7 @@ fn keep_putting(session: &zenoh::Session, key: &str, payload: Vec<u8>) -> tokio:
     })
 }
 
-async fn next_video(subscription: &mut zenoh_web::client::Subscription) -> VideoFrame {
+async fn next_video(subscription: &mut zenoh_gateway::client::Subscription) -> VideoFrame {
     loop {
         match timeout(Duration::from_secs(10), subscription.recv()).await.expect("a video frame").expect("subscription open") {
             Message::Video(frame) => return frame,
@@ -179,7 +179,7 @@ async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
     let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
     let mut frames = vec![next_video(&mut camera).await];
     assert!(frames[0].keyframe, "a stream starts at a keyframe");
-    assert_eq!(frames[0].format, zenoh_web::VideoFormat::H264);
+    assert_eq!(frames[0].format, zenoh_gateway::VideoFormat::H264);
     while frames.len() < 5 {
         frames.push(next_video(&mut camera).await);
     }
@@ -262,7 +262,7 @@ async fn token_and_leases() {
     let session = zenoh::open(isolated_config()).await.unwrap();
     let server = Server::builder()
         .session(session.clone())
-        .authorize(|token, _headers| if token == Some("good") { Ok(zenoh_web::Grant::all()) } else { Err("unknown token".into()) })
+        .authorize(|token, _headers| if token == Some("good") { Ok(zenoh_gateway::Grant::all()) } else { Err("unknown token".into()) })
         .lease_group("drive", ["cmd/**"])
         .build()
         .await
@@ -319,7 +319,7 @@ async fn signalling_over_zenoh() {
     let robot = Server::builder()
         .session(robot_session.clone())
         .zenoh_signalling("robot")
-        .authorize(|token, _headers| if token == Some("good") { Ok(zenoh_web::Grant::all()) } else { Err("unknown token".into()) })
+        .authorize(|token, _headers| if token == Some("good") { Ok(zenoh_gateway::Grant::all()) } else { Err("unknown token".into()) })
         .build()
         .await
         .unwrap();
@@ -328,14 +328,14 @@ async fn signalling_over_zenoh() {
     let mut refused = String::new();
     for _ in 0..50 {
         refused = Client::connect_zenoh(&relay_session, "robot", options("bad")).await.err().unwrap().to_string();
-        if !refused.contains("no zenoh-web server answered") {
+        if !refused.contains("no zenoh-gateway server answered") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(refused.contains("refused the token: unknown token"), "{refused}");
     let absent = Client::connect_zenoh(&relay_session, "nobody", options("good")).await;
-    assert!(absent.err().unwrap().to_string().contains("no zenoh-web server answered"));
+    assert!(absent.err().unwrap().to_string().contains("no zenoh-gateway server answered"));
     let client = Client::connect_zenoh(&relay_session, "robot", options("good")).await.unwrap();
     let mut subscription = client.subscribe("robot/data", SubscribeOptions::default()).await.unwrap();
     let _putter = keep_putting(&robot_session, "robot/data", b"over webrtc".to_vec());
@@ -438,9 +438,9 @@ async fn lease_lost_right_behind_its_grant() {
     running.shutdown().await.unwrap();
 }
 
-/// `GET /zenoh-web/ice` as a browser would.
-async fn browser_ice_servers(url: &str, token: Option<&str>) -> Vec<zenoh_web::IceServer> {
-    let mut request = reqwest::Client::new().get(format!("{url}{}", zenoh_web::ICE_PATH));
+/// `GET /zenoh-gateway/ice` as a browser would.
+async fn browser_ice_servers(url: &str, token: Option<&str>) -> Vec<zenoh_gateway::IceServer> {
+    let mut request = reqwest::Client::new().get(format!("{url}{}", zenoh_gateway::ICE_PATH));
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -451,7 +451,7 @@ async fn browser_ice_servers(url: &str, token: Option<&str>) -> Vec<zenoh_web::I
 #[tokio::test(flavor = "multi_thread")]
 async fn ice_hook_adds_servers_for_both_ends_and_a_failure_leaves_the_static_ones() {
     use std::sync::{Arc, Mutex};
-    use zenoh_web::{IceServer, IceSide};
+    use zenoh_gateway::{IceServer, IceSide};
     let stun = IceServer { urls: vec!["stun:127.0.0.1:3478".into()], ..Default::default() };
     // the hook's TURN server is unreachable, so the connection must still work on host candidates
     let minted = IceServer { urls: vec!["turn:127.0.0.1:9?transport=udp".into()], username: "u".into(), credential: "c".into() };
@@ -488,7 +488,7 @@ async fn ice_hook_adds_servers_for_both_ends_and_a_failure_leaves_the_static_one
 async fn cloudflare_turn_carries_a_relay_only_connection() {
     let key_id = std::env::var("CF_TURN_KEY_ID").expect("CF_TURN_KEY_ID");
     let api_token = std::env::var("CF_TURN_API_TOKEN").expect("CF_TURN_API_TOKEN");
-    let turn = zenoh_web::CloudflareTurn::new(key_id, api_token).ttl(Duration::from_secs(600));
+    let turn = zenoh_gateway::CloudflareTurn::new(key_id, api_token).ttl(Duration::from_secs(600));
     let generated = turn.generate().await.unwrap();
     assert!(generated.iter().any(|server| server.urls.iter().any(|url| url.starts_with("turn")) && !server.credential.is_empty()), "{generated:?}");
     assert!(generated.iter().all(|server| server.urls.iter().all(|url| !url.split('?').next().unwrap().ends_with(":53"))), "port 53 dropped");
@@ -511,12 +511,12 @@ async fn cloudflare_turn_carries_a_relay_only_connection() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relay_policy_in_the_ice_reply_makes_the_connection_relay_only() {
     use axum::{Json, Router, routing::get};
-    // a host app answering /zenoh-web/ice itself, the rest from zenoh-web's routes; no TURN, so relay-only can't connect
+    // a host app answering /zenoh-gateway/ice itself, the rest from zenoh-gateway's routes; no TURN, so relay-only can't connect
     async fn host(policy: Option<&'static str>) -> String {
         let session = zenoh::open(isolated_config()).await.unwrap();
         let server = Server::builder().session(session).build().await.unwrap();
         let ice = move || async move { Json(serde_json::json!({"iceServers": [], "iceTransportPolicy": policy})) };
-        let app = Router::new().route(zenoh_web::ICE_PATH, get(ice)).fallback_service(server.router());
+        let app = Router::new().route(zenoh_gateway::ICE_PATH, get(ice)).fallback_service(server.router());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -539,7 +539,7 @@ async fn video_av1_channel_arrives_as_av1_and_vp8_without_an_encoder_is_refused(
     let mut camera = client.subscribe("camera/front", av1).await.unwrap();
     let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
     let frame = next_video(&mut camera).await;
-    assert_eq!((frame.format, frame.keyframe), (zenoh_web::VideoFormat::Av1, true));
+    assert_eq!((frame.format, frame.keyframe), (zenoh_gateway::VideoFormat::Av1, true));
     assert!(!next_video(&mut camera).await.data.is_empty());
     let vp8 = SubscribeOptions { encoding: Some("test-solid".into()), channel: Some("video-vp8".into()), ..Default::default() };
     let refused = client.subscribe("camera/front", vp8).await.err().unwrap().to_string();

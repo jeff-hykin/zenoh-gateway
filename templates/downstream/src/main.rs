@@ -1,10 +1,10 @@
-//! `my-app [seconds]`: picks a video encoder (hardware first), serves zenoh-web on 127.0.0.1 with it and the dimos /
+//! `my-app [seconds]`: picks a video encoder (hardware first), serves zenoh-gateway on 127.0.0.1 with it and the dimos /
 //! ROS 2 codecs (isolated zenoh session), connects the Rust client to list topics, serves for `seconds` (default 0) and exits.
 
 use anyhow::Result;
 use std::time::Duration;
-use zenoh_web::client::{Client, ClientOptions};
-use zenoh_web::{Server, zenoh};
+use zenoh_gateway::client::{Client, ClientOptions};
+use zenoh_gateway::{Server, zenoh};
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// A STUN or TURN server, in the browser's `RTCIceServer` shape (`GET /zenoh-web/ice` returns these).
+/// A STUN or TURN server, in the browser's `RTCIceServer` shape (`GET /zenoh-gateway/ice` returns these).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IceServer {
     /// e.g. `stun:stun.example.org:3478`, `turn:relay.example.org:3478?transport=udp`

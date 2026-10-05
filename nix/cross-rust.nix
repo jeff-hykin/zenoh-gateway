@@ -1,5 +1,5 @@
 # crate2nix builds where every crate is its own derivation (so crates are shared by every flake that uses this helper,
-# through zenoh-web's nixpkgs and rust-overlay pins), natively and cross compiled to Linux with zig as the C compiler and
+# through zenoh-gateway's nixpkgs and rust-overlay pins), natively and cross compiled to Linux with zig as the C compiler and
 # linker (glibc 2.35 by default: Ubuntu 22.04 / Jetson L4T 36). See README "Nix / cross compiling".
 { nixpkgs, rust-overlay }:
 let

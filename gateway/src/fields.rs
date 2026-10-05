@@ -102,13 +102,13 @@ element!(u8 => U8, i8 => I8, u16 => U16, i16 => I16, u32 => U32, i32 => I32, f32
 /// fields, components outside 1..4 or not dividing the values, scaling a float).
 ///
 /// ```
-/// let bytes = zenoh_web::Fields::new()
+/// let bytes = zenoh_gateway::Fields::new()
 ///     .scalar("width", 2u32)
 ///     .array("data", &[1u16, 2, 3, 4])
 ///     .scaled("positions", &[10.0, 0.0, 0.0], &[0.001; 3], &[1i16, 2, 3])
 ///     .text("encoding", "16UC1")
 ///     .build();
-/// let fields = zenoh_web::fields::parse(&bytes).unwrap();
+/// let fields = zenoh_gateway::fields::parse(&bytes).unwrap();
 /// assert_eq!(fields["positions"].values(), [10.001, 0.002, 0.003]);
 /// ```
 #[derive(Debug, Clone)]

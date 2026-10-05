@@ -1,5 +1,5 @@
 {
-    description = "zenoh-web: view and drive a zenoh system from a browser over WebRTC; plus lib.crossRust, crate2nix builds that cross compile to Linux with zig";
+    description = "zenoh-gateway: view and drive a zenoh system from a browser over WebRTC; plus lib.crossRust, crate2nix builds that cross compile to Linux with zig";
 
     inputs = {
         nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -24,8 +24,8 @@
 
             # the library through a small binary (example/): a loopback server and the Rust client (feature client)
             packages = forAllSystems (system:
-                let built = crossRustLib.crossRustPackages { name = "zenoh-web-example"; inherit system; cargoNix = ./example/Cargo.nix; };
-                in built // { default = built.zenoh-web-example; crate2nix = (crossRustLib.pkgsFor system).crate2nix; });
+                let built = crossRustLib.crossRustPackages { name = "zenoh-gateway-example"; inherit system; cargoNix = ./example/Cargo.nix; };
+                in built // { default = built.zenoh-gateway-example; crate2nix = (crossRustLib.pkgsFor system).crate2nix; });
 
             devShells = forAllSystems (system:
                 let pkgs = crossRustLib.pkgsFor system;
@@ -41,7 +41,7 @@
 
             templates.downstream = {
                 path = ./templates/downstream;
-                description = "a crate using zenoh-web (client) and zenoh-dimos-codecs (codecs + hardware encoders), built natively and for aarch64 / x86_64 Linux with crate2nix + zig";
+                description = "a crate using zenoh-gateway (client) and zenoh-dimos-codecs (codecs + hardware encoders), built natively and for aarch64 / x86_64 Linux with crate2nix + zig";
             };
         };
 }

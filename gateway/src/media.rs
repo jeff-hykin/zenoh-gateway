@@ -242,9 +242,9 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
         let track = Arc::new(TrackLocalStaticSample::new(
             Instant::now(),
             MediaStreamTrack::new(
-                format!("zenoh-web-{ssrc}"),
-                format!("zenoh-web-track-{ssrc}"),
-                "zenoh-web".to_owned(),
+                format!("zenoh-gateway-{ssrc}"),
+                format!("zenoh-gateway-track-{ssrc}"),
+                "zenoh-gateway".to_owned(),
                 kind,
                 vec![RTCRtpEncodingParameters { rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() }, codec: rtp_codec(mime), ..Default::default() }],
             ),

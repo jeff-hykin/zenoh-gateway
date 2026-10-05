@@ -331,7 +331,7 @@ impl DecodedFrame {
 /// frontends and subscriptions concurrently. Keep per-call state in the frames, not in `self`.
 ///
 /// ```
-/// use zenoh_web::{Channel, DecodedFrame, EncodeOptions, EncodingOutput, EncodingSample, MessageEncoding};
+/// use zenoh_gateway::{Channel, DecodedFrame, EncodeOptions, EncodingOutput, EncodingSample, MessageEncoding};
 ///
 /// /// Upper-cases UTF-8 text; lower quality keeps fewer characters.
 /// struct Shout;
