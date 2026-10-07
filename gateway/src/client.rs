@@ -24,7 +24,10 @@
 use crate::encoding::{Compress, VideoFormat};
 use crate::fields::{self, Field};
 use crate::{frame, media};
+
+mod api;
 use anyhow::{Context, Result, anyhow, bail, ensure};
+pub use api::*;
 use base64::Engine;
 use bytes::BytesMut;
 use log::warn;
@@ -182,6 +185,12 @@ pub struct DataMessage {
     pub seq: u32,
     /// fields output: the parsed fields (see [`crate::fields`])
     pub fields: Option<BTreeMap<String, Field>>,
+    /// a delete sample (no payload), not a put
+    pub delete: bool,
+    /// the sample's encoding, when not the default (raw messages only)
+    pub encoding: Option<String>,
+    /// the sample's attachment (raw messages only)
+    pub attachment: Option<Vec<u8>>,
 }
 
 /// An encoded video frame as the gateway's encoder produced it.
@@ -251,7 +260,7 @@ pub struct Topic {
     pub sources: Vec<String>,
 }
 
-/// One reply to [`Client::get`].
+/// One reply to [`Client::get`] / [`Client::get_with`].
 #[derive(Debug, Clone)]
 pub struct GetReply {
     /// the replying key (None for an error reply)
@@ -260,6 +269,14 @@ pub struct GetReply {
     pub bytes: Vec<u8>,
     /// an error reply
     pub error: bool,
+    /// the sample's (or the error's) encoding
+    pub encoding: Option<String>,
+    /// the sample's attachment
+    pub attachment: Option<Vec<u8>>,
+    /// a delete reply (`reply_del`)
+    pub delete: bool,
+    /// the sample's timestamp, unix ms
+    pub timestamp_ms: Option<f64>,
 }
 
 /// The peer connection's state.
@@ -375,6 +392,10 @@ struct Shared {
     leases: Mutex<HashMap<String, Arc<Ending>>>,
     /// lease requests awaiting their reply (request id -> group, lease), held as the reply is read so a `leaseLost` right behind it finds them
     pending_leases: Mutex<HashMap<u64, (String, Arc<Ending>)>>,
+    /// queryables, liveliness subscribers and matching listeners: (event, its id) -> where its events go
+    api_routes: Mutex<HashMap<(&'static str, u64), mpsc::UnboundedSender<Value>>>,
+    /// events that arrived before the reply naming their handle (a liveliness history can), held for it
+    api_early: Mutex<HashMap<(&'static str, u64), Vec<Value>>>,
 }
 
 impl Shared {
@@ -407,7 +428,9 @@ impl Shared {
     }
 
     fn on_control_message(&self, text: &str) {
-        let Ok(message) = serde_json::from_str::<Value>(text) else { return };
+        let Ok(message) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
         let id = message["id"].as_u64().unwrap_or_default();
         let Some(event) = message["event"].as_str() else {
             if let Some((group, ending)) = self.pending_leases.lock().unwrap().remove(&id).filter(|_| message["ok"] == true)
@@ -420,6 +443,23 @@ impl Shared {
             }
             return;
         };
+        if let Some((event, id_field)) = api::EVENT_IDS.iter().find(|(name, _)| *name == event) {
+            let id = message[*id_field].as_u64().unwrap_or_default();
+            let routes = self.api_routes.lock().unwrap();
+            match routes.get(&(*event, id)) {
+                Some(route) => {
+                    let _ = route.send(message);
+                }
+                None => {
+                    let mut early = self.api_early.lock().unwrap();
+                    // ids are never reused, so a stray event for a handle long gone only costs memory: cap it
+                    if early.len() < 1000 {
+                        early.entry((*event, id)).or_default().push(message);
+                    }
+                }
+            }
+            return;
+        }
         let reason = message["reason"].as_str().unwrap_or_default().to_owned();
         match event {
             // revoked
@@ -433,7 +473,9 @@ impl Shared {
             _ => {}
         }
         let mut endpoints = self.endpoints.lock().unwrap();
-        let Some(endpoint) = endpoints.get_mut(&id) else { return };
+        let Some(endpoint) = endpoints.get_mut(&id) else {
+            return;
+        };
         match event {
             "accepted" | "rejected" => {
                 if let Some(accepted) = endpoint.accepted.take() {
@@ -495,7 +537,9 @@ async fn route_track(shared: Arc<Shared>, track: Arc<dyn TrackRemote>) {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let Some(slot) = found else { return warn!("zenoh-gateway client: a track arrived on no known transceiver") };
+    let Some(slot) = found else {
+        return warn!("zenoh-gateway client: a track arrived on no known transceiver");
+    };
     let _ = slot.track.set(track.clone());
     while let Some(event) = track.poll().await {
         if let TrackRemoteEvent::OnRtpPacket(packet) = event {
@@ -654,7 +698,7 @@ impl Client {
 
     async fn connect_with(signalling: Signalling, options: ClientOptions) -> Result<Client> {
         let (state, _) = watch::channel(ConnectionState::Connecting);
-        let shared = Arc::new(Shared { requests: Mutex::default(), endpoints: Mutex::default(), clock: Mutex::default(), state, gathered: Notify::new(), media: Mutex::default(), leases: Mutex::default(), pending_leases: Mutex::default() });
+        let shared = Arc::new(Shared { requests: Mutex::default(), endpoints: Mutex::default(), clock: Mutex::default(), state, gathered: Notify::new(), media: Mutex::default(), leases: Mutex::default(), pending_leases: Mutex::default(), api_routes: Mutex::default(), api_early: Mutex::default() });
         let (ice_servers, server_relay_only) = match &options.ice_servers {
             Some(servers) => (servers.clone(), false),
             None => signalling.ice_servers(options.token.as_deref()).await?,
@@ -752,19 +796,9 @@ impl Client {
         Ok(serde_json::from_value(reply["topics"].take())?)
     }
 
-    /// A zenoh query through the gateway.
+    /// A zenoh query through the gateway (see [`Client::get_with`] for options).
     pub async fn get(&self, key: &str, timeout: Duration) -> Result<Vec<GetReply>> {
-        let timeout_ms = timeout.as_millis() as u64;
-        let reply = self.inner.request(json!({"op": "get", "key": key, "timeoutMs": timeout_ms}), timeout + Duration::from_secs(2)).await?;
-        let base64 = |value: &Value| base64::engine::general_purpose::STANDARD.decode(value.as_str().unwrap_or_default());
-        let replies = reply["replies"].as_array().cloned().unwrap_or_default();
-        replies
-            .iter()
-            .map(|reply| match reply.get("error") {
-                Some(error) => Ok(GetReply { key: None, bytes: base64(error)?, error: true }),
-                None => Ok(GetReply { key: reply["key"].as_str().map(str::to_owned), bytes: base64(&reply["bytes"])?, error: false }),
-            })
-            .collect()
+        self.get_with(key, GetOptions { timeout: Some(timeout), ..Default::default() }).await
     }
 
     /// The gateway's stats for this connection (`channels`, `clock`, `heartbeat`, `bandwidth`; SPEC "Bandwidth allocation").
@@ -802,7 +836,9 @@ impl Client {
                 None => None,
             };
             match self.subscribe_on(key, &options, kind.clone(), slot).await {
-                Err(error) if reuse && media_kind.is_some() && error.to_string().contains("in use") => continue,
+                Err(error) if reuse && media_kind.is_some() && error.to_string().contains("in use") => {
+                    continue;
+                }
                 result => return result,
             }
         }
@@ -1079,7 +1115,9 @@ impl SubscriptionTask {
                     None
                 }
                 Event::Frame(data) => {
-                    let Some((header, chunk)) = frame::decode(&data) else { continue };
+                    let Some((header, chunk)) = frame::decode(&data) else {
+                        continue;
+                    };
                     let message = reassemble(&mut partials, &header, chunk).and_then(|(key, timestamp_ms, flags, bytes)| {
                         to_message(self.kind.as_deref(), key, timestamp_ms, header.seq, flags, bytes).unwrap_or_else(|error| {
                             warn!("zenoh-gateway client: a message on {} did not decode: {error:#}", header.key);
@@ -1129,7 +1167,9 @@ impl SubscriptionTask {
 }
 
 async fn next_packet(packets: &mut Option<mpsc::Receiver<Packet>>) -> Option<Packet> {
-    let Some(receiver) = packets else { return std::future::pending().await };
+    let Some(receiver) = packets else {
+        return std::future::pending().await;
+    };
     let packet = receiver.recv().await;
     if packet.is_none() {
         *packets = None;
@@ -1182,8 +1222,17 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
         }
         // one empty frame per sample, for a browser callback
         Some("audio") => None,
-        _ if flags & frame::FIELDS != 0 => Some(Message::Data(DataMessage { fields: Some(fields::parse(&bytes)?), key, bytes, timestamp_ms, seq })),
-        _ => Some(Message::Data(DataMessage { key, bytes, timestamp_ms, seq, fields: None })),
+        _ => {
+            let delete = flags & frame::DELETE != 0;
+            let (encoding, attachment, bytes) = if flags & frame::META != 0 {
+                let (encoding, attachment, payload) = frame::decode_meta(&bytes).context("bad META header")?;
+                (Some(encoding.to_owned()), (!attachment.is_empty()).then(|| attachment.to_vec()), payload.to_vec())
+            } else {
+                (None, None, bytes)
+            };
+            let fields = if flags & frame::FIELDS != 0 && !delete { Some(fields::parse(&bytes)?) } else { None };
+            Some(Message::Data(DataMessage { key, bytes, timestamp_ms, seq, fields, delete, encoding, attachment }))
+        }
     })
 }
 
@@ -1272,7 +1321,9 @@ fn is_keyframe(format: VideoFormat, data: &[u8]) -> bool {
                 let mut at = 1 + ((header >> 2) & 1) as usize;
                 let mut size = 0usize;
                 for shift in (0..56).step_by(7) {
-                    let Some(&byte) = rest.get(at) else { return false };
+                    let Some(&byte) = rest.get(at) else {
+                        return false;
+                    };
                     at += 1;
                     size |= ((byte & 0x7f) as usize) << shift;
                     if byte & 0x80 == 0 {

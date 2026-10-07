@@ -43,7 +43,7 @@ const sub = z.subscribe("camera/**", {
     maxBitrate: 8e6,             // video channels: most bits/s asked for (default: the server's), see "Video"
     minResolutionScale: 0.5,     // video channels: the picture never shrinks below this share of the source's size
     maxResolution: [1280, 720],  // video channels: box the picture is fitted into
-}, (msg) => { msg.key, msg.bytes, msg.timestamp, msg.seq, msg.decoded, msg.video, msg.mediaStream })
+}, (msg) => { msg.key, msg.kind, msg.bytes, msg.encoding, msg.attachment, msg.timestamp, msg.seq, msg.decoded, msg.video, msg.mediaStream })
 sub.mediaStream  // video and audio channels: a MediaStream for a <video> / <audio> element
 sub.close()
 
@@ -66,8 +66,25 @@ lease.onLost((reason) => {})      // "heartbeat" | "maxSeconds" | "disconnected"
 await lease.release()
 await z.expireLease("arm")        // end another client's lease (needs the grant's forceExpire)
 
-const replies = await z.get("some/key/**")   // zenoh query, returns [{ key, bytes }]
+const replies = await z.get("some/key/**", { parameters: "a=1", payload, encoding, attachment, target, consolidation, timeoutMs })
+                                             // [{ key, bytes, kind, encoding, attachment, timestamp } | { error: true, bytes, encoding }]
 const topics = await z.listTopics("robot/**")  // [{ key, sources }], see "Topic enumeration"
+
+// the rest of zenoh's API, see "The rest of the zenoh API"
+await z.put("some/key", bytes, { encoding: "text/plain", attachment, priority, congestionControl: "block", express: true, timestamp })
+await z.delete("some/key", { attachment })   // also cmd.delete()
+const querier = z.querier("some/key/*", { consolidation: "none" })   // await querier.get({ parameters, payload })
+const queryable = await z.declareQueryable("ui/answers/**", { complete: false }, (query) => {
+    query.key; query.parameters; query.payload; query.encoding; query.attachment
+    await query.reply(bytes, { key, encoding, attachment }); await query.replyErr(bytes); await query.replyDel({ key })
+    await query.finalize()   // the asker's get completes (forgotten queries are finalized after 2 minutes)
+})
+const token = await z.declareToken("ui/present")                     // await token.undeclare()
+await z.livelinessSubscribe("robot/**", { history: true }, ({ key, alive }) => {})
+const alive = await z.livelinessGet("robot/**")                      // ["robot/arm", ...]
+await z.matchingStatus("cmd_vel", "subscribers")                      // or "queryables"; boolean
+await z.matchingListener("cmd_vel", "subscribers", (matching) => {})
+const info = await z.info()                                           // { zid, routers, peers }: the gateway's session
 
 await sub.ready()      // resolves when the gateway accepted the channel, rejects with its reason
 sub.state              // "connecting" | "open" | "rejected" | "closed" (publishers add "tripped")
@@ -90,6 +107,45 @@ registerEncoding("text_uppercase", (bytes, msg) => new TextDecoder().decode(byte
   `minResolutionScale` and `maxResolution` override the server's video policy ("Video"); on a non-video channel they
   reject the channel.
 - No `latched` flag: the gateway always subscribes with zenoh-ext AdvancedSubscriber history (max 1 sample per publisher), so publishers with a cache (e.g. rmw_zenoh transient_local like tf_static) replay their last message.
+
+## The rest of the zenoh API
+
+Besides subscriptions and publishers (data channels), a frontend gets the rest of zenoh's API as
+requests on the `control` channel. Payloads and attachments travel as base64 there, which is fine for
+the small messages these carry (big streams belong on subscriptions). Every request needs a grant
+("Auth"); the gateway answers `{ok: false, error: "not authorized to ..."}` otherwise.
+
+| op (`{id, op, ...}`) | fields | answer | grant |
+|---|---|---|---|
+| `put` | `key, bytes, encoding?, attachment?, priority?, congestionControl?, express?, timestamp?` | `{}` | `publish` |
+| `delete` | `key, attachment?, priority?, congestionControl?, express?, timestamp?` | `{}` | `publish` |
+| `get` | `key` (may hold `?params`), `parameters?, payload?, encoding?, attachment?, target?, consolidation?, timeoutMs?, priority?, congestionControl?, express?` | `{replies: [{key, bytes, encoding, kind, attachment?, timestamp?} \| {error, encoding}]}` | `query` |
+| `declareQueryable` / `undeclareQueryable` | `key, complete?` / `queryableId` | `{queryableId}` | `queryable` |
+| `reply` / `replyErr` / `replyDel` / `finalizeQuery` | `queryId` and `key?, bytes, encoding?, attachment?, timestamp?` | `{}` | (the queryable's) |
+| `declareToken` / `undeclareToken` | `key` / `tokenId` | `{tokenId}` | `liveliness` |
+| `livelinessSubscribe` / `livelinessUnsubscribe` | `key, history?` / `subId` | `{subId}` | `liveliness` |
+| `livelinessGet` | `key, timeoutMs?` | `{tokens: [key, ...]}` | `liveliness` |
+| `matchingStatus` | `key, matching: "subscribers" \| "queryables"` | `{matching}` | `publish` / `query` |
+| `declareMatchingListener` / `undeclareMatchingListener` | same / `listenerId` | `{listenerId}` | `publish` / `query` |
+| `info` | | `{zid, routers, peers}` | |
+
+- `timestamp` is unix ms on the gateway's clock (the JS client converts from its own); `priority` is
+  zenoh's 1-7; `congestionControl` is `"drop"` or `"block"`; `target` is `"bestMatching" | "all" |
+  "allComplete"`; `consolidation` is `"auto" | "none" | "monotonic" | "latest"`.
+- Events: `{event: "query", queryableId, queryId, key, parameters, payload?, encoding?, attachment?}`
+  for each query; `{event: "liveliness", subId, key, kind: "put" | "delete"}`; `{event: "matching",
+  listenerId, matching}`. An event can arrive before the answer that names its id (a liveliness
+  history does), so clients hold events for ids they don't know yet.
+- A query stays open until `finalizeQuery` (any number of replies before it); the gateway finalizes
+  queries the frontend forgets after two minutes. A queryable's replies must be on keys that intersect
+  the query's (zenoh's rule).
+- Everything a frontend declares this way ends with its connection. The JS client re-declares its
+  queryables, tokens and listeners after a reconnect.
+- A querier is client-side: a key and fixed `get` options.
+- Subscriptions carry the sample's kind, encoding and attachment: frame flag bit2 marks a delete,
+  bit3 a message that starts with its encoding and attachment ("Wire format"). They are only sent when
+  they say something (an attachment, or an encoding other than the default), and only on raw data
+  messages (an encoding's output is its own format; deletes skip the encoding).
 
 ## Delivery → transport mapping
 
@@ -480,7 +536,9 @@ per-browser layer on top, with reasons.
   (`connect(url, { token })`). `Err(reason)` answers HTTP 401 with the reason; the client then stops
   reconnecting (`connect` rejects with `gateway refused the token: <reason>`, state `"lost"`). Without a
   hook every connection gets `Grant::all()`, the behaviour before auth existed.
-- A `Grant` (serde, camelCase) holds key-expression lists: `subscribe`, `publish` (and deadmen), `query`
+- A `Grant` (serde, camelCase) holds key-expression lists: `subscribe`, `publish` (and deadmen, `put`/`delete`,
+  matching for subscribers), `queryable` (queryables the frontend declares), `liveliness` (tokens it declares,
+  keys it watches or `livelinessGet`s), `query`
   (`get`), `listTopics` (which keys a listing shows), and the lease rights `leaseGroups` (names, `"*"` =
   any), `maxLeaseSecs` and `forceExpire`. A request is allowed when one of the list's expressions
   includes its key (zenoh's `includes`: `robot/**` includes `robot/arm/cmd` and `robot/arm/**`, not
@@ -594,13 +652,16 @@ resolving so the gateway has an offset before the first put.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.
 - One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
   `encodings`, `renegotiate`, `setDeadman`, `clearDeadman`, `lease {group, keys?, maxSeconds?}`,
-  `releaseLease {group}`, `expireLease {group}`) and events: `accepted` / `rejected` (per sub/pub
-  channel, by label id), `tripped` and `leaseLost {group, reason}`.
+  `releaseLease {group}`, `expireLease {group}`, plus the ops in "The rest of the zenoh API") and events:
+  `accepted` / `rejected` (per sub/pub channel, by label id), `tripped`, `leaseLost {group, reason}`, `query`,
+  `liveliness` and `matching`.
 - Gateway → browser on a `pub` channel: `{"blocked": reason | null}` (JSON text), see "Leases".
 - Gateway → browser frame: `u16 keyLen | key utf8 | f64 timestampMs | u32 seq | u32 frameId | u32 chunkIndex | u32 chunkCount | u8 flags | chunk`,
   little endian. `seq` numbers messages per channel, `frameId` numbers frames; the page acks the highest
   `frameId` it has processed with a 4-byte `u32` message on the same channel. `flags` bit0: the
-  message (its chunks joined) is zstd-compressed; bit1: it is a Fields message (the client decodes it).
+  message (its chunks joined) is zstd-compressed; bit1: it is a Fields message (the client decodes it); bit2: the sample is a delete;
+  bit3: the message (decompressed) starts with `u16 encodingLen | encoding utf8 | u32 attachmentLen | attachment`
+  ahead of the payload.
 - All chunks of one message have the same size, at most 64 KiB (bulk streams use smaller ones, see
   "Bandwidth allocation").
 - Browser → gateway put: `f64 sentAtMs (browser clock) | payload`, little endian.

@@ -211,10 +211,10 @@ mod cloudflare {
                 return self.generate().await;
             }
             let mut cached = self.cached.lock().await;
-            if let Some((minted_at, servers)) = cached.as_ref() {
-                if minted_at.elapsed() < self.ttl / 2 {
-                    return Ok(servers.clone());
-                }
+            if let Some((minted_at, servers)) = cached.as_ref()
+                && minted_at.elapsed() < self.ttl / 2
+            {
+                return Ok(servers.clone());
             }
             let servers = self.generate().await?;
             *cached = Some((Instant::now(), servers.clone()));

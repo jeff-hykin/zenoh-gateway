@@ -84,8 +84,14 @@ export interface VideoFrameInfo {
 
 export interface Message {
     key: string
+    /** "delete" for a delete sample (its bytes are empty) */
+    kind: "put" | "delete"
     /** the payload (decompressed): raw sample bytes, or the encoding's output */
     bytes: Uint8Array
+    /** the sample's encoding, when not the default (raw messages only) */
+    encoding?: string
+    /** the sample's attachment (raw messages only) */
+    attachment?: Uint8Array
     timestamp: number
     seq: number
     /** fields messages: the decoded fields (see `decodeFields`); other data-channel encodings: what the encoding's registered decoder returned (see `registerEncoding`) */
@@ -166,6 +172,13 @@ export interface GetReply {
     key: string | null
     bytes: Uint8Array
     error?: boolean
+    /** a delete reply */
+    kind?: "put" | "delete"
+    /** the sample's (or the error's) encoding */
+    encoding?: string
+    attachment?: Uint8Array
+    /** the sample's timestamp, unix ms */
+    timestamp?: number
 }
 
 export type TopicSource = "token" | "advancedPublisher" | "sample"
@@ -181,7 +194,7 @@ interface ControlResponse {
     id?: number
     ok?: boolean
     error?: string
-    event?: "tripped" | "rejected" | "accepted" | "leaseLost" | "closed"
+    event?: "tripped" | "rejected" | "accepted" | "leaseLost" | "closed" | "query" | "liveliness" | "matching"
     reason?: string
     [field: string]: unknown
 }
@@ -280,6 +293,21 @@ export interface Frame {
 const zstdFlag = 1
 /** frame flag: the message is zenoh-gateway fields */
 const fieldsFlag = 2
+/** frame flag: the sample is a delete */
+const deleteFlag = 4
+/** frame flag: the message starts with the sample's encoding and attachment (see `splitMeta`) */
+const metaFlag = 8
+
+/** u16 encodingLen | encoding | u32 attachmentLen | attachment | payload */
+function splitMeta(message: Uint8Array): { encoding: string, attachment?: Uint8Array, payload: Uint8Array } {
+    const view = new DataView(message.buffer, message.byteOffset, message.byteLength)
+    const encodingLength = view.getUint16(0, true)
+    const encoding = keyDecoder.decode(message.subarray(2, 2 + encodingLength))
+    const attachmentLength = view.getUint32(2 + encodingLength, true)
+    const attachmentStart = 6 + encodingLength
+    const attachment = attachmentLength > 0 ? message.slice(attachmentStart, attachmentStart + attachmentLength) : undefined
+    return { encoding, attachment, payload: message.subarray(attachmentStart + attachmentLength) }
+}
 
 /**
  * Gateway frame (little endian):
@@ -611,7 +639,7 @@ export class Subscription extends Endpoint {
 
     #onFrame(channel: RTCDataChannel, frame: Frame, frameBytes: number): void {
         if (frame.chunkCount <= 1) {
-            this.#deliver({ key: frame.key, bytes: frame.chunk, timestamp: frame.timestamp, seq: frame.seq }, frame.flags)
+            this.#deliver({ key: frame.key, kind: "put", bytes: frame.chunk, timestamp: frame.timestamp, seq: frame.seq }, frame.flags)
         } else {
             this.#addChunk(frame)
         }
@@ -649,7 +677,7 @@ export class Subscription extends Endpoint {
                 this.partialDropped++
             }
         }
-        this.#deliver({ key: partial.key, bytes, timestamp: partial.timestamp, seq: frame.seq }, partial.flags)
+        this.#deliver({ key: partial.key, kind: "put", bytes, timestamp: partial.timestamp, seq: frame.seq }, partial.flags)
     }
 
     #evictPartials(limit: number): void {
@@ -698,7 +726,22 @@ export class Subscription extends Endpoint {
                 return
             }
         }
-        if (this.options.encoding !== undefined && !this.#decode(message, flags)) {
+        message.kind = (flags & deleteFlag) !== 0 ? "delete" : "put"
+        if ((flags & metaFlag) !== 0) {
+            try {
+                const { encoding, attachment, payload } = splitMeta(message.bytes)
+                message.encoding = encoding
+                message.attachment = attachment
+                message.bytes = payload
+            } catch (error) {
+                this.decodeErrors++
+                console.error(`zenoh-gateway: bad sample header on ${message.key}`, error)
+                return
+            }
+        }
+        if (message.kind === "delete") {
+            // nothing to decode
+        } else if (this.options.encoding !== undefined && !this.#decode(message, flags)) {
             return
         }
         this.received++
@@ -819,6 +862,11 @@ export class Publisher extends Endpoint {
     }
 
     /** `timestamp`: when the value was produced, in this client's clock (`z.now()`); defaults to now. */
+    /** A zenoh delete on this publisher's key (over the control channel; needs the `publish` grant). */
+    delete(options: PutOptions = {}): Promise<void> {
+        return this.owner.delete(this.key, options)
+    }
+
     put(value: Bytesish, { timestamp }: { timestamp?: number } = {}): void {
         this.#checkUsable()
         const bytes = toBytes(value)
@@ -1158,6 +1206,7 @@ export class ZenohGateway {
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()
             }
+            await this.#redeclare()
         } catch (error) {
             this.#onLost(generation)
             throw error
@@ -1253,6 +1302,10 @@ export class ZenohGateway {
         } catch {
             return
         }
+        if (response.event === "query" || response.event === "liveliness" || response.event === "matching") {
+            this.#routeApiEvent(response)
+            return
+        }
         if (response.event !== undefined) {
             const endpoint = this.#endpointsById.get(Number(response.id))
             if (response.event === "tripped" && endpoint instanceof Publisher) {
@@ -1327,16 +1380,123 @@ export class ZenohGateway {
         this.#refreshStats(null)
     }
 
-    /** zenoh query. */
-    async get(key: string, { timeoutMs = 5000 }: { timeoutMs?: number } = {}): Promise<GetReply[]> {
-        const response = await this._request({ op: "get", key, timeoutMs }, timeoutMs + 2000)
-        const replies = response.replies as { key?: string, bytes?: string, error?: string }[]
-        return replies.map((reply) => {
-            if (reply.error !== undefined) {
-                return { key: null, bytes: fromBase64(reply.error), error: true }
-            }
-            return { key: reply.key ?? null, bytes: fromBase64(reply.bytes ?? "") }
-        })
+    /** zenoh query: `key` may carry parameters after `?` (or pass `parameters`). */
+    async get(key: string, options: GetOptions = {}): Promise<GetReply[]> {
+        const timeoutMs = options.timeoutMs ?? 5000
+        const response = await this._request({ op: "get", key, ...getRequestFields(options), timeoutMs }, timeoutMs + 2000)
+        return (response.replies as ReplyWire[]).map(parseReply)
+    }
+
+    /** Queries with fixed options, like zenoh's querier. */
+    querier(key: string, options: GetOptions = {}): Querier {
+        return new Querier(this, key, options)
+    }
+
+    /** One zenoh put (needs the `publish` grant). */
+    async put(key: string, value: Bytesish, options: PutOptions = {}): Promise<void> {
+        await this._request({ op: "put", key, bytes: toBase64(toBytes(value)), ...putRequestFields(options, this.clockOffsetMs) }, pingTimeoutMs)
+    }
+
+    /** One zenoh delete (needs the `publish` grant). */
+    async delete(key: string, options: PutOptions = {}): Promise<void> {
+        await this._request({ op: "delete", key, ...putRequestFields(options, this.clockOffsetMs) }, pingTimeoutMs)
+    }
+
+    /**
+     * Answers zenoh queries on `key` from this page (needs the `queryable` grant). The callback gets
+     * each query; reply with `query.reply(...)` (any number of times), then `query.finalize()`.
+     */
+    async declareQueryable(key: string, options: { complete?: boolean }, callback: (query: Query) => void): Promise<Queryable> {
+        const queryable = new Queryable(this, key, options.complete ?? false, callback)
+        await queryable._declare()
+        this.#apiHandles.add(queryable)
+        return queryable
+    }
+
+    /** A liveliness token on `key`, alive until undeclared or this page goes (needs `liveliness`). */
+    async declareToken(key: string): Promise<LivelinessToken> {
+        const token = new LivelinessToken(this, key)
+        await token._declare()
+        this.#apiHandles.add(token)
+        return token
+    }
+
+    /** Tokens appearing (`alive: true`) and going under `key`; `history` also reports the ones already alive. */
+    async livelinessSubscribe(key: string, options: { history?: boolean }, callback: (change: { key: string, alive: boolean }) => void): Promise<LivelinessSubscriber> {
+        const subscriber = new LivelinessSubscriber(this, key, options.history ?? false, callback)
+        await subscriber._declare()
+        this.#apiHandles.add(subscriber)
+        return subscriber
+    }
+
+    /** The keys of the liveliness tokens alive under `key`. */
+    async livelinessGet(key: string, { timeoutMs = 5000 }: { timeoutMs?: number } = {}): Promise<string[]> {
+        const response = await this._request({ op: "livelinessGet", key, timeoutMs }, timeoutMs + 2000)
+        return response.tokens as string[]
+    }
+
+    /** Whether a publisher ("subscribers") or a querier ("queryables") on `key` would reach anyone now. */
+    async matchingStatus(key: string, target: MatchingTarget = "subscribers"): Promise<boolean> {
+        const response = await this._request({ op: "matchingStatus", key, matching: target }, pingTimeoutMs + 5000)
+        return Boolean(response.matching)
+    }
+
+    /** Called each time `matchingStatus(key, target)` changes. */
+    async matchingListener(key: string, target: MatchingTarget, callback: (matching: boolean) => void): Promise<MatchingListener> {
+        const listener = new MatchingListener(this, key, target, callback)
+        await listener._declare()
+        this.#apiHandles.add(listener)
+        return listener
+    }
+
+    /** The gateway's zenoh session: its id, and the routers and peers it is connected to. */
+    async info(): Promise<SessionInfo> {
+        const response = await this._request({ op: "info" }, pingTimeoutMs)
+        return { zid: String(response.zid), routers: response.routers as string[], peers: response.peers as string[] }
+    }
+
+    /** api handles by event and id, and events that came before their handle's id did */
+    #apiRoutes = new Map<string, (event: ControlResponse) => void>()
+    #apiEarly = new Map<string, ControlResponse[]>()
+    /** declared queryables, tokens and listeners: re-declared after a reconnect */
+    #apiHandles = new Set<ApiHandle>()
+
+    _route(event: string, id: number, handler: (event: ControlResponse) => void): void {
+        const routeKey = `${event}:${id}`
+        this.#apiRoutes.set(routeKey, handler)
+        for (const early of this.#apiEarly.get(routeKey) ?? []) {
+            handler(early)
+        }
+        this.#apiEarly.delete(routeKey)
+    }
+
+    _unroute(event: string, id: number): void {
+        this.#apiRoutes.delete(`${event}:${id}`)
+    }
+
+    _forgetHandle(handle: ApiHandle): void {
+        this.#apiHandles.delete(handle)
+    }
+
+    #routeApiEvent(response: ControlResponse): void {
+        const idField = { query: "queryableId", liveliness: "subId", matching: "listenerId" }[response.event as "query" | "liveliness" | "matching"]
+        const routeKey = `${response.event}:${response[idField]}`
+        const handler = this.#apiRoutes.get(routeKey)
+        if (handler) {
+            handler(response)
+        } else if (this.#apiEarly.size < 1000) {
+            // a liveliness history can arrive before the reply naming its subscriber
+            this.#apiEarly.set(routeKey, [...(this.#apiEarly.get(routeKey) ?? []), response])
+        }
+    }
+
+    /** After a reconnect the gateway has none of this page's declarations: make them again. */
+    async #redeclare(): Promise<void> {
+        this.#apiRoutes.clear()
+        this.#apiEarly.clear()
+        for (const handle of this.#apiHandles) {
+            await handle._declare().catch((error) => console.error("zenoh-gateway: re-declaring after reconnect failed", error))
+        }
     }
 
     /**
@@ -1446,4 +1606,258 @@ export async function connect(url: string, options: ConnectOptions = {}): Promis
     await client._open()
     client._startStats()
     return client
+}
+
+// ── The rest of the zenoh API (SPEC "The rest of the zenoh API") ─────────────────────────────
+
+/** Options of `put` / `delete` (and `publisher.delete`). */
+export interface PutOptions {
+    /** e.g. "text/plain" (put only) */
+    encoding?: string
+    attachment?: Bytesish
+    /** zenoh priority, 1 (real time) to 7 (background) */
+    priority?: number
+    congestionControl?: "drop" | "block"
+    express?: boolean
+    /** the sample's timestamp: unix ms on this client's clock (converted to the gateway's) */
+    timestamp?: number
+}
+
+/** Options of `get` (and a `Querier`). */
+export interface GetOptions {
+    /** the selector's parameters ("a=1;b=2"); also allowed inline in the key after `?` */
+    parameters?: string
+    payload?: Bytesish
+    encoding?: string
+    attachment?: Bytesish
+    target?: "bestMatching" | "all" | "allComplete"
+    consolidation?: "auto" | "none" | "monotonic" | "latest"
+    /** default 5000 */
+    timeoutMs?: number
+    priority?: number
+    congestionControl?: "drop" | "block"
+    express?: boolean
+}
+
+export type MatchingTarget = "subscribers" | "queryables"
+
+export interface SessionInfo {
+    /** the gateway's zenoh id */
+    zid: string
+    routers: string[]
+    peers: string[]
+}
+
+interface ReplyWire {
+    key?: string
+    bytes?: string
+    error?: string
+    encoding?: string
+    attachment?: string
+    kind?: "put" | "delete"
+    timestamp?: number
+}
+
+function parseReply(reply: ReplyWire): GetReply {
+    if (reply.error !== undefined) {
+        return { key: null, bytes: fromBase64(reply.error), error: true, encoding: reply.encoding }
+    }
+    return {
+        key: reply.key ?? null,
+        bytes: fromBase64(reply.bytes ?? ""),
+        kind: reply.kind,
+        encoding: reply.encoding,
+        attachment: reply.attachment === undefined ? undefined : fromBase64(reply.attachment),
+        timestamp: reply.timestamp,
+    }
+}
+
+function putRequestFields(options: PutOptions, clockOffsetMs: number | null = null): Record<string, unknown> {
+    return {
+        encoding: options.encoding,
+        attachment: options.attachment === undefined ? undefined : toBase64(toBytes(options.attachment)),
+        priority: options.priority,
+        congestionControl: options.congestionControl,
+        express: options.express,
+        timestamp: options.timestamp === undefined ? undefined : options.timestamp + (clockOffsetMs ?? 0),
+    }
+}
+
+function getRequestFields(options: GetOptions): Record<string, unknown> {
+    return {
+        parameters: options.parameters,
+        payload: options.payload === undefined ? undefined : toBase64(toBytes(options.payload)),
+        encoding: options.encoding,
+        attachment: options.attachment === undefined ? undefined : toBase64(toBytes(options.attachment)),
+        target: options.target,
+        consolidation: options.consolidation,
+        priority: options.priority,
+        congestionControl: options.congestionControl,
+        express: options.express,
+    }
+}
+
+/** Something declared on the gateway for this page; re-declared after a reconnect. */
+interface ApiHandle {
+    _declare(): Promise<void>
+}
+
+/** Fixed-option queries on one key (`gateway.querier(key, options)`). */
+export class Querier {
+    constructor(readonly owner: ZenohGateway, readonly key: string, readonly options: GetOptions) {}
+
+    /** A query with the querier's options, plus these per-call ones. */
+    get(options: Pick<GetOptions, "parameters" | "payload" | "attachment" | "encoding"> = {}): Promise<GetReply[]> {
+        return this.owner.get(this.key, { ...this.options, ...options })
+    }
+
+    /** Whether a queryable would answer now. */
+    matchingStatus(): Promise<boolean> {
+        return this.owner.matchingStatus(this.key, "queryables")
+    }
+
+    matchingListener(callback: (matching: boolean) => void): Promise<MatchingListener> {
+        return this.owner.matchingListener(this.key, "queryables", callback)
+    }
+}
+
+/** A query this page's `Queryable` received. */
+export class Query {
+    #finalized = false
+
+    constructor(
+        readonly owner: ZenohGateway,
+        readonly id: number,
+        readonly key: string,
+        readonly parameters: string,
+        readonly payload: Uint8Array | undefined,
+        readonly encoding: string | undefined,
+        readonly attachment: Uint8Array | undefined,
+    ) {}
+
+    /** Replies with a sample on `key` (default: the query's key). Any number of replies, then `finalize()`. */
+    async reply(value: Bytesish, options: { key?: string, encoding?: string, attachment?: Bytesish, timestamp?: number } = {}): Promise<void> {
+        await this.owner._request({
+            op: "reply",
+            queryId: this.id,
+            key: options.key ?? "",
+            bytes: toBase64(toBytes(value)),
+            ...putRequestFields(options, this.owner.clockOffsetMs),
+        }, pingTimeoutMs)
+    }
+
+    async replyErr(value: Bytesish, options: { encoding?: string } = {}): Promise<void> {
+        await this.owner._request({ op: "replyErr", queryId: this.id, bytes: toBase64(toBytes(value)), encoding: options.encoding }, pingTimeoutMs)
+    }
+
+    /** Replies that `key` (default: the query's key) was deleted. */
+    async replyDel(options: { key?: string, attachment?: Bytesish } = {}): Promise<void> {
+        await this.owner._request({ op: "replyDel", queryId: this.id, key: options.key ?? "", ...putRequestFields(options) }, pingTimeoutMs)
+    }
+
+    /** No more replies: the asker's get completes. (The gateway finalizes forgotten queries after two minutes.) */
+    async finalize(): Promise<void> {
+        if (!this.#finalized) {
+            this.#finalized = true
+            await this.owner._request({ op: "finalizeQuery", queryId: this.id }, pingTimeoutMs)
+        }
+    }
+}
+
+/** Queries for this page to answer (`gateway.declareQueryable`). */
+export class Queryable implements ApiHandle {
+    #id = 0
+
+    constructor(readonly owner: ZenohGateway, readonly key: string, readonly complete: boolean, readonly callback: (query: Query) => void) {}
+
+    async _declare(): Promise<void> {
+        const response = await this.owner._request({ op: "declareQueryable", key: this.key, complete: this.complete }, pingTimeoutMs)
+        this.#id = Number(response.queryableId)
+        this.owner._route("query", this.#id, (event) => {
+            const query = new Query(
+                this.owner,
+                Number(event.queryId),
+                String(event.key),
+                String(event.parameters ?? ""),
+                event.payload === undefined ? undefined : fromBase64(String(event.payload)),
+                event.encoding === undefined ? undefined : String(event.encoding),
+                event.attachment === undefined ? undefined : fromBase64(String(event.attachment)),
+            )
+            try {
+                this.callback(query)
+            } catch (error) {
+                console.error(`zenoh-gateway: queryable callback for ${this.key} threw`, error)
+            }
+        })
+    }
+
+    async undeclare(): Promise<void> {
+        this.owner._forgetHandle(this)
+        this.owner._unroute("query", this.#id)
+        await this.owner._request({ op: "undeclareQueryable", queryableId: this.#id }, pingTimeoutMs)
+    }
+}
+
+/** A liveliness token (`gateway.declareToken`). */
+export class LivelinessToken implements ApiHandle {
+    #id = 0
+
+    constructor(readonly owner: ZenohGateway, readonly key: string) {}
+
+    async _declare(): Promise<void> {
+        this.#id = Number((await this.owner._request({ op: "declareToken", key: this.key }, pingTimeoutMs)).tokenId)
+    }
+
+    async undeclare(): Promise<void> {
+        this.owner._forgetHandle(this)
+        await this.owner._request({ op: "undeclareToken", tokenId: this.#id }, pingTimeoutMs)
+    }
+}
+
+/** Liveliness changes under a key (`gateway.livelinessSubscribe`). */
+export class LivelinessSubscriber implements ApiHandle {
+    #id = 0
+
+    constructor(readonly owner: ZenohGateway, readonly key: string, readonly history: boolean, readonly callback: (change: { key: string, alive: boolean }) => void) {}
+
+    async _declare(): Promise<void> {
+        this.#id = Number((await this.owner._request({ op: "livelinessSubscribe", key: this.key, history: this.history }, pingTimeoutMs)).subId)
+        this.owner._route("liveliness", this.#id, (event) => {
+            try {
+                this.callback({ key: String(event.key), alive: event.kind === "put" })
+            } catch (error) {
+                console.error(`zenoh-gateway: liveliness callback for ${this.key} threw`, error)
+            }
+        })
+    }
+
+    async undeclare(): Promise<void> {
+        this.owner._forgetHandle(this)
+        this.owner._unroute("liveliness", this.#id)
+        await this.owner._request({ op: "livelinessUnsubscribe", subId: this.#id }, pingTimeoutMs)
+    }
+}
+
+/** Matching changes (`gateway.matchingListener`). */
+export class MatchingListener implements ApiHandle {
+    #id = 0
+
+    constructor(readonly owner: ZenohGateway, readonly key: string, readonly target: MatchingTarget, readonly callback: (matching: boolean) => void) {}
+
+    async _declare(): Promise<void> {
+        this.#id = Number((await this.owner._request({ op: "declareMatchingListener", key: this.key, matching: this.target }, pingTimeoutMs)).listenerId)
+        this.owner._route("matching", this.#id, (event) => {
+            try {
+                this.callback(Boolean(event.matching))
+            } catch (error) {
+                console.error(`zenoh-gateway: matching callback for ${this.key} threw`, error)
+            }
+        })
+    }
+
+    async undeclare(): Promise<void> {
+        this.owner._forgetHandle(this)
+        this.owner._unroute("matching", this.#id)
+        await this.owner._request({ op: "undeclareMatchingListener", listenerId: this.#id }, pingTimeoutMs)
+    }
 }

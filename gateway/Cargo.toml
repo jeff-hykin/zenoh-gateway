@@ -68,3 +68,6 @@ required-features = ["client"]
 name = "relay_sketch"
 required-features = ["client"]
 
+[patch.crates-io]
+# zenoh 1.6.2 plus a routing fix (puts dropped after a publisher is undeclared): https://github.com/jeff-hykin/zenoh-vendor
+zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.6.2-patch.1" }

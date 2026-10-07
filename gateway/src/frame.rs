@@ -3,7 +3,8 @@
 //! `seq` numbers messages per channel; a message larger than one chunk is split across frames
 //! that share its `seq` (chunk size is per message, at most `CHUNK_BYTES`). `frameId` numbers frames per channel; the page acks frameIds.
 //! `flags` bit0 ([`ZSTD`]): the whole message (all its chunks joined) is zstd-compressed; bit1 ([`FIELDS`]): it is a
-//! zenoh-gateway fields message, which the client decodes into `msg.decoded`.
+//! zenoh-gateway fields message, which the client decodes into `msg.decoded`; bit2 ([`DELETE`]): the sample is a delete;
+//! bit3 ([`META`]): the message (after decompression) starts with [`encode_meta`]'s header: the sample's encoding and attachment.
 
 use bytes::{BufMut, BytesMut};
 
@@ -12,6 +13,10 @@ pub const HEADER_FIXED_LEN: usize = 2 + 8 + 4 + 4 + 4 + 4 + 1;
 pub const ZSTD: u8 = 1;
 /// `flags` bit: the message is zenoh-gateway fields.
 pub const FIELDS: u8 = 2;
+/// `flags` bit: the sample is a delete (its kind), not a put.
+pub const DELETE: u8 = 4;
+/// `flags` bit: the message starts with the sample's encoding and attachment (see [`encode_meta`]).
+pub const META: u8 = 8;
 /// Payload bytes per frame; well under the 256 KiB SCTP message limit, small enough to interleave.
 pub const CHUNK_BYTES: usize = 64 * 1024;
 
@@ -45,6 +50,30 @@ pub fn encode(header: &FrameHeader, chunk: &[u8]) -> BytesMut {
 }
 
 /// A frame's header and chunk (what [`encode`] wrote), None if it is malformed.
+/// `u16 encodingLen | encoding utf8 | u32 attachmentLen | attachment bytes`, ahead of the payload in a [`META`] message.
+pub fn encode_meta(encoding: &str, attachment: Option<&[u8]>, payload: &[u8]) -> Vec<u8> {
+    let encoding = &encoding.as_bytes()[..encoding.len().min(u16::MAX as usize)];
+    let attachment = attachment.unwrap_or_default();
+    let mut out = Vec::with_capacity(2 + encoding.len() + 4 + attachment.len() + payload.len());
+    out.extend_from_slice(&(encoding.len() as u16).to_le_bytes());
+    out.extend_from_slice(encoding);
+    out.extend_from_slice(&(attachment.len() as u32).to_le_bytes());
+    out.extend_from_slice(attachment);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Splits a [`META`] message into (encoding, attachment, payload).
+#[cfg(any(test, feature = "client"))]
+pub fn decode_meta(message: &[u8]) -> Option<(&str, &[u8], &[u8])> {
+    let encoding_len = u16::from_le_bytes(message.get(..2)?.try_into().ok()?) as usize;
+    let encoding = std::str::from_utf8(message.get(2..2 + encoding_len)?).ok()?;
+    let at = 2 + encoding_len;
+    let attachment_len = u32::from_le_bytes(message.get(at..at + 4)?.try_into().ok()?) as usize;
+    let attachment = message.get(at + 4..at + 4 + attachment_len)?;
+    Some((encoding, attachment, &message[at + 4 + attachment_len..]))
+}
+
 #[cfg(any(test, feature = "client"))]
 pub fn decode(frame: &[u8]) -> Option<(FrameHeader<'_>, &[u8])> {
     let key_len = u16::from_le_bytes(frame.get(..2)?.try_into().ok()?) as usize;

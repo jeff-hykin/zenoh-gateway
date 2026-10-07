@@ -70,9 +70,16 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 
 | member | |
 |---|---|
-| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, bytes, timestamp, seq, decoded?, video?, mediaStream? }` |
+| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, kind, bytes, encoding?, attachment?, timestamp, seq, decoded?, video?, mediaStream? }` (`kind`: `"put"` / `"delete"`) |
 | `publisher(key, options)` → `Publisher` | |
-| `get(key, { timeoutMs = 5000 })` → `[{ key, bytes, error? }]` | zenoh query |
+| `get(key, { parameters, payload, encoding, attachment, target, consolidation, timeoutMs = 5000, priority, congestionControl, express })` → `[{ key, bytes, kind, encoding, attachment?, timestamp? }` or `{ error: true, bytes, encoding }]` | zenoh query |
+| `querier(key, getOptions)` → `Querier` | fixed-option queries: `querier.get({ parameters, payload })`, `querier.matchingStatus()` |
+| `put(key, bytes, { encoding, attachment, priority, congestionControl, express, timestamp })`, `delete(key, options)` | one zenoh put / delete (also `publisher.delete()`) |
+| `declareQueryable(key, { complete }, (query) => …)` → `Queryable` | the page answers zenoh queries: `query.reply(bytes, { key, encoding, attachment })`, `replyErr(bytes)`, `replyDel({ key })`, then `query.finalize()` |
+| `declareToken(key)` → `LivelinessToken` | a liveliness token (`undeclare()`) |
+| `livelinessSubscribe(key, { history }, ({ key, alive }) => …)`, `livelinessGet(key)` → `[key]` | watch / list liveliness tokens |
+| `matchingStatus(key, "subscribers" \| "queryables")` → `boolean`, `matchingListener(key, target, (matching) => …)` | whether a publisher / querier on the key would reach anyone |
+| `info()` → `{ zid, routers, peers }` | the gateway's zenoh session |
 | `listTopics(filter = "**", { probeMs = 600 })` → `[{ key, sources }]` | live keys; `sources` ⊂ `token`, `advancedPublisher`, `sample` (SPEC "Topic enumeration"); `probeMs: 0` skips the `sample` probe, so publishers that only send while matched stay asleep |
 | `encodings` | `[{ name, output }]`: every message encoding the gateway runs (`output` on its default channel: `"video"`, `"audio"`, `"fields"` or `"data"`), fetched on connect |
 | `stats` | per key: `received`, `dropped`, `backlogBytes`, `rttMs`, `gateway` (normalized options, gateway counters, `allocation`) |
@@ -218,6 +225,15 @@ let cmd = client.publish("cmd_vel", PublisherOptions::default()).await?;
 cmd.put(b"...").await?;
 cmd.set_deadman(b"stop").await?;                     // needs heartbeat_hz
 let lease = client.lease("drive", None, None).await?; // exclusive publishing (SPEC "Leases")
+// the rest of zenoh's API (SPEC "The rest of the zenoh API")
+client.put("ui/note", b"hi", PutOptions { encoding: Some("text/plain".into()), ..Default::default() }).await?;
+let replies = client.get_with("robot/params/*", GetOptions { parameters: Some("depth=2".into()), ..Default::default() }).await?;
+let mut queryable = client.declare_queryable("ui/answers/**", false).await?;
+while let Some(query) = queryable.recv().await { query.reply(None, b"42", None, None).await?; query.finalize().await?; }
+let token = client.declare_token("ui/present").await?;
+let alive = client.liveliness_get("robot/**", Duration::from_secs(1)).await?;
+let matching = client.matching_status("cmd_vel", MatchingTarget::Subscribers).await?;
+let info = client.info().await?;                     // the gateway's zid, routers, peers
 client.close().await;                                // reconnecting is the caller's job: watch client.closed()
 ```
 
@@ -303,7 +319,8 @@ server.revoke("driver-token");   // closes its live connections; the hook decide
 ```
 
 The page connects with `connect(url, { token })`. A `Grant` lists key expressions per action (`subscribe`,
-`publish`, `query`, `listTopics`) plus lease rights (`leaseGroups`, `maxLeaseSecs`, `forceExpire`); a
+`publish` (also put, delete, matching for subscribers), `query` (also queriers, matching for queryables),
+`queryable` (queryables the page declares), `liveliness` (tokens, liveliness watching and get), `listTopics`) plus lease rights (`leaseGroups`, `maxLeaseSecs`, `forceExpire`); a
 request is allowed when one of them includes its key, otherwise the channel is rejected with
 `not authorized to <action> "<key>"`. No hook = `Grant::all()` for everyone. Issuing tokens is up to
 the host; zenoh-gateway-cli's `--auth-file` is a small file-based example. SPEC "Auth".
@@ -374,6 +391,16 @@ Your nix may build one derivation at a time (`max-jobs = 1`); with hundreds of c
 
 ### A crate that depends on zenoh-gateway
 
+zenoh 1.6.2 drops a client's puts on a key after a publisher on it was undeclared and the key's
+subscribers changed. zenoh-gateway builds against a fixed zenoh
+([jeff-hykin/zenoh-vendor](https://github.com/jeff-hykin/zenoh-vendor)); `[patch]` doesn't carry over to
+dependents, so add the same to yours:
+
+```toml
+[patch.crates-io]
+zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.6.2-patch.1" }
+```
+
 ```sh
 nix flake init -t github:jeff-hykin/zenoh-gateway#downstream   # Cargo.toml, src/main.rs, flake.nix
 cargo generate-lockfile && nix run github:jeff-hykin/zenoh-gateway#crate2nix -- generate   # Cargo.lock -> Cargo.nix
@@ -410,7 +437,8 @@ deno task check                            # type-check the client
 ```
 
 The end-to-end suites (a real zenoh peer, the server and headless Chrome; delivery, clock sync,
-deadmen, allocation, latency under load, throughput on a shaped link, video latency, encodings, auth and leases) are in
+deadmen, allocation, latency under load, throughput on a shaped link, video latency, encodings, auth and leases, and the rest of the
+zenoh API from a page) are in
 [zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli), which builds them against this crate.
 
 ## Known limitations

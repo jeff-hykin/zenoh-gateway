@@ -15,10 +15,14 @@ use zenoh::key_expr::keyexpr;
 pub struct Grant {
     /// subscriptions
     pub subscribe: Vec<String>,
-    /// publishers (and their deadmen)
+    /// publishers (and their deadmen), session `put`/`delete`, and matching status/listeners for subscribers
     pub publish: Vec<String>,
-    /// `get` queries
+    /// `get` queries, queriers, and matching status/listeners for queryables
     pub query: Vec<String>,
+    /// queryables it may declare (the browser answers queries)
+    pub queryable: Vec<String>,
+    /// liveliness: tokens it may declare, and keys it may watch or `get`
+    pub liveliness: Vec<String>,
     /// which keys `listTopics` shows
     pub list_topics: Vec<String>,
     /// lease groups it may take (`"*"`: any); a lease's keys must also be within `publish`
@@ -33,7 +37,17 @@ impl Grant {
     /// Everything, including force-expiring leases.
     pub fn all() -> Self {
         let any = || vec!["**".to_owned()];
-        Grant { subscribe: any(), publish: any(), query: any(), list_topics: any(), lease_groups: vec!["*".into()], max_lease_secs: None, force_expire: true }
+        Grant {
+            subscribe: any(),
+            publish: any(),
+            query: any(),
+            queryable: any(),
+            liveliness: any(),
+            list_topics: any(),
+            lease_groups: vec!["*".into()],
+            max_lease_secs: None,
+            force_expire: true,
+        }
     }
 
     /// `Err("not authorized to <action> <key>")` unless a rule includes `key`.

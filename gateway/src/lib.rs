@@ -40,6 +40,7 @@
 #![warn(missing_docs)]
 
 mod allocator;
+mod api;
 mod audio;
 mod auth;
 #[cfg(feature = "client")]

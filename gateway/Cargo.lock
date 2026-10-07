@@ -4789,8 +4789,7 @@ dependencies = [
 [[package]]
 name = "zenoh"
 version = "1.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5df040795169d4b6e4fc8a5f9dce81b5210d1d606399634ec380deda30c347f"
+source = "git+https://github.com/jeff-hykin/zenoh-vendor?tag=zenoh-1.6.2-patch.1#3148154ba096252497a9c564375e0d4c8bf7b6e9"
 dependencies = [
  "ahash",
  "arc-swap",

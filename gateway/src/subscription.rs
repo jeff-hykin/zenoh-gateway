@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use zenoh::bytes::{Encoding, ZBytes};
-use zenoh::sample::Sample;
+use zenoh::sample::{Sample, SampleKind};
 use zenoh_ext::{AdvancedSubscriberBuilderExt, HistoryConfig};
 
 /// Smallest send window (it grows with the bandwidth-delay product); sending resumes at half the window.
@@ -97,6 +97,8 @@ pub struct SubStats {
 pub struct Pending {
     pub payload: ZBytes,
     pub encoding: Encoding,
+    pub kind: SampleKind,
+    pub attachment: Option<ZBytes>,
     pub timestamp_ms: f64,
     pub seq: u32,
     arrived: Instant,
@@ -455,6 +457,8 @@ impl SubShared {
             state.stats.max_receive_lag_ms = state.stats.max_receive_lag_ms.max(now_unix_ms() - timestamp_ms);
             let pending = Pending {
                 encoding: sample.encoding().clone(),
+                kind: sample.kind(),
+                attachment: sample.attachment().cloned(),
                 timestamp_ms,
                 seq,
                 arrived: Instant::now(),
@@ -496,7 +500,9 @@ impl SubShared {
         let mut best: Option<(&String, (u8, Instant))> = None;
         let mut wake_at: Option<Instant> = None;
         for (key, queue) in state.keys.iter() {
-            let Some(head) = queue.items.front() else { continue };
+            let Some(head) = queue.items.front() else {
+                continue;
+            };
             if let (Some(interval), Some(last_sent)) = (self.key_interval(queue, &state.allocation), queue.last_sent) {
                 let ready_at = last_sent + interval;
                 if ready_at > now {
@@ -509,7 +515,9 @@ impl SubShared {
                 best = Some((key, rank));
             }
         }
-        let Some((key, _)) = best else { return (None, wake_at) };
+        let Some((key, _)) = best else {
+            return (None, wake_at);
+        };
         let key = key.clone();
         let queue = state.keys.get_mut(&key).unwrap();
         let item = queue.items.pop_front().unwrap();
@@ -688,6 +696,8 @@ impl Pacer {
 enum Body<'a> {
     Raw(std::borrow::Cow<'a, [u8]>),
     Compressed(Vec<u8>),
+    /// raw bytes behind a [`frame::META`] header
+    Owned(Vec<u8>),
     Encoded(Arc<registry::Encoded>),
 }
 
@@ -696,6 +706,7 @@ impl Body<'_> {
         match self {
             Body::Raw(bytes) => bytes,
             Body::Compressed(bytes) => bytes,
+            Body::Owned(bytes) => bytes,
             Body::Encoded(encoded) => &encoded.bytes,
         }
     }
@@ -710,15 +721,28 @@ impl Body<'_> {
     }
 }
 
-/// A raw payload, zstd-compressed off the async runtime when the subscription asks for it.
+/// Whether a raw message carries the sample's encoding and attachment ([`frame::META`]): only when they say something.
+fn needs_meta(item: &Pending) -> bool {
+    item.attachment.is_some() || item.encoding != Encoding::default()
+}
+
+/// A raw payload (behind its [`frame::META`] header when [`needs_meta`]), zstd-compressed off the async runtime when
+/// the subscription asks for it.
 async fn raw_body(compress: Compress, item: &Pending) -> Body<'_> {
+    let with_meta = needs_meta(item).then(|| {
+        let attachment = item.attachment.as_ref().map(|attachment| attachment.to_bytes());
+        frame::encode_meta(&item.encoding.to_string(), attachment.as_deref(), &item.payload.to_bytes())
+    });
     if compress != Compress::None {
-        let payload = item.payload.clone();
-        if let Ok(Some(compressed)) = tokio::task::spawn_blocking(move || compress.apply(&payload.to_bytes())).await {
+        let message = with_meta.clone().unwrap_or_else(|| item.payload.to_bytes().into_owned());
+        if let Ok(Some(compressed)) = tokio::task::spawn_blocking(move || compress.apply(&message)).await {
             return Body::Compressed(compressed);
         }
     }
-    Body::Raw(item.payload.to_bytes())
+    match with_meta {
+        Some(message) => Body::Owned(message),
+        None => Body::Raw(item.payload.to_bytes()),
+    }
 }
 
 /// Transcodes off the async runtime (shared with other frontends asking for the same encode).
@@ -755,13 +779,20 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
         };
         // encode on send: only messages the pacing and queues let through get transcoded
         let body = match &shared.codec {
-            Some(codec) => match encode(&shared, codec.clone(), &key, &item).await {
+            // a delete has no payload to transcode: it goes as an empty raw message with its DELETE flag
+            Some(codec) if item.kind != SampleKind::Delete => match encode(&shared, codec.clone(), &key, &item).await {
                 Some(encoded) => Body::Encoded(encoded),
                 None => continue,
             },
-            None => raw_body(shared.compress, &item).await,
+            _ => raw_body(shared.compress, &item).await,
         };
-        let flags = body.flags() | if shared.output == EncodingOutput::Fields { frame::FIELDS } else { 0 };
+        let mut flags = body.flags() | if shared.output == EncodingOutput::Fields { frame::FIELDS } else { 0 };
+        if item.kind == SampleKind::Delete {
+            flags |= frame::DELETE;
+        }
+        if (shared.codec.is_none() || item.kind == SampleKind::Delete) && needs_meta(&item) {
+            flags |= frame::META;
+        }
         if sender.send(&dc, &shared, &key, &item, body.bytes(), flags).await == Sent::Closed {
             return;
         }
@@ -880,7 +911,16 @@ mod tests {
     }
 
     fn pending(seq: u32, priority: u8, arrived: Instant) -> Pending {
-        Pending { payload: ZBytes::from(vec![0u8; 10]), encoding: Encoding::default(), timestamp_ms: 0.0, seq, arrived, priority }
+        Pending {
+            payload: ZBytes::from(vec![0u8; 10]),
+            encoding: Encoding::default(),
+            kind: SampleKind::Put,
+            attachment: None,
+            timestamp_ms: 0.0,
+            seq,
+            arrived,
+            priority,
+        }
     }
 
     fn insert(shared: &SubShared, key: &str, item: Pending, cap: Option<usize>) {
