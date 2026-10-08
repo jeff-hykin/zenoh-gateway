@@ -485,7 +485,8 @@ impl VideoSessions {
         let same_stream = |session: &&Arc<EncodeSession>| session.codec == codec && session.format == format && session.key == key && session.policy == policy;
         let oldest_fit = sessions.iter().filter(same_stream).filter(|session| session.fits(member, grant.0)).min_by_key(|session| session.id).cloned();
         let session = match (current, oldest_fit) {
-            (Some(current), oldest) if current.fits(member, grant.0) && (current.grants.lock().unwrap().len() > 1 || oldest.as_ref().is_none_or(|oldest| oldest.id >= current.id)) => current,
+            // the policy changes when the subscription is updated (updateSubscription)
+            (Some(current), oldest) if current.policy == policy && current.fits(member, grant.0) && (current.grants.lock().unwrap().len() > 1 || oldest.as_ref().is_none_or(|oldest| oldest.id >= current.id)) => current,
             (current, oldest) => {
                 if let Some(current) = current {
                     Self::leave_locked(&mut sessions, &current, member);
