@@ -173,9 +173,37 @@ fn seq_at_or_before(a: u32, b: u32) -> bool {
     b.wrapping_sub(a) < u32::MAX / 2
 }
 
+/// A subscription's options that `updateSubscription` may change while it runs.
+#[derive(Clone, Copy)]
+pub struct Tuning {
+    min_interval: Option<Duration>,
+    max_hz: Option<f64>,
+    /// bandwidthPriority: higher keeps more when bandwidth is short
+    bandwidth_priority: f64,
+    quality_range: (f64, f64),
+    tradeoff: f64,
+    /// video channels: the server's policy with this subscription's overrides
+    pub video_policy: VideoPolicy,
+    /// video channels: (min, max) playout delay for the browser, in 10 ms units
+    pub playout_delay: (u16, u16),
+}
+
+impl Tuning {
+    fn new(opts: &SubOpts, server_policy: VideoPolicy) -> Self {
+        Tuning {
+            min_interval: opts.min_interval(),
+            max_hz: opts.max_hz,
+            bandwidth_priority: opts.bandwidth_priority.unwrap_or(1.0),
+            quality_range: opts.quality_range(),
+            tradeoff: opts.quality_to_hz_tradeoff.unwrap_or(0.5),
+            video_policy: opts.video_policy(server_policy),
+            playout_delay: opts.playout_delay_units(),
+        }
+    }
+}
+
 pub struct SubShared {
     delivery: Delivery,
-    min_interval: Option<Duration>,
     priority_override: Option<u8>,
     pub codec: Option<Arc<dyn MessageEncoding>>,
     /// what the frames travel on, and what the encoding sends there
@@ -188,13 +216,8 @@ pub struct SubShared {
     compress: Compress,
     /// the server's encodings, with the caches that share work across frontends
     pub codecs: Arc<EncodingRegistry>,
-    max_hz: Option<f64>,
-    /// bandwidthPriority: higher keeps more when bandwidth is short
-    bandwidth_priority: f64,
-    quality_range: (f64, f64),
-    tradeoff: f64,
-    /// video channels: the server's policy with this subscription's overrides
-    pub video_policy: VideoPolicy,
+    /// the options `updateSubscription` may change while it runs
+    tuning: Mutex<Tuning>,
     /// this frontend's shared send gate, and this stream's id in it
     gate: Arc<SendGate>,
     stream_id: usize,
@@ -228,7 +251,7 @@ impl SubShared {
             sample_priority: AtomicU8::new(0),
             bucket: Mutex::new(TokenBucket::default()),
             delivery: opts.delivery(),
-            min_interval: opts.min_interval(),
+            tuning: Mutex::new(Tuning::new(opts, codecs.video_policy)),
             priority_override: opts.priority,
             key_prefix: codec.as_ref().and_then(|codec| codec.key_prefix()).map(|prefix| format!("{}/", prefix.trim_end_matches('/'))),
             codec,
@@ -236,18 +259,23 @@ impl SubShared {
             output,
             encode_options: opts.encoding_options(),
             compress: opts.compress.unwrap_or_default(),
-            video_policy: opts.video_policy(codecs.video_policy),
             codecs,
-            max_hz: opts.max_hz,
-            bandwidth_priority: opts.bandwidth_priority.unwrap_or(1.0),
-            quality_range: opts.quality_range(),
-            tradeoff: opts.quality_to_hz_tradeoff.unwrap_or(0.5),
             state: Mutex::new(SubState::default()),
             data_ready: Notify::new(),
             drained: Notify::new(),
             closed: AtomicBool::new(false),
             closed_signal: tokio::sync::watch::Sender::new(false),
         }
+    }
+
+    pub fn tuning(&self) -> Tuning {
+        *self.tuning.lock().unwrap()
+    }
+
+    /// Applies new options to the running subscription (`updateSubscription`); the next frame uses them.
+    pub fn retune(&self, opts: &SubOpts) {
+        *self.tuning.lock().unwrap() = Tuning::new(opts, self.codecs.video_policy);
+        self.data_ready.notify_one();
     }
 
     /// The zenoh key expression a subscription to `key` reads (see [`MessageEncoding::key_prefix`]).
@@ -276,14 +304,21 @@ impl SubShared {
 
     /// Quality to transcode at now: the allocation's, or the best allowed before the first one.
     pub fn current_quality(&self) -> f64 {
-        self.state.lock().unwrap().allocation.quality.unwrap_or(self.quality_range.1)
+        self.state.lock().unwrap().allocation.quality.unwrap_or(self.tuning().quality_range.1)
     }
 
     /// Granted Hz for one key of this stream (video encoders size their bitrate by it).
     pub fn key_hz(&self, key: &str) -> f64 {
         let state = self.state.lock().unwrap();
         let rate = state.keys.get(key).map_or(0.0, |queue| queue.rate_hz);
-        self.allocated_key_hz(rate, &state.allocation).or(self.max_hz).unwrap_or(if rate > 0.0 { rate } else { 30.0 })
+        // never above the source's own rate: the encoder spreads its bitrate over this many frames a second
+        let wanted = match (self.tuning().max_hz, rate > 0.0) {
+            (Some(max), true) => max.min(rate),
+            (Some(max), false) => max,
+            (None, true) => rate,
+            (None, false) => 30.0,
+        };
+        self.allocated_key_hz(rate, &state.allocation).unwrap_or(wanted)
     }
 
     /// What a video key is granted: (quality, bits/s, frames/s); before the first allocation, the most it may ask for.
@@ -291,11 +326,11 @@ impl SubShared {
         let hz = self.key_hz(key);
         let state = self.state.lock().unwrap();
         let allocation = &state.allocation;
-        let quality = allocation.quality.unwrap_or(self.quality_range.1);
+        let quality = allocation.quality.unwrap_or(self.tuning().quality_range.1);
         let bitrate = if allocation.hz > 0.0 {
             allocation.budget_bytes_per_sec * 8.0 * (hz / allocation.hz).min(1.0)
         } else {
-            self.video_policy.frame_bytes(state.video_source.unwrap_or(DEFAULT_VIDEO_SOURCE), hz, quality) * 8.0 * hz
+            self.tuning().video_policy.frame_bytes(state.video_source.unwrap_or(DEFAULT_VIDEO_SOURCE), hz, quality) * 8.0 * hz
         };
         (quality, bitrate, hz)
     }
@@ -305,15 +340,15 @@ impl SubShared {
         if self.reserved() || !allocation.constrained || rate_hz <= 0.0 {
             return None;
         }
-        let wanted = self.max_hz.map_or(rate_hz, |max| max.min(rate_hz));
+        let wanted = self.tuning().max_hz.map_or(rate_hz, |max| max.min(rate_hz));
         Some((wanted * allocation.hz_fraction).max(MIN_ALLOCATED_HZ))
     }
 
     /// Spacing between two sends of a key: maxHz, tightened by the allocation.
     fn key_interval(&self, queue: &KeyQueue, allocation: &Allocation) -> Option<Duration> {
         match self.allocated_key_hz(queue.rate_hz, allocation) {
-            Some(hz) => Some(Duration::from_secs_f64(1.0 / hz).max(self.min_interval.unwrap_or_default())),
-            None => self.min_interval,
+            Some(hz) => Some(Duration::from_secs_f64(1.0 / hz).max(self.tuning().min_interval.unwrap_or_default())),
+            None => self.tuning().min_interval,
         }
     }
 
@@ -343,7 +378,7 @@ impl SubShared {
         for queue in state.keys.values_mut() {
             queue.rate_hz = ewma(queue.rate_hz, queue.arrivals as f64 / interval_secs.max(1e-3));
             queue.arrivals = 0;
-            max_hz += self.max_hz.map_or(queue.rate_hz, |max| max.min(queue.rate_hz));
+            max_hz += self.tuning().max_hz.map_or(queue.rate_hz, |max| max.min(queue.rate_hz));
         }
         let bytes_sent = state.stats.bytes_sent - state.accounted_bytes_sent;
         let network_blocked_ms = state.stats.blocked_on_network_ms - state.accounted_blocked_ms;
@@ -358,7 +393,7 @@ impl SubShared {
             Some(_) if matches!(self.channel, Channel::Video(_)) => {
                 let source = state.video_source.unwrap_or(DEFAULT_VIDEO_SOURCE);
                 let keys = state.keys.values().filter(|queue| queue.rate_hz > 0.0).count().max(1);
-                let (policy, frame_hz) = (self.video_policy, max_hz / keys as f64);
+                let (policy, frame_hz) = (self.tuning().video_policy, max_hz / keys as f64);
                 Box::new(move |quality| policy.frame_bytes(source, frame_hz, quality))
             }
             Some(codec) => {
@@ -376,10 +411,10 @@ impl SubShared {
             }
         };
         let demand = Demand {
-            priority: self.bandwidth_priority,
+            priority: self.tuning().bandwidth_priority,
             max_hz,
-            quality_range: self.codec.as_ref().map(|_| self.quality_range),
-            tradeoff: self.tradeoff,
+            quality_range: self.codec.as_ref().map(|_| self.tuning().quality_range),
+            tradeoff: self.tuning().tradeoff,
             price,
             fixed_bytes_per_sec: self.reserved().then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
         };
@@ -573,7 +608,7 @@ impl SubShared {
 }
 
 /// Runs a `sub` channel until it closes. Video and audio channels send frames to `track` instead of `dc`.
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>, track: Option<Arc<crate::media::MediaTrack>>) {
+pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>, track: Option<crate::media::TrackClaim>) {
     let _ = dc.set_buffered_amount_low_threshold((shared.gate.window_bytes() / 2) as u32).await;
     let feed = shared.clone();
     let subscriber = session
@@ -898,6 +933,20 @@ mod tests {
     fn shared(opts: &str) -> SubShared {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
         SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default())
+    }
+
+    #[test]
+    fn video_hz_is_max_hz_capped_at_the_source_rate() {
+        let capped = shared(r#"{"maxHz":30}"#);
+        assert_eq!(capped.key_hz("cam"), 30.0, "no measured rate yet");
+        capped.state.lock().unwrap().keys.entry("cam".into()).or_default().rate_hz = 4.5;
+        assert_eq!(capped.key_hz("cam"), 4.5, "a 4.5 Hz source is encoded as 4.5 Hz, not 30");
+        let uncapped = shared(r#"{}"#);
+        uncapped.state.lock().unwrap().keys.entry("cam".into()).or_default().rate_hz = 12.0;
+        assert_eq!(uncapped.key_hz("cam"), 12.0);
+        // retune changes it on the running subscription
+        uncapped.retune(&SubOpts::parse(&serde_json::json!({"maxHz": 5})).unwrap());
+        assert_eq!(uncapped.key_hz("cam"), 5.0);
     }
 
     #[test]

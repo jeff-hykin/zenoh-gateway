@@ -54,6 +54,8 @@ pub struct SubOpts {
     pub max_bitrate: Option<f64>,
     pub min_resolution_scale: Option<f64>,
     pub max_resolution: Option<(u32, u32)>,
+    /// video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once)
+    pub playout_delay: Option<(f64, f64)>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -109,6 +111,10 @@ impl SubOpts {
         if parsed.max_resolution.is_some_and(|(width, height)| width < 16 || height < 16) {
             return Err("maxResolution must be at least [16, 16]".into());
         }
+        // the RTP extension carries 12 bits of 10 ms each
+        if parsed.playout_delay.is_some_and(|(min, max)| !(min >= 0.0 && min <= max && max <= 40_950.0)) {
+            return Err("playoutDelay must be [min, max] ms with 0 <= min <= max <= 40950".into());
+        }
         check("bandwidthPriority", parsed.bandwidth_priority, |weight| weight.is_finite() && weight >= 0.0, ">= 0")?;
         let quality = match parsed.encode_options.as_ref().and_then(|options| options.get("quality")) {
             None => None,
@@ -149,8 +155,8 @@ impl SubOpts {
         let channel = channel.unwrap_or_else(|| Channel::default_for(encoding.output(), VideoFormat::H264));
         let output = encoding.output_on(channel, &self.encoding_options())?;
         let video = matches!(channel, Channel::Video(_));
-        if !video && (self.max_bitrate.is_some() || self.min_resolution_scale.is_some() || self.max_resolution.is_some()) {
-            return Err(format!("maxBitrate, minResolutionScale and maxResolution are for video channels, not {}", channel.as_str()));
+        if !video && (self.max_bitrate.is_some() || self.min_resolution_scale.is_some() || self.max_resolution.is_some() || self.playout_delay.is_some()) {
+            return Err(format!("maxBitrate, minResolutionScale, maxResolution and playoutDelay are for video channels, not {}", channel.as_str()));
         }
         if let Channel::Video(format) = channel {
             registry.video_encoder(&*encoding, format)?;
@@ -166,6 +172,12 @@ impl SubOpts {
         }
         self.compress.get_or_insert(encoding.default_compress());
         Ok(Resolved { encoding: Some(encoding), channel, output })
+    }
+
+    /// playoutDelay in the RTP extension's 10 ms units.
+    pub fn playout_delay_units(&self) -> (u16, u16) {
+        let (min, max) = self.playout_delay.unwrap_or((0.0, 0.0));
+        ((min / 10.0).round() as u16, (max / 10.0).round() as u16)
     }
 
     /// The server's video policy with this subscription's overrides.
@@ -211,6 +223,7 @@ impl SubOpts {
             "maxBitrate": self.max_bitrate,
             "minResolutionScale": self.min_resolution_scale,
             "maxResolution": self.max_resolution,
+            "playoutDelay": self.playout_delay.unwrap_or((0.0, 0.0)),
         })
     }
 }
@@ -355,6 +368,10 @@ mod tests {
         assert!(sub(r#"{"bandwidthPriority":-1}"#).is_err());
         assert!(sub(r#"{"dangerousMinHz":1}"#).is_err());
         assert!(sub(r#"{"maxBitrate":0}"#).is_err());
+        assert_eq!(sub(r#"{"playoutDelay":[0,200]}"#).unwrap().playout_delay_units(), (0, 20), "10 ms units");
+        assert!(sub(r#"{"playoutDelay":[100,50]}"#).is_err(), "min above max");
+        assert!(sub(r#"{"playoutDelay":[0,50000]}"#).is_err(), "past the extension's 12 bits");
+        assert!(resolve(r#"{"encoding":"table","playoutDelay":[0,100]}"#).unwrap_err().contains("are for video channels"));
         assert!(sub(r#"{"minResolutionScale":1.5}"#).is_err());
         assert!(sub(r#"{"maxResolution":[8,8]}"#).is_err());
         assert!(resolve(r#"{"encoding":"table","maxBitrate":1e6}"#).unwrap_err().contains("for video channels"));

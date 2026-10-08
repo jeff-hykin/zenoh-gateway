@@ -2,7 +2,7 @@
 //! to a WebRTC audio track (`media` negotiates it). The browser's jitter buffer smooths arrival.
 
 use crate::encoding::{AudioPcm, DecodedFrame};
-use crate::media::{MediaTrack, start_decode};
+use crate::media::{MediaTrack, TrackClaim, start_decode};
 use crate::subscription::{self, SubShared};
 use anyhow::{Result, ensure};
 use std::sync::Arc;
@@ -57,12 +57,12 @@ impl Drop for Opus {
 /// Sends an audio subscription: decode each picked sample to PCM, cut it into 20 ms Opus packets
 /// (a remainder waits for the next sample) and write them to the track; a small frame per sample
 /// on the data channel delivers the message to the page.
-pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: Arc<MediaTrack>) {
+pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: TrackClaim) {
     let Some(codec) = shared.codec.clone() else { return };
     let mut opus: Option<Opus> = None;
     let mut pending: Vec<i16> = Vec::new();
     let mut frame_id: u32 = 0;
-    while !shared.is_closed() {
+    while !shared.is_closed() && track.is_current() {
         let (picked, wake_at) = shared.pick(Instant::now());
         let Some((key, item)) = picked else {
             shared.wait_for_data(wake_at).await;
@@ -93,7 +93,6 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         }
         frame_id = frame_id.wrapping_add(1);
     }
-    track.release();
 }
 
 /// Adds `pcm` to `pending` and writes every whole packet; returns the bytes written.
@@ -110,7 +109,7 @@ async fn send_pcm(opus: &mut Option<Opus>, pending: &mut Vec<i16>, pcm: &AudioPc
         let packet = opus.encode(&pending[..packet_samples])?;
         pending.drain(..packet_samples);
         bytes += packet.len();
-        track.write(packet, PACKET).await?;
+        track.write(packet, PACKET, (0, 0)).await?;
     }
     Ok(bytes)
 }

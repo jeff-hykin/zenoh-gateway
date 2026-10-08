@@ -123,7 +123,15 @@ export interface SubscribeOptions {
     minResolutionScale?: number
     /** video channels: [width, height] box the picture is fitted into */
     maxResolution?: [number, number]
+    /** video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once) */
+    playoutDelay?: [number, number]
 }
+
+/** What `Subscription.update` may change on a running subscription; `null` puts an option back to its default. */
+export type SubscriptionUpdate = {
+    [option in "maxHz" | "minQuality" | "qualityToHzTradeoff" | "bandwidthPriority" | "maxBitrate" | "minResolutionScale" | "maxResolution" | "playoutDelay"]?:
+        SubscribeOptions[option] | null
+} & { encodeOptions?: { quality?: number } }
 
 export interface PublisherOptions {
     delivery?: Delivery
@@ -557,9 +565,29 @@ export class Subscription extends Endpoint {
     #ackTimer: ReturnType<typeof setTimeout> | null = null
     #partials = new Map<number, PartialMessage>()
 
-    constructor(owner: ZenohGateway, id: number, key: string, readonly options: SubscribeOptions, readonly callback: (message: Message) => void) {
+    constructor(owner: ZenohGateway, id: number, key: string, public options: SubscribeOptions, readonly callback: (message: Message) => void) {
         super(owner, id, key)
         this.channelName = channelOf(options, owner.encodings)
+    }
+
+    /**
+     * Changes the running subscription's options in place: same channel and track, no resubscribe; the gateway's
+     * next frame uses them. Reconnects keep them too.
+     */
+    async update(changes: SubscriptionUpdate): Promise<void> {
+        await this.ready()
+        await this.owner._request({ op: "updateSubscription", subId: this.id, opts: changes }, pingTimeoutMs)
+        const options: Record<string, unknown> = { ...this.options }
+        for (const [name, value] of Object.entries(changes)) {
+            if (name === "encodeOptions") {
+                options.encodeOptions = { ...this.options.encodeOptions, ...(value as object) }
+            } else if (value === null) {
+                delete options[name]
+            } else {
+                options[name] = value
+            }
+        }
+        this.options = options as SubscribeOptions
     }
 
     get state(): SubscriptionState {

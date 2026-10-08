@@ -141,6 +141,8 @@ pub struct SubscribeOptions {
     pub min_resolution_scale: Option<f64>,
     /// video channels: (width, height) box the picture is fitted into
     pub max_resolution: Option<(u32, u32)>,
+    /// video channels: (min, max) ms the browser may hold a frame to smooth out jitter (default (0, 0): show at once)
+    pub playout_delay: Option<(f64, f64)>,
 }
 
 /// Publisher options.
@@ -1030,6 +1032,15 @@ impl Subscription {
     /// after loss; the client also sends one itself when it drops a frame). Fails before any video arrived.
     pub async fn request_keyframe(&self) -> Result<()> {
         self.slot.as_ref().context("not a video subscription")?.request_keyframe().await
+    }
+
+    /// Changes the running subscription's options in place (same channel and track): any of maxHz, minQuality,
+    /// qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale, maxResolution, playoutDelay and
+    /// encodeOptions.quality, as JSON (`null` puts one back to its default). Returns the options now in force.
+    pub async fn update(&self, changes: Value) -> Result<Value> {
+        let inner = self.client.upgrade().context("the client closed")?;
+        let mut reply = inner.request(json!({"op": "updateSubscription", "subId": self.id, "opts": changes}), PING_TIMEOUT).await?;
+        Ok(reply["opts"].take())
     }
 }
 

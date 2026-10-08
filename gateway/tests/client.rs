@@ -5,6 +5,7 @@ mod relay_sketch;
 
 use anyhow::Result;
 use openh264::formats::YUVSource;
+use serde_json::json;
 use std::time::Duration;
 use tokio::time::timeout;
 use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions, VideoFrame};
@@ -201,6 +202,37 @@ async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
     let first = next_video(&mut again).await;
     assert!(first.keyframe);
     assert_eq!(decode_all(&[first]).0, (160, 120), "maxResolution reached the gateway");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_video_subscription_changes_its_options_in_place() {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { encoding: Some("test-solid".into()), min_quality: Some(1.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await.unwrap();
+    let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
+    assert_eq!(decode_all(&[next_video(&mut camera).await]).0, (320, 240));
+    let now = camera.update(json!({"maxResolution": [160, 120], "playoutDelay": [0, 100], "maxHz": 20})).await.unwrap();
+    assert_eq!((now["maxResolution"].clone(), now["playoutDelay"].clone(), now["maxHz"].clone()), (json!([160, 120]), json!([0.0, 100.0]), json!(20.0)));
+    // the new size starts at a keyframe on the same subscription
+    let resized = loop {
+        let frame = next_video(&mut camera).await;
+        if frame.keyframe && decode_all(&[frame.clone()]).0 == (160, 120) {
+            break frame;
+        }
+    };
+    assert!(resized.keyframe);
+    // null puts an option back to its default
+    camera.update(json!({"maxResolution": null})).await.unwrap();
+    while !(next_video(&mut camera).await.keyframe) {}
+    // options that decide what the subscription is need a new one
+    let refused = camera.update(json!({"encoding": "raw"})).await.unwrap_err().to_string();
+    assert!(refused.contains("can't change on a running subscription"), "{refused}");
+    assert!(camera.update(json!({"maxHz": -1})).await.is_err(), "checked like at subscribe");
+    let stats = client.stats().await.unwrap();
+    assert_eq!(stats["channels"][0]["opts"]["maxHz"], json!(20.0), "stats show the options in force: {}", stats["channels"][0]["opts"]);
     client.close().await;
     running.shutdown().await.unwrap();
 }

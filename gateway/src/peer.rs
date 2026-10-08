@@ -10,7 +10,7 @@ use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
 use crate::pacing::SendGate;
 use crate::publisher::{self, PubShared};
 use crate::subscription::{self, SubShared, now_unix_ms};
-use crate::media::{self, MediaTrack};
+use crate::media::{self, MediaTrack, TrackClaim};
 use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
@@ -693,8 +693,65 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     }
 }
 
+/// The options a running subscription may change (the rest decide what it is, so they need a new subscription).
+const UPDATABLE: [&str; 9] =
+    ["maxHz", "minQuality", "qualityToHzTradeoff", "bandwidthPriority", "maxBitrate", "minResolutionScale", "maxResolution", "playoutDelay", "encodeOptions"];
+
+/// Changes a running subscription's options in place: same channel, same track, the next frame uses them.
+fn update_subscription(state: &PeerState, request: &ControlRequest) -> Value {
+    let result = (|| -> Result<Value, String> {
+        let sub_id = request.sub_id.ok_or("updateSubscription needs subId")?;
+        let Some(Value::Object(changes)) = &request.opts else { return Err("updateSubscription needs opts (an object)".into()) };
+        let mut channels = state.channels.lock().unwrap();
+        let entry = channels
+            .values_mut()
+            .find(|entry| entry.label.kind == "sub" && entry.label.id == Some(sub_id))
+            .ok_or_else(|| format!("no subscription with id {sub_id}"))?;
+        let ChannelStats::Sub(shared) = &entry.stats else { return Err(format!("no subscription with id {sub_id}")) };
+        let mut merged = match &entry.label.opts {
+            Value::Object(opts) => opts.clone(),
+            _ => serde_json::Map::new(),
+        };
+        for (name, value) in changes {
+            if !UPDATABLE.contains(&name.as_str()) {
+                return Err(format!("{name} can't change on a running subscription (it may change: {})", UPDATABLE.join(", ")));
+            }
+            // encodeOptions: only its quality, the rest is how the encoding works
+            if name == "encodeOptions" {
+                let Value::Object(options) = value else { return Err("encodeOptions must be an object".into()) };
+                if let Some(other) = options.keys().find(|option| *option != "quality") {
+                    return Err(format!("encodeOptions.{other} can't change on a running subscription (encodeOptions.quality may)"));
+                }
+                let current = merged.entry("encodeOptions").or_insert_with(|| json!({}));
+                if let (Value::Object(current), Some(quality)) = (current, options.get("quality")) {
+                    current.insert("quality".into(), quality.clone());
+                }
+                continue;
+            }
+            // null clears an option back to its default
+            if value.is_null() {
+                merged.remove(name);
+            } else {
+                merged.insert(name.clone(), value.clone());
+            }
+        }
+        let merged = Value::Object(merged);
+        let mut opts = SubOpts::parse(&merged)?;
+        opts.resolve_encoding(&state.codecs)?;
+        shared.retune(&opts);
+        entry.opts = opts.normalized();
+        entry.label.opts = merged;
+        Ok(json!({"opts": entry.opts}))
+    })();
+    // the allocator's next tick (every ALLOCATION_INTERVAL) picks up the new demand
+    match result {
+        Ok(extra) => ok(&request.id, extra),
+        Err(error) => fail(&request.id, error),
+    }
+}
+
 /// A video or audio channel's subscription claims the track the browser renegotiated for it (by mid).
-fn bind_track(state: &PeerState, resolved: &Resolved, label: &Label) -> Result<Option<Arc<MediaTrack>>, String> {
+fn bind_track(state: &PeerState, resolved: &Resolved, label: &Label) -> Result<Option<TrackClaim>, String> {
     let Some(mime) = media::track_mime(resolved.channel) else {
         return Ok(None);
     };
@@ -704,10 +761,7 @@ fn bind_track(state: &PeerState, resolved: &Resolved, label: &Label) -> Result<O
     if track.mime != mime {
         return Err(format!("track {mid:?} carries {}, channel {channel} needs {mime}", track.mime));
     }
-    if !track.claim() {
-        return Err(format!("video track {mid:?} is in use by another subscription"));
-    }
-    Ok(Some(track))
+    Ok(Some(track.claim()))
 }
 
 /// `allocator::allocate` over every stream, except that video streams together get no more than
@@ -812,6 +866,9 @@ struct ControlRequest {
     group: Option<String>,
     keys: Option<Vec<String>>,
     max_seconds: Option<f64>,
+    /// updateSubscription: the subscription's channel id, and the options to change
+    sub_id: Option<u64>,
+    opts: Option<Value>,
 }
 
 fn ok(id: &Value, extra: Value) -> Value {
@@ -892,6 +949,7 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 ok(&request.id, json!({"encodings": encodings}))
             }
             "lease" => take_lease(&state, &request),
+            "updateSubscription" => update_subscription(&state, &request),
             "releaseLease" => {
                 state.leases.end(request.group.as_deref().unwrap_or_default(), |holder, _| holder == state.peer_id);
                 ok(&request.id, json!({}))

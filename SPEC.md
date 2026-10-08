@@ -408,8 +408,12 @@ The client adds a recvonly video (or audio) transceiver and renegotiates over `c
 (H.264 is constrained baseline, `profile-level-id=42e01f`; VP9 profile 0; Opus 48 kHz) that pairs
 with the new m-line, then the `sub` channel's label names that `mid` (the gateway refuses a track of
 another format). Renegotiations run one at a time. A closed subscription's transceiver (and the
-gateway's track) is reused by the next one of the same channel instead of renegotiating again.
+gateway's track) is reused by the next one of the same channel instead of renegotiating again; the gateway gives
+the track to the newest subscription that names it, so a page may open the next one before the old one's close
+has reached the gateway.
 Each video frame also sends a 28-byte metadata frame on the `sub` channel (`msg.video`).
+Video RTP carries the playout-delay extension with the subscription's `playoutDelay` (default `[0, 0]`: the browser
+shows each frame at once; a larger max lets its jitter buffer smooth an uneven network).
 Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden per subscription):
 - A stream asks the allocator for at most `maxBitrate` bits/s (default: `max_bits_per_pixel` × the source's pixels ×
   its rate, 0.3: ~17 Mbit/s for 720p60, ~1.4 Mbit/s for 320x240 at 60 Hz). The encoder runs at what the allocator
@@ -652,7 +656,9 @@ resolving so the gateway has an offset before the first put.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.
 - One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
   `encodings`, `renegotiate`, `setDeadman`, `clearDeadman`, `lease {group, keys?, maxSeconds?}`,
-  `releaseLease {group}`, `expireLease {group}`, plus the ops in "The rest of the zenoh API") and events:
+  `releaseLease {group}`, `expireLease {group}`, `updateSubscription {subId, opts}` (changes a running
+  subscription's maxHz, minQuality, qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale,
+  maxResolution, playoutDelay or encodeOptions.quality; replies `{opts}`, the options now in force), plus the ops in "The rest of the zenoh API") and events:
   `accepted` / `rejected` (per sub/pub channel, by label id), `tripped`, `leaseLost {group, reason}`, `query`,
   `liveliness` and `matching`.
 - Gateway → browser on a `pub` channel: `{"blocked": reason | null}` (JSON text), see "Leases".

@@ -189,26 +189,57 @@ pub struct MediaTrack {
     keyframe_requested: Arc<AtomicBool>,
     /// PLI/FIR requests from the browser
     pub keyframe_requests: Arc<AtomicU64>,
-    in_use: AtomicBool,
+    /// the claim writing to the track (0: none)
+    owner: AtomicU64,
 }
 
+static NEXT_CLAIM: AtomicU64 = AtomicU64::new(1);
+
 impl MediaTrack {
-    /// Claims the track for one subscription; false if another one holds it.
-    pub fn claim(&self) -> bool {
-        self.in_use.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    /// Claims the track for a subscription. The newest claim wins: a page that closes a subscription and opens another on
+    /// the same transceiver must not wait for the old one's send loop to notice it closed.
+    pub fn claim(self: &Arc<Self>) -> TrackClaim {
+        let token = NEXT_CLAIM.fetch_add(1, Ordering::Relaxed);
+        if self.owner.swap(token, Ordering::AcqRel) != 0 {
+            log::debug!("track {}: a new subscription took it over", self.mid);
+        }
+        TrackClaim { track: self.clone(), token }
     }
 
-    pub fn release(&self) {
-        self.in_use.store(false, Ordering::Release);
-    }
-
-    pub async fn write(&self, data: Vec<u8>, duration: Duration) -> Result<()> {
+    /// `playout_delay`: (min, max) in 10 ms units, video only (audio has its own jitter buffer and no playout-delay extension).
+    pub async fn write(&self, data: Vec<u8>, duration: Duration, playout_delay: (u16, u16)) -> Result<()> {
         let sample = Sample { data: Bytes::from(data), duration, ..Sample::new(Instant::now()) };
         let writer = self.track.sample_writer(self.ssrc, self.payload_type);
-        // video only: audio has its own jitter buffer and no playout-delay extension negotiated
-        let writer = if self.mime == OPUS { writer } else { writer.with_extension(HeaderExtension::PlayoutDelay(PlayoutDelayExtension { min_delay: 0, max_delay: 0 })) };
+        let (min_delay, max_delay) = playout_delay;
+        let writer = if self.mime == OPUS { writer } else { writer.with_extension(HeaderExtension::PlayoutDelay(PlayoutDelayExtension { min_delay, max_delay })) };
         writer.write_sample(&sample).await?;
         Ok(())
+    }
+}
+
+/// One subscription's hold on a track; dropping it frees the track unless a newer claim took it over.
+pub struct TrackClaim {
+    track: Arc<MediaTrack>,
+    token: u64,
+}
+
+impl TrackClaim {
+    /// False once a newer subscription claimed the track: this one must stop writing to it.
+    pub fn is_current(&self) -> bool {
+        self.track.owner.load(Ordering::Acquire) == self.token
+    }
+}
+
+impl std::ops::Deref for TrackClaim {
+    type Target = MediaTrack;
+    fn deref(&self) -> &MediaTrack {
+        &self.track
+    }
+}
+
+impl Drop for TrackClaim {
+    fn drop(&mut self) {
+        let _ = self.track.owner.compare_exchange(self.token, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
@@ -270,7 +301,7 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
     let mid = mid.context("the offer had no new m-line for the track (add a recvonly transceiver of its kind before renegotiating)")?;
     let payload_type = negotiated_payload_type(&sender, mime).await.with_context(|| format!("the browser did not accept {mime}"))?;
     let keyframe_requested = Arc::new(AtomicBool::new(true));
-    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), in_use: AtomicBool::new(false) });
+    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), owner: AtomicU64::new(0) });
     spawn_rtcp_reader(track, Arc::downgrade(&video), video.keyframe_requested.clone(), video.keyframe_requests.clone());
     Ok((local, Some(video)))
 }
@@ -605,7 +636,7 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
 /// of its grant (shared by viewers at that grant, off the runtime), write to the track. The next decode overlaps this
 /// encode, so the slower of the two sets the rate (in series a 1920x1536 jpeg on a Jetson Orin core, ~16 ms + ~20 ms,
 /// could not keep up with 30 Hz).
-pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: Arc<MediaTrack>) {
+pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: TrackClaim) {
     let Some(codec) = shared.codec.clone() else { return };
     let sessions = &shared.codecs.video_sessions;
     let mut member = Member { id: sessions.next_member.fetch_add(1, Ordering::Relaxed), session: None, next_seq: None, synced: false };
@@ -614,7 +645,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
     let mut warned_write = false;
     let mut next: Option<Decoding> = None;
     let mut decode_ms: Option<f64> = None;
-    while !shared.is_closed() {
+    while !shared.is_closed() && track.is_current() {
         let decoding = match next.take() {
             Some(decoding) => decoding,
             None => {
@@ -646,7 +677,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         let (quality, bitrate, hz) = shared.video_grant(&key);
         let previous = member.session.take();
         let Channel::Video(format) = shared.channel else { return };
-        let session = sessions.place(previous.clone(), member.id, (codec.name(), format, &key), shared.video_policy, (bitrate, hz));
+        let session = sessions.place(previous.clone(), member.id, (codec.name(), format, &key), shared.tuning().video_policy, (bitrate, hz));
         if previous.is_none_or(|previous| !Arc::ptr_eq(&previous, &session)) {
             (member.next_seq, member.synced) = (None, false);
         }
@@ -682,7 +713,10 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             let duration = last_write.map_or(Duration::from_secs_f64(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
             last_write = Some(now);
             let meta = metadata(frame, logged.source, quality);
-            if let Err(error) = track.write(frame.data.clone(), duration).await {
+            if !track.is_current() {
+                break;
+            }
+            if let Err(error) = track.write(frame.data.clone(), duration, shared.tuning().playout_delay).await {
                 if !warned_write {
                     log::warn!("video track {}: write failed: {error:#}", track.mid);
                     warned_write = true;
@@ -701,7 +735,6 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
     if let Some(session) = member.session.take() {
         sessions.leave(&session, member.id);
     }
-    track.release();
 }
 
 #[cfg(test)]

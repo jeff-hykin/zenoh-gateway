@@ -112,11 +112,15 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 | `maxBitrate` | the server's (~0.3 bit/pixel at the source's size and rate) | video channels: most bits/s the stream asks for; it encodes at what the allocator grants |
 | `minResolutionScale` | 0.25 | video channels: the picture keeps its full size unless the grant is under 0.05 bit/pixel there, and never shrinks below this share |
 | `maxResolution` | none | video channels: `[width, height]` box the picture is fitted into |
+| `playoutDelay` | `[0, 0]` | video channels: `[min, max]` ms the browser may hold a frame to smooth out jitter; `[0, 0]` shows each frame at once |
 
 `Subscription`: `ready()` (resolves when the gateway accepted it and the channel is open, rejects with
 the gateway's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"`), `mediaStream`
 (video and audio channels), `channelName` (the channel in use), `received`, `dropped`, `partialDropped`,
-`decodeErrors`, `gatewayStats`, `close()`.
+`decodeErrors`, `gatewayStats`, `close()`, and `update(changes)`: changes `maxHz`, `minQuality`,
+`qualityToHzTradeoff`, `bandwidthPriority`, `maxBitrate`, `minResolutionScale`, `maxResolution`, `playoutDelay` or
+`encodeOptions.quality` on the running subscription (same channel and track, no resubscribe; `null` puts one back
+to its default). A changed picture size starts at a keyframe.
 
 ### Publisher options and methods
 
