@@ -4940,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "zenoh-gateway"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",

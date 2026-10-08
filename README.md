@@ -112,7 +112,7 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 | `maxBitrate` | the server's (~0.3 bit/pixel at the source's size and rate) | video channels: most bits/s the stream asks for; it encodes at what the allocator grants |
 | `minResolutionScale` | 0.25 | video channels: the picture keeps its full size unless the grant is under 0.05 bit/pixel there, and never shrinks below this share |
 | `maxResolution` | none | video channels: `[width, height]` box the picture is fitted into |
-| `playoutDelay` | `[0, 0]` | video channels: `[min, max]` ms the browser may hold a frame to smooth out jitter; `[0, 0]` shows each frame at once |
+| `playoutDelay` | `[0, 0]` | video channels: `[min, max]` ms the browser may hold a frame to smooth out jitter; `[0, 0]` shows each frame at once (after a non-zero min on the same track, `[10, 10]`: Firefox can't go back) |
 
 `Subscription`: `ready()` (resolves when the gateway accepted it and the channel is open, rejects with
 the gateway's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"`), `mediaStream`

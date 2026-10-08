@@ -191,6 +191,25 @@ pub struct MediaTrack {
     pub keyframe_requests: Arc<AtomicU64>,
     /// the claim writing to the track (0: none)
     owner: AtomicU64,
+    /// it has carried a playout delay outside low-latency rendering (see [`sent_playout_delay`])
+    left_low_latency: AtomicBool,
+}
+
+/// libwebrtc renders "as soon as decoded" (render time 0) while the playout delay is low-latency: min 0 and max at most
+/// 500 ms (kLowLatencyStreamMaxPlayoutDelayThreshold), in 10 ms units.
+const LOW_LATENCY_MAX_UNITS: u16 = 50;
+
+/// The playout delay to put on a packet, given the one asked for and whether the track has left low-latency rendering.
+/// A stream can't go back to it: Firefox stops showing a receiver's frames for good once their render time drops from
+/// a real time to 0 (they decode, and the picture stays frozen), so after a non-zero minimum (High quality's
+/// [100, 400] ms) a low-latency [0, x] goes out as [10 ms, max(x, 10 ms)], the nearest delay that keeps real render times.
+fn sent_playout_delay((min, max): (u16, u16), left_low_latency: bool) -> (u16, u16) {
+    let low_latency = min == 0 && max <= LOW_LATENCY_MAX_UNITS;
+    if low_latency && left_low_latency {
+        (1, max.max(1))
+    } else {
+        (min, max)
+    }
 }
 
 static NEXT_CLAIM: AtomicU64 = AtomicU64::new(1);
@@ -210,7 +229,11 @@ impl MediaTrack {
     pub async fn write(&self, data: Vec<u8>, duration: Duration, playout_delay: (u16, u16)) -> Result<()> {
         let sample = Sample { data: Bytes::from(data), duration, ..Sample::new(Instant::now()) };
         let writer = self.track.sample_writer(self.ssrc, self.payload_type);
-        let (min_delay, max_delay) = playout_delay;
+        let low_latency = playout_delay.0 == 0 && playout_delay.1 <= LOW_LATENCY_MAX_UNITS;
+        if !low_latency && self.mime != OPUS {
+            self.left_low_latency.store(true, Ordering::Relaxed);
+        }
+        let (min_delay, max_delay) = sent_playout_delay(playout_delay, self.left_low_latency.load(Ordering::Relaxed));
         let writer = if self.mime == OPUS { writer } else { writer.with_extension(HeaderExtension::PlayoutDelay(PlayoutDelayExtension { min_delay, max_delay })) };
         writer.write_sample(&sample).await?;
         Ok(())
@@ -301,7 +324,7 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
     let mid = mid.context("the offer had no new m-line for the track (add a recvonly transceiver of its kind before renegotiating)")?;
     let payload_type = negotiated_payload_type(&sender, mime).await.with_context(|| format!("the browser did not accept {mime}"))?;
     let keyframe_requested = Arc::new(AtomicBool::new(true));
-    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), owner: AtomicU64::new(0) });
+    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), owner: AtomicU64::new(0), left_low_latency: AtomicBool::new(false) });
     spawn_rtcp_reader(track, Arc::downgrade(&video), video.keyframe_requested.clone(), video.keyframe_requests.clone());
     Ok((local, Some(video)))
 }
@@ -740,6 +763,17 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn playout_delay_never_returns_to_low_latency() {
+        use super::sent_playout_delay;
+        assert_eq!(sent_playout_delay((0, 0), false), (0, 0), "low latency from the start: as asked");
+        assert_eq!(sent_playout_delay((0, 40), false), (0, 40));
+        assert_eq!(sent_playout_delay((10, 40), true), (10, 40), "outside low latency: as asked");
+        assert_eq!(sent_playout_delay((0, 60), true), (0, 60), "min 0 but max past 500 ms isn't low latency");
+        assert_eq!(sent_playout_delay((0, 0), true), (1, 1), "back to [0, 0] after a non-zero min: [10, 10] ms");
+        assert_eq!(sent_playout_delay((0, 30), true), (1, 30));
+    }
+
     use super::*;
     use crate::encoding::{EncodingOutput, EncodingSample, VideoImage, VideoTarget};
     use std::sync::atomic::AtomicUsize;

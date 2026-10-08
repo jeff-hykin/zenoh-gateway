@@ -412,7 +412,10 @@ Chrome stopped assembling a reused receiver's frames after a few quick close-and
 track to the newest subscription that names it.
 Each video frame also sends a 28-byte metadata frame on the `sub` channel (`msg.video`).
 Video RTP carries the playout-delay extension with the subscription's `playoutDelay` (default `[0, 0]`: the browser
-shows each frame at once; a larger max lets its jitter buffer smooth an uneven network).
+shows each frame at once; a larger max lets its jitter buffer smooth an uneven network). A track never returns to
+low-latency rendering (min 0, max <= 500 ms) once it has carried a delay outside it (an update from `[100, 400]` back to
+`[0, 0]`): that goes out as `[10, 10]` ms, since Firefox stops showing a receiver's frames for good when their render time
+drops from a real time to 0.
 Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden per subscription):
 - A stream asks the allocator for at most `maxBitrate` bits/s (default: `max_bits_per_pixel` × the source's pixels ×
   its rate, 0.3: ~17 Mbit/s for 720p60, ~1.4 Mbit/s for 320x240 at 60 Hz). The encoder runs at what the allocator
