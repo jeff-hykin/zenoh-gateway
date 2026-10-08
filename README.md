@@ -12,7 +12,7 @@ by the application:
 - [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs): ROS 2 / dimos images,
   lossless depth and point clouds.
 
-[SPEC.md](SPEC.md) is the detailed contract; this README is the overview.
+[docs/how-to.md](docs/how-to.md): how do I subscribe, publish, show video, get point clouds, ... from a page. [SPEC.md](SPEC.md) is the detailed contract; this README is the overview.
 
 ![the example page: topic list, H.264 video, point cloud, depth, a raw stream and live allocation stats](https://raw.githubusercontent.com/jeff-hykin/zenoh-gateway-cli/main/test/artifacts/example.png)
 
