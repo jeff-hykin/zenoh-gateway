@@ -1,6 +1,6 @@
 [package]
 name = "zenoh-gateway"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.88"
 description = "View and drive a zenoh system from a browser over WebRTC (data channels, H.264 video, bandwidth allocation, deadmen): an embeddable server with pluggable codecs"
@@ -18,8 +18,8 @@ include = ["/src/**/*.rs", "/Cargo.toml"]
 zenoh = "=1.6.2"
 zenoh-ext = { version = "=1.6.2", features = ["unstable"] }
 # webrtc-rs with small fixes, renamed so they reach crates that depend on zenoh-gateway (github.com/jeff-hykin/webrtc-rs-zenoh-web)
-webrtc = { package = "zenoh-web-webrtc", version = "=0.21.0-zw.2" }
-rtc = { package = "zenoh-web-rtc", version = "=0.21.0-zw.2" }
+webrtc = { package = "zenoh-web-webrtc", version = "=0.21.0-zw.3" }
+rtc = { package = "zenoh-web-rtc", version = "=0.21.0-zw.3" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "cors"] }

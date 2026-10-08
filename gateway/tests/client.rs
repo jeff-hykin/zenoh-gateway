@@ -238,6 +238,54 @@ async fn a_running_video_subscription_changes_its_options_in_place() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn video_keeps_flowing_at_the_source_rate() {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { encoding: Some("test-solid".into()), max_hz: Some(10.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await.unwrap();
+    let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
+    next_video(&mut camera).await;
+    let start = std::time::Instant::now();
+    let mut frames = 0;
+    while start.elapsed() < Duration::from_secs(5) {
+        next_video(&mut camera).await;
+        frames += 1;
+    }
+    assert!(frames >= 35, "{frames} frames in 5 s at maxHz 10 from a 20 Hz source");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quick_switches_keep_video_flowing() {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
+    let options = || SubscribeOptions { encoding: Some("test-solid".into()), max_hz: Some(10.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options()).await.unwrap();
+    next_video(&mut camera).await;
+    for round in 0..15 {
+        drop(camera);
+        camera = match client.subscribe("camera/front", options()).await {
+            Ok(camera) => camera,
+            Err(error) => panic!("round {round}: {error:#}; gateway: {}", client.stats().await.map(|stats| stats["channels"].to_string()).unwrap_or_default()),
+        };
+        let mut frames = vec![];
+        let start = std::time::Instant::now();
+        while frames.len() < 10 && start.elapsed() < Duration::from_secs(5) {
+            if let Ok(Some(Message::Video(frame))) = timeout(Duration::from_secs(5), camera.recv()).await {
+                frames.push(frame);
+            }
+        }
+        assert!(frames.len() >= 10, "round {round}: {} frames", frames.len());
+        let first_key = frames.iter().position(|frame| frame.keyframe).unwrap_or_else(|| panic!("round {round}: no keyframe"));
+        assert_eq!(decode_all(&frames[first_key..]).0, (320, 240), "round {round} decodes");
+    }
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn publish_arrives_in_zenoh() {
     let (running, session, url) = start().await;
     let subscriber = session.declare_subscriber("cmd/vel").await.unwrap();
