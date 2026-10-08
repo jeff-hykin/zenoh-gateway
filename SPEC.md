@@ -407,10 +407,9 @@ The client adds a recvonly video (or audio) transceiver and renegotiates over `c
 (`{op: "renegotiate", channel, sdp}` → `{sdp, mid}`); the gateway adds a track of that channel's format
 (H.264 is constrained baseline, `profile-level-id=42e01f`; VP9 profile 0; Opus 48 kHz) that pairs
 with the new m-line, then the `sub` channel's label names that `mid` (the gateway refuses a track of
-another format). Renegotiations run one at a time. A closed subscription's transceiver (and the
-gateway's track) is reused by the next one of the same channel instead of renegotiating again; the gateway gives
-the track to the newest subscription that names it, so a page may open the next one before the old one's close
-has reached the gateway.
+another format). Renegotiations run one at a time. A closed subscription's transceiver is stopped (the next renegotiation frees its m-line) rather than reused:
+Chrome stopped assembling a reused receiver's frames after a few quick close-and-reopen switches. The gateway gives a
+track to the newest subscription that names it.
 Each video frame also sends a 28-byte metadata frame on the `sub` channel (`msg.video`).
 Video RTP carries the playout-delay extension with the subscription's `playoutDelay` (default `[0, 0]`: the browser
 shows each frame at once; a larger max lets its jitter buffer smooth an uneven network).

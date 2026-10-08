@@ -631,7 +631,7 @@ export class Subscription extends Endpoint {
         }
         this.owner._acquireTransceiver(peer, kind, channelName).then((transceiver) => {
             if (this.closed || acceptance !== this.acceptance) {
-                this.owner._releaseTransceiver(peer, channelName, transceiver)
+                this.owner._releaseTransceiver(peer, transceiver)
                 return
             }
             this.#transceiver = transceiver
@@ -660,7 +660,7 @@ export class Subscription extends Endpoint {
         super.close()
         const peer = this.owner._peer
         if (this.#transceiver && peer) {
-            this.owner._releaseTransceiver(peer, this.channelName, this.#transceiver)
+            this.owner._releaseTransceiver(peer, this.#transceiver)
         }
         this.#transceiver = null
     }
@@ -1065,9 +1065,6 @@ export class ZenohGateway {
     /** resolves once the current peer connection is up (renegotiation needs `control`) */
     #connected: Promise<void> = new Promise(() => {})
     #markConnected: () => void = () => {}
-    /** video transceivers of closed subscriptions, reused before adding new ones */
-    /** per channel: transceivers whose track carries its format, free for the next subscription */
-    #freeTransceivers = new Map<RTCPeerConnection, Map<string, RTCRtpTransceiver[]>>()
 
     constructor(url: string, options: ConnectOptions = {}) {
         this.url = url.replace(/\/+$/, "")
@@ -1125,14 +1122,11 @@ export class ZenohGateway {
     }
 
     /**
-     * A recvonly transceiver bound to a gateway track of `channel`'s format: a free one, or a new one
-     * added through a renegotiation over `control` (the gateway answers with a track for the new m-line).
+     * A new recvonly transceiver bound to a gateway track of `channel`'s format, added through a renegotiation over
+     * `control` (the gateway answers with a track for the new m-line). Never a reused one: Chrome stopped assembling
+     * a reused receiver's frames after a few quick close-and-reopen switches.
      */
     _acquireTransceiver(peer: RTCPeerConnection, kind: "video" | "audio", channel: Channel): Promise<RTCRtpTransceiver> {
-        const free = this.#freeTransceivers.get(peer)?.get(channel)?.pop()
-        if (free) {
-            return Promise.resolve(free)
-        }
         const run = async () => {
             await this.#connected
             if (peer !== this.#peer) {
@@ -1160,11 +1154,10 @@ export class ZenohGateway {
         return result
     }
 
-    _releaseTransceiver(peer: RTCPeerConnection, channel: Channel, transceiver: RTCRtpTransceiver): void {
-        if (peer === this.#peer && peer.connectionState !== "closed") {
-            const byCodec = this.#freeTransceivers.get(peer) ?? new Map<string, RTCRtpTransceiver[]>()
-            byCodec.set(channel, [...byCodec.get(channel) ?? [], transceiver])
-            this.#freeTransceivers.set(peer, byCodec)
+    /** A closed subscription's transceiver stops; the next renegotiation frees its m-line (Chrome reuses the slot). */
+    _releaseTransceiver(peer: RTCPeerConnection, transceiver: RTCRtpTransceiver): void {
+        if (peer.connectionState !== "closed" && transceiver.currentDirection !== "stopped") {
+            transceiver.stop()
         }
     }
 
@@ -1175,9 +1168,6 @@ export class ZenohGateway {
         this.#connected = new Promise((resolve) => {
             this.#markConnected = resolve
         })
-        if (this.#peer) {
-            this.#freeTransceivers.delete(this.#peer)
-        }
         const auth: Record<string, string> = this.options.token === undefined ? {} : { authorization: `Bearer ${this.options.token}` }
         let iceServers = this.options.iceServers
         let iceTransportPolicy = this.options.iceTransportPolicy
