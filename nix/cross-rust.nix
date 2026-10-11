@@ -76,9 +76,12 @@ let
             toolchain = toolchainFor pkgs;
             # the same for native and cross builds (nixpkgs' own would differ per package set, and cross would pull GCC):
             # zstd-sys from its bundled C sources, statically (nixpkgs' override links a nix libzstd dylib);
-            # proc-macro-crate asks $CARGO where the manifest is, so give it the toolchain's cargo
-            overrides = {
+            # proc-macro-crate asks $CARGO where the manifest is, so give it the toolchain's cargo;
+            # av-scenechange and rav1e (feature av1) read CARGO_ENCODED_RUSTFLAGS, which only cargo sets
+            overrides = let encodedRustflags = attrs: { preConfigure = (attrs.preConfigure or "") + "export CARGO_ENCODED_RUSTFLAGS=\n"; }; in {
                 zstd-sys = attrs: { };
+                av-scenechange = encodedRustflags;
+                rav1e = encodedRustflags;
                 proc-macro-crate = attrs: lib.optionalAttrs (lib.versionAtLeast attrs.version "2.0") {
                     postPatch = (attrs.postPatch or "") + ''
                         substituteInPlace src/lib.rs --replace-fail 'env::var("CARGO")' 'Ok::<_, core::convert::Infallible>("${toolchain}/bin/cargo")'

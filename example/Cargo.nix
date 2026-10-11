@@ -39,7 +39,7 @@ rec {
   #
 
   rootCrate = rec {
-    packageId = "zenoh-web-example";
+    packageId = "zenoh-gateway-example";
 
     # Use this attribute to refer to the derivation building your root crate package.
     # You can override the features with rootCrate.build.override { features = [ "default" "feature1" ... ]; }.
@@ -55,10 +55,10 @@ rec {
   # You can override the features with
   # workspaceMembers."${crateName}".build.override { features = [ "default" "feature1" ... ]; }.
   workspaceMembers = {
-    "zenoh-web-example" = rec {
-      packageId = "zenoh-web-example";
+    "zenoh-gateway-example" = rec {
+      packageId = "zenoh-gateway-example";
       build = internal.buildRustCrateWithFeatures {
-        packageId = "zenoh-web-example";
+        packageId = "zenoh-gateway-example";
       };
 
       # Debug support which might change between releases.
@@ -93,6 +93,21 @@ rec {
     #   inject test dependencies into the build
 
     crates = {
+      "adler2" = rec {
+        crateName = "adler2";
+        version = "2.0.1";
+        edition = "2021";
+        sha256 = "1ymy18s9hs7ya1pjc9864l30wk8p2qfqdi7mhhcc5nfakxbij09j";
+        authors = [
+          "Jonas Schievink <jonasschievink@gmail.com>"
+          "oyvindln <oyvindln@users.noreply.github.com>"
+        ];
+        features = {
+          "core" = [ "dep:core" ];
+          "default" = [ "std" ];
+          "rustc-dep-of-std" = [ "core" ];
+        };
+      };
       "aead" = rec {
         crateName = "aead";
         version = "0.5.2";
@@ -233,6 +248,40 @@ rec {
         };
         resolvedDefaultFeatures = [ "std" ];
       };
+      "aligned" = rec {
+        crateName = "aligned";
+        version = "0.4.3";
+        edition = "2024";
+        sha256 = "1186lhb3gb4x6spzw7ff0zcraa8cr9zqk4ldpm5g1vb2ijc0higf";
+        dependencies = [
+          {
+            name = "as-slice";
+            packageId = "as-slice";
+          }
+        ];
+
+      };
+      "aligned-vec" = rec {
+        crateName = "aligned-vec";
+        version = "0.6.4";
+        edition = "2021";
+        sha256 = "16vnf78hvfix5cwzd5xs5a2g6afmgb4h7n6yfsc36bv0r22072fw";
+        libName = "aligned_vec";
+        authors = [
+          "sarah <>"
+        ];
+        dependencies = [
+          {
+            name = "equator";
+            packageId = "equator";
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+          "serde" = [ "dep:serde" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
+      };
       "allocator-api2" = rec {
         crateName = "allocator-api2";
         version = "0.2.21";
@@ -278,6 +327,24 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "std" ];
       };
+      "arbitrary" = rec {
+        crateName = "arbitrary";
+        version = "1.5.0";
+        edition = "2021";
+        sha256 = "1v8a080p8z746w8pi7lggaa5791qpk1i9mb313sj2cy3gk4jmiiv";
+        authors = [
+          "The Rust-Fuzz Project Developers"
+          "Nick Fitzgerald <fitzgen@gmail.com>"
+          "Manish Goregaokar <manishsmail@gmail.com>"
+          "Simonas Kazlauskas <arbitrary@kazlauskas.me>"
+          "Brian L. Troutwine <brian@troutwine.us>"
+          "Corey Farwell <coreyf@rwell.org>"
+        ];
+        features = {
+          "derive" = [ "derive_arbitrary" ];
+          "derive_arbitrary" = [ "dep:derive_arbitrary" ];
+        };
+      };
       "arc-swap" = rec {
         crateName = "arc-swap";
         version = "1.9.2";
@@ -296,6 +363,32 @@ rec {
         features = {
           "serde" = [ "dep:serde" ];
         };
+      };
+      "arg_enum_proc_macro" = rec {
+        crateName = "arg_enum_proc_macro";
+        version = "0.3.4";
+        edition = "2018";
+        sha256 = "1sjdfd5a8j6r99cf0bpqrd6b160x9vz97y5rysycsjda358jms8a";
+        procMacro = true;
+        authors = [
+          "Luca Barbato <lu_zero@gentoo.org>"
+        ];
+        dependencies = [
+          {
+            name = "proc-macro2";
+            packageId = "proc-macro2";
+          }
+          {
+            name = "quote";
+            packageId = "quote";
+          }
+          {
+            name = "syn";
+            packageId = "syn 2.0.119";
+            features = [ "extra-traits" ];
+          }
+        ];
+
       };
       "array-init" = rec {
         crateName = "array-init";
@@ -316,6 +409,41 @@ rec {
         sha256 = "1jzyp0nvp10dmahaq9a2rnxqdd5wxgbvp8xaibps3zai8c9fi8kn";
         authors = [
           "David Roundy <roundyd@physics.oregonstate.edu>"
+        ];
+
+      };
+      "arrayvec" = rec {
+        crateName = "arrayvec";
+        version = "0.7.8";
+        edition = "2018";
+        sha256 = "0mmd8lrijbvg1qp4c5zis5dq41a3mjv2rb6bxkyj9kwaw2k6gyyk";
+        authors = [
+          "bluss"
+        ];
+        features = {
+          "borsh" = [ "dep:borsh" ];
+          "default" = [ "std" ];
+          "serde" = [ "dep:serde" ];
+          "zeroize" = [ "dep:zeroize" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
+      };
+      "as-slice" = rec {
+        crateName = "as-slice";
+        version = "0.2.1";
+        edition = "2015";
+        sha256 = "05j52y1ws8kir5zjxnl48ann0if79sb56p9nm76hvma01r7nnssi";
+        libName = "as_slice";
+        authors = [
+          "Jorge Aparicio <jorge@japaric.io>"
+          "Emil Fresk <emil.fresk@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "stable_deref_trait";
+            packageId = "stable_deref_trait";
+            usesDefaultFeatures = false;
+          }
         ];
 
       };
@@ -343,7 +471,7 @@ rec {
           }
           {
             name = "nom";
-            packageId = "nom";
+            packageId = "nom 7.1.3";
             usesDefaultFeatures = false;
             features = [ "std" ];
           }
@@ -406,7 +534,7 @@ rec {
           }
           {
             name = "nom";
-            packageId = "nom";
+            packageId = "nom 7.1.3";
             usesDefaultFeatures = false;
             features = [ "std" ];
           }
@@ -652,6 +780,137 @@ rec {
           "Josh Stone <cuviper@gmail.com>"
         ];
 
+      };
+      "av-scenechange" = rec {
+        crateName = "av-scenechange";
+        version = "0.14.1";
+        edition = "2021";
+        crateBin = [];
+        sha256 = "1543y7riwcy4mmsgcalxcm3bnb41hvwiqiz774nbj68fq9vischg";
+        libName = "av_scenechange";
+        authors = [
+          "Josh Holmer <jholmer.in@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "aligned";
+            packageId = "aligned";
+          }
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "arg_enum_proc_macro";
+            packageId = "arg_enum_proc_macro";
+          }
+          {
+            name = "arrayvec";
+            packageId = "arrayvec";
+          }
+          {
+            name = "log";
+            packageId = "log";
+          }
+          {
+            name = "num-rational";
+            packageId = "num-rational";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "num-traits";
+            packageId = "num-traits";
+          }
+          {
+            name = "pastey";
+            packageId = "pastey";
+          }
+          {
+            name = "rayon";
+            packageId = "rayon";
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 2.0.21";
+          }
+          {
+            name = "v_frame";
+            packageId = "v_frame";
+          }
+          {
+            name = "y4m";
+            packageId = "y4m";
+          }
+        ];
+        features = {
+          "asm" = [ "nasm-rs" "cc" "libc" ];
+          "binary" = [ "clap" "serialize" ];
+          "cc" = [ "dep:cc" ];
+          "clap" = [ "dep:clap" ];
+          "console" = [ "dep:console" ];
+          "default" = [ "binary" "asm" ];
+          "devel" = [ "console" "fern" ];
+          "fern" = [ "dep:fern" ];
+          "ffmpeg" = [ "ffmpeg-the-third" ];
+          "ffmpeg-the-third" = [ "dep:ffmpeg-the-third" ];
+          "libc" = [ "dep:libc" ];
+          "nasm-rs" = [ "dep:nasm-rs" ];
+          "serde" = [ "dep:serde" ];
+          "serde_json" = [ "dep:serde_json" ];
+          "serialize" = [ "serde" "serde_json" ];
+          "tracing" = [ "tracing-subscriber" "tracing-chrome" "dep:tracing" ];
+          "tracing-chrome" = [ "dep:tracing-chrome" ];
+          "tracing-subscriber" = [ "dep:tracing-subscriber" ];
+          "vapoursynth" = [ "dep:vapoursynth" ];
+        };
+      };
+      "av1-grain" = rec {
+        crateName = "av1-grain";
+        version = "0.2.5";
+        edition = "2021";
+        sha256 = "1y3p43i5xncbny0pfh8kw09am3l3mgyg82ln65r3f434443xpzcc";
+        libName = "av1_grain";
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "arrayvec";
+            packageId = "arrayvec";
+          }
+          {
+            name = "log";
+            packageId = "log";
+          }
+          {
+            name = "nom";
+            packageId = "nom 8.0.0";
+            optional = true;
+          }
+          {
+            name = "num-rational";
+            packageId = "num-rational";
+            optional = true;
+          }
+          {
+            name = "v_frame";
+            packageId = "v_frame";
+            optional = true;
+          }
+        ];
+        features = {
+          "default" = [ "create" "parse" "diff" "estimate" ];
+          "diff" = [ "num-rational" "v_frame" ];
+          "estimate" = [ "v_frame" ];
+          "nom" = [ "dep:nom" ];
+          "num-rational" = [ "dep:num-rational" ];
+          "parse" = [ "nom" ];
+          "serde" = [ "dep:serde" ];
+          "serialize" = [ "serde" "arrayvec/serde" ];
+          "v_frame" = [ "dep:v_frame" ];
+        };
+        resolvedDefaultFeatures = [ "create" "default" "diff" "estimate" "nom" "num-rational" "parse" "v_frame" ];
       };
       "axum" = rec {
         crateName = "axum";
@@ -1013,6 +1272,28 @@ rec {
         };
         resolvedDefaultFeatures = [ "serde" "serde_core" ];
       };
+      "bitstream-io" = rec {
+        crateName = "bitstream-io";
+        version = "4.10.0";
+        edition = "2018";
+        sha256 = "07zxcy47l51k6vsxphzhgcnqyzl21pprs7212687c64s56z01zvy";
+        libName = "bitstream_io";
+        authors = [
+          "Brian Langenberger <bjl@usa.net>"
+        ];
+        dependencies = [
+          {
+            name = "no_std_io2";
+            packageId = "no_std_io2";
+          }
+        ];
+        features = {
+          "alloc" = [ "no_std_io2/alloc" ];
+          "default" = [ "std" ];
+          "std" = [ "no_std_io2/std" "alloc" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" "default" "std" ];
+      };
       "block-buffer" = rec {
         crateName = "block-buffer";
         version = "0.10.4";
@@ -1062,6 +1343,23 @@ rec {
           "tinyvec" = [ "dep:tinyvec" ];
         };
         resolvedDefaultFeatures = [ "alloc" "std" ];
+      };
+      "built" = rec {
+        crateName = "built";
+        version = "0.8.1";
+        edition = "2024";
+        sha256 = "1saq332pd6g3svvc9ah8myjpfvgqlzl2ksb1ypp3976kjcfm63jw";
+        authors = [
+          "Lukas Lueg <lukas.lueg@gmail.com>"
+        ];
+        features = {
+          "cargo-lock" = [ "dep:cargo-lock" ];
+          "chrono" = [ "dep:chrono" ];
+          "dependency-tree" = [ "cargo-lock/dependency-tree" ];
+          "git2" = [ "dep:git2" ];
+          "gix" = [ "dep:gix" ];
+          "semver" = [ "dep:semver" ];
+        };
       };
       "bumpalo" = rec {
         crateName = "bumpalo";
@@ -1728,6 +2026,26 @@ rec {
         ];
 
       };
+      "crc32fast" = rec {
+        crateName = "crc32fast";
+        version = "1.5.2";
+        edition = "2021";
+        sha256 = "0y0f955n2hr5a8rd9nw9sr23nhjc42ddx3bjc47dnlmqssgpk9q1";
+        authors = [
+          "Sam Rijs <srijs@airpost.net>"
+          "Alex Crichton <alex@alexcrichton.com>"
+        ];
+        dependencies = [
+          {
+            name = "cfg-if";
+            packageId = "cfg-if";
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+        };
+        resolvedDefaultFeatures = [ "std" ];
+      };
       "crossbeam" = rec {
         crateName = "crossbeam";
         version = "0.8.5";
@@ -1817,7 +2135,7 @@ rec {
           "default" = [ "std" ];
           "std" = [ "crossbeam-epoch/std" "crossbeam-utils/std" ];
         };
-        resolvedDefaultFeatures = [ "std" ];
+        resolvedDefaultFeatures = [ "default" "std" ];
       };
       "crossbeam-epoch" = rec {
         crateName = "crossbeam-epoch";
@@ -2170,7 +2488,7 @@ rec {
           }
           {
             name = "nom";
-            packageId = "nom";
+            packageId = "nom 7.1.3";
           }
           {
             name = "num-bigint";
@@ -2218,7 +2536,7 @@ rec {
           }
           {
             name = "nom";
-            packageId = "nom";
+            packageId = "nom 7.1.3";
           }
           {
             name = "num-bigint";
@@ -2418,6 +2736,49 @@ rec {
         };
         resolvedDefaultFeatures = [ "std" "use_std" ];
       };
+      "equator" = rec {
+        crateName = "equator";
+        version = "0.4.2";
+        edition = "2021";
+        sha256 = "1z760z5r0haxjyakbqxvswrz9mq7c29arrivgq8y1zldhc9v44a7";
+        authors = [
+          "sarah <>"
+        ];
+        dependencies = [
+          {
+            name = "equator-macro";
+            packageId = "equator-macro";
+          }
+        ];
+
+      };
+      "equator-macro" = rec {
+        crateName = "equator-macro";
+        version = "0.4.2";
+        edition = "2021";
+        sha256 = "1cqzx3cqn9rxln3a607xr54wippzff56zs5chqdf3z2bnks3rwj4";
+        procMacro = true;
+        libName = "equator_macro";
+        authors = [
+          "sarah <>"
+        ];
+        dependencies = [
+          {
+            name = "proc-macro2";
+            packageId = "proc-macro2";
+          }
+          {
+            name = "quote";
+            packageId = "quote";
+          }
+          {
+            name = "syn";
+            packageId = "syn 2.0.119";
+            features = [ "full" ];
+          }
+        ];
+
+      };
       "equivalent" = rec {
         crateName = "equivalent";
         version = "1.0.2";
@@ -2601,6 +2962,56 @@ rec {
           "default" = [ "std" ];
           "serde" = [ "dep:serde" ];
         };
+      };
+      "flate2" = rec {
+        crateName = "flate2";
+        version = "1.1.10";
+        edition = "2018";
+        sha256 = "1jvd2cl8j5hyf8imi62y1x7gwzz1hajirni0801yxhds1qp4wqvf";
+        authors = [
+          "Alex Crichton <alex@alexcrichton.com>"
+          "Josh Triplett <josh@joshtriplett.org>"
+        ];
+        dependencies = [
+          {
+            name = "crc32fast";
+            packageId = "crc32fast";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "miniz_oxide";
+            packageId = "miniz_oxide";
+            optional = true;
+            features = [ "simd" ];
+          }
+          {
+            name = "zlib-rs";
+            packageId = "zlib-rs";
+            optional = true;
+            usesDefaultFeatures = false;
+            features = [ "rust-allocator" ];
+          }
+        ];
+        features = {
+          "any_c_zlib" = [ "any_zlib" ];
+          "any_zlib" = [ "any_impl" ];
+          "cloudflare_zlib" = [ "zlib" ];
+          "default" = [ "rust_backend" "runtime_detection" ];
+          "document-features" = [ "dep:document-features" ];
+          "libz-ng-sys" = [ "dep:libz-ng-sys" ];
+          "libz-sys" = [ "dep:libz-sys" ];
+          "miniz-sys" = [ "rust_backend" ];
+          "miniz_oxide" = [ "any_impl" "dep:miniz_oxide" "dep:crc32fast" ];
+          "runtime_detection" = [ "zlib-rs?/std" "crc32fast?/std" ];
+          "rust_backend" = [ "miniz_oxide" "any_impl" ];
+          "zlib" = [ "any_c_zlib" "libz-sys" "dep:crc32fast" ];
+          "zlib-default" = [ "any_c_zlib" "libz-sys/default" "dep:crc32fast" ];
+          "zlib-ng" = [ "any_c_zlib" "libz-ng-sys" "dep:crc32fast" ];
+          "zlib-ng-compat" = [ "zlib" "libz-sys/zlib-ng" "dep:crc32fast" ];
+          "zlib-rs" = [ "any_zlib" "dep:zlib-rs" ];
+        };
+        resolvedDefaultFeatures = [ "any_impl" "default" "miniz_oxide" "runtime_detection" "rust_backend" ];
       };
       "flume" = rec {
         crateName = "flume";
@@ -3126,6 +3537,7 @@ rec {
         features = {
           "wasm_js" = [ "dep:wasm-bindgen" "dep:js-sys" ];
         };
+        resolvedDefaultFeatures = [ "std" ];
       };
       "getrandom 0.4.3" = rec {
         crateName = "getrandom";
@@ -3762,7 +4174,7 @@ rec {
           }
           {
             name = "webpki-roots";
-            packageId = "webpki-roots 1.0.9";
+            packageId = "webpki-roots";
             optional = true;
           }
         ];
@@ -4472,6 +4884,32 @@ rec {
           "std" = [ "block-padding/std" ];
         };
       };
+      "interpolate_name" = rec {
+        crateName = "interpolate_name";
+        version = "0.2.4";
+        edition = "2018";
+        sha256 = "0q7s5mrfkx4p56dl8q9zq71y1ysdj4shh6f28qf9gly35l21jj63";
+        procMacro = true;
+        authors = [
+          "Luca Barbato <lu_zero@gentoo.org>"
+        ];
+        dependencies = [
+          {
+            name = "proc-macro2";
+            packageId = "proc-macro2";
+          }
+          {
+            name = "quote";
+            packageId = "quote";
+          }
+          {
+            name = "syn";
+            packageId = "syn 2.0.119";
+            features = [ "fold" "full" ];
+          }
+        ];
+
+      };
       "ipnet" = rec {
         crateName = "ipnet";
         version = "2.12.2";
@@ -5077,6 +5515,34 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "extra_traits" "std" ];
       };
+      "libfuzzer-sys" = rec {
+        crateName = "libfuzzer-sys";
+        version = "0.4.13";
+        edition = "2018";
+        sha256 = "1li9z5q55wi81zzyifm7a4rw1xvcclsnqsqbkbvrk86bl50jzzd9";
+        libName = "libfuzzer_sys";
+        authors = [
+          "The rust-fuzz Project Developers"
+        ];
+        dependencies = [
+          {
+            name = "arbitrary";
+            packageId = "arbitrary";
+          }
+        ];
+        buildDependencies = [
+          {
+            name = "cc";
+            packageId = "cc";
+            features = [ "parallel" ];
+          }
+        ];
+        features = {
+          "arbitrary-derive" = [ "arbitrary/derive" ];
+          "default" = [ "link_libfuzzer" ];
+        };
+        resolvedDefaultFeatures = [ "default" "link_libfuzzer" ];
+      };
       "libloading" = rec {
         crateName = "libloading";
         version = "0.8.9";
@@ -5210,6 +5676,28 @@ rec {
         };
         resolvedDefaultFeatures = [ "alloc" "std" ];
       };
+      "lru" = rec {
+        crateName = "lru";
+        version = "0.16.4";
+        edition = "2015";
+        sha256 = "0fgg35wrpfdrkv9hcabkg92g3sv4867g1rir7ay9lq1zs3ayhrkz";
+        authors = [
+          "Jerome Froelich <jeromefroelic@hotmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "hashbrown";
+            packageId = "hashbrown 0.16.1";
+            optional = true;
+          }
+        ];
+        features = {
+          "default" = [ "hashbrown" ];
+          "hashbrown" = [ "dep:hashbrown" ];
+          "nightly" = [ "hashbrown" "hashbrown/nightly" ];
+        };
+        resolvedDefaultFeatures = [ "default" "hashbrown" ];
+      };
       "lru-slab" = rec {
         crateName = "lru-slab";
         version = "0.1.3";
@@ -5223,9 +5711,9 @@ rec {
       };
       "lz4_flex" = rec {
         crateName = "lz4_flex";
-        version = "0.11.6";
-        edition = "2021";
-        sha256 = "0jl5q4jfhldjd8d0adcxxjnidm64zgr150h9q7h2aydbxv75wgrp";
+        version = "0.10.0";
+        edition = "2018";
+        sha256 = "10sgbj93sagbl0ngzqvnlkldzbfz5vnzr7fry8sgssy299cp534b";
         authors = [
           "Pascal Seitz <pascal.seitz@gmail.com>"
           "Arthur Silva <arthurprs@gmail.com>"
@@ -5237,14 +5725,13 @@ rec {
             packageId = "twox-hash";
             optional = true;
             usesDefaultFeatures = false;
-            features = [ "xxhash32" ];
           }
         ];
         features = {
-          "default" = [ "std" "safe-encode" "safe-decode" "frame" "checked-decode" ];
+          "default" = [ "std" "safe-encode" "safe-decode" "frame" ];
           "frame" = [ "std" "dep:twox-hash" ];
         };
-        resolvedDefaultFeatures = [ "checked-decode" "default" "frame" "safe-decode" "safe-encode" "std" ];
+        resolvedDefaultFeatures = [ "default" "frame" "safe-decode" "safe-encode" "std" ];
       };
       "matchers" = rec {
         crateName = "matchers";
@@ -5277,6 +5764,30 @@ rec {
         features = {
         };
         resolvedDefaultFeatures = [ "default" ];
+      };
+      "maybe-rayon" = rec {
+        crateName = "maybe-rayon";
+        version = "0.1.1";
+        edition = "2021";
+        sha256 = "06cmvhj4n36459g327ng5dnj8d58qs472pv5ahlhm7ynxl6g78cf";
+        libName = "maybe_rayon";
+        dependencies = [
+          {
+            name = "cfg-if";
+            packageId = "cfg-if";
+          }
+          {
+            name = "rayon";
+            packageId = "rayon";
+            optional = true;
+          }
+        ];
+        features = {
+          "default" = [ "threads" ];
+          "rayon" = [ "dep:rayon" ];
+          "threads" = [ "rayon" ];
+        };
+        resolvedDefaultFeatures = [ "rayon" "threads" ];
       };
       "md-5" = rec {
         crateName = "md-5";
@@ -5401,6 +5912,41 @@ rec {
           "default" = [ "std" ];
         };
         resolvedDefaultFeatures = [ "std" ];
+      };
+      "miniz_oxide" = rec {
+        crateName = "miniz_oxide";
+        version = "0.9.1";
+        edition = "2021";
+        sha256 = "0k2bgjzk2sbsynpsv4wizwxbqp6vs7g08y5anbkrh3l6a15bqgxn";
+        authors = [
+          "Frommi <daniil.liferenko@gmail.com>"
+          "oyvindln <oyvindln@users.noreply.github.com>"
+          "Rich Geldreich richgel99@gmail.com"
+        ];
+        dependencies = [
+          {
+            name = "adler2";
+            packageId = "adler2";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "simd-adler32";
+            packageId = "simd-adler32";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "alloc" = [ "dep:alloc" ];
+          "core" = [ "dep:core" ];
+          "default" = [ "with-alloc" ];
+          "rustc-dep-of-std" = [ "core" "alloc" "adler2/rustc-dep-of-std" ];
+          "serde" = [ "dep:serde" ];
+          "simd" = [ "simd-adler32" ];
+          "simd-adler32" = [ "dep:simd-adler32" ];
+          "std" = [ "serde?/std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "simd" "simd-adler32" "with-alloc" ];
       };
       "mio" = rec {
         crateName = "mio";
@@ -5533,6 +6079,18 @@ rec {
           "parallel" = [ "jobserver" ];
         };
       };
+      "new_debug_unreachable" = rec {
+        crateName = "new_debug_unreachable";
+        version = "1.0.6";
+        edition = "2021";
+        sha256 = "11phpf1mjxq6khk91yzcbd3ympm78m3ivl7xg6lg2c0lf66fy3k5";
+        libName = "debug_unreachable";
+        authors = [
+          "Matt Brubeck <mbrubeck@limpet.net>"
+          "Jonathan Reem <jonathan.reem@gmail.com>"
+        ];
+
+      };
       "nix 0.29.0" = rec {
         crateName = "nix";
         version = "0.29.0";
@@ -5644,7 +6202,24 @@ rec {
         };
         resolvedDefaultFeatures = [ "std" ];
       };
-      "nom" = rec {
+      "no_std_io2" = rec {
+        crateName = "no_std_io2";
+        version = "0.9.4";
+        edition = "2021";
+        sha256 = "00w0ggkaaacbwiv4qw188ih5llmhf53qgp20wk5gdyrldldvv2j1";
+        dependencies = [
+          {
+            name = "memchr";
+            packageId = "memchr";
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "std" = [ "alloc" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" "default" "std" ];
+      };
+      "nom 7.1.3" = rec {
         crateName = "nom";
         version = "7.1.3";
         edition = "2018";
@@ -5667,6 +6242,27 @@ rec {
         features = {
           "default" = [ "std" ];
           "std" = [ "alloc" "memchr/std" "minimal-lexical/std" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" "default" "std" ];
+      };
+      "nom 8.0.0" = rec {
+        crateName = "nom";
+        version = "8.0.0";
+        edition = "2021";
+        sha256 = "01cl5xng9d0gxf26h39m0l8lprgpa00fcc75ps1yzgbib1vn35yz";
+        authors = [
+          "contact@geoffroycouprie.com"
+        ];
+        dependencies = [
+          {
+            name = "memchr";
+            packageId = "memchr";
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+          "std" = [ "alloc" "memchr/std" ];
         };
         resolvedDefaultFeatures = [ "alloc" "default" "std" ];
       };
@@ -5694,6 +6290,17 @@ rec {
           "serde" = [ "dep:serde" ];
         };
         resolvedDefaultFeatures = [ "serde" ];
+      };
+      "noop_proc_macro" = rec {
+        crateName = "noop_proc_macro";
+        version = "0.3.0";
+        edition = "2018";
+        sha256 = "1j2v1c6ric4w9v12h34jghzmngcwmn0hll1ywly4h6lcm4rbnxh6";
+        procMacro = true;
+        authors = [
+          "Luca Barbato <lu_zero@gentoo.org>"
+        ];
+
       };
       "nu-ansi-term" = rec {
         crateName = "nu-ansi-term";
@@ -5871,6 +6478,32 @@ rec {
         ];
 
       };
+      "num-derive" = rec {
+        crateName = "num-derive";
+        version = "0.4.2";
+        edition = "2021";
+        sha256 = "00p2am9ma8jgd2v6xpsz621wc7wbn1yqi71g15gc3h67m7qmafgd";
+        procMacro = true;
+        libName = "num_derive";
+        authors = [
+          "The Rust Project Developers"
+        ];
+        dependencies = [
+          {
+            name = "proc-macro2";
+            packageId = "proc-macro2";
+          }
+          {
+            name = "quote";
+            packageId = "quote";
+          }
+          {
+            name = "syn";
+            packageId = "syn 2.0.119";
+          }
+        ];
+
+      };
       "num-integer" = rec {
         crateName = "num-integer";
         version = "0.1.47";
@@ -5921,6 +6554,44 @@ rec {
           "default" = [ "std" ];
           "std" = [ "num-integer/std" "num-traits/std" ];
         };
+      };
+      "num-rational" = rec {
+        crateName = "num-rational";
+        version = "0.4.2";
+        edition = "2021";
+        sha256 = "093qndy02817vpgcqjnj139im3jl7vkq4h68kykdqqh577d18ggq";
+        libName = "num_rational";
+        authors = [
+          "The Rust Project Developers"
+        ];
+        dependencies = [
+          {
+            name = "num-bigint";
+            packageId = "num-bigint";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "num-integer";
+            packageId = "num-integer";
+            usesDefaultFeatures = false;
+            features = [ "i128" ];
+          }
+          {
+            name = "num-traits";
+            packageId = "num-traits";
+            usesDefaultFeatures = false;
+            features = [ "i128" ];
+          }
+        ];
+        features = {
+          "default" = [ "num-bigint" "std" ];
+          "num-bigint" = [ "dep:num-bigint" ];
+          "num-bigint-std" = [ "num-bigint/std" ];
+          "serde" = [ "dep:serde" ];
+          "std" = [ "num-bigint?/std" "num-integer/std" "num-traits/std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "num-bigint" "std" ];
       };
       "num-traits" = rec {
         crateName = "num-traits";
@@ -6201,6 +6872,18 @@ rec {
         sha256 = "02pxffpdqkapy292harq6asfjvadgp1s005fip9ljfsn9fvxgh2p";
         procMacro = true;
         authors = [
+          "David Tolnay <dtolnay@gmail.com>"
+        ];
+
+      };
+      "pastey" = rec {
+        crateName = "pastey";
+        version = "0.1.1";
+        edition = "2018";
+        sha256 = "1v389jkifv757903flrrps67dvc6q6giwlyx3xi33hcfjmgjxyrm";
+        procMacro = true;
+        authors = [
+          "Aditya Kumar <git@adityais.dev>"
           "David Tolnay <dtolnay@gmail.com>"
         ];
 
@@ -6890,6 +7573,63 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "proc-macro" ];
       };
+      "profiling" = rec {
+        crateName = "profiling";
+        version = "1.0.18";
+        edition = "2018";
+        sha256 = "1xdwlvxlgy99nn1dra7arzinkc8lbqljvcwpq70m7g16lda5wn9x";
+        authors = [
+          "Philip Degarmo <aclysma@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "profiling-procmacros";
+            packageId = "profiling-procmacros";
+            optional = true;
+          }
+        ];
+        features = {
+          "default" = [ "procmacros" ];
+          "optick" = [ "dep:optick" ];
+          "procmacros" = [ "profiling-procmacros" ];
+          "profile-with-optick" = [ "optick" "profiling-procmacros?/profile-with-optick" ];
+          "profile-with-puffin" = [ "puffin" "profiling-procmacros?/profile-with-puffin" ];
+          "profile-with-superluminal" = [ "superluminal-perf" "profiling-procmacros?/profile-with-superluminal" ];
+          "profile-with-tracing" = [ "tracing" "profiling-procmacros?/profile-with-tracing" ];
+          "profile-with-tracy" = [ "tracy-client" "profiling-procmacros?/profile-with-tracy" ];
+          "profiling-procmacros" = [ "dep:profiling-procmacros" ];
+          "puffin" = [ "dep:puffin" ];
+          "superluminal-perf" = [ "dep:superluminal-perf" ];
+          "tracing" = [ "dep:tracing" ];
+          "tracy-client" = [ "dep:tracy-client" ];
+        };
+        resolvedDefaultFeatures = [ "default" "procmacros" "profiling-procmacros" ];
+      };
+      "profiling-procmacros" = rec {
+        crateName = "profiling-procmacros";
+        version = "1.0.18";
+        edition = "2018";
+        sha256 = "1jxvqff6j1z7ph3qghw2xhv18z7pf6cs6cja6fwscjwsdfis9224";
+        procMacro = true;
+        libName = "profiling_procmacros";
+        authors = [
+          "Philip Degarmo <aclysma@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "quote";
+            packageId = "quote";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "syn";
+            packageId = "syn 2.0.119";
+            features = [ "full" ];
+          }
+        ];
+        features = {
+        };
+      };
       "ptr_meta" = rec {
         crateName = "ptr_meta";
         version = "0.3.2";
@@ -7156,7 +7896,7 @@ rec {
           "rustls-log" = [ "rustls?/logging" ];
           "rustls-ring" = [ "dep:rustls" "rustls?/ring" "ring" ];
         };
-        resolvedDefaultFeatures = [ "bloom" "log" "platform-verifier" "ring" "rustls-ring" ];
+        resolvedDefaultFeatures = [ "bloom" "default" "log" "platform-verifier" "ring" "rustls-ring" ];
       };
       "quinn-udp 0.5.16" = rec {
         crateName = "quinn-udp";
@@ -7372,7 +8112,7 @@ rec {
           }
           {
             name = "rand_chacha";
-            packageId = "rand_chacha";
+            packageId = "rand_chacha 0.3.1";
             optional = true;
             usesDefaultFeatures = false;
           }
@@ -7394,7 +8134,39 @@ rec {
         };
         resolvedDefaultFeatures = [ "alloc" "default" "getrandom" "libc" "rand_chacha" "std" "std_rng" ];
       };
-      "rand_chacha" = rec {
+      "rand 0.9.5" = rec {
+        crateName = "rand";
+        version = "0.9.5";
+        edition = "2021";
+        sha256 = "0hbvllk8g28mqjld6hqmckk69w296qpzg95whm3didsyg46ivvxr";
+        authors = [
+          "The Rand Project Developers"
+          "The Rust Project Developers"
+        ];
+        dependencies = [
+          {
+            name = "rand_chacha";
+            packageId = "rand_chacha 0.9.0";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "rand_core";
+            packageId = "rand_core 0.9.5";
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "default" = [ "std" "std_rng" "os_rng" "small_rng" "thread_rng" ];
+          "os_rng" = [ "rand_core/os_rng" ];
+          "serde" = [ "dep:serde" "rand_core/serde" ];
+          "std" = [ "rand_core/std" "rand_chacha?/std" "alloc" ];
+          "std_rng" = [ "dep:rand_chacha" ];
+          "thread_rng" = [ "std" "std_rng" "os_rng" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" "default" "os_rng" "small_rng" "std" "std_rng" "thread_rng" ];
+      };
+      "rand_chacha 0.3.1" = rec {
         crateName = "rand_chacha";
         version = "0.3.1";
         edition = "2018";
@@ -7421,6 +8193,43 @@ rec {
           "serde" = [ "dep:serde" ];
           "serde1" = [ "serde" ];
           "std" = [ "ppv-lite86/std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
+      };
+      "rand_chacha 0.9.0" = rec {
+        crateName = "rand_chacha";
+        version = "0.9.0";
+        edition = "2021";
+        sha256 = "1jr5ygix7r60pz0s1cv3ms1f6pd1i9pcdmnxzzhjc3zn3mgjn0nk";
+        authors = [
+          "The Rand Project Developers"
+          "The Rust Project Developers"
+          "The CryptoCorrosion Contributors"
+        ];
+        dependencies = [
+          {
+            name = "ppv-lite86";
+            packageId = "ppv-lite86";
+            usesDefaultFeatures = false;
+            features = [ "simd" ];
+          }
+          {
+            name = "rand_core";
+            packageId = "rand_core 0.9.5";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "rand_core";
+            packageId = "rand_core 0.9.5";
+            features = [ "os_rng" ];
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+          "os_rng" = [ "rand_core/os_rng" ];
+          "serde" = [ "dep:serde" ];
+          "std" = [ "ppv-lite86/std" "rand_core/std" ];
         };
         resolvedDefaultFeatures = [ "default" "std" ];
       };
@@ -7458,6 +8267,29 @@ rec {
         };
         resolvedDefaultFeatures = [ "alloc" "getrandom" "std" ];
       };
+      "rand_core 0.9.5" = rec {
+        crateName = "rand_core";
+        version = "0.9.5";
+        edition = "2021";
+        sha256 = "0g6qc5r3f0hdmz9b11nripyp9qqrzb0xqk9piip8w8qlvqkcibvn";
+        authors = [
+          "The Rand Project Developers"
+          "The Rust Project Developers"
+        ];
+        dependencies = [
+          {
+            name = "getrandom";
+            packageId = "getrandom 0.3.4";
+            optional = true;
+          }
+        ];
+        features = {
+          "os_rng" = [ "dep:getrandom" ];
+          "serde" = [ "dep:serde" ];
+          "std" = [ "getrandom?/std" ];
+        };
+        resolvedDefaultFeatures = [ "os_rng" "std" ];
+      };
       "rand_pcg" = rec {
         crateName = "rand_pcg";
         version = "0.10.2";
@@ -7474,6 +8306,230 @@ rec {
         ];
         features = {
           "serde" = [ "dep:serde" ];
+        };
+      };
+      "rav1e" = rec {
+        crateName = "rav1e";
+        version = "0.8.1";
+        edition = "2021";
+        crateBin = [];
+        sha256 = "0axk3ji3jmlr81svmsy5zvj8shmhpp8lz5nyghkq752xx1bdvdj3";
+        authors = [
+          "Thomas Daede <tdaede@xiph.org>"
+        ];
+        dependencies = [
+          {
+            name = "aligned-vec";
+            packageId = "aligned-vec";
+          }
+          {
+            name = "arbitrary";
+            packageId = "arbitrary";
+            target = { target, features }: (target."fuzzing" or false);
+          }
+          {
+            name = "arg_enum_proc_macro";
+            packageId = "arg_enum_proc_macro";
+          }
+          {
+            name = "arrayvec";
+            packageId = "arrayvec";
+          }
+          {
+            name = "av-scenechange";
+            packageId = "av-scenechange";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "av1-grain";
+            packageId = "av1-grain";
+          }
+          {
+            name = "bitstream-io";
+            packageId = "bitstream-io";
+          }
+          {
+            name = "cfg-if";
+            packageId = "cfg-if";
+          }
+          {
+            name = "interpolate_name";
+            packageId = "interpolate_name";
+            target = { target, features }: (target."fuzzing" or false);
+          }
+          {
+            name = "itertools";
+            packageId = "itertools";
+          }
+          {
+            name = "libc";
+            packageId = "libc";
+          }
+          {
+            name = "libfuzzer-sys";
+            packageId = "libfuzzer-sys";
+            target = { target, features }: (target."fuzzing" or false);
+          }
+          {
+            name = "log";
+            packageId = "log";
+          }
+          {
+            name = "maybe-rayon";
+            packageId = "maybe-rayon";
+            rename = "rayon";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "new_debug_unreachable";
+            packageId = "new_debug_unreachable";
+          }
+          {
+            name = "noop_proc_macro";
+            packageId = "noop_proc_macro";
+          }
+          {
+            name = "num-derive";
+            packageId = "num-derive";
+          }
+          {
+            name = "num-traits";
+            packageId = "num-traits";
+          }
+          {
+            name = "paste";
+            packageId = "paste";
+          }
+          {
+            name = "profiling";
+            packageId = "profiling";
+          }
+          {
+            name = "rand";
+            packageId = "rand 0.9.5";
+            target = { target, features }: (target."fuzzing" or false);
+          }
+          {
+            name = "rand_chacha";
+            packageId = "rand_chacha 0.9.0";
+            target = { target, features }: (target."fuzzing" or false);
+          }
+          {
+            name = "simd_helpers";
+            packageId = "simd_helpers";
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 2.0.21";
+          }
+          {
+            name = "v_frame";
+            packageId = "v_frame";
+          }
+        ];
+        buildDependencies = [
+          {
+            name = "built";
+            packageId = "built";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "interpolate_name";
+            packageId = "interpolate_name";
+          }
+          {
+            name = "rand";
+            packageId = "rand 0.9.5";
+          }
+          {
+            name = "rand_chacha";
+            packageId = "rand_chacha 0.9.0";
+          }
+        ];
+        features = {
+          "aom-sys" = [ "dep:aom-sys" ];
+          "asm" = [ "nasm-rs" "cc" ];
+          "av-metrics" = [ "dep:av-metrics" ];
+          "backtrace" = [ "dep:backtrace" ];
+          "binaries" = [ "ivf" "y4m" "clap" "clap_complete" "scan_fmt" "fern" "console" "av-metrics" "nom" ];
+          "byteorder" = [ "dep:byteorder" ];
+          "capi" = [ "scan_fmt" ];
+          "cc" = [ "dep:cc" ];
+          "channel-api" = [ "crossbeam" ];
+          "clap" = [ "dep:clap" ];
+          "clap_complete" = [ "dep:clap_complete" ];
+          "console" = [ "dep:console" ];
+          "crossbeam" = [ "dep:crossbeam" ];
+          "dav1d-sys" = [ "dep:dav1d-sys" ];
+          "decode_test" = [ "aom-sys" ];
+          "decode_test_dav1d" = [ "dav1d-sys" ];
+          "default" = [ "binaries" "asm" "threading" "signal_support" "git_version" ];
+          "desync_finder" = [ "backtrace" ];
+          "dump_ivf" = [ "ivf" ];
+          "dump_lookahead_data" = [ "byteorder" "image" ];
+          "fern" = [ "dep:fern" ];
+          "git_version" = [ "built/git2" ];
+          "image" = [ "dep:image" ];
+          "ivf" = [ "dep:ivf" ];
+          "nasm-rs" = [ "dep:nasm-rs" ];
+          "nom" = [ "dep:nom" ];
+          "scan_fmt" = [ "dep:scan_fmt" ];
+          "serde" = [ "dep:serde" ];
+          "serde-big-array" = [ "dep:serde-big-array" ];
+          "serialize" = [ "serde" "toml" "v_frame/serialize" "serde-big-array" "av1-grain/serialize" ];
+          "signal-hook" = [ "dep:signal-hook" ];
+          "signal_support" = [ "signal-hook" ];
+          "threading" = [ "rayon/threads" ];
+          "toml" = [ "dep:toml" ];
+          "tracing" = [ "profiling/profile-with-tracing" "tracing-subscriber" "tracing-chrome" "dep:tracing" ];
+          "tracing-chrome" = [ "dep:tracing-chrome" ];
+          "tracing-subscriber" = [ "dep:tracing-subscriber" ];
+          "wasm" = [ "wasm-bindgen" ];
+          "wasm-bindgen" = [ "dep:wasm-bindgen" ];
+          "y4m" = [ "dep:y4m" ];
+        };
+        resolvedDefaultFeatures = [ "threading" ];
+      };
+      "rayon" = rec {
+        crateName = "rayon";
+        version = "1.12.0";
+        edition = "2021";
+        sha256 = "0vcj63xgnk72c30vdrak7dhl53snnaqv9x2faf1d94hzg1kb2fgv";
+        dependencies = [
+          {
+            name = "either";
+            packageId = "either";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "rayon-core";
+            packageId = "rayon-core";
+          }
+        ];
+        features = {
+          "web_spin_lock" = [ "dep:wasm_sync" "rayon-core/web_spin_lock" ];
+        };
+      };
+      "rayon-core" = rec {
+        crateName = "rayon-core";
+        version = "1.13.0";
+        edition = "2021";
+        links = "rayon-core";
+        sha256 = "14dbr0sq83a6lf1rfjq5xdpk5r6zgzvmzs5j6110vlv2007qpq92";
+        libName = "rayon_core";
+        dependencies = [
+          {
+            name = "crossbeam-deque";
+            packageId = "crossbeam-deque";
+          }
+          {
+            name = "crossbeam-utils";
+            packageId = "crossbeam-utils";
+          }
+        ];
+        features = {
+          "web_spin_lock" = [ "dep:wasm_sync" ];
         };
       };
       "rcgen" = rec {
@@ -7523,7 +8579,7 @@ rec {
           "x509-parser" = [ "dep:x509-parser" ];
           "zeroize" = [ "dep:zeroize" ];
         };
-        resolvedDefaultFeatures = [ "crypto" "pem" "ring" ];
+        resolvedDefaultFeatures = [ "crypto" "default" "pem" "ring" ];
       };
       "redox_syscall" = rec {
         crateName = "redox_syscall";
@@ -7898,7 +8954,7 @@ rec {
           }
           {
             name = "webpki-roots";
-            packageId = "webpki-roots 1.0.9";
+            packageId = "webpki-roots";
             optional = true;
             target = { target, features }: (!("wasm32" == target."arch" or null));
           }
@@ -8194,9 +9250,9 @@ rec {
       };
       "ron" = rec {
         crateName = "ron";
-        version = "0.11.0";
+        version = "0.12.2";
         edition = "2021";
-        sha256 = "0s6l0hlkxkk31iq6z4y4cy68szyy5dx7ffai4qd1yilyr06082fv";
+        sha256 = "1czbkmp4wz87ngrqrf9k6b5bqd94dd5qw8pb3b2an7nn66ann4c1";
         authors = [
           "Christopher Durham <cad97@cad97.com>"
           "Dzmitry Malyshau <kvarkus@gmail.com>"
@@ -8205,16 +9261,16 @@ rec {
         ];
         dependencies = [
           {
-            name = "base64";
-            packageId = "base64 0.22.1";
-            usesDefaultFeatures = false;
-            features = [ "alloc" ];
-          }
-          {
             name = "bitflags";
             packageId = "bitflags 2.13.2";
             usesDefaultFeatures = false;
             features = [ "serde" ];
+          }
+          {
+            name = "once_cell";
+            packageId = "once_cell";
+            usesDefaultFeatures = false;
+            features = [ "alloc" "race" ];
           }
           {
             name = "serde";
@@ -8225,6 +9281,11 @@ rec {
           {
             name = "serde_derive";
             packageId = "serde_derive";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "typeid";
+            packageId = "typeid";
             usesDefaultFeatures = false;
           }
           {
@@ -9025,7 +10086,7 @@ rec {
         dependencies = [
           {
             name = "nom";
-            packageId = "nom";
+            packageId = "nom 7.1.3";
             usesDefaultFeatures = false;
             features = [ "std" ];
           }
@@ -9062,7 +10123,7 @@ rec {
           }
           {
             name = "rustls-webpki";
-            packageId = "rustls-webpki 0.103.15";
+            packageId = "rustls-webpki";
             rename = "webpki";
             usesDefaultFeatures = false;
             features = [ "alloc" ];
@@ -9240,21 +10301,21 @@ rec {
           }
           {
             name = "rustls-webpki";
-            packageId = "rustls-webpki 0.103.15";
+            packageId = "rustls-webpki";
             rename = "webpki";
             usesDefaultFeatures = false;
             target = { target, features }: ((target."unix" or false) && (!("android" == target."os" or null)) && (!("apple" == target."vendor" or null)) && (!("wasm32" == target."arch" or null)));
           }
           {
             name = "rustls-webpki";
-            packageId = "rustls-webpki 0.103.15";
+            packageId = "rustls-webpki";
             rename = "webpki";
             usesDefaultFeatures = false;
             target = { target, features }: ("wasm32" == target."arch" or null);
           }
           {
             name = "rustls-webpki";
-            packageId = "rustls-webpki 0.103.15";
+            packageId = "rustls-webpki";
             rename = "webpki";
             usesDefaultFeatures = false;
             target = { target, features }: ("android" == target."os" or null);
@@ -9312,40 +10373,7 @@ rec {
         libName = "rustls_platform_verifier_android";
 
       };
-      "rustls-webpki 0.102.8" = rec {
-        crateName = "rustls-webpki";
-        version = "0.102.8";
-        edition = "2021";
-        sha256 = "1sdy8ks86b7jpabpnb2px2s7f1sq8v0nqf6fnlvwzm4vfk41pjk4";
-        libName = "webpki";
-        dependencies = [
-          {
-            name = "ring";
-            packageId = "ring";
-            optional = true;
-            usesDefaultFeatures = false;
-          }
-          {
-            name = "rustls-pki-types";
-            packageId = "rustls-pki-types";
-            rename = "pki-types";
-            usesDefaultFeatures = false;
-          }
-          {
-            name = "untrusted";
-            packageId = "untrusted";
-          }
-        ];
-        features = {
-          "alloc" = [ "ring?/alloc" "pki-types/alloc" ];
-          "aws_lc_rs" = [ "dep:aws-lc-rs" ];
-          "default" = [ "std" "ring" ];
-          "ring" = [ "dep:ring" ];
-          "std" = [ "alloc" "pki-types/std" ];
-        };
-        resolvedDefaultFeatures = [ "alloc" "default" "ring" "std" ];
-      };
-      "rustls-webpki 0.103.15" = rec {
+      "rustls-webpki" = rec {
         crateName = "rustls-webpki";
         version = "0.103.15";
         edition = "2021";
@@ -9378,7 +10406,7 @@ rec {
           "ring" = [ "dep:ring" ];
           "std" = [ "alloc" "pki-types/std" ];
         };
-        resolvedDefaultFeatures = [ "alloc" "ring" "std" ];
+        resolvedDefaultFeatures = [ "alloc" "default" "ring" "std" ];
       };
       "rustversion" = rec {
         crateName = "rustversion";
@@ -9477,72 +10505,6 @@ rec {
         ];
 
       };
-      "schemars 0.8.22" = rec {
-        crateName = "schemars";
-        version = "0.8.22";
-        edition = "2021";
-        sha256 = "05an9nbi18ynyxv1rjmwbg6j08j0496hd64mjggh53mwp3hjmgrz";
-        authors = [
-          "Graham Esau <gesau@hotmail.co.uk>"
-        ];
-        dependencies = [
-          {
-            name = "dyn-clone";
-            packageId = "dyn-clone";
-          }
-          {
-            name = "either";
-            packageId = "either";
-            optional = true;
-            usesDefaultFeatures = false;
-          }
-          {
-            name = "schemars_derive";
-            packageId = "schemars_derive";
-            optional = true;
-          }
-          {
-            name = "serde";
-            packageId = "serde";
-            features = [ "derive" ];
-          }
-          {
-            name = "serde_json";
-            packageId = "serde_json";
-          }
-        ];
-        features = {
-          "arrayvec" = [ "arrayvec05" ];
-          "arrayvec05" = [ "dep:arrayvec05" ];
-          "arrayvec07" = [ "dep:arrayvec07" ];
-          "bigdecimal" = [ "bigdecimal03" ];
-          "bigdecimal03" = [ "dep:bigdecimal03" ];
-          "bigdecimal04" = [ "dep:bigdecimal04" ];
-          "bytes" = [ "dep:bytes" ];
-          "chrono" = [ "dep:chrono" ];
-          "default" = [ "derive" ];
-          "derive" = [ "schemars_derive" ];
-          "derive_json_schema" = [ "impl_json_schema" ];
-          "either" = [ "dep:either" ];
-          "enumset" = [ "dep:enumset" ];
-          "impl_json_schema" = [ "derive" ];
-          "indexmap" = [ "dep:indexmap" ];
-          "indexmap1" = [ "indexmap" ];
-          "indexmap2" = [ "dep:indexmap2" ];
-          "preserve_order" = [ "indexmap" ];
-          "raw_value" = [ "serde_json/raw_value" ];
-          "rust_decimal" = [ "dep:rust_decimal" ];
-          "schemars_derive" = [ "dep:schemars_derive" ];
-          "semver" = [ "dep:semver" ];
-          "smallvec" = [ "dep:smallvec" ];
-          "smol_str" = [ "dep:smol_str" ];
-          "url" = [ "dep:url" ];
-          "uuid" = [ "uuid08" ];
-          "uuid08" = [ "dep:uuid08" ];
-          "uuid1" = [ "dep:uuid1" ];
-        };
-        resolvedDefaultFeatures = [ "default" "derive" "either" "schemars_derive" ];
-      };
       "schemars 0.9.0" = rec {
         crateName = "schemars";
         version = "0.9.0";
@@ -9616,8 +10578,20 @@ rec {
             packageId = "dyn-clone";
           }
           {
+            name = "either";
+            packageId = "either";
+            rename = "either1";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+          {
             name = "ref-cast";
             packageId = "ref-cast";
+          }
+          {
+            name = "schemars_derive";
+            packageId = "schemars_derive";
+            optional = true;
           }
           {
             name = "serde";
@@ -9633,6 +10607,13 @@ rec {
           }
         ];
         devDependencies = [
+          {
+            name = "either";
+            packageId = "either";
+            rename = "either1";
+            usesDefaultFeatures = false;
+            features = [ "serde" ];
+          }
           {
             name = "serde";
             packageId = "serde";
@@ -9660,13 +10641,13 @@ rec {
           "url2" = [ "dep:url2" ];
           "uuid1" = [ "dep:uuid1" ];
         };
-        resolvedDefaultFeatures = [ "std" ];
+        resolvedDefaultFeatures = [ "default" "derive" "either1" "schemars_derive" "std" ];
       };
       "schemars_derive" = rec {
         crateName = "schemars_derive";
-        version = "0.8.22";
+        version = "1.2.2";
         edition = "2021";
-        sha256 = "0kakyzrp5801s4i043l4ilv96lzimnlh01pap958h66n99w6bqij";
+        sha256 = "1fp2wkdk32nv66swy7k7pz7sxygn634snlppih5jzbs6ddqng36r";
         procMacro = true;
         authors = [
           "Graham Esau <gesau@hotmail.co.uk>"
@@ -9686,7 +10667,13 @@ rec {
           }
           {
             name = "syn";
-            packageId = "syn 2.0.119";
+            packageId = "syn 3.0.6";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "syn";
+            packageId = "syn 3.0.6";
             features = [ "extra-traits" ];
           }
         ];
@@ -9909,9 +10896,9 @@ rec {
       };
       "serde_derive_internals" = rec {
         crateName = "serde_derive_internals";
-        version = "0.29.1";
-        edition = "2015";
-        sha256 = "04g7macx819vbnxhi52cx0nhxi56xlhrybgwybyy7fb9m4h6mlhq";
+        version = "0.30.0";
+        edition = "2021";
+        sha256 = "1gd9n45na7n79nr54ghfl79rygkbzw2ybk3wyr6nlp83rry16lpq";
         libPath = "lib.rs";
         authors = [
           "Erick Tryzelaar <erick.tryzelaar@gmail.com>"
@@ -9930,7 +10917,7 @@ rec {
           }
           {
             name = "syn";
-            packageId = "syn 2.0.119";
+            packageId = "syn 3.0.6";
             usesDefaultFeatures = false;
             features = [ "clone-impls" "derive" "parsing" "printing" ];
           }
@@ -10021,6 +11008,27 @@ rec {
           }
         ];
 
+      };
+      "serde_spanned" = rec {
+        crateName = "serde_spanned";
+        version = "1.1.2";
+        edition = "2024";
+        sha256 = "0b0crd16vvp0n81pgh0ldi3apld0ph5ywsrml80y5v2ynnz26xaf";
+        dependencies = [
+          {
+            name = "serde_core";
+            packageId = "serde_core";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "alloc" = [ "serde_core?/alloc" ];
+          "default" = [ "std" "serde" ];
+          "serde" = [ "dep:serde_core" ];
+          "std" = [ "alloc" "serde_core?/std" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" "serde" "std" ];
       };
       "serde_urlencoded" = rec {
         crateName = "serde_urlencoded";
@@ -10457,6 +11465,19 @@ rec {
         };
         resolvedDefaultFeatures = [ "alloc" "digest" "rand_core" "std" ];
       };
+      "simd-adler32" = rec {
+        crateName = "simd-adler32";
+        version = "0.3.10";
+        edition = "2018";
+        sha256 = "1sny4y2qa5mwyxx5x59ln2p02vsdh92004njlslnx98imjc9489s";
+        libName = "simd_adler32";
+        authors = [
+          "Marvin Countryman <me@maar.vin>"
+        ];
+        features = {
+          "default" = [ "std" "const-generics" ];
+        };
+      };
       "simd_cesu8" = rec {
         crateName = "simd_cesu8";
         version = "1.2.0";
@@ -10483,6 +11504,23 @@ rec {
           "std" = [ "simdutf8/std" ];
         };
         resolvedDefaultFeatures = [ "default" "std" ];
+      };
+      "simd_helpers" = rec {
+        crateName = "simd_helpers";
+        version = "0.1.0";
+        edition = "2018";
+        sha256 = "19idqicn9k4vhd04ifh2ff41wvna79zphdf2c81rlmpc7f3hz2cm";
+        procMacro = true;
+        authors = [
+          "Luca Barbato <lu_zero@gentoo.org>"
+        ];
+        dependencies = [
+          {
+            name = "quote";
+            packageId = "quote";
+          }
+        ];
+
       };
       "simdutf8" = rec {
         crateName = "simdutf8";
@@ -10691,9 +11729,9 @@ rec {
       };
       "stabby" = rec {
         crateName = "stabby";
-        version = "36.2.2";
+        version = "72.1.16";
         edition = "2021";
-        sha256 = "1y3rxj12xriiw9gdy4n5djip2i3i97xv4pzinmv2w327mx7fkdw9";
+        sha256 = "1k7k683djkmin9fwfm3rwjhmlnapjgil2bgxz9vn5i1li51d4lrx";
         authors = [
           "Pierre Avital <pierre.avital@gmail.com>"
         ];
@@ -10729,9 +11767,9 @@ rec {
       };
       "stabby-abi" = rec {
         crateName = "stabby-abi";
-        version = "36.2.2";
+        version = "72.1.16";
         edition = "2021";
-        sha256 = "06jcfc36qrmbm0c91cpwvjr0cybflmfxiqzzpx8lxdbnh8xsdiqd";
+        sha256 = "147iafnh1x9qkwkij2frkskw0ybvmv94qzg4wlz20m5vh3kflxgk";
         libName = "stabby_abi";
         authors = [
           "Pierre Avital <pierre.avital@gmail.com>"
@@ -10770,9 +11808,9 @@ rec {
       };
       "stabby-macros" = rec {
         crateName = "stabby-macros";
-        version = "36.2.2";
+        version = "72.1.16";
         edition = "2021";
-        sha256 = "058ncn4bc6q798fh1ldyq56j7shvydavw3qjkp3kxj8yc72pxjzf";
+        sha256 = "1wgffq6c0iskanrvx2865glzaanq4g0ilagf5zizgibnlmqlcrpa";
         procMacro = true;
         libName = "stabby_macros";
         authors = [
@@ -10792,12 +11830,8 @@ rec {
             packageId = "quote";
           }
           {
-            name = "rand";
-            packageId = "rand 0.8.8";
-          }
-          {
             name = "syn";
-            packageId = "syn 1.0.109";
+            packageId = "syn 2.0.119";
             features = [ "full" "extra-traits" ];
           }
         ];
@@ -10815,6 +11849,17 @@ rec {
         features = {
           "default" = [ "std" ];
           "std" = [ "alloc" ];
+        };
+      };
+      "static_assertions" = rec {
+        crateName = "static_assertions";
+        version = "1.1.0";
+        edition = "2015";
+        sha256 = "0gsl6xmw10gvn3zs1rv99laj5ig7ylffnh71f9l34js4nr4r7sx2";
+        authors = [
+          "Nikolai Vazquez"
+        ];
+        features = {
         };
       };
       "strsim" = rec {
@@ -10858,40 +11903,6 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "i128" "std" ];
       };
-      "syn 1.0.109" = rec {
-        crateName = "syn";
-        version = "1.0.109";
-        edition = "2018";
-        sha256 = "0ds2if4600bd59wsv7jjgfkayfzy3hnazs394kz6zdkmna8l3dkj";
-        authors = [
-          "David Tolnay <dtolnay@gmail.com>"
-        ];
-        dependencies = [
-          {
-            name = "proc-macro2";
-            packageId = "proc-macro2";
-            usesDefaultFeatures = false;
-          }
-          {
-            name = "quote";
-            packageId = "quote";
-            optional = true;
-            usesDefaultFeatures = false;
-          }
-          {
-            name = "unicode-ident";
-            packageId = "unicode-ident";
-          }
-        ];
-        features = {
-          "default" = [ "derive" "parsing" "printing" "clone-impls" "proc-macro" ];
-          "printing" = [ "quote" ];
-          "proc-macro" = [ "proc-macro2/proc-macro" "quote/proc-macro" ];
-          "quote" = [ "dep:quote" ];
-          "test" = [ "syn-test-suite/all-features" ];
-        };
-        resolvedDefaultFeatures = [ "clone-impls" "default" "derive" "extra-traits" "full" "parsing" "printing" "proc-macro" "quote" ];
-      };
       "syn 2.0.119" = rec {
         crateName = "syn";
         version = "2.0.119";
@@ -10923,7 +11934,7 @@ rec {
           "proc-macro" = [ "proc-macro2/proc-macro" "quote?/proc-macro" ];
           "test" = [ "syn-test-suite/all-features" ];
         };
-        resolvedDefaultFeatures = [ "clone-impls" "default" "derive" "extra-traits" "full" "parsing" "printing" "proc-macro" "visit" "visit-mut" ];
+        resolvedDefaultFeatures = [ "clone-impls" "default" "derive" "extra-traits" "fold" "full" "parsing" "printing" "proc-macro" "visit" "visit-mut" ];
       };
       "syn 3.0.6" = rec {
         crateName = "syn";
@@ -11707,7 +12718,92 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "futures-util" "io" "rt" ];
       };
-      "toml_datetime" = rec {
+      "toml" = rec {
+        crateName = "toml";
+        version = "0.9.12+spec-1.1.0";
+        edition = "2021";
+        sha256 = "0qwqbrymqn88mg2yqyq3rj52z6p20448z0jxdbpjsbpwg5g894ng";
+        dependencies = [
+          {
+            name = "indexmap";
+            packageId = "indexmap 2.14.2";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "serde_core";
+            packageId = "serde_core";
+            optional = true;
+            usesDefaultFeatures = false;
+            features = [ "alloc" ];
+          }
+          {
+            name = "serde_spanned";
+            packageId = "serde_spanned";
+            usesDefaultFeatures = false;
+            features = [ "alloc" ];
+          }
+          {
+            name = "toml_datetime";
+            packageId = "toml_datetime 0.7.5+spec-1.1.0";
+            usesDefaultFeatures = false;
+            features = [ "alloc" ];
+          }
+          {
+            name = "toml_parser";
+            packageId = "toml_parser";
+            optional = true;
+            usesDefaultFeatures = false;
+            features = [ "alloc" ];
+          }
+          {
+            name = "toml_writer";
+            packageId = "toml_writer";
+            optional = true;
+            usesDefaultFeatures = false;
+            features = [ "alloc" ];
+          }
+          {
+            name = "winnow";
+            packageId = "winnow 0.7.15";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "debug" = [ "std" "toml_parser?/debug" "dep:anstream" "dep:anstyle" ];
+          "default" = [ "std" "serde" "parse" "display" ];
+          "display" = [ "dep:toml_writer" ];
+          "fast_hash" = [ "preserve_order" "dep:foldhash" ];
+          "parse" = [ "dep:toml_parser" "dep:winnow" ];
+          "preserve_order" = [ "dep:indexmap" "std" ];
+          "serde" = [ "dep:serde_core" "toml_datetime/serde" "serde_spanned/serde" ];
+          "std" = [ "indexmap?/std" "serde_core?/std" "toml_parser?/std" "toml_writer?/std" "toml_datetime/std" "serde_spanned/std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "display" "parse" "serde" "std" ];
+      };
+      "toml_datetime 0.7.5+spec-1.1.0" = rec {
+        crateName = "toml_datetime";
+        version = "0.7.5+spec-1.1.0";
+        edition = "2021";
+        sha256 = "0iqkgvgsxmszpai53dbip7sf2igic39s4dby29dbqf1h9bnwzqcj";
+        dependencies = [
+          {
+            name = "serde_core";
+            packageId = "serde_core";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "alloc" = [ "serde_core?/alloc" ];
+          "default" = [ "std" ];
+          "serde" = [ "dep:serde_core" ];
+          "std" = [ "alloc" "serde_core?/std" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" "serde" "std" ];
+      };
+      "toml_datetime 1.1.1+spec-1.1.0" = rec {
         crateName = "toml_datetime";
         version = "1.1.1+spec-1.1.0";
         edition = "2024";
@@ -11741,7 +12837,7 @@ rec {
           }
           {
             name = "toml_datetime";
-            packageId = "toml_datetime";
+            packageId = "toml_datetime 1.1.1+spec-1.1.0";
           }
           {
             name = "toml_parser";
@@ -11750,7 +12846,7 @@ rec {
           }
           {
             name = "winnow";
-            packageId = "winnow";
+            packageId = "winnow 1.0.4";
             optional = true;
           }
         ];
@@ -11771,7 +12867,7 @@ rec {
         dependencies = [
           {
             name = "winnow";
-            packageId = "winnow";
+            packageId = "winnow 1.0.4";
             usesDefaultFeatures = false;
           }
         ];
@@ -11782,6 +12878,17 @@ rec {
           "std" = [ "alloc" ];
         };
         resolvedDefaultFeatures = [ "alloc" "default" "std" ];
+      };
+      "toml_writer" = rec {
+        crateName = "toml_writer";
+        version = "1.1.3+spec-1.1.0";
+        edition = "2024";
+        sha256 = "0w17cps8mfg7wcwyp0gggi9cpgmxldb9pwl55qp8ssq5zj6bvg86";
+        features = {
+          "default" = [ "std" ];
+          "std" = [ "alloc" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" "std" ];
       };
       "tower" = rec {
         crateName = "tower";
@@ -12463,20 +13570,46 @@ rec {
       };
       "twox-hash" = rec {
         crateName = "twox-hash";
-        version = "2.1.4";
-        edition = "2021";
-        sha256 = "0yhin35iw4gq0b47f8682vyhk410pjs0nli0gcnfiscga57670sj";
+        version = "1.6.3";
+        edition = "2018";
+        crateBin = [];
+        sha256 = "0xgn72j36a270l5ls1jk88n7bmq2dhlfkbhdh5554hbagjsydzlp";
         libName = "twox_hash";
         authors = [
           "Jake Goulding <jake.goulding@gmail.com>"
         ];
+        dependencies = [
+          {
+            name = "cfg-if";
+            packageId = "cfg-if";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "static_assertions";
+            packageId = "static_assertions";
+            usesDefaultFeatures = false;
+          }
+        ];
         features = {
-          "default" = [ "random" "xxhash32" "xxhash64" "xxhash3_64" "xxhash3_128" "std" ];
-          "random" = [ "dep:rand" ];
-          "serialize" = [ "dep:serde" ];
-          "std" = [ "alloc" ];
+          "default" = [ "std" ];
+          "digest" = [ "dep:digest" ];
+          "digest_0_10" = [ "dep:digest_0_10" ];
+          "digest_0_9" = [ "dep:digest_0_9" ];
+          "rand" = [ "dep:rand" ];
+          "serde" = [ "dep:serde" ];
+          "serialize" = [ "serde" ];
+          "std" = [ "rand" ];
         };
-        resolvedDefaultFeatures = [ "xxhash32" ];
+      };
+      "typeid" = rec {
+        crateName = "typeid";
+        version = "1.0.3";
+        edition = "2018";
+        sha256 = "0727ypay2p6mlw72gz3yxkqayzdmjckw46sxqpaj08v0b0r64zdw";
+        authors = [
+          "David Tolnay <dtolnay@gmail.com>"
+        ];
+
       };
       "typenum" = rec {
         crateName = "typenum";
@@ -12809,6 +13942,36 @@ rec {
           "zerocopy" = [ "dep:zerocopy" ];
         };
         resolvedDefaultFeatures = [ "default" "rng" "std" "v4" ];
+      };
+      "v_frame" = rec {
+        crateName = "v_frame";
+        version = "0.3.9";
+        edition = "2021";
+        sha256 = "1qkvb4ks33zck931vzqckjn36hkngj6l2cwmvfsnlpc7r0kpfsv6";
+        authors = [
+          "Luca Barbato <lu_zero@gentoo.org>"
+        ];
+        dependencies = [
+          {
+            name = "aligned-vec";
+            packageId = "aligned-vec";
+          }
+          {
+            name = "num-traits";
+            packageId = "num-traits";
+          }
+          {
+            name = "wasm-bindgen";
+            packageId = "wasm-bindgen";
+            target = { target, features }: (target.name == "wasm32-unknown-unknown");
+          }
+        ];
+        features = {
+          "profiling" = [ "dep:profiling" ];
+          "serde" = [ "dep:serde" ];
+          "serialize" = [ "serde" "aligned-vec/serde" ];
+          "tracing" = [ "profiling" "dep:tracing" "profiling/profile-with-tracing" ];
+        };
       };
       "validated_struct" = rec {
         crateName = "validated_struct";
@@ -13721,22 +14884,7 @@ rec {
         ];
 
       };
-      "webpki-roots 0.26.11" = rec {
-        crateName = "webpki-roots";
-        version = "0.26.11";
-        edition = "2021";
-        sha256 = "1agpayg5zzf7m1a01q30jahlgmn5nwggbabdhq0in008pf5c66sj";
-        libName = "webpki_roots";
-        dependencies = [
-          {
-            name = "webpki-roots";
-            packageId = "webpki-roots 1.0.9";
-            rename = "parent";
-          }
-        ];
-
-      };
-      "webpki-roots 1.0.9" = rec {
+      "webpki-roots" = rec {
         crateName = "webpki-roots";
         version = "1.0.9";
         edition = "2021";
@@ -14630,7 +15778,20 @@ rec {
         ];
 
       };
-      "winnow" = rec {
+      "winnow 0.7.15" = rec {
+        crateName = "winnow";
+        version = "0.7.15";
+        edition = "2021";
+        sha256 = "0i9rkl2rqpbnnxlgs20gmkj3nd0b2k8q55mjmpc2ybb84xwxjyfz";
+        features = {
+          "debug" = [ "std" "dep:anstream" "dep:anstyle" "dep:is_terminal_polyfill" "dep:terminal_size" ];
+          "default" = [ "std" ];
+          "simd" = [ "dep:memchr" ];
+          "std" = [ "alloc" "memchr?/std" ];
+          "unstable-doc" = [ "alloc" "std" "simd" "unstable-recover" ];
+        };
+      };
+      "winnow 1.0.4" = rec {
         crateName = "winnow";
         version = "1.0.4";
         edition = "2021";
@@ -14718,7 +15879,7 @@ rec {
           }
           {
             name = "nom";
-            packageId = "nom";
+            packageId = "nom 7.1.3";
           }
           {
             name = "oid-registry";
@@ -14775,7 +15936,7 @@ rec {
           }
           {
             name = "nom";
-            packageId = "nom";
+            packageId = "nom 7.1.3";
           }
           {
             name = "oid-registry";
@@ -14808,6 +15969,16 @@ rec {
           "verify-aws" = [ "aws-lc-rs" ];
         };
         resolvedDefaultFeatures = [ "default" "ring" "verify" ];
+      };
+      "y4m" = rec {
+        crateName = "y4m";
+        version = "0.8.0";
+        edition = "2015";
+        sha256 = "0j24y2zf60lpxwd7kyg737hqfyqx16y32s0fjyi6fax6w4hlnnks";
+        authors = [
+          "Kagami Hiiragi <kagami@genshiken.org>"
+        ];
+
       };
       "yasna" = rec {
         crateName = "yasna";
@@ -14907,9 +16078,9 @@ rec {
       };
       "zenoh" = rec {
         crateName = "zenoh";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0zrl1jiys39qxhs9cf86sv8i0lhvx3fgk9f89xp4p78njl3h9py5";
+        sha256 = "1115q903zn2379zsf6as3l2wgmd9fkyj9c2bmqx6b5qiib9aafs5";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
           "Luca Cominardi <luca.cominardi@zettascale.tech>"
@@ -14937,6 +16108,10 @@ rec {
           {
             name = "const_format";
             packageId = "const_format";
+          }
+          {
+            name = "flate2";
+            packageId = "flate2";
           }
           {
             name = "flume";
@@ -14972,10 +16147,6 @@ rec {
             packageId = "once_cell";
           }
           {
-            name = "paste";
-            packageId = "paste";
-          }
-          {
             name = "petgraph";
             packageId = "petgraph";
           }
@@ -14989,10 +16160,6 @@ rec {
             packageId = "rand 0.8.8";
             usesDefaultFeatures = false;
             features = [ "default" ];
-          }
-          {
-            name = "ref-cast";
-            packageId = "ref-cast";
           }
           {
             name = "serde";
@@ -15139,7 +16306,8 @@ rec {
           "internal" = [ "zenoh-config/internal" "zenoh-keyexpr/internal" "zenoh-protocol/internal" ];
           "runtime_plugins" = [ "plugins" ];
           "shared-memory" = [ "zenoh-buffers/shared-memory" "zenoh-protocol/shared-memory" "zenoh-shm" "zenoh-transport/shared-memory" ];
-          "stats" = [ "zenoh-transport/stats" ];
+          "stats" = [ "zenoh-stats" "zenoh-transport/stats" ];
+          "test" = [ "zenoh-transport/test" ];
           "tracing-instrument" = [ "zenoh-runtime/tracing-instrument" "zenoh-task/tracing-instrument" ];
           "transport_compression" = [ "zenoh-transport/transport_compression" ];
           "transport_multilink" = [ "zenoh-transport/transport_multilink" ];
@@ -15153,16 +16321,18 @@ rec {
           "transport_unixsock-stream" = [ "zenoh-transport/transport_unixsock-stream" ];
           "transport_vsock" = [ "zenoh-transport/transport_vsock" ];
           "transport_ws" = [ "zenoh-transport/transport_ws" ];
-          "unstable" = [ "internal_config" "zenoh-config/unstable" "zenoh-keyexpr/unstable" "zenoh-protocol/unstable" ];
+          "unstable" = [ "zenoh-config/unstable" "zenoh-keyexpr/unstable" "zenoh-protocol/unstable" "zenoh-transport/unstable" ];
+          "uring" = [ "zenoh-transport/uring" ];
           "zenoh-shm" = [ "dep:zenoh-shm" ];
+          "zenoh-stats" = [ "dep:zenoh-stats" ];
         };
-        resolvedDefaultFeatures = [ "auth_pubkey" "auth_usrpwd" "default" "internal" "internal_config" "transport_compression" "transport_multilink" "transport_quic" "transport_quic_datagram" "transport_tcp" "transport_tls" "transport_udp" "transport_unixsock-stream" "transport_ws" "unstable" ];
+        resolvedDefaultFeatures = [ "auth_pubkey" "auth_usrpwd" "default" "internal" "transport_compression" "transport_multilink" "transport_quic" "transport_quic_datagram" "transport_tcp" "transport_tls" "transport_udp" "transport_unixsock-stream" "transport_ws" "unstable" ];
       };
       "zenoh-buffers" = rec {
         crateName = "zenoh-buffers";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "1i7ciah2zwafhhziqy8yz8x2j4js6mvc3bkykcwkyy83gf4j22ai";
+        sha256 = "1d431sr40p073fnsnlz145k7inv37a2d4f0v3xbwb3w8r5lq2njm";
         libName = "zenoh_buffers";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -15187,9 +16357,9 @@ rec {
       };
       "zenoh-codec" = rec {
         crateName = "zenoh-codec";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "181vlw0nf7x54dn7asipjbydrq2v2ynm5axgxrm750d7yzppfnjq";
+        sha256 = "0m780m3pbaj4s8p3zwhbwx76pxnnlbschlf0dsvbkslkg1r9z5dw";
         libName = "zenoh_codec";
         authors = [
           "Luca Cominardi <luca.cominardi@zettascale.tech>"
@@ -15197,6 +16367,11 @@ rec {
           "kydos <angelo@icorsaro.net>"
         ];
         dependencies = [
+          {
+            name = "rand";
+            packageId = "rand 0.8.8";
+            usesDefaultFeatures = false;
+          }
           {
             name = "tracing";
             packageId = "tracing";
@@ -15220,6 +16395,12 @@ rec {
         ];
         devDependencies = [
           {
+            name = "rand";
+            packageId = "rand 0.8.8";
+            usesDefaultFeatures = false;
+            features = [ "default" ];
+          }
+          {
             name = "zenoh-protocol";
             packageId = "zenoh-protocol";
             usesDefaultFeatures = false;
@@ -15237,9 +16418,9 @@ rec {
       };
       "zenoh-collections" = rec {
         crateName = "zenoh-collections";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "11w8wbn7j51nz4wcpy5n4vl28rbs1cwkg6prmf7a3ar1ygnaf5zs";
+        sha256 = "0acfqi63dzwvab9r3ffnnrmlq2c5xpa9pdxmvyl3j8pxvkcan18c";
         libName = "zenoh_collections";
         authors = [
           "Luca Cominardi <luca.cominardi@zettascale.tech>"
@@ -15261,9 +16442,9 @@ rec {
       };
       "zenoh-config" = rec {
         crateName = "zenoh-config";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "15cj3gryf9z65varshsnccxdq7wnzl8aqp856w2b3l6qizph2a60";
+        sha256 = "1p82ka0b229m1alwi6bbh6a0i3f47c7wkadhdj47kb2gddarsyar";
         libName = "zenoh_config";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -15310,6 +16491,11 @@ rec {
             packageId = "serde_yaml";
           }
           {
+            name = "toml";
+            packageId = "toml";
+            optional = true;
+          }
+          {
             name = "tracing";
             packageId = "tracing";
           }
@@ -15352,15 +16538,15 @@ rec {
           }
         ];
         features = {
-          "unstable" = [ "zenoh-protocol/unstable" ];
+          "unstable" = [ "dep:toml" "zenoh-protocol/unstable" ];
         };
         resolvedDefaultFeatures = [ "internal" "transport_tcp" "unstable" ];
       };
       "zenoh-core" = rec {
         crateName = "zenoh-core";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "1n8w8mkz1n3ynhgc826lszcic3177svjl75ma60g8x0gkp84amij";
+        sha256 = "1m26zhla7x93344k0pryj503b1k06nzp10x9h4zc7hak2g2p6l4p";
         libName = "zenoh_core";
         authors = [
           "Luca Cominardi <luca.cominardi@zettascale.tech>"
@@ -15396,9 +16582,9 @@ rec {
       };
       "zenoh-crypto" = rec {
         crateName = "zenoh-crypto";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0bvcgcv27dzjjdkf4c4jhgi2bj3cwwapy5x6rd4j272gb4axci2j";
+        sha256 = "0ls5kbhcprzkhygpag8cmkrhybbqdaa9v29458isj6rmzmna70g2";
         libName = "zenoh_crypto";
         authors = [
           "Luca Cominardi <luca.cominardi@zettascale.tech>"
@@ -15423,7 +16609,7 @@ rec {
           }
           {
             name = "rand_chacha";
-            packageId = "rand_chacha";
+            packageId = "rand_chacha 0.3.1";
           }
           {
             name = "sha3";
@@ -15440,19 +16626,15 @@ rec {
       };
       "zenoh-ext" = rec {
         crateName = "zenoh-ext";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0a658sgghqc5gcw7z7p3g7vrxaqc574x0as3yxwp5wjbjrjnp2bc";
+        sha256 = "1kj09md16250ahddk7mvqy0s1992yrr6pdm3dp0m9v841hfcb9fi";
         libName = "zenoh_ext";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
           "kydos <angelo@icorsaro.net>"
         ];
         dependencies = [
-          {
-            name = "async-trait";
-            packageId = "async-trait";
-          }
           {
             name = "bincode";
             packageId = "bincode";
@@ -15470,6 +16652,10 @@ rec {
             packageId = "leb128";
           }
           {
+            name = "lru";
+            packageId = "lru";
+          }
+          {
             name = "serde";
             packageId = "serde";
             usesDefaultFeatures = false;
@@ -15480,6 +16666,10 @@ rec {
             packageId = "tokio";
             usesDefaultFeatures = false;
             features = [ "io-std" "macros" "rt" "sync" "time" ];
+          }
+          {
+            name = "tokio-util";
+            packageId = "tokio-util";
           }
           {
             name = "tracing";
@@ -15510,11 +16700,161 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "unstable" ];
       };
+      "zenoh-gateway" = rec {
+        crateName = "zenoh-gateway";
+        version = "0.5.4";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../gateway; };
+        libName = "zenoh_gateway";
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "async-trait";
+            packageId = "async-trait";
+          }
+          {
+            name = "axum";
+            packageId = "axum";
+          }
+          {
+            name = "base64";
+            packageId = "base64 0.22.1";
+          }
+          {
+            name = "bytes";
+            packageId = "bytes";
+          }
+          {
+            name = "futures";
+            packageId = "futures";
+          }
+          {
+            name = "hmac";
+            packageId = "hmac";
+          }
+          {
+            name = "log";
+            packageId = "log";
+          }
+          {
+            name = "openh264";
+            packageId = "openh264";
+          }
+          {
+            name = "openh264-sys2";
+            packageId = "openh264-sys2";
+          }
+          {
+            name = "rav1e";
+            packageId = "rav1e";
+            optional = true;
+            usesDefaultFeatures = false;
+            features = [ "threading" ];
+          }
+          {
+            name = "reqwest";
+            packageId = "reqwest";
+            optional = true;
+            usesDefaultFeatures = false;
+            features = [ "json" "rustls-tls" ];
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
+          }
+          {
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+          {
+            name = "sha1";
+            packageId = "sha1";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "full" ];
+          }
+          {
+            name = "tower-http";
+            packageId = "tower-http";
+            features = [ "fs" "cors" ];
+          }
+          {
+            name = "unsafe-libopus";
+            packageId = "unsafe-libopus";
+          }
+          {
+            name = "zenoh";
+            packageId = "zenoh";
+          }
+          {
+            name = "zenoh-ext";
+            packageId = "zenoh-ext";
+            features = [ "unstable" ];
+          }
+          {
+            name = "zenoh-web-rtc";
+            packageId = "zenoh-web-rtc";
+            rename = "rtc";
+          }
+          {
+            name = "zenoh-web-webrtc";
+            packageId = "zenoh-web-webrtc";
+            rename = "webrtc";
+          }
+          {
+            name = "zstd";
+            packageId = "zstd";
+          }
+        ];
+        features = {
+          "av1" = [ "dep:rav1e" ];
+          "client" = [ "dep:reqwest" ];
+          "cloudflare" = [ "dep:reqwest" ];
+          "default" = [ "av1" ];
+        };
+        resolvedDefaultFeatures = [ "av1" "client" "default" ];
+      };
+      "zenoh-gateway-example" = rec {
+        crateName = "zenoh-gateway-example";
+        version = "0.1.0";
+        edition = "2024";
+        crateBin = [
+          {
+            name = "zenoh-gateway-example";
+            path = "src/main.rs";
+            requiredFeatures = [ ];
+          }
+        ];
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./.; };
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "macros" "rt-multi-thread" ];
+          }
+          {
+            name = "zenoh-gateway";
+            packageId = "zenoh-gateway";
+            features = [ "client" ];
+          }
+        ];
+
+      };
       "zenoh-keyexpr" = rec {
         crateName = "zenoh-keyexpr";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "1rzy799w573i3cha8hj76mq46cxpgw57crdl89sghcakm065qjf9";
+        sha256 = "1bna2hazw9ahbwns2m5bb1w8vv2nqvbixilpn3lv8il8y6vzrih2";
         libName = "zenoh_keyexpr";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -15545,9 +16885,9 @@ rec {
           }
           {
             name = "schemars";
-            packageId = "schemars 0.8.22";
+            packageId = "schemars 1.2.2";
             optional = true;
-            features = [ "either" ];
+            features = [ "either1" ];
           }
           {
             name = "serde";
@@ -15583,9 +16923,9 @@ rec {
       };
       "zenoh-link" = rec {
         crateName = "zenoh-link";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0fsjwcz15sjl7vz3iwgpaqzy9x6x7sw7ly5fciisw1iba83py6h0";
+        sha256 = "0v6ykj4smw2jwqc05xr1cjimgdskzwijfj8v5fvg0a1kjay4yp65";
         libName = "zenoh_link";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -15660,6 +17000,7 @@ rec {
           "transport_unixsock-stream" = [ "zenoh-link-unixsock_stream" ];
           "transport_vsock" = [ "zenoh-link-vsock" ];
           "transport_ws" = [ "zenoh-link-ws" ];
+          "uring" = [ "zenoh-link-commons/uring" "zenoh-link-quic/uring" "zenoh-link-quic_datagram/uring" "zenoh-link-serial/uring" "zenoh-link-tcp/uring" "zenoh-link-tls/uring" "zenoh-link-udp/uring" "zenoh-link-unixpipe/uring" "zenoh-link-unixsock_stream/uring" "zenoh-link-vsock/uring" "zenoh-link-ws/uring" ];
           "zenoh-link-quic" = [ "dep:zenoh-link-quic" ];
           "zenoh-link-quic_datagram" = [ "dep:zenoh-link-quic_datagram" ];
           "zenoh-link-serial" = [ "dep:zenoh-link-serial" ];
@@ -15675,9 +17016,9 @@ rec {
       };
       "zenoh-link-commons" = rec {
         crateName = "zenoh-link-commons";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "08pnj72cx6pbglabc3baysbf58ya5khm6hny4hhgp6kqkd4mpq2v";
+        sha256 = "0p9jmbnsx9srkknr2y27fiys2f6q32z3q7k2r1rm3l129h5m4lkd";
         libName = "zenoh_link_commons";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -15697,6 +17038,11 @@ rec {
             optional = true;
           }
           {
+            name = "bytes";
+            packageId = "bytes";
+            optional = true;
+          }
+          {
             name = "flume";
             packageId = "flume";
           }
@@ -15707,6 +17053,16 @@ rec {
           {
             name = "quinn";
             packageId = "quinn";
+            optional = true;
+          }
+          {
+            name = "quinn-proto";
+            packageId = "quinn-proto";
+            optional = true;
+          }
+          {
+            name = "rcgen";
+            packageId = "rcgen";
             optional = true;
           }
           {
@@ -15728,7 +17084,7 @@ rec {
           }
           {
             name = "rustls-webpki";
-            packageId = "rustls-webpki 0.102.8";
+            packageId = "rustls-webpki";
             optional = true;
           }
           {
@@ -15769,7 +17125,7 @@ rec {
           }
           {
             name = "webpki-roots";
-            packageId = "webpki-roots 0.26.11";
+            packageId = "webpki-roots";
             optional = true;
           }
           {
@@ -15815,16 +17171,17 @@ rec {
           }
         ];
         features = {
-          "quic" = [ "dep:base64" "dep:quinn" "dep:rustls-pemfile" "dep:rustls-pki-types" "dep:secrecy" "dep:webpki-roots" "dep:x509-parser" "dep:zenoh-config" "tls" ];
+          "quic" = [ "dep:base64" "dep:bytes" "dep:quinn" "dep:quinn-proto" "dep:rcgen" "dep:rustls-pemfile" "dep:rustls-pki-types" "dep:secrecy" "dep:webpki-roots" "dep:x509-parser" "dep:zenoh-config" "tls" ];
           "tls" = [ "dep:rustls" "dep:rustls-webpki" ];
+          "unsecure_quic" = [ "quic" ];
         };
-        resolvedDefaultFeatures = [ "quic" "tls" ];
+        resolvedDefaultFeatures = [ "quic" "tls" "unsecure_quic" ];
       };
       "zenoh-link-quic" = rec {
         crateName = "zenoh-link-quic";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "1am4khp31f6c1wa0my44hv2gmyf7wznhbl9lm0xk2p80nx5h6s21";
+        sha256 = "0na7r3c2qjzijpvc105yxdxlshcshgjc9mvm3xil7f9bhg4fr7wf";
         libName = "zenoh_link_quic";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -15839,58 +17196,16 @@ rec {
             packageId = "async-trait";
           }
           {
-            name = "base64";
-            packageId = "base64 0.22.1";
-          }
-          {
-            name = "quinn";
-            packageId = "quinn";
-          }
-          {
-            name = "rustls";
-            packageId = "rustls";
-            usesDefaultFeatures = false;
-            features = [ "logging" "ring" "tls12" ];
-          }
-          {
-            name = "rustls-pemfile";
-            packageId = "rustls-pemfile";
-          }
-          {
             name = "rustls-webpki";
-            packageId = "rustls-webpki 0.102.8";
-          }
-          {
-            name = "secrecy";
-            packageId = "secrecy";
-            features = [ "alloc" "serde" ];
+            packageId = "rustls-webpki";
           }
           {
             name = "time";
             packageId = "time";
           }
           {
-            name = "tokio";
-            packageId = "tokio";
-            usesDefaultFeatures = false;
-            features = [ "fs" "io-util" "net" "sync" "time" ];
-          }
-          {
-            name = "tokio-util";
-            packageId = "tokio-util";
-            features = [ "rt" ];
-          }
-          {
             name = "tracing";
             packageId = "tracing";
-          }
-          {
-            name = "webpki-roots";
-            packageId = "webpki-roots 0.26.11";
-          }
-          {
-            name = "zenoh-config";
-            packageId = "zenoh-config";
           }
           {
             name = "zenoh-core";
@@ -15902,6 +17217,10 @@ rec {
             features = [ "quic" ];
           }
           {
+            name = "zenoh-link-quic_datagram";
+            packageId = "zenoh-link-quic_datagram";
+          }
+          {
             name = "zenoh-protocol";
             packageId = "zenoh-protocol";
             usesDefaultFeatures = false;
@@ -15911,18 +17230,15 @@ rec {
             packageId = "zenoh-result";
             usesDefaultFeatures = false;
           }
-          {
-            name = "zenoh-util";
-            packageId = "zenoh-util";
-          }
         ];
-
+        features = {
+        };
       };
       "zenoh-link-quic_datagram" = rec {
         crateName = "zenoh-link-quic_datagram";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0lafg9hfzp4wq27m5bcrkji035x0nwlhh2d5cpycpbw3a95mjm5r";
+        sha256 = "1272kp8v87mk81mpfxz7kyr7rixpxvfvar386p58573i3ksapwqs";
         libName = "zenoh_link_quic_datagram";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -15937,28 +17253,12 @@ rec {
             packageId = "async-trait";
           }
           {
-            name = "quinn";
-            packageId = "quinn";
-          }
-          {
-            name = "rustls";
-            packageId = "rustls";
-            usesDefaultFeatures = false;
-            features = [ "logging" "ring" "tls12" ];
-          }
-          {
             name = "rustls-webpki";
-            packageId = "rustls-webpki 0.102.8";
+            packageId = "rustls-webpki";
           }
           {
             name = "time";
             packageId = "time";
-          }
-          {
-            name = "tokio";
-            packageId = "tokio";
-            usesDefaultFeatures = false;
-            features = [ "fs" "io-util" "net" "sync" "time" ];
           }
           {
             name = "tokio-util";
@@ -15988,18 +17288,15 @@ rec {
             packageId = "zenoh-result";
             usesDefaultFeatures = false;
           }
-          {
-            name = "zenoh-util";
-            packageId = "zenoh-util";
-          }
         ];
-
+        features = {
+        };
       };
       "zenoh-link-tcp" = rec {
         crateName = "zenoh-link-tcp";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0ianknhwbga8v73r76f338spz85fr6rhg75n1xv508v80qsqv5iv";
+        sha256 = "1dsjamvhzim43rd6iknig8x6j2msz00ijq1v3nyprwg9bzah4isd";
         libName = "zenoh_link_tcp";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -16056,13 +17353,14 @@ rec {
             usesDefaultFeatures = false;
           }
         ];
-
+        features = {
+        };
       };
       "zenoh-link-tls" = rec {
         crateName = "zenoh-link-tls";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0vsr3nx44kf02adjzmh714py5cizl3qxrshkaz3w87018jxa8458";
+        sha256 = "1i6nqhb7xz7s5lgxcg65yqd1bh5aizi45185hld84ca63gbmzrnc";
         libName = "zenoh_link_tls";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -16096,7 +17394,7 @@ rec {
           }
           {
             name = "rustls-webpki";
-            packageId = "rustls-webpki 0.102.8";
+            packageId = "rustls-webpki";
           }
           {
             name = "secrecy";
@@ -16139,7 +17437,7 @@ rec {
           }
           {
             name = "webpki-roots";
-            packageId = "webpki-roots 0.26.11";
+            packageId = "webpki-roots";
           }
           {
             name = "x509-parser";
@@ -16173,13 +17471,14 @@ rec {
             packageId = "zenoh-runtime";
           }
         ];
-
+        features = {
+        };
       };
       "zenoh-link-udp" = rec {
         crateName = "zenoh-link-udp";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0r93dbgv9lb0pj4zb1r0nan9q6bp2fvww1izvg8b84y61ja8n5x4";
+        sha256 = "0jyz73z16099dn9chcb96j0n3z0963ybkch6nwlqpzhmayvffh5i";
         libName = "zenoh_link_udp";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -16236,6 +17535,11 @@ rec {
           {
             name = "zenoh-link-commons";
             packageId = "zenoh-link-commons";
+            features = [ "unsecure_quic" ];
+          }
+          {
+            name = "zenoh-link-quic_datagram";
+            packageId = "zenoh-link-quic_datagram";
           }
           {
             name = "zenoh-protocol";
@@ -16256,13 +17560,14 @@ rec {
             packageId = "zenoh-util";
           }
         ];
-
+        features = {
+        };
       };
       "zenoh-link-unixsock_stream" = rec {
         crateName = "zenoh-link-unixsock_stream";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "02r1bl270pf6h478287aalij1vmg1d2m60gc75c6vk2fkxdf2va8";
+        sha256 = "19q3czyy3q3ia6ghxlm26i92pnnq63qb2sr4d3353kksglwaslb1";
         libName = "zenoh_link_unixsock_stream";
         authors = [
           "Gabriele Baldoni <gabriele.baldoni@zettascale.tech>"
@@ -16326,13 +17631,14 @@ rec {
             packageId = "zenoh-runtime";
           }
         ];
-
+        features = {
+        };
       };
       "zenoh-link-ws" = rec {
         crateName = "zenoh-link-ws";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "1sgp8s25321xzcgw7wr5bb1hr0z6j1sp51l552n0d14b3fmkvdqw";
+        sha256 = "0sa0a4jfzy0mbaxa6cnxzn7wlzhr8pz8vii1bqwjdnp0p00p4c9y";
         libName = "zenoh_link_ws";
         authors = [
           "Gabriele Baldoni <gabriele.baldoni@zettascale.tech>"
@@ -16403,13 +17709,14 @@ rec {
             packageId = "zenoh-util";
           }
         ];
-
+        features = {
+        };
       };
       "zenoh-macros" = rec {
         crateName = "zenoh-macros";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "1jhahhkafpcfirimgij2c955l84pziwgnmm9yva0xqc7yrzg3grb";
+        sha256 = "1y3hppngvybbdabdg923ybzff262qssk1wbrgnyw3dkrzm1v70zl";
         procMacro = true;
         libName = "zenoh_macros";
         authors = [
@@ -16444,9 +17751,9 @@ rec {
       };
       "zenoh-plugin-trait" = rec {
         crateName = "zenoh-plugin-trait";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0wkim6a82953ymdpi926mxlsh924k5lb6ly534gvxic5nnq731cn";
+        sha256 = "08afcah3q3hab9nsg2dcqihy775ww96qxrlfsq9p9yisys8z8mvx";
         libName = "zenoh_plugin_trait";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -16506,9 +17813,9 @@ rec {
       };
       "zenoh-protocol" = rec {
         crateName = "zenoh-protocol";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "073jgy85y93szcgk2lsh9319n4kkpw2r1gr4z3sm87w3a7pnd6l7";
+        sha256 = "0qgvq946gqgfqy5wd31dplxlvyrpla5fp3iwycklc16zhqlik4j4";
         libName = "zenoh_protocol";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -16551,6 +17858,10 @@ rec {
             usesDefaultFeatures = false;
           }
           {
+            name = "zenoh-macros";
+            packageId = "zenoh-macros";
+          }
+          {
             name = "zenoh-result";
             packageId = "zenoh-result";
             usesDefaultFeatures = false;
@@ -16575,9 +17886,9 @@ rec {
       };
       "zenoh-result" = rec {
         crateName = "zenoh-result";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "1gcl5zk69i29l5xy3dqgcriv5l5ipa4nsrd4906ksi2f6b9n9xg0";
+        sha256 = "1pd38y96z2cgkn4nikg51xlsrbq91a5qpl7j2jzwznc686i0qvcd";
         libName = "zenoh_result";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -16601,9 +17912,9 @@ rec {
       };
       "zenoh-runtime" = rec {
         crateName = "zenoh-runtime";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "1kwd6h8lz5bzcvgvcmmck47jpkdy3msk51ai8sqswsfl7zqwx9g3";
+        sha256 = "1ygr1a8jh1317367s7ksbnm5i9r158hb60y35g800czvv5pfms4i";
         libName = "zenoh_runtime";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -16653,9 +17964,9 @@ rec {
       };
       "zenoh-sync" = rec {
         crateName = "zenoh-sync";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "1qvh6a6576kizzkx3y2yijnjjl8vykfdqy57j1cwxdqza4ik38h4";
+        sha256 = "0azivn4x5fh90498k9kzd8l3sz92fbfi7yq3gf3nxpv1dcax4znm";
         libName = "zenoh_sync";
         authors = [
           "Luca Cominardi <luca.cominardi@zettascale.tech>"
@@ -16709,9 +18020,9 @@ rec {
       };
       "zenoh-task" = rec {
         crateName = "zenoh-task";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0hafh73hd9g81mc1z5gkgxkc5zjsk7vmf2ggl8ihn509hihrgnca";
+        sha256 = "0448l3xvk1j72xiv1f0n7vc2jf0wkv6zrrlrkf6gywhwz301awc8";
         libName = "zenoh_task";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -16755,9 +18066,9 @@ rec {
       };
       "zenoh-transport" = rec {
         crateName = "zenoh-transport";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "0d0zc359kzxdhgnwf3siw4236x06lnchgz2n24b96q2mrlhlbg9a";
+        sha256 = "1vlk2hfw0z0k8jymdcyb8rs3djgwqdm7rhyn3d1wcsm5mkhf5fkj";
         libName = "zenoh_transport";
         authors = [
           "Julien Enoch <julien@enoch.fr>"
@@ -16780,16 +18091,16 @@ rec {
             packageId = "flume";
           }
           {
+            name = "futures";
+            packageId = "futures";
+          }
+          {
             name = "lazy_static";
             packageId = "lazy_static";
           }
           {
             name = "lz4_flex";
             packageId = "lz4_flex";
-          }
-          {
-            name = "paste";
-            packageId = "paste";
           }
           {
             name = "rand";
@@ -16903,8 +18214,11 @@ rec {
           "auth_pubkey" = [ "rsa" "transport_auth" ];
           "auth_usrpwd" = [ "transport_auth" ];
           "default" = [ "test" "transport_multilink" ];
+          "lockfree" = [ "dep:lockfree" ];
           "rsa" = [ "dep:rsa" ];
-          "shared-memory" = [ "zenoh-buffers/shared-memory" "zenoh-codec/shared-memory" "zenoh-protocol/shared-memory" "zenoh-shm" ];
+          "shared-memory" = [ "lockfree" "static_init" "zenoh-buffers/shared-memory" "zenoh-codec/shared-memory" "zenoh-protocol/shared-memory" "zenoh-shm" "zenoh-stats?/shared-memory" ];
+          "static_init" = [ "dep:static_init" ];
+          "stats" = [ "zenoh-stats" ];
           "transport_multilink" = [ "auth_pubkey" ];
           "transport_quic" = [ "zenoh-link/transport_quic" ];
           "transport_quic_datagram" = [ "zenoh-link/transport_quic_datagram" ];
@@ -16917,15 +18231,18 @@ rec {
           "transport_vsock" = [ "zenoh-link/transport_vsock" ];
           "transport_ws" = [ "zenoh-link/transport_ws" ];
           "unstable" = [ "zenoh-config/unstable" "zenoh-protocol/unstable" ];
+          "uring" = [ "zenoh-link/uring" "zenoh-uring" ];
           "zenoh-shm" = [ "dep:zenoh-shm" ];
+          "zenoh-stats" = [ "dep:zenoh-stats" ];
+          "zenoh-uring" = [ "dep:zenoh-uring" ];
         };
-        resolvedDefaultFeatures = [ "auth_pubkey" "auth_usrpwd" "rsa" "transport_auth" "transport_compression" "transport_multilink" "transport_quic" "transport_quic_datagram" "transport_tcp" "transport_tls" "transport_udp" "transport_unixsock-stream" "transport_ws" ];
+        resolvedDefaultFeatures = [ "auth_pubkey" "auth_usrpwd" "rsa" "transport_auth" "transport_compression" "transport_multilink" "transport_quic" "transport_quic_datagram" "transport_tcp" "transport_tls" "transport_udp" "transport_unixsock-stream" "transport_ws" "unstable" ];
       };
       "zenoh-util" = rec {
         crateName = "zenoh-util";
-        version = "1.6.2";
+        version = "1.10.1";
         edition = "2021";
-        sha256 = "178aick8x19yk5h96zwdy2ahzr6cgh353haqyag5r4yhkqakd9s2";
+        sha256 = "0izrvm0wgyia7maabfvh82mpvjq45g325k4sb3cvj9i0qvf77923";
         libName = "zenoh_util";
         authors = [
           "Luca Cominardi <luca.cominardi@zettascale.tech>"
@@ -16973,8 +18290,8 @@ rec {
           }
           {
             name = "schemars";
-            packageId = "schemars 0.8.22";
-            features = [ "either" ];
+            packageId = "schemars 1.2.2";
+            features = [ "either1" ];
           }
           {
             name = "serde";
@@ -17025,151 +18342,11 @@ rec {
         features = {
         };
       };
-      "zenoh-web" = rec {
-        crateName = "zenoh-web";
-        version = "0.4.1";
-        edition = "2024";
-        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../gateway; };
-        libName = "zenoh_web";
-        dependencies = [
-          {
-            name = "anyhow";
-            packageId = "anyhow";
-          }
-          {
-            name = "async-trait";
-            packageId = "async-trait";
-          }
-          {
-            name = "axum";
-            packageId = "axum";
-          }
-          {
-            name = "base64";
-            packageId = "base64 0.22.1";
-          }
-          {
-            name = "bytes";
-            packageId = "bytes";
-          }
-          {
-            name = "futures";
-            packageId = "futures";
-          }
-          {
-            name = "hmac";
-            packageId = "hmac";
-          }
-          {
-            name = "log";
-            packageId = "log";
-          }
-          {
-            name = "openh264";
-            packageId = "openh264";
-          }
-          {
-            name = "openh264-sys2";
-            packageId = "openh264-sys2";
-          }
-          {
-            name = "reqwest";
-            packageId = "reqwest";
-            optional = true;
-            usesDefaultFeatures = false;
-            features = [ "json" "rustls-tls" ];
-          }
-          {
-            name = "serde";
-            packageId = "serde";
-            features = [ "derive" ];
-          }
-          {
-            name = "serde_json";
-            packageId = "serde_json";
-          }
-          {
-            name = "sha1";
-            packageId = "sha1";
-          }
-          {
-            name = "tokio";
-            packageId = "tokio";
-            features = [ "full" ];
-          }
-          {
-            name = "tower-http";
-            packageId = "tower-http";
-            features = [ "fs" "cors" ];
-          }
-          {
-            name = "unsafe-libopus";
-            packageId = "unsafe-libopus";
-          }
-          {
-            name = "zenoh";
-            packageId = "zenoh";
-          }
-          {
-            name = "zenoh-ext";
-            packageId = "zenoh-ext";
-            features = [ "unstable" ];
-          }
-          {
-            name = "zenoh-web-rtc";
-            packageId = "zenoh-web-rtc";
-            rename = "rtc";
-          }
-          {
-            name = "zenoh-web-webrtc";
-            packageId = "zenoh-web-webrtc";
-            rename = "webrtc";
-          }
-          {
-            name = "zstd";
-            packageId = "zstd";
-          }
-        ];
-        features = {
-          "client" = [ "dep:reqwest" ];
-        };
-        resolvedDefaultFeatures = [ "client" ];
-      };
-      "zenoh-web-example" = rec {
-        crateName = "zenoh-web-example";
-        version = "0.1.0";
-        edition = "2024";
-        crateBin = [
-          {
-            name = "zenoh-web-example";
-            path = "src/main.rs";
-            requiredFeatures = [ ];
-          }
-        ];
-        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./.; };
-        dependencies = [
-          {
-            name = "anyhow";
-            packageId = "anyhow";
-          }
-          {
-            name = "tokio";
-            packageId = "tokio";
-            features = [ "macros" "rt-multi-thread" ];
-          }
-          {
-            name = "zenoh-web";
-            packageId = "zenoh-web";
-            features = [ "client" ];
-          }
-        ];
-
-      };
       "zenoh-web-rtc" = rec {
         crateName = "zenoh-web-rtc";
-        version = "0.21.0-zw.2";
+        version = "0.21.0-zw.3";
         edition = "2024";
-        sha256 = "0gm1snp904lk329r2w636cki9cs3xz89y88ql416y6k9z0zkp5l5";
+        sha256 = "1n6ss106gwv1awa7759m0v3cryzl0rcpxrc73xzv3x7mchvzgx45";
         libName = "rtc";
         authors = [
           "Rain Liu <yliu@webrtc.rs>"
@@ -17325,9 +18502,9 @@ rec {
       };
       "zenoh-web-rtc-datachannel" = rec {
         crateName = "zenoh-web-rtc-datachannel";
-        version = "0.21.0-zw.2";
+        version = "0.21.0-zw.3";
         edition = "2024";
-        sha256 = "04idhlfh27fq1q3yjfi6bihnx9cx2hr92971r2jvpdb4i4knyqjr";
+        sha256 = "1c9q1xh0k2i56damzp9rycls5cr2ghpxz4vnfj2vc8mbd3cqbi2r";
         libName = "rtc_datachannel";
         authors = [
           "Rain Liu <yliu@webrtc.rs>"
@@ -17362,9 +18539,9 @@ rec {
       };
       "zenoh-web-rtc-sctp" = rec {
         crateName = "zenoh-web-rtc-sctp";
-        version = "0.21.0-zw.2";
+        version = "0.21.0-zw.3";
         edition = "2024";
-        sha256 = "020r3r4c02pq4mhjdy0lz3vdf61q87bnpkccs6gfrvkjjfplzhks";
+        sha256 = "1jrj3xhdbxk01jbk0lmvrsd2a48yn2c4vkwdhv5i6qhl8352241x";
         libName = "rtc_sctp";
         authors = [
           "Rain Liu <yliu@webrtc.rs>"
@@ -17410,9 +18587,9 @@ rec {
       };
       "zenoh-web-webrtc" = rec {
         crateName = "zenoh-web-webrtc";
-        version = "0.21.0-zw.2";
+        version = "0.21.0-zw.3";
         edition = "2024";
-        sha256 = "0wah9sijw78qmnvrjipw5fw0kx5jc8z9b2kjpsfivymvlx9fslk7";
+        sha256 = "0mda72jxj8rrjcjwbvic5mwzvc0jg4632zf1z70cl2sxcl7ds690";
         libName = "webrtc";
         authors = [
           "Rain Liu <yliu@webrtc.rs>"
@@ -17719,6 +18896,23 @@ rec {
           }
         ];
 
+      };
+      "zlib-rs" = rec {
+        crateName = "zlib-rs";
+        version = "0.6.8";
+        edition = "2021";
+        sha256 = "04j158293bx73kv5pj1i89ai411q7fxc9zwk3wkpqgb9gj7fas5j";
+        libName = "zlib_rs";
+        features = {
+          "__internal-fuzz" = [ "arbitrary" ];
+          "__internal-test" = [ "quickcheck" ];
+          "arbitrary" = [ "dep:arbitrary" ];
+          "avx512" = [ "vpclmulqdq" ];
+          "default" = [ "std" "c-allocator" ];
+          "quickcheck" = [ "dep:quickcheck" ];
+          "std" = [ "rust-allocator" ];
+        };
+        resolvedDefaultFeatures = [ "rust-allocator" "std" ];
       };
       "zmij" = rec {
         crateName = "zmij";
