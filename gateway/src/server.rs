@@ -227,6 +227,14 @@ impl ServerBuilder {
         self
     }
 
+    /// Told about every request a connection's [`Grant`] refuses (a subscription, publisher, put, query, ... outside
+    /// it), with that grant (its [`subject`](Grant::subject) says whose) and the reason the client also gets, e.g. to
+    /// show the user why a page can't do something. It runs on the gateway's tasks: keep it quick.
+    pub fn on_refused(mut self, hook: impl Fn(&Grant, &str) + Send + Sync + 'static) -> Self {
+        self.connect_config.on_refused = Some(crate::auth::RefusalHook(Arc::new(hook)));
+        self
+    }
+
     /// Also answers offers over zenoh, on queryables `zenoh-gateway/<name>/offer` and `zenoh-gateway/<name>/ice`, so a client with
     /// a zenoh session that reaches this one (e.g. a relay this side dialled out to) connects without HTTP; see SPEC
     /// "Signalling over zenoh". `name` is one key chunk. Authorized like HTTP, with the token the query carries.

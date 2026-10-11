@@ -5,7 +5,7 @@
 //! Requests are `{id, op, ...}` and answers `{id, ok, ...}` (see `peer::run_control`); queries,
 //! liveliness changes and matching changes arrive as events: `{event: "query" | "liveliness" | "matching", ...}`.
 
-use crate::auth::Grant;
+use crate::auth::Access;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -133,7 +133,7 @@ pub(crate) struct ApiRequest {
 /// What an op needs from the frontend's connection.
 pub(crate) struct Context<'a> {
     pub session: &'a Session,
-    pub grant: &'a Grant,
+    pub access: Access<'a>,
     pub api: &'a ApiState,
     /// sends `{event: ...}` to the frontend
     pub events: tokio::sync::mpsc::UnboundedSender<Value>,
@@ -256,12 +256,13 @@ pub(crate) async fn handle(context: Context<'_>, request: ApiRequest) -> Value {
 }
 
 async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String> {
-    let Context { session, grant, api, events } = context;
+    let Context { session, access, api, events } = context;
+    let grant = access.grant;
     api.reap_queries();
     let error = |error: zenoh::Error| error.to_string();
     match request.op.as_str() {
         "put" => {
-            Grant::check(&grant.publish, "publish", &request.key)?;
+            access.check(&grant.publish, "publish", &request.key)?;
             let mut builder = session.put(&request.key, decode("bytes", &request.bytes)?.unwrap_or_default());
             if let Some(encoding) = &request.encoding {
                 builder = builder.encoding(Encoding::from(encoding.as_str()));
@@ -279,7 +280,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "delete" => {
-            Grant::check(&grant.publish, "publish", &request.key)?;
+            access.check(grant.deletes(), "delete", &request.key)?;
             let mut builder = session.delete(&request.key);
             if let Some(attachment) = decode("attachment", &request.attachment)? {
                 builder = builder.attachment(attachment);
@@ -294,7 +295,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "get" => {
-            Grant::check(&grant.query, "query", key_of(&request.key))?;
+            access.check(&grant.query, "query", key_of(&request.key))?;
             let selector = match &request.parameters {
                 Some(parameters) if !parameters.is_empty() => {
                     format!("{}?{}", key_of(&request.key), parameters)
@@ -332,7 +333,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({"replies": results}))
         }
         "declareQueryable" => {
-            Grant::check(&grant.queryable, "declare a queryable on", &request.key)?;
+            access.check(&grant.queryable, "declare a queryable on", &request.key)?;
             let queryable_id = api.next();
             let (queries, next_query) = (api.queries.clone(), api.next_id.clone());
             let queryable = session
@@ -409,7 +410,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "declareToken" => {
-            Grant::check(&grant.liveliness, "declare a liveliness token on", &request.key)?;
+            access.check(grant.tokens(), "declare a liveliness token on", &request.key)?;
             let token = session.liveliness().declare_token(&request.key).await.map_err(error)?;
             let token_id = api.next();
             api.tokens.lock().unwrap().insert(token_id, token);
@@ -421,7 +422,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "livelinessSubscribe" => {
-            Grant::check(&grant.liveliness, "watch liveliness of", &request.key)?;
+            access.check(&grant.liveliness, "watch liveliness of", &request.key)?;
             let sub_id = api.next();
             let subscriber = session
                 .liveliness()
@@ -442,7 +443,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "livelinessGet" => {
-            Grant::check(&grant.liveliness, "query liveliness of", &request.key)?;
+            access.check(&grant.liveliness, "query liveliness of", &request.key)?;
             let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_GET_TIMEOUT_MS));
             let replies = session.liveliness().get(&request.key).timeout(timeout).await.map_err(error)?;
             let mut tokens = Vec::new();
@@ -462,9 +463,9 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                 }
             };
             if queryables {
-                Grant::check(&grant.query, "query", &request.key)?;
+                access.check(&grant.query, "query", &request.key)?;
             } else {
-                Grant::check(&grant.publish, "publish", &request.key)?;
+                access.check(&grant.publish, "publish", &request.key)?;
             }
             let key = request.key.clone();
             if request.op == "matchingStatus" {

@@ -59,6 +59,8 @@ pub struct AllocationConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ConnectConfig {
     pub ice_servers: Vec<IceServer>,
+    /// told about every request a connection's grant refuses
+    pub(crate) on_refused: Option<crate::auth::RefusalHook>,
     /// coturn's static-auth-secret and the minted credentials' lifetime
     pub turn_secret: Option<(String, Duration)>,
     /// servers minted per connection, after the static ones
@@ -158,6 +160,7 @@ struct PeerState {
     /// the bearer token it connected with, and what it may do
     token: Option<String>,
     grant: Grant,
+    on_refused: Option<crate::auth::RefusalHook>,
     leases: Arc<Leases>,
     /// queryables, liveliness, matching listeners it declared through the control channel
     api: api::ApiState,
@@ -181,6 +184,7 @@ impl PeerState {
             gateway: Arc::downgrade(gateway),
             token,
             grant,
+            on_refused: gateway.connect_config.on_refused.clone(),
             leases: gateway.leases.clone(),
             peer_id,
             session: gateway.session.clone(),
@@ -310,6 +314,11 @@ impl PeerState {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         warn!("peer {}: control channel never opened, dropped {event}", self.peer_id);
+    }
+
+    /// Its grant and the gateway's refusal hook.
+    fn access(&self) -> crate::auth::Access<'_> {
+        crate::auth::Access { grant: &self.grant, on_refused: self.on_refused.as_ref() }
     }
 
     async fn send_accepted(&self, id: Option<u64>) {
@@ -641,7 +650,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         state.channels.lock().unwrap().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
     let rejected = match label.kind.as_str() {
-        "sub" => match Grant::check(&state.grant.subscribe, "subscribe", &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
+        "sub" => match state.access().check(&state.grant.subscribe, "subscribe", &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
             let resolved = opts.resolve_encoding(&state.codecs)?;
             let track = bind_track(&state, &resolved, &label)?;
             Ok((opts, resolved, track))
@@ -656,7 +665,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
             }
             Err(error) => Some(error),
         },
-        "pub" => match Grant::check(&state.grant.publish, "publish", &label.key).and_then(|()| PubOpts::parse(&label.opts)) {
+        "pub" => match state.access().check(&state.grant.publish, "publish", &label.key).and_then(|()| PubOpts::parse(&label.opts)) {
             Ok(opts) => {
                 let shared = Arc::new(PubShared::default());
                 register(json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit}), ChannelStats::Pub(shared.clone()));
@@ -900,7 +909,7 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             let (dc, state) = (dc.clone(), state.clone());
             let slow = api::SLOW_OPS.contains(&request.op.as_str());
             let task = async move {
-                let context = api::Context { session: &state.session, grant: &state.grant, api: &state.api, events: state.api_events.clone() };
+                let context = api::Context { session: &state.session, access: state.access(), api: &state.api, events: state.api_events.clone() };
                 let response = api::handle(context, request).await;
                 let _ = dc.send_text(&response.to_string()).await;
             };

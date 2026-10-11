@@ -289,3 +289,45 @@ async fn grants_cover_the_new_capabilities() {
     client.close().await;
     running.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refusals_reach_the_hook_and_split_rules_hold() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    // deletes and liveliness tokens kept apart from publishing and watching
+    let grant = Grant {
+        publish: vec!["api/split/**".into()],
+        delete: Some(vec![]),
+        liveliness: vec!["api/split/**".into()],
+        liveliness_tokens: Some(vec![]),
+        subject: Some("the-app".into()),
+        ..Default::default()
+    };
+    let refusals = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(Option<String>, String)>::new()));
+    let heard = refusals.clone();
+    let running = Server::builder()
+        .session(session.clone())
+        .authorize(move |_token, _headers| Ok(grant.clone()))
+        .on_refused(move |grant, reason| heard.lock().unwrap().push((grant.subject.clone(), reason.to_owned())))
+        .build()
+        .await
+        .unwrap()
+        .bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    client.put("api/split/a", b"x", Default::default()).await.unwrap();
+    client.liveliness_subscribe("api/split/**", false).await.unwrap();
+    let error = client.delete("api/split/a", Default::default()).await.unwrap_err().to_string();
+    assert!(error.contains("not authorized to delete \"api/split/a\""), "{error}");
+    let error = client.declare_token("api/split/t").await.map(drop).unwrap_err().to_string();
+    assert!(error.contains("not authorized to declare a liveliness token on"), "{error}");
+    let error = client.subscribe("api/split/a", SubscribeOptions::default()).await.map(drop).unwrap_err().to_string();
+    assert!(error.contains("not authorized to subscribe"), "{error}");
+    let refusals = refusals.lock().unwrap().clone();
+    assert_eq!(refusals.len(), 3, "{refusals:?}");
+    assert!(refusals.iter().all(|(subject, _)| subject.as_deref() == Some("the-app")), "{refusals:?}");
+    assert_eq!(refusals[0].1, "not authorized to delete \"api/split/a\"");
+    assert!(refusals[2].1.starts_with("not authorized to subscribe"), "{refusals:?}");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}

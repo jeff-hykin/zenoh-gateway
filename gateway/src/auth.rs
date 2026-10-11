@@ -17,12 +17,16 @@ pub struct Grant {
     pub subscribe: Vec<String>,
     /// publishers (and their deadmen), session `put`/`delete`, and matching status/listeners for subscribers
     pub publish: Vec<String>,
+    /// session `delete`s, when set (else `publish` covers them)
+    pub delete: Option<Vec<String>>,
     /// `get` queries, queriers, and matching status/listeners for queryables
     pub query: Vec<String>,
     /// queryables it may declare (the browser answers queries)
     pub queryable: Vec<String>,
     /// liveliness: tokens it may declare, and keys it may watch or `get`
     pub liveliness: Vec<String>,
+    /// liveliness tokens it may declare, when set (else `liveliness` covers them): keeps watching apart from declaring
+    pub liveliness_tokens: Option<Vec<String>>,
     /// which keys `listTopics` shows
     pub list_topics: Vec<String>,
     /// lease groups it may take (`"*"`: any); a lease's keys must also be within `publish`
@@ -31,6 +35,9 @@ pub struct Grant {
     pub max_lease_secs: Option<f64>,
     /// may end another client's lease
     pub force_expire: bool,
+    /// who the connection is, in the host's words (e.g. an app's name): passed back with each refusal
+    /// ([`crate::ServerBuilder::on_refused`])
+    pub subject: Option<String>,
 }
 
 impl Grant {
@@ -47,13 +54,54 @@ impl Grant {
             lease_groups: vec!["*".into()],
             max_lease_secs: None,
             force_expire: true,
+            ..Default::default()
         }
+    }
+
+    /// The rules session `delete`s are checked against.
+    pub fn deletes(&self) -> &[String] {
+        self.delete.as_deref().unwrap_or(&self.publish)
+    }
+
+    /// The rules declaring a liveliness token is checked against.
+    pub fn tokens(&self) -> &[String] {
+        self.liveliness_tokens.as_deref().unwrap_or(&self.liveliness)
     }
 
     /// `Err("not authorized to <action> <key>")` unless a rule includes `key`.
     pub fn check(rules: &[String], action: &str, key: &str) -> Result<(), String> {
         let allowed = keyexpr::new(key).is_ok_and(|key| rules.iter().any(|rule| keyexpr::new(rule).is_ok_and(|rule| rule.includes(key))));
         if allowed { Ok(()) } else { Err(format!("not authorized to {action} {key:?}")) }
+    }
+}
+
+/// The refusal hook: the connection's grant and the reason (`not authorized to <action> "<key>"`), for each request
+/// a grant refused ([`crate::ServerBuilder::on_refused`]).
+pub type OnRefused = dyn Fn(&Grant, &str) + Send + Sync;
+
+#[derive(Clone)]
+pub(crate) struct RefusalHook(pub std::sync::Arc<OnRefused>);
+
+impl std::fmt::Debug for RefusalHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RefusalHook")
+    }
+}
+
+/// A connection's grant and who hears about its refusals.
+pub(crate) struct Access<'a> {
+    pub grant: &'a Grant,
+    pub on_refused: Option<&'a RefusalHook>,
+}
+
+impl Access<'_> {
+    /// [`Grant::check`], telling the refusal hook when it refuses.
+    pub fn check(&self, rules: &[String], action: &str, key: &str) -> Result<(), String> {
+        Grant::check(rules, action, key).inspect_err(|reason| {
+            if let Some(hook) = self.on_refused {
+                (hook.0)(self.grant, reason);
+            }
+        })
     }
 }
 

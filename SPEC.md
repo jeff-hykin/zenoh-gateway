@@ -548,8 +548,12 @@ per-browser layer on top, with reasons.
   (`get`), `listTopics` (which keys a listing shows), and the lease rights `leaseGroups` (names, `"*"` =
   any), `maxLeaseSecs` and `forceExpire`. A request is allowed when one of the list's expressions
   includes its key (zenoh's `includes`: `robot/**` includes `robot/arm/cmd` and `robot/arm/**`, not
-  `**`). A refused sub or pub channel is `rejected` with `not authorized to subscribe "<key>"`; a
+  `**`). Two optional lists narrow `publish` and `liveliness` when set: `delete` (session `delete`s) and
+  `livelinessTokens` (tokens it declares; `liveliness` then only watches and gets). `subject` (optional) names
+  the connection for the host. A refused sub or pub channel is `rejected` with `not authorized to subscribe "<key>"`; a
   refused `get` fails the same way; `listTopics` leaves the keys out.
+- `ServerBuilder::on_refused(|grant: &Grant, reason: &str|)` (0.5.5) hears every request a grant refuses, with
+  the same reason the client gets, e.g. for the host to tell the user which page wanted what.
 - `Server::revoke(token)` closes every live connection made with that token (deadmen fire with reason
   `"revoked"`, leases end); whether it can come back is the hook's call, since it runs on every offer.
 - Token issuance is the host's business (no store, no JWT in core). zenoh-gateway-cli's `--auth-file` is a
