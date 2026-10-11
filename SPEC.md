@@ -91,6 +91,7 @@ sub.state              // "connecting" | "open" | "rejected" | "closed" (publish
 
 z.stats          // per-key: received, dropped, backlogBytes, rttMs, gateway (normalized options, stats, allocation)
 z.gatewayStats.bandwidth  // this frontend's estimate, cap, budget, demand (see "Bandwidth allocation")
+z.congestion     // { degraded, limitedBy: "network" | "page" | null, droppedPerSec, sentBytesPerSec, wantedBytesPerSec }, see "Congestion"
 z.clockOffsetMs  // gateway clock - browser clock
 z.rttMs
 z.onState(fn)    // "connecting" | "connected" | "degraded" | "lost"
@@ -151,7 +152,7 @@ the small messages these carry (big streams belong on subscriptions). Every requ
 
 | options | data channel init | gateway behavior when the channel is backed up |
 |---|---|---|
-| `delivery: "reliable"` | ordered, fully reliable | queue every sample |
+| `delivery: "reliable"` | ordered, fully reliable | queue every sample; a sample that waited 2 s goes when a newer one of its key waits behind it |
 | `delivery: "latest"` | unordered, maxRetransmits 0 | keep only the newest sample per key |
 | `+ maxAge: M` | latest: unordered, maxPacketLifeTime M | also drop anything older than M |
 
@@ -163,12 +164,31 @@ round trip, ~150 KB/s on a Wi-Fi path whose RTT swings to 400 ms, and SCTP's con
 grows while data waits for it, so it stayed there too. (The page acks consumption with a 4-byte `u32 seq` message on each `sub`
 channel, because browsers queue received messages for the page without limit; on lossy channels a
 sender blocked only by that window sends one probe frame after 50 ms, doubling to 1 s, so a lost tail
-can't wedge it). The gateway drains
-its own queue on bufferedAmountLow / acks. Nothing piles up in kernel/wifi buffers or the browser,
-so a slow phone sees fewer frames instead of stale ones.
+can't wedge it; an unacked frame is never forgotten by age, since a page that far behind would then stop holding the
+gateway back). The gateway drains its own queue on bufferedAmountLow / acks.
+
+Bytes alone can't bound the delay: a window sized for the network is seconds of backlog for a phone that decodes slower
+than the link delivers, and the heartbeat replies and control answers wait behind it in the page's one event loop (a
+Controller page's latency once grew from 0.2 to 13 s in 30 s and its drive hold tripped). So every `sub` channel of a
+frontend also waits while the page is more than 250 ms behind (`pageLagMs` / `maxPageLagMs` in `bandwidth` stats): how
+long the page has had the oldest frame it hasn't gotten past, across all its channels, counted from when SCTP delivered
+it to the browser (its peer acknowledged it), so the network's own delay doesn't count: measured from the send, a Wi-Fi
+path whose RTT swings 60-480 ms was held to stop-and-wait. An ack of any frame means the page is past every lossy frame
+sent before it, which was lost if still unacked; a `reliable` frame is never lost, but SCTP sends unordered chunks
+first, so it can wait behind lossy ones sent after it and only its own channel's ack passes it (counting it as passed
+let a tf feed wait 13 s in SCTP on a jittery path). For the same reason channels also wait while a frame has been in
+SCTP undelivered longer than the path's recent highest RTT (at most its minimum + 500 ms) + 250 ms (`networkLagMs` /
+`maxNetworkLagMs`), which keeps lossy bulk from holding a reliable stream's frames in SCTP. Meanwhile `latest` keys keep replacing their waiting sample, so what goes next is the newest.
+Nothing piles up in kernel/wifi buffers or the browser, so a slow phone sees fewer frames instead of stale ones.
 
 Browser → zenoh puts: priority from the publisher options, congestion control Block for `"reliable"`,
 Drop otherwise, express for priority ≤ INTERACTIVE_HIGH.
+
+What `reliable` guarantees: samples of a key arrive in order, each at most once, and every one arrives while the page
+keeps up. Under congestion a key's queue on the gateway is bounded by time, not grown without limit: a sample that has
+waited 2 s is dropped once a newer sample of the same key waits behind it (so the newest is always delivered, and a key
+that publishes once, like tf_static, never loses it). Drops count in `droppedQueue` and show as `seq` gaps. A stream that
+must coalesce by content (tf by child frame) needs an encoding that does it; the gateway doesn't parse payloads.
 
 ## Client
 
@@ -447,7 +467,14 @@ gateway keeps the path's queues short and lets urgent streams skip what queue re
   measured rate is reserved off the top, and while it sends a message no bulk chunk starts.
 - **Target fraction (headroom).** The allocator hands out `bandwidth_target_fraction` (default 0.75)
   of the estimate, so bulk traffic runs below the path's capacity and its queue stays near empty.
-- **Pacing.** Bulk streams send through a per-stream token bucket at their granted rate × 1.25, in
+- **One big message at a time.** A bulk stream whose messages span more than one chunk takes the frontend's message
+  turn (first come, first served) and picks its sample only once it has it, so it sends its newest; it holds the turn
+  until the message is sent whole. Interleaved, three 200 KB clouds and a 400 KB map on a 500 KB/s path each took as
+  long as all of them and arrived ~1.7 s old; in turn, each takes its own size / rate. Small messages (one chunk) and
+  strict streams don't wait for the turn.
+- **Pacing.** Bulk streams send through a per-stream token bucket at the bulk budget (their grant sets how often a
+  message starts, not how fast it goes, so a big message granted little goes out quickly and less often instead of
+  trickling for seconds) × 1.25, in
   chunks of 4 ms of the frontend's budget (4–64 KiB). A per-frontend gate admits a bulk chunk only
   while the bulk bytes outstanding in SCTP are under `budget × (min RTT + 5 ms)`, when the frontend has a strict stream
   to protect (none: no in-flight limit, `bulkInflightLimit: null` in stats; at least two chunks,
@@ -510,6 +537,27 @@ Stats: each subscription's `allocation` (`demandBytesPerSec`,
 `demandBytesPerSec`, `sentBytesPerSec`, `networkBlockedFraction`, `constrained`). Per stream,
 `pacedMs` is time spent waiting on the token bucket and the gate.
 
+## Congestion
+
+`z.congestion` (JS client), refreshed with each stats poll (`statsIntervalMs`, 1 s), says whether the link keeps up so a
+page can show "link degraded, dropping N/s" instead of letting its user find out from stale data:
+
+- `degraded`: the subscriptions want more than the frontend's budget (`bandwidth.constrained`), so the gateway sends
+  fewer or smaller messages;
+- `limitedBy`: while degraded, `"page"` when senders waited on the page's acks more than on the network
+  (`bandwidth.pageBlockedFraction` vs `networkBlockedFraction`), else `"network"`;
+- `droppedPerSec`: messages of the constrained subscriptions that never reached the page (replaced by a newer sample,
+  older than `maxAge`, or incomplete), per second since the previous poll; an unconstrained subscription's drops are its
+  own `maxHz`;
+- `sentBytesPerSec`, `wantedBytesPerSec`: `bandwidth.sentBytesPerSec` and `demandBytesPerSec`.
+
+Waiting on the page doesn't lower the bandwidth estimate: a page is slow per message (a big map holds its event loop a
+while at any rate), so it would drive the estimate down without bound; the delivery-lag limit keeps its backlog short.
+
+Measured by `client/test/backpressure.ts`: headless Chrome through a userspace shaper (1 MB/s gateway→browser, 2 MB
+drop-tail queue, 30 ms each way), three 200 KB point clouds at 10 Hz, a 400 KB map at 1 Hz and a 200 B pose at 20 Hz
+(~6.4 MB/s wanted), all `latest`, on a page that spends 1 s of main thread per 800 KB of bulk.
+
 ## Topic enumeration
 
 `z.listTopics(filter = "**", { probeMs = 600 })` merges what the gateway can see, each key tagged with its sources:
@@ -548,8 +596,20 @@ per-browser layer on top, with reasons.
   (`get`), `listTopics` (which keys a listing shows), and the lease rights `leaseGroups` (names, `"*"` =
   any), `maxLeaseSecs` and `forceExpire`. A request is allowed when one of the list's expressions
   includes its key (zenoh's `includes`: `robot/**` includes `robot/arm/cmd` and `robot/arm/**`, not
-  `**`). A refused sub or pub channel is `rejected` with `not authorized to subscribe "<key>"`; a
+  `**`). Two optional lists narrow `publish` and `liveliness` when set: `delete` (session `delete`s) and
+  `livelinessTokens` (tokens it declares; `liveliness` then only watches and gets). `subject` (optional) names
+  the connection for the host. A refused sub or pub channel is `rejected` with `not authorized to subscribe "<key>"`; a
   refused `get` fails the same way; `listTopics` leaves the keys out.
+- `Grant.acl` (0.5.6, optional) replaces the lists with zenoh's access-control model for that connection:
+  `{default_permission: "allow"|"deny", rules: [{id?, messages, flows?, key_exprs, permission}]}`, zenoh's field
+  names and messages (`put`, `delete`, `declare_subscriber`, `query`, `declare_queryable`, `reply`,
+  `liveliness_token`, `declare_liveliness_subscriber`, `liveliness_query`), with the gateway in the router's place:
+  ingress is what the browser sends, egress what it is handed. Decided like zenoh: a `deny` rule including the key
+  wins, then `default_permission`, then the `allow` rules. Ingress (a subscription's or queryable's declaration, a put,
+  delete, `get`, reply, token, liveliness watch or get) is refused with `not authorized to ...`; egress (samples, `get`
+  replies, queries reaching a queryable, liveliness tokens watched or got) the rules deny is dropped silently.
+- `ServerBuilder::on_refused(|grant: &Grant, reason: &str|)` (0.5.5) hears every request a grant refuses, with
+  the same reason the client gets, e.g. for the host to tell the user which page wanted what.
 - `Server::revoke(token)` closes every live connection made with that token (deadmen fire with reason
   `"revoked"`, leases end); whether it can come back is the hook's call, since it runs on every offer.
 - Token issuance is the host's business (no store, no JWT in core). zenoh-gateway-cli's `--auth-file` is a

@@ -325,9 +325,12 @@ server.revoke("driver-token");   // closes its live connections; the hook decide
 
 The page connects with `connect(url, { token })`. A `Grant` lists key expressions per action (`subscribe`,
 `publish` (also put, delete, matching for subscribers), `query` (also queriers, matching for queryables),
-`queryable` (queryables the page declares), `liveliness` (tokens, liveliness watching and get), `listTopics`) plus lease rights (`leaseGroups`, `maxLeaseSecs`, `forceExpire`); a
+`queryable` (queryables the page declares), `liveliness` (tokens, liveliness watching and get), `listTopics`;
+optionally `delete` and `livelinessTokens` to keep deletes and tokens apart) plus lease rights (`leaseGroups`, `maxLeaseSecs`, `forceExpire`); a
 request is allowed when one of them includes its key, otherwise the channel is rejected with
-`not authorized to <action> "<key>"`. No hook = `Grant::all()` for everyone. Issuing tokens is up to
+`not authorized to <action> "<key>"`, and `.on_refused(|grant, reason| ...)` hears it (`grant.subject` says whose
+connection it was). `Grant.acl` swaps the lists for zenoh's own ACL model (default_permission, allow/deny rules of
+messages, flows and key_exprs; SPEC "Auth"). No hook = `Grant::all()` for everyone. Issuing tokens is up to
 the host; zenoh-gateway-cli's `--auth-file` is a small file-based example. SPEC "Auth".
 
 ## Leases

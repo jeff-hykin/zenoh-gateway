@@ -289,3 +289,163 @@ async fn grants_cover_the_new_capabilities() {
     client.close().await;
     running.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refusals_reach_the_hook_and_split_rules_hold() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    // deletes and liveliness tokens kept apart from publishing and watching
+    let grant = Grant {
+        publish: vec!["api/split/**".into()],
+        delete: Some(vec![]),
+        liveliness: vec!["api/split/**".into()],
+        liveliness_tokens: Some(vec![]),
+        subject: Some("the-app".into()),
+        ..Default::default()
+    };
+    let refusals = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(Option<String>, String)>::new()));
+    let heard = refusals.clone();
+    let running = Server::builder()
+        .session(session.clone())
+        .authorize(move |_token, _headers| Ok(grant.clone()))
+        .on_refused(move |grant, reason| heard.lock().unwrap().push((grant.subject.clone(), reason.to_owned())))
+        .build()
+        .await
+        .unwrap()
+        .bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    client.put("api/split/a", b"x", Default::default()).await.unwrap();
+    client.liveliness_subscribe("api/split/**", false).await.unwrap();
+    let error = client.delete("api/split/a", Default::default()).await.unwrap_err().to_string();
+    assert!(error.contains("not authorized to delete \"api/split/a\""), "{error}");
+    let error = client.declare_token("api/split/t").await.map(drop).unwrap_err().to_string();
+    assert!(error.contains("not authorized to declare a liveliness token on"), "{error}");
+    let error = client.subscribe("api/split/a", SubscribeOptions::default()).await.map(drop).unwrap_err().to_string();
+    assert!(error.contains("not authorized to subscribe"), "{error}");
+    let refusals = refusals.lock().unwrap().clone();
+    assert_eq!(refusals.len(), 3, "{refusals:?}");
+    assert!(refusals.iter().all(|(subject, _)| subject.as_deref() == Some("the-app")), "{refusals:?}");
+    assert_eq!(refusals[0].1, "not authorized to delete \"api/split/a\"");
+    assert!(refusals[2].1.starts_with("not authorized to subscribe"), "{refusals:?}");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+fn acl(value: serde_json::Value) -> zenoh_gateway::Acl {
+    serde_json::from_value(value).unwrap()
+}
+
+/// zenoh's decision order: a deny including the key wins, then default_permission, then the allow rules.
+#[test]
+fn acl_decides_like_zenoh() {
+    use zenoh_gateway::{AclMessage::*, Flow::*};
+    let rules = acl(serde_json::json!({
+        "default_permission": "deny",
+        "rules": [
+            {"messages": ["put", "declare_subscriber"], "key_exprs": ["robot/**"], "permission": "allow"},
+            {"messages": ["put"], "flows": ["ingress"], "key_exprs": ["robot/estop"], "permission": "deny"},
+        ],
+    }));
+    assert!(rules.allows(Put, Ingress, "robot/cmd_vel"));
+    assert!(rules.allows(Put, Egress, "robot/estop"), "the deny is ingress only");
+    assert!(!rules.allows(Put, Ingress, "robot/estop"), "deny beats allow");
+    assert!(!rules.allows(Put, Ingress, "camera/a"), "default deny");
+    assert!(!rules.allows(Delete, Ingress, "robot/cmd_vel"), "another message");
+    assert!(!rules.allows(DeclareSubscriber, Ingress, "**"), "robot/** doesn't include **");
+    let open = acl(serde_json::json!({
+        "default_permission": "allow",
+        "rules": [{"messages": ["declare_subscriber"], "key_exprs": ["secret/**"], "permission": "deny"}],
+    }));
+    assert!(open.allows(DeclareSubscriber, Ingress, "anything/else"));
+    assert!(open.allows(Put, Ingress, "secret/x"));
+    assert!(!open.allows(DeclareSubscriber, Ingress, "secret/x"));
+    assert!(open.allows(DeclareSubscriber, Ingress, "**"), "a deny only covers what it includes, like zenoh");
+}
+
+/// A connection with an ACL: ingress refused with a reason (and the hook), egress dropped silently.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acl_refuses_ingress_and_drops_egress() {
+    let grant = Grant {
+        acl: Some(acl(serde_json::json!({
+            "default_permission": "allow",
+            "rules": [
+                {"messages": ["put"], "flows": ["egress"], "key_exprs": ["acl/hidden"], "permission": "deny"},
+                {"messages": ["put"], "flows": ["ingress"], "key_exprs": ["acl/locked/**"], "permission": "deny"},
+                {"messages": ["reply"], "flows": ["egress"], "key_exprs": ["acl/q/hidden"], "permission": "deny"},
+            ],
+        }))),
+        subject: Some("page".into()),
+        ..Default::default()
+    };
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let heard = refused.clone();
+    let running = Server::builder()
+        .session(session.clone())
+        .authorize(move |_token, _headers| Ok(grant.clone()))
+        .on_refused(move |_grant, reason| heard.lock().unwrap().push(reason.to_owned()))
+        .build()
+        .await
+        .unwrap()
+        .bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    // ingress: default allow, the deny wins on its keys
+    client.put("acl/open", b"x", Default::default()).await.unwrap();
+    let error = client.put("acl/locked/a", b"x", Default::default()).await.unwrap_err().to_string();
+    assert!(error.contains("not authorized to publish \"acl/locked/a\""), "{error}");
+    // egress: a subscription to acl/* gets acl/shown, never acl/hidden
+    let mut subscription = client.subscribe("acl/*", SubscribeOptions::default()).await.unwrap();
+    let publisher_hidden = session.declare_publisher("acl/hidden").await.unwrap();
+    let publisher_shown = session.declare_publisher("acl/shown").await.unwrap();
+    let mut keys = Vec::new();
+    let _ = timeout(Duration::from_secs(3), async {
+        loop {
+            publisher_hidden.put("h").await.unwrap();
+            publisher_shown.put("s").await.unwrap();
+            if let Ok(Some(Message::Data(message))) = timeout(Duration::from_millis(100), subscription.recv()).await {
+                keys.push(message.key);
+                if keys.len() >= 5 {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(!keys.is_empty() && keys.iter().all(|key| key == "acl/shown"), "{keys:?}");
+    // replies: the denied reply key never reaches the browser
+    let queryable = session
+        .declare_queryable("acl/q/*")
+        .callback(|query| {
+            use zenoh::Wait;
+            query.reply("acl/q/hidden", "h").wait().unwrap();
+            query.reply("acl/q/shown", "s").wait().unwrap();
+        })
+        .await
+        .unwrap();
+    let replies = client.get_with("acl/q/*", Default::default()).await.unwrap();
+    let keys: Vec<String> = replies.iter().filter_map(|reply| reply.key.clone()).collect();
+    assert_eq!(keys, ["acl/q/shown"]);
+    drop(queryable);
+    assert!(client.publish("acl/locked/b", Default::default()).await.is_err());
+    assert_eq!(refused.lock().unwrap().first().map(String::as_str), Some("not authorized to publish \"acl/locked/a\""));
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+/// A channel opened right after a rejected one opens (the rejected one's stream reset used to close it: "closed before
+/// opening", a third of the time).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_channel_never_closes_the_next_one() {
+    let grant = Grant { subscribe: vec!["**".into()], ..Default::default() };
+    let (running, _session, url) = start(Some(grant)).await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    for _ in 0..5 {
+        assert!(client.publish("a/b", Default::default()).await.is_err());
+        client.subscribe("a/*", SubscribeOptions::default()).await.unwrap();
+    }
+    client.close().await;
+    running.shutdown().await.unwrap();
+}

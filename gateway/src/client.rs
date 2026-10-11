@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
-use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState};
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
@@ -648,6 +648,14 @@ impl Inner {
                 Ok(Ok(())) => Ok(channel),
                 failed => {
                     let _ = channel.close().await;
+                    // the next channel may get this one's stream id: open it only once this one is closed, or the
+                    // stream's reset can land on the new channel and close it before it opens
+                    let closed = async {
+                        while !matches!(channel.ready_state().await, Ok(RTCDataChannelState::Closed) | Err(_)) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    };
+                    let _ = tokio::time::timeout(Duration::from_secs(2), closed).await;
                     Err(failed.unwrap_or_else(|_| Err(anyhow!("{key}: opening timed out"))).unwrap_err())
                 }
             }

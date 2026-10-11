@@ -59,6 +59,8 @@ pub struct AllocationConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ConnectConfig {
     pub ice_servers: Vec<IceServer>,
+    /// told about every request a connection's grant refuses
+    pub(crate) on_refused: Option<crate::auth::RefusalHook>,
     /// coturn's static-auth-secret and the minted credentials' lifetime
     pub turn_secret: Option<(String, Duration)>,
     /// servers minted per connection, after the static ones
@@ -93,6 +95,14 @@ struct BandwidthStats {
     demand_bytes_per_sec: f64,
     sent_bytes_per_sec: f64,
     network_blocked_fraction: f64,
+    /// share of the interval senders waited for the page (its JS behind on what arrived) rather than the network
+    page_blocked_fraction: f64,
+    /// how long the page has had the oldest frame it hasn't gotten past, and how long before channels wait
+    page_lag_ms: f64,
+    max_page_lag_ms: f64,
+    /// how long the oldest frame SCTP hasn't delivered has been in it, and how long before channels wait
+    network_lag_ms: f64,
+    max_network_lag_ms: f64,
     constrained: bool,
 }
 
@@ -158,6 +168,7 @@ struct PeerState {
     /// the bearer token it connected with, and what it may do
     token: Option<String>,
     grant: Grant,
+    on_refused: Option<crate::auth::RefusalHook>,
     leases: Arc<Leases>,
     /// queryables, liveliness, matching listeners it declared through the control channel
     api: api::ApiState,
@@ -181,6 +192,7 @@ impl PeerState {
             gateway: Arc::downgrade(gateway),
             token,
             grant,
+            on_refused: gateway.connect_config.on_refused.clone(),
             leases: gateway.leases.clone(),
             peer_id,
             session: gateway.session.clone(),
@@ -239,12 +251,13 @@ impl PeerState {
         let data_usages = || usages.iter().filter(|usage| !usage.on_track);
         let sent: u64 = data_usages().map(|usage| usage.bytes_sent).sum();
         let blocked_ms: f64 = data_usages().map(|usage| usage.network_blocked_ms).sum();
-        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.network_blocked_ms > 0.0).count();
+        let page_blocked_ms: f64 = data_usages().map(|usage| usage.page_blocked_ms).sum();
+        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.network_blocked_ms > 0.0 || usage.page_blocked_ms > 0.0).count();
         let data_demand: f64 = data_usages().map(|usage| usage.demand.wants()).sum();
         let total_demand: f64 = usages.iter().map(|usage| usage.demand.wants()).sum();
         let estimator = {
             let mut estimator = self.estimator.lock().unwrap();
-            estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, active_senders: active, data_demand, queue_delay_ms });
+            estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, page_blocked_secs: page_blocked_ms / 1000.0, active_senders: active, data_demand, queue_delay_ms });
             estimator.clone()
         };
         let has_video = usages.iter().any(|usage| usage.on_track);
@@ -259,8 +272,9 @@ impl PeerState {
         let strict_present = subscriptions.iter().any(|shared| shared.is_strict());
         self.gate.configure((budget - reserved).max(0.0), min_rtt_ms, allocator::DELAY_THRESHOLD_MS, strict_present);
         self.gate.set_window(budget, min_rtt_ms, high_rtt_ms);
+        let bulk_budget = (budget - video_estimate.min(budget) - reserved).max(0.0);
         for (shared, allocation) in subscriptions.iter().zip(allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video)) {
-            shared.apply(allocation);
+            shared.apply(allocation, bulk_budget);
         }
         *self.bandwidth.lock().unwrap() = BandwidthStats {
             data_estimate_bytes_per_sec: estimator.data_bytes_per_sec,
@@ -278,6 +292,11 @@ impl PeerState {
             demand_bytes_per_sec: total_demand,
             sent_bytes_per_sec: estimator.sent_bytes_per_sec,
             network_blocked_fraction: estimator.network_blocked_fraction,
+            page_blocked_fraction: estimator.page_blocked_fraction,
+            page_lag_ms: self.gate.page_lag(now).as_secs_f64() * 1000.0,
+            max_page_lag_ms: self.gate.max_page_lag().as_secs_f64() * 1000.0,
+            network_lag_ms: self.gate.network_lag(now).as_secs_f64() * 1000.0,
+            max_network_lag_ms: self.gate.max_network_lag().as_secs_f64() * 1000.0,
             constrained: total_demand > budget,
         };
     }
@@ -310,6 +329,11 @@ impl PeerState {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         warn!("peer {}: control channel never opened, dropped {event}", self.peer_id);
+    }
+
+    /// Its grant and the gateway's refusal hook.
+    fn access(&self) -> crate::auth::Access<'_> {
+        crate::auth::Access { grant: &self.grant, on_refused: self.on_refused.as_ref() }
     }
 
     async fn send_accepted(&self, id: Option<u64>) {
@@ -641,7 +665,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         state.channels.lock().unwrap().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
     let rejected = match label.kind.as_str() {
-        "sub" => match Grant::check(&state.grant.subscribe, "subscribe", &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
+        "sub" => match state.access().check(crate::auth::Action::Subscribe, &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
             let resolved = opts.resolve_encoding(&state.codecs)?;
             let track = bind_track(&state, &resolved, &label)?;
             Ok((opts, resolved, track))
@@ -651,12 +675,12 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
                 state.leases.changed();
                 state.send_accepted(label.id).await;
-                subscription::run(dc.clone(), label.clone(), session, shared, track).await;
+                subscription::run(dc.clone(), label.clone(), session, shared, track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
                 None
             }
             Err(error) => Some(error),
         },
-        "pub" => match Grant::check(&state.grant.publish, "publish", &label.key).and_then(|()| PubOpts::parse(&label.opts)) {
+        "pub" => match state.access().check(crate::auth::Action::Publish, &label.key).and_then(|()| PubOpts::parse(&label.opts)) {
             Ok(opts) => {
                 let shared = Arc::new(PubShared::default());
                 register(json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit}), ChannelStats::Pub(shared.clone()));
@@ -680,7 +704,18 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     if let Some(error) = rejected {
         warn!("peer {peer_id}: rejected channel {raw_label}: {error}");
         state.send_event(json!({"event": "rejected", "id": label.id, "reason": error})).await;
-        let _ = dc.close().await;
+        // the client closes a rejected channel itself; closing it from both ends at once lets the second reset land on
+        // the next channel that reuses its stream id (it then closes before opening)
+        let client_closed = async {
+            while let Some(event) = dc.poll().await {
+                if matches!(event, DataChannelEvent::OnClose) {
+                    break;
+                }
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), client_closed).await.is_err() {
+            let _ = dc.close().await;
+        }
     }
     if state.channels.lock().unwrap().remove(&entry_id).is_some_and(|entry| matches!(entry.stats, ChannelStats::Sub(_))) {
         state.leases.changed();
@@ -900,7 +935,7 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             let (dc, state) = (dc.clone(), state.clone());
             let slow = api::SLOW_OPS.contains(&request.op.as_str());
             let task = async move {
-                let context = api::Context { session: &state.session, grant: &state.grant, api: &state.api, events: state.api_events.clone() };
+                let context = api::Context { session: &state.session, access: state.access(), api: &state.api, events: state.api_events.clone() };
                 let response = api::handle(context, request).await;
                 let _ = dc.send_text(&response.to_string()).await;
             };
@@ -1125,7 +1160,7 @@ async fn handle_list_topics(session: &zenoh::Session, request: &ControlRequest, 
     let filter = if request.key.is_empty() { "**" } else { &request.key };
     match list_topics(session, filter, Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS))).await {
         Ok(mut topics) => {
-            topics.retain(|topic| Grant::check(&grant.list_topics, "list", topic["key"].as_str().unwrap_or_default()).is_ok());
+            topics.retain(|topic| grant.allows(crate::auth::Action::List, topic["key"].as_str().unwrap_or_default()).is_ok());
             ok(&request.id, json!({"topics": topics}))
         }
         Err(error) => fail(&request.id, error),
