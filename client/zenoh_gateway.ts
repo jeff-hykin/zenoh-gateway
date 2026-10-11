@@ -173,6 +173,22 @@ export interface GatewayChannelStats {
     allocation: Record<string, number | boolean | null> | null
 }
 
+/**
+ * How the gateway copes with this page's link, from each stats poll (SPEC "Congestion"): an app shows "link degraded,
+ * dropping N/s" from it instead of the user finding out from stale data.
+ */
+export interface Congestion {
+    /** the subscriptions want more than the link or the page takes, so the gateway sends fewer or smaller messages */
+    degraded: boolean
+    /** what holds them back while degraded: the network path, or this page not getting through what already arrived */
+    limitedBy: "network" | "page" | null
+    /** messages per second of the held-back subscriptions that never reached the page (a newer one replaced them, they outlived maxAge, or arrived incomplete) */
+    droppedPerSec: number
+    /** bytes per second the gateway sends this page, and what its subscriptions would take at their full rate */
+    sentBytesPerSec: number
+    wantedBytesPerSec: number
+}
+
 /** The gateway's `clock`, `heartbeat` and `bandwidth` stats (SPEC "Stats"). */
 export type GatewayStats = Record<string, Record<string, unknown> | null>
 
@@ -1035,6 +1051,8 @@ export class ZenohGateway {
     clockOffsetMs: number | null = null
     /** gateway-side heartbeat, clock and bandwidth stats */
     gatewayStats: GatewayStats | null = null
+    /** whether the link keeps up with the subscriptions, and what is dropped when it doesn't; null before the first stats poll */
+    congestion: Congestion | null = null
     /** the message encodings the gateway runs, fetched on connect */
     encodings: readonly EncodingInfo[] = []
     /** the ICE servers in use (the gateway's unless given) */
@@ -1060,6 +1078,9 @@ export class ZenohGateway {
     #closed = false
     #generation = 0
     #statsTimer: ReturnType<typeof setInterval> | null = null
+    /** each subscription's drops so far, and when they were counted (for `congestion`) */
+    #dropTotals = new Map<number, number>()
+    #dropsCountedAt = 0
     /** renegotiations run one at a time */
     #negotiation: Promise<unknown> = Promise.resolve()
     /** resolves once the current peer connection is up (renegotiation needs `control`) */
@@ -1564,8 +1585,40 @@ export class ZenohGateway {
         const response = await this._request({ op: "stats" }, pingTimeoutMs).catch(() => null)
         if (response) {
             this.gatewayStats = { clock: response.clock, heartbeat: response.heartbeat, bandwidth: response.bandwidth ?? null } as GatewayStats
+            this.#updateCongestion((response.bandwidth ?? null) as Record<string, unknown> | null, (response.channels as GatewayChannelStats[] | undefined) ?? [])
         }
         this.#refreshStats((response?.channels as GatewayChannelStats[] | undefined) ?? null)
+    }
+
+    #updateCongestion(bandwidth: Record<string, unknown> | null, channels: GatewayChannelStats[]): void {
+        const now = performance.now()
+        const seconds = this.#dropsCountedAt > 0 ? (now - this.#dropsCountedAt) / 1000 : 0
+        this.#dropsCountedAt = now
+        const totals = new Map<number, number>()
+        let dropped = 0
+        for (const channel of channels) {
+            if (channel.type !== "sub" || channel.id === null) {
+                continue
+            }
+            const endpoint = this.#endpointsById.get(channel.id)
+            const count = (name: string) => Number(channel.stats[name] ?? 0)
+            const total = count("droppedQueue") + count("droppedAge") + count("abandonedPartial") + (endpoint instanceof Subscription ? endpoint.partialDropped : 0)
+            totals.set(channel.id, total)
+            // an unconstrained subscription's drops are its own maxHz, not the link
+            if (channel.allocation?.constrained === true) {
+                dropped += total - (this.#dropTotals.get(channel.id) ?? total)
+            }
+        }
+        this.#dropTotals = totals
+        const number = (name: string) => Number(bandwidth?.[name] ?? 0)
+        const degraded = bandwidth?.constrained === true
+        this.congestion = {
+            degraded,
+            limitedBy: !degraded ? null : number("pageBlockedFraction") > number("networkBlockedFraction") ? "page" : "network",
+            droppedPerSec: seconds > 0 ? dropped / seconds : 0,
+            sentBytesPerSec: number("sentBytesPerSec"),
+            wantedBytesPerSec: number("demandBytesPerSec"),
+        }
     }
 
     #refreshStats(gatewayChannels: GatewayChannelStats[] | null): void {
