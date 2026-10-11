@@ -152,7 +152,7 @@ the small messages these carry (big streams belong on subscriptions). Every requ
 
 | options | data channel init | gateway behavior when the channel is backed up |
 |---|---|---|
-| `delivery: "reliable"` | ordered, fully reliable | queue every sample |
+| `delivery: "reliable"` | ordered, fully reliable | queue every sample; a sample that waited 2 s goes when a newer one of its key waits behind it |
 | `delivery: "latest"` | unordered, maxRetransmits 0 | keep only the newest sample per key |
 | `+ maxAge: M` | latest: unordered, maxPacketLifeTime M | also drop anything older than M |
 
@@ -170,14 +170,25 @@ gateway back). The gateway drains its own queue on bufferedAmountLow / acks.
 Bytes alone can't bound the delay: a window sized for the network is seconds of backlog for a phone that decodes slower
 than the link delivers, and the heartbeat replies and control answers wait behind it in the page's one event loop (a
 Controller page's latency once grew from 0.2 to 13 s in 30 s and its drive hold tripped). So every `sub` channel of a
-frontend also waits while the page is further behind than the path's minimum RTT + 250 ms (`deliveryLagMs` /
-`maxDeliveryLagMs` in `bandwidth` stats): how long the oldest frame the page hasn't gotten past has been out, across
-all its channels (an ack of any frame means the page is past everything sent before it; frames sent earlier and still
-unacked were lost). Meanwhile `latest` keys keep replacing their waiting sample, so what goes next is the newest.
+frontend also waits while the page is more than 250 ms behind (`pageLagMs` / `maxPageLagMs` in `bandwidth` stats): how
+long the page has had the oldest frame it hasn't gotten past, across all its channels, counted from when SCTP delivered
+it to the browser (its peer acknowledged it), so the network's own delay doesn't count: measured from the send, a Wi-Fi
+path whose RTT swings 60-480 ms was held to stop-and-wait. An ack of any frame means the page is past every lossy frame
+sent before it, which was lost if still unacked; a `reliable` frame is never lost, but SCTP sends unordered chunks
+first, so it can wait behind lossy ones sent after it and only its own channel's ack passes it (counting it as passed
+let a tf feed wait 13 s in SCTP on a jittery path). For the same reason channels also wait while a frame has been in
+SCTP undelivered longer than the path's recent highest RTT (at most its minimum + 500 ms) + 250 ms (`networkLagMs` /
+`maxNetworkLagMs`), which keeps lossy bulk from holding a reliable stream's frames in SCTP. Meanwhile `latest` keys keep replacing their waiting sample, so what goes next is the newest.
 Nothing piles up in kernel/wifi buffers or the browser, so a slow phone sees fewer frames instead of stale ones.
 
 Browser → zenoh puts: priority from the publisher options, congestion control Block for `"reliable"`,
 Drop otherwise, express for priority ≤ INTERACTIVE_HIGH.
+
+What `reliable` guarantees: samples of a key arrive in order, each at most once, and every one arrives while the page
+keeps up. Under congestion a key's queue on the gateway is bounded by time, not grown without limit: a sample that has
+waited 2 s is dropped once a newer sample of the same key waits behind it (so the newest is always delivered, and a key
+that publishes once, like tf_static, never loses it). Drops count in `droppedQueue` and show as `seq` gaps. A stream that
+must coalesce by content (tf by child frame) needs an encoding that does it; the gateway doesn't parse payloads.
 
 ## Client
 
@@ -456,8 +467,14 @@ gateway keeps the path's queues short and lets urgent streams skip what queue re
   measured rate is reserved off the top, and while it sends a message no bulk chunk starts.
 - **Target fraction (headroom).** The allocator hands out `bandwidth_target_fraction` (default 0.75)
   of the estimate, so bulk traffic runs below the path's capacity and its queue stays near empty.
-- **Pacing.** Bulk streams send through a per-stream token bucket at their granted rate (at least an even share of the
-  bulk budget, so a big message granted little goes out quickly and less often instead of trickling for seconds) × 1.25, in
+- **One big message at a time.** A bulk stream whose messages span more than one chunk takes the frontend's message
+  turn (first come, first served) and picks its sample only once it has it, so it sends its newest; it holds the turn
+  until the message is sent whole. Interleaved, three 200 KB clouds and a 400 KB map on a 500 KB/s path each took as
+  long as all of them and arrived ~1.7 s old; in turn, each takes its own size / rate. Small messages (one chunk) and
+  strict streams don't wait for the turn.
+- **Pacing.** Bulk streams send through a per-stream token bucket at the bulk budget (their grant sets how often a
+  message starts, not how fast it goes, so a big message granted little goes out quickly and less often instead of
+  trickling for seconds) × 1.25, in
   chunks of 4 ms of the frontend's budget (4–64 KiB). A per-frontend gate admits a bulk chunk only
   while the bulk bytes outstanding in SCTP are under `budget × (min RTT + 5 ms)`, when the frontend has a strict stream
   to protect (none: no in-flight limit, `bulkInflightLimit: null` in stats; at least two chunks,
