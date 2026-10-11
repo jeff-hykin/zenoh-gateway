@@ -1,6 +1,6 @@
 [package]
 name = "zenoh-gateway"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "View and drive a zenoh system from a browser over WebRTC (data channels, H.264 video, bandwidth allocation, deadmen): an embeddable server with pluggable codecs"
@@ -14,9 +14,9 @@ include = ["/src/**/*.rs", "/Cargo.toml"]
 
 
 [dependencies]
-# 1.6.2: zenoh 1.7.0 through 1.10.1 deadlock when the admin space answers a query during a declaration
-zenoh = "=1.6.2"
-zenoh-ext = { version = "=1.6.2", features = ["unstable"] }
+# 1.7.0 through 1.10.1 deadlock when the admin space answers a query during a declaration: keep it off (the default)
+zenoh = "=1.10.1"
+zenoh-ext = { version = "=1.10.1", features = ["unstable"] }
 # webrtc-rs with small fixes, renamed so they reach crates that depend on zenoh-gateway (github.com/jeff-hykin/webrtc-rs-zenoh-web)
 webrtc = { package = "zenoh-web-webrtc", version = "=0.21.0-zw.3" }
 rtc = { package = "zenoh-web-rtc", version = "=0.21.0-zw.3" }
@@ -69,5 +69,5 @@ name = "relay_sketch"
 required-features = ["client"]
 
 [patch.crates-io]
-# zenoh 1.6.2 plus a routing fix (puts dropped after a publisher is undeclared): https://github.com/jeff-hykin/zenoh-vendor
-zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.6.2-patch.1" }
+# zenoh 1.10.1 plus a routing fix (puts dropped after a publisher is undeclared): https://github.com/jeff-hykin/zenoh-vendor
+zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.10.1-patch.1" }

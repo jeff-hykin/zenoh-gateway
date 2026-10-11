@@ -21,7 +21,7 @@ by the application:
 ```
 zenoh peers / routers (publishers you don't control: ROS 2 over rmw_zenoh, dimos, anything)
         │  zenoh (the gateway is a normal zenoh peer or client)
-   zenoh-gateway server  (Rust, in your process: zenoh 1.6.2, webrtc-rs, tokio, axum)
+   zenoh-gateway server  (Rust, in your process: zenoh 1.10.1, webrtc-rs, tokio, axum)
         │  HTTP: POST /offer (signaling) + optional static files
         │  WebRTC: one SCTP data channel per subscription/publisher, + video and audio tracks
    browser page  (client/zenoh_gateway.ts, loaded from esm.sh or bundled)
@@ -293,9 +293,10 @@ a video encoding producing I420 frames); its `test/custom_codec.js` drives it fr
 [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs) is a whole crate of them (ROS 2 / dimos images,
 depth, point clouds, audio).
 
-zenoh is pinned to 1.6.2: 1.7.0 through 1.10.1 deadlock when the admin space answers a query while
-a declaration waits for the routing tables (the fix, eclipse-zenoh/zenoh branch
-`bugfix/routing-deadlock`, is unreleased). A dependent uses the same zenoh. The webrtc-rs fixes
+zenoh is pinned to 1.10.1; a dependent uses the same zenoh. Leave zenoh's admin space off (`adminspace/enabled`,
+off by default) in a config you give the gateway: 1.7.0 through 1.10.1 deadlock when the admin space answers a
+query while a declaration waits for the routing tables (the fix, eclipse-zenoh/zenoh#2619 on branch
+`bugfix/routing-deadlock`, is unreleased). The gateway never asks the admin space, and warns if it is on. The webrtc-rs fixes
 zenoh-gateway needs are published as renamed crates (`zenoh-web-webrtc`, `zenoh-web-rtc`,
 `zenoh-web-rtc-datachannel`, `zenoh-web-rtc-sctp`, from
 [webrtc-rs-zenoh-web](https://github.com/jeff-hykin/webrtc-rs-zenoh-web), each with a `PATCHES.md`),
@@ -395,14 +396,14 @@ Your nix may build one derivation at a time (`max-jobs = 1`); with hundreds of c
 
 ### A crate that depends on zenoh-gateway
 
-zenoh 1.6.2 drops a client's puts on a key after a publisher on it was undeclared and the key's
-subscribers changed. zenoh-gateway builds against a fixed zenoh
+zenoh (1.6.2 through 1.10.1) drops a client's puts on a key after a publisher on it was undeclared and the key's
+subscribers changed (the fix, eclipse-zenoh/zenoh#2832, is unreleased). zenoh-gateway builds against a fixed zenoh
 ([jeff-hykin/zenoh-vendor](https://github.com/jeff-hykin/zenoh-vendor)); `[patch]` doesn't carry over to
 dependents, so add the same to yours:
 
 ```toml
 [patch.crates-io]
-zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.6.2-patch.1" }
+zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.10.1-patch.1" }
 ```
 
 ```sh

@@ -245,6 +245,9 @@ impl ServerBuilder {
         self.video_policy.validate()?;
         let codecs = EncodingRegistry::new(self.encodings)?.with_video(self.video_encoders, self.video_policy);
         let mut config = self.zenoh_config.unwrap_or_default();
+        if config.get_json("adminspace/enabled").is_ok_and(|enabled| enabled == "true") {
+            log::warn!("adminspace/enabled: zenoh 1.7.0 through 1.10.1 deadlock answering the admin space while a declaration waits for the routing tables");
+        }
         let (session, owns_session) = match self.session {
             Some(session) => {
                 ensure!(self.connect.is_empty(), "connect endpoints only apply to a session zenoh-gateway opens; configure them on the session you pass instead");

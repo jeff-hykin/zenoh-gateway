@@ -231,9 +231,9 @@ lease), `changes()` (a `watch` counter bumped when either changes) and `expire_l
 as a force-expiry does, the holder told `reason`). Shutdown fires every frontend's deadmen
 (reason `"shutdown"`), closes the browser connections, then the session if the server opened it.
 
-zenoh is pinned to 1.6.2: 1.7.0 through 1.10.1 deadlock when the admin space answers a query while a
-declaration waits for the routing tables (fixed upstream on branch `bugfix/routing-deadlock`, not
-released). The webrtc-rs fixes the gateway relies on (see "Delivery → transport mapping", "Large
+zenoh is pinned to 1.10.1. Its admin space stays off (zenoh's default; the server warns if a given config
+turns it on): 1.7.0 through 1.10.1 deadlock when the admin space answers a query while a declaration waits for
+the routing tables (fixed upstream on branch `bugfix/routing-deadlock`, not released). The webrtc-rs fixes the gateway relies on (see "Delivery → transport mapping", "Large
 messages") are published as renamed crates (`zenoh-web-webrtc` → `zenoh-web-rtc` →
 `zenoh-web-rtc-datachannel`, `zenoh-web-rtc-sctp`; github.com/jeff-hykin/webrtc-rs-zenoh-web), so
 crates that depend on zenoh-gateway build the fixed code.

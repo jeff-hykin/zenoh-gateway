@@ -1165,9 +1165,8 @@ mod tests {
         assert_eq!((allocations[0].budget_bytes_per_sec, allocations[1].budget_bytes_per_sec), (500_000.0, 500_000.0));
     }
 
-    /// zenoh 1.7.0-1.10.1 answer the admin space under the routing tables' read lock and take it again, so a racing declaration deadlocked every thread (it hung web_ctrl).
-    #[test]
-    fn list_topics_survives_concurrent_declarations() {
+    /// Races listTopics and admin-space queries against declarations for 3 s; false if they deadlocked.
+    fn list_topics_races_declarations(adminspace: bool) -> bool {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
@@ -1175,8 +1174,10 @@ mod tests {
                 let mut config = zenoh::Config::default();
                 config.insert_json5("scouting/multicast/enabled", "false").unwrap();
                 config.insert_json5("listen/endpoints", "[]").unwrap();
-                config.insert_json5("adminspace/enabled", "true").unwrap();
-                config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).unwrap();
+                if adminspace {
+                    config.insert_json5("adminspace/enabled", "true").unwrap();
+                    config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).unwrap();
+                }
                 let session = zenoh::open(config).await.unwrap();
                 let deadline = Instant::now() + Duration::from_secs(3);
                 let mut tasks = Vec::new();
@@ -1208,6 +1209,23 @@ mod tests {
             });
             let _ = done_tx.send(());
         });
-        assert!(done_rx.recv_timeout(Duration::from_secs(30)).is_ok(), "listTopics and declarations deadlocked");
+        done_rx.recv_timeout(Duration::from_secs(30)).is_ok()
+    }
+
+    /// The admin space is off unless a config turns it on (zenoh's default, and the gateway never does), so nothing in
+    /// the process answers `@/...` and racing declarations can't deadlock.
+    #[test]
+    fn list_topics_survives_concurrent_declarations() {
+        assert_eq!(zenoh::Config::default().get_json("adminspace/enabled").unwrap(), "false");
+        assert!(list_topics_races_declarations(false), "listTopics and declarations deadlocked");
+    }
+
+    /// zenoh 1.7.0 through 1.10.1 answer the admin space under the routing tables' read lock and take it again, so a
+    /// racing declaration deadlocks every thread (it hung web_ctrl when listTopics asked the admin space). Fixed by
+    /// eclipse-zenoh/zenoh#2619 (bugfix/routing-deadlock), unreleased; run with --ignored to check a new zenoh.
+    #[test]
+    #[ignore]
+    fn admin_space_survives_concurrent_declarations() {
+        assert!(list_topics_races_declarations(true), "the admin space and declarations deadlocked");
     }
 }
