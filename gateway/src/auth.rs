@@ -38,6 +38,131 @@ pub struct Grant {
     /// who the connection is, in the host's words (e.g. an app's name): passed back with each refusal
     /// ([`crate::ServerBuilder::on_refused`])
     pub subject: Option<String>,
+    /// zenoh access-control rules for this connection, in place of the lists above when set ([`Acl`])
+    pub acl: Option<Acl>,
+}
+
+/// zenoh's access-control model ([zenoh docs](https://zenoh.io/docs/manual/access-control/)) for one connection, with
+/// the gateway in the router's place: **ingress** is what the browser sends (its puts, declarations, queries, replies),
+/// **egress** what the gateway hands it (samples, replies, queries for its queryables, liveliness tokens). A message is
+/// decided like zenoh does: denied when a `deny` rule for its message and flow includes its key, else allowed when
+/// `default_permission` is `allow` or an `allow` rule includes it, else denied. Refused requests fail with
+/// `not authorized to ...`; egress the rules deny is dropped silently, as zenoh drops it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Acl {
+    /// what a message no rule decides gets
+    pub default_permission: Permission,
+    /// the rules, in any order (a deny always wins)
+    #[serde(default)]
+    pub rules: Vec<AclRule>,
+}
+
+/// One rule, zenoh's shape: `flows` left out means both.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AclRule {
+    /// a name for the rule
+    #[serde(default)]
+    pub id: Option<String>,
+    /// the messages it decides
+    pub messages: Vec<AclMessage>,
+    /// the flows it decides (None: both)
+    #[serde(default)]
+    pub flows: Option<Vec<Flow>>,
+    /// the keys it decides: a message's key must be included by one of them
+    pub key_exprs: Vec<String>,
+    /// allow or deny
+    pub permission: Permission,
+}
+
+/// A rule's (or the default's) verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    /// let it through
+    Allow,
+    /// refuse (ingress) or drop (egress) it
+    Deny,
+}
+
+/// Which way a message goes, from the gateway's side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Flow {
+    /// from the browser
+    Ingress,
+    /// to the browser
+    Egress,
+}
+
+/// zenoh's ACL messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AclMessage {
+    /// a put (ingress: the browser's; egress: a sample it receives)
+    Put,
+    /// a delete (ingress: the browser's; egress: a delete sample it receives)
+    Delete,
+    /// declaring a subscriber
+    DeclareSubscriber,
+    /// a query (ingress: the browser's `get`; egress: a query for its queryable)
+    Query,
+    /// declaring a queryable
+    DeclareQueryable,
+    /// a reply (ingress: the browser answering; egress: a reply to its `get`)
+    Reply,
+    /// a liveliness token (ingress: declaring one; egress: one it watches or gets)
+    LivelinessToken,
+    /// watching liveliness
+    DeclareLivelinessSubscriber,
+    /// `livelinessGet`
+    LivelinessQuery,
+}
+
+impl Acl {
+    /// zenoh's decision for `message` on `flow` with `key`: a deny rule including it wins, then the default, then the
+    /// allow rules.
+    pub fn allows(&self, message: AclMessage, flow: Flow, key: &str) -> bool {
+        let Ok(key) = keyexpr::new(key) else { return false };
+        let matches = |permission: Permission| {
+            self.rules.iter().filter(|rule| rule.permission == permission && rule.messages.contains(&message) && rule.flows.as_ref().is_none_or(|flows| flows.contains(&flow))).any(|rule| rule.key_exprs.iter().any(|rule_key| keyexpr::new(rule_key).is_ok_and(|rule_key| rule_key.includes(key))))
+        };
+        if matches(Permission::Deny) {
+            return false;
+        }
+        self.default_permission == Permission::Allow || matches(Permission::Allow)
+    }
+}
+
+/// What a request asks to do; with an [`Acl`] it is the zenoh message the browser sends (ingress).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    Subscribe,
+    Publish,
+    Delete,
+    Query,
+    Queryable,
+    LivelinessToken,
+    LivelinessWatch,
+    LivelinessGet,
+    List,
+}
+
+impl Action {
+    fn words(self) -> &'static str {
+        match self {
+            Action::Subscribe => "subscribe",
+            Action::Publish => "publish",
+            Action::Delete => "delete",
+            Action::Query => "query",
+            Action::Queryable => "declare a queryable on",
+            Action::LivelinessToken => "declare a liveliness token on",
+            Action::LivelinessWatch => "watch liveliness of",
+            Action::LivelinessGet => "query liveliness of",
+            Action::List => "list",
+        }
+    }
 }
 
 impl Grant {
@@ -68,6 +193,42 @@ impl Grant {
         self.liveliness_tokens.as_deref().unwrap_or(&self.liveliness)
     }
 
+    /// Whether this grant allows `action` on `key`: its [`Acl`] when it has one, else the action's list.
+    pub(crate) fn allows(&self, action: Action, key: &str) -> Result<(), String> {
+        let Some(acl) = &self.acl else {
+            let rules: &[String] = match action {
+                Action::Subscribe => &self.subscribe,
+                Action::Publish => &self.publish,
+                Action::Delete => self.deletes(),
+                Action::Query => &self.query,
+                Action::Queryable => &self.queryable,
+                Action::LivelinessToken => self.tokens(),
+                Action::LivelinessWatch | Action::LivelinessGet => &self.liveliness,
+                Action::List => &self.list_topics,
+            };
+            return Grant::check(rules, action.words(), key);
+        };
+        let ingress = |message| acl.allows(message, Flow::Ingress, key);
+        let allowed = match action {
+            Action::Subscribe => ingress(AclMessage::DeclareSubscriber),
+            Action::Publish => ingress(AclMessage::Put),
+            Action::Delete => ingress(AclMessage::Delete),
+            Action::Query => ingress(AclMessage::Query),
+            Action::Queryable => ingress(AclMessage::DeclareQueryable),
+            Action::LivelinessToken => ingress(AclMessage::LivelinessToken),
+            Action::LivelinessWatch => ingress(AclMessage::DeclareLivelinessSubscriber),
+            Action::LivelinessGet => ingress(AclMessage::LivelinessQuery),
+            // what it could subscribe to or query
+            Action::List => ingress(AclMessage::DeclareSubscriber) || ingress(AclMessage::Query),
+        };
+        if allowed { Ok(()) } else { Err(format!("not authorized to {} {key:?}", action.words())) }
+    }
+
+    /// Whether `message` with `key` may reach the browser (egress); always without an [`Acl`].
+    pub fn passes(&self, message: AclMessage, key: &str) -> bool {
+        self.acl.as_ref().is_none_or(|acl| acl.allows(message, Flow::Egress, key))
+    }
+
     /// `Err("not authorized to <action> <key>")` unless a rule includes `key`.
     pub fn check(rules: &[String], action: &str, key: &str) -> Result<(), String> {
         let allowed = keyexpr::new(key).is_ok_and(|key| rules.iter().any(|rule| keyexpr::new(rule).is_ok_and(|rule| rule.includes(key))));
@@ -95,13 +256,27 @@ pub(crate) struct Access<'a> {
 }
 
 impl Access<'_> {
-    /// [`Grant::check`], telling the refusal hook when it refuses.
-    pub fn check(&self, rules: &[String], action: &str, key: &str) -> Result<(), String> {
-        Grant::check(rules, action, key).inspect_err(|reason| {
+    /// [`Grant::allows`], telling the refusal hook when it refuses.
+    pub fn check(&self, action: Action, key: &str) -> Result<(), String> {
+        self.grant.allows(action, key).inspect_err(|reason| {
             if let Some(hook) = self.on_refused {
                 (hook.0)(self.grant, reason);
             }
         })
+    }
+
+    /// The browser's reply to a query (reply, ingress): with an [`Acl`], allowed like zenoh would; otherwise its
+    /// queryable's grant covered it already.
+    pub fn reply(&self, key: &str) -> Result<(), String> {
+        let Some(acl) = &self.grant.acl else { return Ok(()) };
+        if acl.allows(AclMessage::Reply, Flow::Ingress, key) {
+            return Ok(());
+        }
+        let reason = format!("not authorized to reply on {key:?}");
+        if let Some(hook) = self.on_refused {
+            (hook.0)(self.grant, &reason);
+        }
+        Err(reason)
     }
 }
 
@@ -143,7 +318,7 @@ impl Leases {
             None => keys.filter(|keys| !keys.is_empty()).ok_or_else(|| format!("no lease group {group:?} on the server; pass keys to define it"))?,
         };
         for key in &keys {
-            Grant::check(&grant.publish, "lease", key)?;
+            grant.allows(Action::Publish, key).map_err(|_| format!("not authorized to lease {key:?}"))?;
         }
         let secs = match (max_secs, grant.max_lease_secs) {
             (Some(asked), Some(limit)) => Some(asked.min(limit)),

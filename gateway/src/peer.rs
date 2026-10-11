@@ -650,7 +650,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         state.channels.lock().unwrap().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
     let rejected = match label.kind.as_str() {
-        "sub" => match state.access().check(&state.grant.subscribe, "subscribe", &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
+        "sub" => match state.access().check(crate::auth::Action::Subscribe, &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
             let resolved = opts.resolve_encoding(&state.codecs)?;
             let track = bind_track(&state, &resolved, &label)?;
             Ok((opts, resolved, track))
@@ -660,12 +660,12 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
                 state.leases.changed();
                 state.send_accepted(label.id).await;
-                subscription::run(dc.clone(), label.clone(), session, shared, track).await;
+                subscription::run(dc.clone(), label.clone(), session, shared, track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
                 None
             }
             Err(error) => Some(error),
         },
-        "pub" => match state.access().check(&state.grant.publish, "publish", &label.key).and_then(|()| PubOpts::parse(&label.opts)) {
+        "pub" => match state.access().check(crate::auth::Action::Publish, &label.key).and_then(|()| PubOpts::parse(&label.opts)) {
             Ok(opts) => {
                 let shared = Arc::new(PubShared::default());
                 register(json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit}), ChannelStats::Pub(shared.clone()));
@@ -689,7 +689,18 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     if let Some(error) = rejected {
         warn!("peer {peer_id}: rejected channel {raw_label}: {error}");
         state.send_event(json!({"event": "rejected", "id": label.id, "reason": error})).await;
-        let _ = dc.close().await;
+        // the client closes a rejected channel itself; closing it from both ends at once lets the second reset land on
+        // the next channel that reuses its stream id (it then closes before opening)
+        let client_closed = async {
+            while let Some(event) = dc.poll().await {
+                if matches!(event, DataChannelEvent::OnClose) {
+                    break;
+                }
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), client_closed).await.is_err() {
+            let _ = dc.close().await;
+        }
     }
     if state.channels.lock().unwrap().remove(&entry_id).is_some_and(|entry| matches!(entry.stats, ChannelStats::Sub(_))) {
         state.leases.changed();
@@ -1134,7 +1145,7 @@ async fn handle_list_topics(session: &zenoh::Session, request: &ControlRequest, 
     let filter = if request.key.is_empty() { "**" } else { &request.key };
     match list_topics(session, filter, Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS))).await {
         Ok(mut topics) => {
-            topics.retain(|topic| Grant::check(&grant.list_topics, "list", topic["key"].as_str().unwrap_or_default()).is_ok());
+            topics.retain(|topic| grant.allows(crate::auth::Action::List, topic["key"].as_str().unwrap_or_default()).is_ok());
             ok(&request.id, json!({"topics": topics}))
         }
         Err(error) => fail(&request.id, error),

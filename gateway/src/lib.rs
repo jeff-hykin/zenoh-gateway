@@ -58,7 +58,7 @@ mod server;
 mod subscription;
 
 pub use encoding::{AudioPcm, Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
-pub use auth::{Grant, OnRefused};
+pub use auth::{Acl, AclMessage, AclRule, Flow, Grant, OnRefused, Permission};
 pub use fields::Fields;
 pub use ice::{ICE_HOOK_TIMEOUT, IceRequest, IceServer, IceServersFn, IceSide, turn_credentials};
 #[cfg(feature = "cloudflare")]

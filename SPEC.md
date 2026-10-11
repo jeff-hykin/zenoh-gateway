@@ -552,6 +552,14 @@ per-browser layer on top, with reasons.
   `livelinessTokens` (tokens it declares; `liveliness` then only watches and gets). `subject` (optional) names
   the connection for the host. A refused sub or pub channel is `rejected` with `not authorized to subscribe "<key>"`; a
   refused `get` fails the same way; `listTopics` leaves the keys out.
+- `Grant.acl` (0.5.6, optional) replaces the lists with zenoh's access-control model for that connection:
+  `{default_permission: "allow"|"deny", rules: [{id?, messages, flows?, key_exprs, permission}]}`, zenoh's field
+  names and messages (`put`, `delete`, `declare_subscriber`, `query`, `declare_queryable`, `reply`,
+  `liveliness_token`, `declare_liveliness_subscriber`, `liveliness_query`), with the gateway in the router's place:
+  ingress is what the browser sends, egress what it is handed. Decided like zenoh: a `deny` rule including the key
+  wins, then `default_permission`, then the `allow` rules. Ingress (a subscription's or queryable's declaration, a put,
+  delete, `get`, reply, token, liveliness watch or get) is refused with `not authorized to ...`; egress (samples, `get`
+  replies, queries reaching a queryable, liveliness tokens watched or got) the rules deny is dropped silently.
 - `ServerBuilder::on_refused(|grant: &Grant, reason: &str|)` (0.5.5) hears every request a grant refuses, with
   the same reason the client gets, e.g. for the host to tell the user which page wanted what.
 - `Server::revoke(token)` closes every live connection made with that token (deadmen fire with reason

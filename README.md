@@ -328,7 +328,8 @@ The page connects with `connect(url, { token })`. A `Grant` lists key expression
 optionally `delete` and `livelinessTokens` to keep deletes and tokens apart) plus lease rights (`leaseGroups`, `maxLeaseSecs`, `forceExpire`); a
 request is allowed when one of them includes its key, otherwise the channel is rejected with
 `not authorized to <action> "<key>"`, and `.on_refused(|grant, reason| ...)` hears it (`grant.subject` says whose
-connection it was). No hook = `Grant::all()` for everyone. Issuing tokens is up to
+connection it was). `Grant.acl` swaps the lists for zenoh's own ACL model (default_permission, allow/deny rules of
+messages, flows and key_exprs; SPEC "Auth"). No hook = `Grant::all()` for everyone. Issuing tokens is up to
 the host; zenoh-gateway-cli's `--auth-file` is a small file-based example. SPEC "Auth".
 
 ## Leases

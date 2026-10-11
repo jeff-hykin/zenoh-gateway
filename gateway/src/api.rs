@@ -5,7 +5,7 @@
 //! Requests are `{id, op, ...}` and answers `{id, ok, ...}` (see `peer::run_control`); queries,
 //! liveliness changes and matching changes arrive as events: `{event: "query" | "liveliness" | "matching", ...}`.
 
-use crate::auth::Access;
+use crate::auth::{Access, AclMessage, Action};
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -262,7 +262,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
     let error = |error: zenoh::Error| error.to_string();
     match request.op.as_str() {
         "put" => {
-            access.check(&grant.publish, "publish", &request.key)?;
+            access.check(Action::Publish, &request.key)?;
             let mut builder = session.put(&request.key, decode("bytes", &request.bytes)?.unwrap_or_default());
             if let Some(encoding) = &request.encoding {
                 builder = builder.encoding(Encoding::from(encoding.as_str()));
@@ -280,7 +280,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "delete" => {
-            access.check(grant.deletes(), "delete", &request.key)?;
+            access.check(Action::Delete, &request.key)?;
             let mut builder = session.delete(&request.key);
             if let Some(attachment) = decode("attachment", &request.attachment)? {
                 builder = builder.attachment(attachment);
@@ -295,7 +295,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "get" => {
-            access.check(&grant.query, "query", key_of(&request.key))?;
+            access.check(Action::Query, key_of(&request.key))?;
             let selector = match &request.parameters {
                 Some(parameters) if !parameters.is_empty() => {
                     format!("{}?{}", key_of(&request.key), parameters)
@@ -328,18 +328,29 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             let replies = builder.express(request.express.unwrap_or(false)).await.map_err(error)?;
             let mut results = Vec::new();
             while let Ok(reply) = replies.recv_async().await {
+                // a reply the rules keep from the browser (reply, egress) is dropped, as zenoh drops it
+                if let Ok(sample) = reply.result()
+                    && !grant.passes(AclMessage::Reply, sample.key_expr().as_str())
+                {
+                    continue;
+                }
                 results.push(reply_json(&reply));
             }
             Ok(json!({"replies": results}))
         }
         "declareQueryable" => {
-            access.check(&grant.queryable, "declare a queryable on", &request.key)?;
+            access.check(Action::Queryable, &request.key)?;
             let queryable_id = api.next();
             let (queries, next_query) = (api.queries.clone(), api.next_id.clone());
+            let rules = grant.clone();
             let queryable = session
                 .declare_queryable(&request.key)
                 .complete(request.complete.unwrap_or(false))
                 .callback(move |query: Query| {
+                    // a query the rules keep from the browser (query, egress) never reaches it
+                    if !rules.passes(AclMessage::Query, query.key_expr().as_str()) {
+                        return;
+                    }
                     let query_id = next_query.fetch_add(1, Ordering::Relaxed) + 1;
                     let mut event = json!({
                         "event": "query",
@@ -377,6 +388,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             match request.op.as_str() {
                 "reply" => {
                     let key = if request.key.is_empty() { query.key_expr().to_string() } else { request.key.clone() };
+                    access.reply(&key)?;
                     let mut builder = query.reply(key, decode("bytes", &request.bytes)?.unwrap_or_default());
                     if let Some(encoding) = &request.encoding {
                         builder = builder.encoding(Encoding::from(encoding.as_str()));
@@ -395,6 +407,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                 }
                 _ => {
                     let key = if request.key.is_empty() { query.key_expr().to_string() } else { request.key.clone() };
+                    access.reply(&key)?;
                     let mut builder = query.reply_del(key);
                     if let Some(attachment) = decode("attachment", &request.attachment)? {
                         builder = builder.attachment(attachment);
@@ -410,7 +423,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "declareToken" => {
-            access.check(grant.tokens(), "declare a liveliness token on", &request.key)?;
+            access.check(Action::LivelinessToken, &request.key)?;
             let token = session.liveliness().declare_token(&request.key).await.map_err(error)?;
             let token_id = api.next();
             api.tokens.lock().unwrap().insert(token_id, token);
@@ -422,13 +435,18 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "livelinessSubscribe" => {
-            access.check(&grant.liveliness, "watch liveliness of", &request.key)?;
+            access.check(Action::LivelinessWatch, &request.key)?;
             let sub_id = api.next();
+            let rules = grant.clone();
             let subscriber = session
                 .liveliness()
                 .declare_subscriber(&request.key)
                 .history(request.history.unwrap_or(false))
                 .callback(move |sample: Sample| {
+                    // tokens the rules keep from the browser (liveliness_token, egress) aren't reported
+                    if !rules.passes(AclMessage::LivelinessToken, sample.key_expr().as_str()) {
+                        return;
+                    }
                     let _ = events
                         .send(json!({"event": "liveliness", "subId": sub_id, "key": sample.key_expr().as_str(), "kind": kind(sample.kind()), "t": now_ms()}));
                 })
@@ -443,12 +461,14 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({}))
         }
         "livelinessGet" => {
-            access.check(&grant.liveliness, "query liveliness of", &request.key)?;
+            access.check(Action::LivelinessGet, &request.key)?;
             let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_GET_TIMEOUT_MS));
             let replies = session.liveliness().get(&request.key).timeout(timeout).await.map_err(error)?;
             let mut tokens = Vec::new();
             while let Ok(reply) = replies.recv_async().await {
-                if let Ok(sample) = reply.result() {
+                if let Ok(sample) = reply.result()
+                    && grant.passes(AclMessage::LivelinessToken, sample.key_expr().as_str())
+                {
                     tokens.push(sample.key_expr().as_str().to_owned());
                 }
             }
@@ -463,9 +483,9 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                 }
             };
             if queryables {
-                access.check(&grant.query, "query", &request.key)?;
+                access.check(Action::Query, &request.key)?;
             } else {
-                access.check(&grant.publish, "publish", &request.key)?;
+                access.check(Action::Publish, &request.key)?;
             }
             let key = request.key.clone();
             if request.op == "matchingStatus" {
