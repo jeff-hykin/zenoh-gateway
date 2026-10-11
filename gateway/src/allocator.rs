@@ -120,6 +120,10 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
 ///   usual jitter (`DELAY_THRESHOLD_MS` + twice the median delay over `JITTER_WINDOW`, so an idle jittery Wi-Fi or VPN
 ///   path doesn't read as congested) for `DELAY_PERSISTENCE` intervals: -15% at once, and probing pauses 1 s;
 /// - backpressure: senders blocked on SCTP more than 20% of the interval: 0.9 x measured rate, at most -15% per interval.
+///   Waiting on the page (its acks) is reported (`page_blocked_fraction`) and doesn't lower the estimate: a page is slow
+///   per message (a big map holds it for a while whatever the rate), so it would drive the estimate down without bound;
+///   the delivery-lag limit in `subscription::Pacer` keeps its backlog short instead. It does stop probing, since
+///   senders held back by the page aren't testing the network.
 ///
 /// Otherwise, while streams want more, it probes up 50% per interval until the first congestion event, then 10% below
 /// 90% of the level that last triggered congestion and 2% above it (overshoot builds queue slowly enough to be caught),
@@ -130,6 +134,7 @@ pub struct Estimator {
     pub data_bytes_per_sec: f64,
     pub sent_bytes_per_sec: f64,
     pub network_blocked_fraction: f64,
+    pub page_blocked_fraction: f64,
     /// estimate at the last congestion event
     pub congested_at_bytes_per_sec: f64,
     pub delay_events: u64,
@@ -171,6 +176,7 @@ impl Default for Estimator {
             data_bytes_per_sec: INITIAL_ESTIMATE,
             sent_bytes_per_sec: 0.0,
             network_blocked_fraction: 0.0,
+            page_blocked_fraction: 0.0,
             congested_at_bytes_per_sec: f64::INFINITY,
             delay_events: 0,
             delay_threshold_ms: DELAY_THRESHOLD_MS,
@@ -190,6 +196,8 @@ pub struct Interval {
     pub sent_bytes: f64,
     /// time senders waited on SCTP, summed over `active_senders` channels
     pub blocked_secs: f64,
+    /// time senders waited for the page to ack what it has, summed likewise
+    pub page_blocked_secs: f64,
     pub active_senders: usize,
     pub data_demand: f64,
     /// the interval's smallest RTT minus the recent minimum, if any sample came in
@@ -198,12 +206,14 @@ pub struct Interval {
 
 impl Estimator {
     pub fn update(&mut self, interval: Interval) {
-        let Interval { now, secs: interval_secs, sent_bytes, blocked_secs, active_senders, data_demand, queue_delay_ms } = interval;
+        let Interval { now, secs: interval_secs, sent_bytes, blocked_secs, page_blocked_secs, active_senders, data_demand, queue_delay_ms } = interval;
         if interval_secs <= 0.0 {
             return;
         }
         self.sent_bytes_per_sec = sent_bytes / interval_secs;
-        self.network_blocked_fraction = (blocked_secs / (interval_secs * active_senders.max(1) as f64)).min(1.0);
+        let sender_secs = interval_secs * active_senders.max(1) as f64;
+        self.network_blocked_fraction = (blocked_secs / sender_secs).min(1.0);
+        self.page_blocked_fraction = (page_blocked_secs / sender_secs).min(1.0);
         let holding = self.hold_probing_until.is_some_and(|until| now < until);
         let queued = self.queue_building(now, queue_delay_ms);
         if queued && !holding {
@@ -216,7 +226,8 @@ impl Estimator {
             self.congested_at_bytes_per_sec = self.data_bytes_per_sec;
             self.last_congestion = Some(now);
             self.data_bytes_per_sec = (0.9 * self.sent_bytes_per_sec).max(self.data_bytes_per_sec * BLOCKED_DECREASE);
-        } else if !holding && data_demand > self.data_bytes_per_sec * 0.95 {
+        } else if !holding && data_demand > self.data_bytes_per_sec * 0.95 && self.page_blocked_fraction <= CONGESTED_FRACTION {
+            // (held back by the page, the senders never test the network: probing then would only make up a number)
             let stale = self.last_congestion.is_some_and(|at| now.duration_since(at) > STALE_CONGESTION);
             let gain = if self.congested_at_bytes_per_sec.is_infinite() {
                 SLOW_START_GAIN
@@ -323,7 +334,7 @@ mod tests {
     }
 
     fn sample(now: std::time::Instant, secs: f64, sent_bytes: f64, blocked_secs: f64, active_senders: usize, data_demand: f64, queue_delay_ms: Option<f64>) -> Interval {
-        Interval { now, secs, sent_bytes, blocked_secs, active_senders, data_demand, queue_delay_ms }
+        Interval { now, secs, sent_bytes, blocked_secs, page_blocked_secs: 0.0, active_senders, data_demand, queue_delay_ms }
     }
 
     #[test]
@@ -347,6 +358,16 @@ mod tests {
         let before = estimator.data_bytes_per_sec;
         estimator.update(sample(later, 0.25, 50_000.0, 0.0, 1, 5e6, None));
         assert!((estimator.data_bytes_per_sec - before * 1.1).abs() < 1.0, "{estimator:?}");
+    }
+
+    #[test]
+    fn waiting_on_the_page_is_reported_not_taken_for_the_network() {
+        let now = std::time::Instant::now();
+        let mut estimator = Estimator::default();
+        let page_bound = Interval { page_blocked_secs: 0.15, ..sample(now, 0.25, 100_000.0, 0.0, 2, 5e6, None) };
+        estimator.update(page_bound);
+        assert!((estimator.page_blocked_fraction - 0.3).abs() < 1e-9 && estimator.network_blocked_fraction == 0.0);
+        assert_eq!(estimator.data_bytes_per_sec, INITIAL_ESTIMATE, "neither lowered nor probed up: {estimator:?}");
     }
 
     #[test]

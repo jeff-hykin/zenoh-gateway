@@ -26,8 +26,6 @@ const BACKSTOP: Duration = Duration::from_millis(20);
 /// Max bytes sent but not yet consumed by the page's JS (`ack`), or twice the send window if larger:
 /// SCTP's backlog only covers the network, and a busy page queues what SCTP delivered without limit.
 pub const UNCONSUMED_WINDOW: usize = 256 * 1024;
-/// A sent frame never acked for this long is assumed lost (lossy channels), not unconsumed.
-const ASSUME_LOST_AFTER: Duration = Duration::from_secs(1);
 /// A lossy channel blocked only by the ack window probes after this (doubling while unacked), in case its tail was lost.
 const FIRST_PROBE_AFTER: Duration = Duration::from_millis(50);
 const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -119,10 +117,8 @@ struct SubState {
     keys: HashMap<String, KeyQueue>,
     next_seq: u32,
     stats: SubStats,
-    /// (frameId, frame bytes, sent at) in send order, until the page acks a frameId at or past it
-    unconsumed: VecDeque<(u32, usize, Instant)>,
-    /// acks that released something; lets a blocked sender notice progress
-    acks_with_progress: u64,
+    /// (frameId, frame bytes, place in the frontend's send order) in send order, until the page acks a frameId at or past it
+    unconsumed: VecDeque<(u32, usize, u64)>,
     allocation: Allocation,
     payload_bytes: f64,
     /// bytes on the wire per message (untranscoded)
@@ -134,6 +130,7 @@ struct SubState {
     /// counters as of the allocator's previous look
     accounted_bytes_sent: u64,
     accounted_blocked_ms: f64,
+    accounted_page_blocked_ms: f64,
 }
 
 impl SubStats {
@@ -152,20 +149,10 @@ pub struct Usage {
     pub demand: Demand,
     pub bytes_sent: u64,
     pub network_blocked_ms: f64,
+    /// time it waited for the page to catch up (ack window, delivery lag)
+    pub page_blocked_ms: f64,
     /// sent on an RTP track (video, audio), not the data channel
     pub on_track: bool,
-}
-
-impl SubState {
-    fn forget_lost(&mut self, now: Instant) {
-        while let Some(&(_, len, sent_at)) = self.unconsumed.front() {
-            if now.duration_since(sent_at) < ASSUME_LOST_AFTER {
-                break;
-            }
-            self.unconsumed.pop_front();
-            self.stats.unconsumed_bytes -= len;
-        }
-    }
 }
 
 /// `a <= b` for wrapping u32 sequence numbers.
@@ -363,7 +350,7 @@ impl SubShared {
     }
 
     /// Reserved at its measured rate, never paced or shrunk: reliable, strict-priority and audio streams.
-    fn reserved(&self) -> bool {
+    pub fn reserved(&self) -> bool {
         self.delivery.reliable || self.is_strict() || self.channel == Channel::Audio
     }
 
@@ -384,6 +371,8 @@ impl SubShared {
         let network_blocked_ms = state.stats.blocked_on_network_ms - state.accounted_blocked_ms;
         state.accounted_bytes_sent = state.stats.bytes_sent;
         state.accounted_blocked_ms = state.stats.blocked_on_network_ms;
+        let page_blocked_ms = state.stats.blocked_on_page_ms - state.accounted_page_blocked_ms;
+        state.accounted_page_blocked_ms = state.stats.blocked_on_page_ms;
         let payload_bytes = state.payload_bytes;
         let price: crate::allocator::Price = match &self.codec {
             None => {
@@ -418,13 +407,16 @@ impl SubShared {
             price,
             fixed_bytes_per_sec: self.reserved().then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
         };
-        Usage { demand, bytes_sent, network_blocked_ms, on_track: self.on_track() }
+        Usage { demand, bytes_sent, network_blocked_ms, page_blocked_ms, on_track: self.on_track() }
     }
 
-    pub fn apply(&self, allocation: Allocation) {
-        // bulk streams trickle at their grant; reserved ones aren't paced
+    /// `fair_share`: the bulk budget split evenly among the frontend's paced streams. A message goes out at least that
+    /// fast while its grant sets how often one starts (`key_interval`): paced at a small grant, a 400 KB map granted
+    /// 50 KB/s took 8 s to send and arrived 8 s old; at its share it arrives in well under one, as often as before.
+    pub fn apply(&self, allocation: Allocation, fair_share: f64) {
+        // reserved streams aren't paced
         let paced = !self.reserved() && allocation.demand_bytes_per_sec > 0.0;
-        let rate = paced.then_some(allocation.budget_bytes_per_sec * PACING_SLACK);
+        let rate = paced.then_some(allocation.budget_bytes_per_sec.max(fair_share) * PACING_SLACK);
         self.bucket.lock().unwrap().set_rate(rate, 2 * self.gate.chunk_bytes());
         self.state.lock().unwrap().allocation = allocation;
         self.data_ready.notify_one();
@@ -564,18 +556,19 @@ impl SubShared {
     /// Page consumed every frame up to `frame_id` (4-byte little endian message on the sub channel).
     fn ack(&self, frame_id: u32) {
         let mut state = self.state.lock().unwrap();
-        let before = state.unconsumed.len();
-        while let Some(&(sent_frame_id, len, _)) = state.unconsumed.front() {
+        let mut newest_acked = None;
+        while let Some(&(sent_frame_id, len, order)) = state.unconsumed.front() {
             if !seq_at_or_before(sent_frame_id, frame_id) {
                 break;
             }
             state.unconsumed.pop_front();
             state.stats.unconsumed_bytes -= len;
-        }
-        if state.unconsumed.len() != before {
-            state.acks_with_progress += 1;
+            newest_acked = Some(order);
         }
         drop(state);
+        if let Some(order) = newest_acked {
+            self.gate.frame_acked(order);
+        }
         self.drained.notify_one();
     }
 
@@ -584,9 +577,19 @@ impl SubShared {
         self.delivery.max_age_ms.is_some_and(|max_age_ms| now.duration_since(item.arrived).as_secs_f64() * 1000.0 > max_age_ms)
     }
 
+    /// Frames sent and not yet acked. A lost frame is covered by the ack of any later one (acks are cumulative), a lost
+    /// tail by the probe in `Pacer::wait_writable`: nothing is forgotten by age, or a page more than that far behind
+    /// would stop holding the gateway back and its backlog would grow without bound.
     fn unconsumed_bytes(&self) -> usize {
+        let passed = self.gate.passed();
         let mut state = self.state.lock().unwrap();
-        state.forget_lost(Instant::now());
+        // the page acked a frame (of any channel) sent after these: they were lost, not waiting for the page
+        while let Some(&(_, len, order)) = state.unconsumed.front()
+            && order < passed
+        {
+            state.unconsumed.pop_front();
+            state.stats.unconsumed_bytes -= len;
+        }
         state.stats.unconsumed_bytes
     }
 
@@ -663,6 +666,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     }
     shared.close();
     let _ = sender.await;
+    shared.gate.frames_dropped(shared.state.lock().unwrap().unconsumed.drain(..).map(|(_, _, order)| order));
     shared.gate.forget(shared.stream_id);
     drop(subscriber);
     debug!("unsubscribed {:?}", label.key);
@@ -671,7 +675,8 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
 /// Paces one channel: tracks SCTP backlog, the page's ack window and tail-loss probes.
 struct Pacer {
     probe_interval: Duration,
-    acks_seen: u64,
+    /// the page's progress (`SendGate::passed`) when the probe timer last restarted
+    passed_seen: u64,
     /// the low-water mark last given to the channel
     resume_bytes: usize,
 }
@@ -693,12 +698,16 @@ impl Pacer {
             state.stats.window_bytes = window;
             state.stats.unconsumed_bytes
         };
-        if outstanding < window && unconsumed < unconsumed_window {
+        // the page (or the path to it) is this far behind: anything sent now would wait behind it, and so would the
+        // heartbeat replies and control answers that share its event loop and the path
+        let max_lag = shared.gate.max_delivery_lag();
+        let lagging = |shared: &SubShared| shared.gate.delivery_lag(Instant::now()) > max_lag;
+        if outstanding < window && unconsumed < unconsumed_window && !lagging(shared) {
             return;
         }
         shared.state.lock().unwrap().stats.backed_up = true;
-        let mut probe_at = Instant::now() + self.probe_interval;
-        while (outstanding > resume_bytes || shared.unconsumed_bytes() >= unconsumed_window)
+        let mut probe_timer_from = Instant::now();
+        while (outstanding > resume_bytes || shared.unconsumed_bytes() >= unconsumed_window || lagging(shared))
             && !shared.closed.load(Ordering::Relaxed)
         {
             let waiting_on_network = outstanding > resume_bytes;
@@ -708,23 +717,27 @@ impl Pacer {
                 _ = tokio::time::sleep(BACKSTOP) => {}
             }
             let waited_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
-            let acks_now = {
+            {
                 let mut state = shared.state.lock().unwrap();
                 if waiting_on_network {
                     state.stats.blocked_on_network_ms += waited_ms;
                 } else {
                     state.stats.blocked_on_page_ms += waited_ms;
                 }
-                state.acks_with_progress
-            };
-            outstanding = dc.outstanding_bytes().await.unwrap_or(0);
-            if acks_now != self.acks_seen {
-                self.acks_seen = acks_now;
-                self.probe_interval = FIRST_PROBE_AFTER;
-                probe_at = Instant::now() + self.probe_interval;
             }
+            outstanding = dc.outstanding_bytes().await.unwrap_or(0);
+            // while the page gets through anything of this frontend it is busy, not missing a lost tail: no probe
+            let passed = shared.gate.passed();
+            if passed != self.passed_seen {
+                self.passed_seen = passed;
+                self.probe_interval = FIRST_PROBE_AFTER;
+                probe_timer_from = Instant::now();
+            }
+            // a page that is behind may go quiet for a whole message's work: only a silence longer than the lag it may
+            // have reads as a lost tail
+            let probe_after = if lagging(shared) { self.probe_interval.max(max_lag) } else { self.probe_interval };
             let window_only = outstanding <= resume_bytes;
-            if window_only && !shared.delivery.reliable && Instant::now() >= probe_at {
+            if window_only && !shared.delivery.reliable && Instant::now() >= probe_timer_from + probe_after {
                 shared.state.lock().unwrap().stats.probes += 1;
                 // if this probe isn't acked either, the page is busy rather than the tail lost
                 self.probe_interval = (self.probe_interval * 2).min(MAX_PROBE_INTERVAL);
@@ -864,7 +877,7 @@ pub struct MessageSender {
 
 impl MessageSender {
     pub fn new() -> Self {
-        MessageSender { pacer: Pacer { probe_interval: FIRST_PROBE_AFTER, acks_seen: 0, resume_bytes: BACKED_UP_BYTES / 2 }, next_frame_id: 0, warned_send_error: false }
+        MessageSender { pacer: Pacer { probe_interval: FIRST_PROBE_AFTER, passed_seen: 0, resume_bytes: BACKED_UP_BYTES / 2 }, next_frame_id: 0, warned_send_error: false }
     }
 
     pub async fn send(&mut self, dc: &Arc<dyn DataChannel>, shared: &SubShared, key: &str, item: &Pending, payload: &[u8], flags: u8) -> Sent {
@@ -907,7 +920,8 @@ impl MessageSender {
             message_bytes += frame_len;
             {
                 let mut state = shared.state.lock().unwrap();
-                state.unconsumed.push_back((frame_id, frame_len, Instant::now()));
+                let order = shared.gate.frame_sent(Instant::now());
+                state.unconsumed.push_back((frame_id, frame_len, order));
                 state.stats.unconsumed_bytes += frame_len;
                 state.stats.frames_sent += 1;
                 state.stats.bytes_sent += frame_len as u64;
@@ -1010,11 +1024,10 @@ mod tests {
     #[test]
     fn ack_releases_window() {
         let shared = shared(r#"{}"#);
-        let now = Instant::now();
         {
             let mut state = shared.state.lock().unwrap();
             for seq in [5u32, 6, 9] {
-                state.unconsumed.push_back((seq, 100, now));
+                state.unconsumed.push_back((seq, 100, shared.gate.frame_sent(Instant::now())));
                 state.stats.unconsumed_bytes += 100;
             }
         }

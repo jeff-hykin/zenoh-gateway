@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use webrtc::data_channel::DataChannel;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -23,6 +23,22 @@ const WINDOW_RTTS: f64 = 2.0;
 pub const MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 /// The RTT the window covers is at most the path's minimum plus this, so the window's own queue can't grow it.
 const WINDOW_MAX_EXTRA_RTT_MS: f64 = 500.0;
+/// Channels wait while the page is further behind than the path's minimum RTT plus this ([`SendGate::delivery_lag`]): the
+/// queue (network + page) a frontend may build. Bytes alone can't bound it: a window sized for the network is seconds of
+/// backlog for a phone that decodes slower than the link delivers, and its heartbeat replies wait behind all of it.
+pub const MAX_DELIVERY_LAG_MS: f64 = 250.0;
+
+/// Every frame of a frontend's `sub` channels the page hasn't gotten past, in send order. The page is one event loop, so
+/// its backlog is all its channels' together, and an ack of any frame means it is past everything sent before it (a frame
+/// sent earlier and still unacked was lost, or its ack is on the way).
+#[derive(Default)]
+struct PageQueue {
+    next: u64,
+    /// send order -> sent at
+    unpassed: std::collections::BTreeMap<u64, Instant>,
+    /// the page has gotten past every frame sent before this one
+    passed: u64,
+}
 
 pub struct SendGate {
     /// strict streams currently sending a message
@@ -34,6 +50,9 @@ pub struct SendGate {
     inflight_limit: AtomicUsize,
     chunk_bytes: AtomicUsize,
     window_bytes: AtomicUsize,
+    /// `MAX_DELIVERY_LAG_MS` + the path's minimum RTT, in microseconds
+    max_delivery_lag_us: AtomicU64,
+    page: Mutex<PageQueue>,
     changed: Notify,
 }
 
@@ -46,6 +65,8 @@ impl Default for SendGate {
             inflight_limit: AtomicUsize::new(usize::MAX),
             chunk_bytes: AtomicUsize::new(MAX_CHUNK_BYTES),
             window_bytes: AtomicUsize::new(crate::subscription::BACKED_UP_BYTES),
+            max_delivery_lag_us: AtomicU64::new((MAX_DELIVERY_LAG_MS * 1000.0) as u64),
+            page: Mutex::default(),
             changed: Notify::new(),
         }
     }
@@ -82,6 +103,48 @@ impl SendGate {
         };
         let window = (budget_bytes_per_sec * WINDOW_RTTS * rtt_ms / 1000.0) as usize;
         self.window_bytes.store(window.clamp(crate::subscription::BACKED_UP_BYTES, MAX_WINDOW_BYTES), Ordering::Relaxed);
+        let max_lag_ms = min_rtt_ms.unwrap_or(0.0) + MAX_DELIVERY_LAG_MS;
+        self.max_delivery_lag_us.store((max_lag_ms * 1000.0) as u64, Ordering::Relaxed);
+    }
+
+    /// How far behind the page may be before channels stop sending.
+    pub fn max_delivery_lag(&self) -> Duration {
+        Duration::from_micros(self.max_delivery_lag_us.load(Ordering::Relaxed))
+    }
+
+    /// A frame went to the page; returns its place in the frontend's send order.
+    pub fn frame_sent(&self, now: Instant) -> u64 {
+        let mut page = self.page.lock().unwrap();
+        let order = page.next;
+        page.next += 1;
+        page.unpassed.insert(order, now);
+        order
+    }
+
+    /// The page acked the frame sent `order`-th: it is past everything sent before it too.
+    pub fn frame_acked(&self, order: u64) {
+        let mut page = self.page.lock().unwrap();
+        page.unpassed = page.unpassed.split_off(&(order + 1));
+        page.passed = page.passed.max(order + 1);
+    }
+
+    /// The page has gotten past every frame sent before this place in the send order: any of them still unacked was
+    /// lost. It only grows, so a change means the page made progress.
+    pub fn passed(&self) -> u64 {
+        self.page.lock().unwrap().passed
+    }
+
+    /// Frames of a closed channel the page will never ack.
+    pub fn frames_dropped(&self, orders: impl IntoIterator<Item = u64>) {
+        let mut page = self.page.lock().unwrap();
+        for order in orders {
+            page.unpassed.remove(&order);
+        }
+    }
+
+    /// How long the oldest frame the page hasn't gotten past has been out: the network's queue plus the page's.
+    pub fn delivery_lag(&self, now: Instant) -> Duration {
+        self.page.lock().unwrap().unpassed.values().next().map_or(Duration::ZERO, |sent_at| now.duration_since(*sent_at))
     }
 
     /// Bytes a channel may have in SCTP (sent, not yet acknowledged) before it waits.
@@ -239,6 +302,28 @@ mod tests {
         assert_eq!(gate.window_bytes(), crate::subscription::BACKED_UP_BYTES, "never below 64 KB");
         gate.set_window(1e9, Some(10.0), Some(400.0));
         assert_eq!(gate.window_bytes(), MAX_WINDOW_BYTES);
+    }
+
+    #[test]
+    fn delivery_lag_is_the_oldest_frame_the_page_has_not_gotten_past() {
+        let gate = SendGate::default();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert_eq!(gate.delivery_lag(at(0)), Duration::ZERO);
+        let lost = gate.frame_sent(at(0));
+        let first = gate.frame_sent(at(10));
+        let second = gate.frame_sent(at(20));
+        assert_eq!(gate.delivery_lag(at(100)), Duration::from_millis(100));
+        // an ack of a later frame (any channel) means the page is past the earlier ones: lost or acked soon
+        gate.frame_acked(first);
+        assert_eq!(gate.delivery_lag(at(100)), Duration::from_millis(80), "only {second} is still ahead of the page");
+        gate.frame_acked(lost);
+        assert_eq!(gate.delivery_lag(at(100)), Duration::from_millis(80), "a late ack of an older frame changes nothing");
+        gate.frames_dropped([second]);
+        assert_eq!(gate.delivery_lag(at(100)), Duration::ZERO, "a closed channel's frames don't hold the rest");
+        assert_eq!(gate.max_delivery_lag(), Duration::from_millis(MAX_DELIVERY_LAG_MS as u64));
+        gate.set_window(1e6, Some(40.0), Some(80.0));
+        assert_eq!(gate.max_delivery_lag(), Duration::from_millis(40 + MAX_DELIVERY_LAG_MS as u64), "the path's minimum RTT on top");
     }
 
     #[test]

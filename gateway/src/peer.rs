@@ -95,6 +95,11 @@ struct BandwidthStats {
     demand_bytes_per_sec: f64,
     sent_bytes_per_sec: f64,
     network_blocked_fraction: f64,
+    /// share of the interval senders waited for the page (its JS behind on what arrived) rather than the network
+    page_blocked_fraction: f64,
+    /// how far behind the page is (the oldest frame it hasn't gotten past), and how far it may get before channels wait
+    delivery_lag_ms: f64,
+    max_delivery_lag_ms: f64,
     constrained: bool,
 }
 
@@ -243,12 +248,13 @@ impl PeerState {
         let data_usages = || usages.iter().filter(|usage| !usage.on_track);
         let sent: u64 = data_usages().map(|usage| usage.bytes_sent).sum();
         let blocked_ms: f64 = data_usages().map(|usage| usage.network_blocked_ms).sum();
-        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.network_blocked_ms > 0.0).count();
+        let page_blocked_ms: f64 = data_usages().map(|usage| usage.page_blocked_ms).sum();
+        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.network_blocked_ms > 0.0 || usage.page_blocked_ms > 0.0).count();
         let data_demand: f64 = data_usages().map(|usage| usage.demand.wants()).sum();
         let total_demand: f64 = usages.iter().map(|usage| usage.demand.wants()).sum();
         let estimator = {
             let mut estimator = self.estimator.lock().unwrap();
-            estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, active_senders: active, data_demand, queue_delay_ms });
+            estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, page_blocked_secs: page_blocked_ms / 1000.0, active_senders: active, data_demand, queue_delay_ms });
             estimator.clone()
         };
         let has_video = usages.iter().any(|usage| usage.on_track);
@@ -263,8 +269,10 @@ impl PeerState {
         let strict_present = subscriptions.iter().any(|shared| shared.is_strict());
         self.gate.configure((budget - reserved).max(0.0), min_rtt_ms, allocator::DELAY_THRESHOLD_MS, strict_present);
         self.gate.set_window(budget, min_rtt_ms, high_rtt_ms);
+        let paced_streams = subscriptions.iter().filter(|shared| !shared.reserved() && !shared.on_track()).count().max(1);
+        let fair_share = (budget - video_estimate.min(budget) - reserved).max(0.0) / paced_streams as f64;
         for (shared, allocation) in subscriptions.iter().zip(allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video)) {
-            shared.apply(allocation);
+            shared.apply(allocation, fair_share);
         }
         *self.bandwidth.lock().unwrap() = BandwidthStats {
             data_estimate_bytes_per_sec: estimator.data_bytes_per_sec,
@@ -282,6 +290,9 @@ impl PeerState {
             demand_bytes_per_sec: total_demand,
             sent_bytes_per_sec: estimator.sent_bytes_per_sec,
             network_blocked_fraction: estimator.network_blocked_fraction,
+            page_blocked_fraction: estimator.page_blocked_fraction,
+            delivery_lag_ms: self.gate.delivery_lag(now).as_secs_f64() * 1000.0,
+            max_delivery_lag_ms: self.gate.max_delivery_lag().as_secs_f64() * 1000.0,
             constrained: total_demand > budget,
         };
     }
