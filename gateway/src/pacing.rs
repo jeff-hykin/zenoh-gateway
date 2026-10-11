@@ -23,21 +23,39 @@ const WINDOW_RTTS: f64 = 2.0;
 pub const MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 /// The RTT the window covers is at most the path's minimum plus this, so the window's own queue can't grow it.
 const WINDOW_MAX_EXTRA_RTT_MS: f64 = 500.0;
-/// Channels wait while the page is further behind than the path's minimum RTT plus this ([`SendGate::delivery_lag`]): the
-/// queue (network + page) a frontend may build. Bytes alone can't bound it: a window sized for the network is seconds of
-/// backlog for a phone that decodes slower than the link delivers, and its heartbeat replies wait behind all of it.
-pub const MAX_DELIVERY_LAG_MS: f64 = 250.0;
+/// Channels wait while the page is further behind than this ([`SendGate::page_lag`]): the backlog a frontend's page may
+/// hold. Bytes alone can't bound it: a window sized for the network is seconds of backlog for a phone that decodes
+/// slower than the link delivers, and its heartbeat replies wait behind all of it in its one event loop.
+pub const MAX_PAGE_LAG_MS: f64 = 250.0;
+/// Channels also wait while a frame has been in SCTP undelivered for longer than the path's recent highest RTT (at most
+/// its minimum + `NETWORK_LAG_MAX_EXTRA_RTT_MS`) plus this ([`SendGate::network_lag`]). SCTP sends unordered chunks
+/// before ordered ones, so a `reliable` stream's frames wait behind every lossy chunk queued after them: without this
+/// bound a tf feed sat 13 s in SCTP on a jittery path while bulk kept its unordered queue full.
+const NETWORK_LAG_MARGIN_MS: f64 = 250.0;
+const NETWORK_LAG_MAX_EXTRA_RTT_MS: f64 = 500.0;
 
 /// Every frame of a frontend's `sub` channels the page hasn't gotten past, in send order. The page is one event loop, so
-/// its backlog is all its channels' together, and an ack of any frame means it is past everything sent before it (a frame
-/// sent earlier and still unacked was lost, or its ack is on the way).
+/// its backlog is all its channels' together. An ack of any frame means the page is past every *lossy* frame sent before
+/// it (SCTP sends unordered chunks first and in order, so one sent earlier and still unacked was lost); a reliable frame
+/// is never lost but can wait in SCTP behind lossy ones sent after it, so only its own channel's ack passes it.
 #[derive(Default)]
 struct PageQueue {
     next: u64,
-    /// send order -> sent at
-    unpassed: std::collections::BTreeMap<u64, Instant>,
+    unpassed: std::collections::BTreeMap<u64, PageFrame>,
     /// the page has gotten past every frame sent before this one
     passed: u64,
+    /// frame bytes handed to SCTP so far, by stream
+    sent_bytes: HashMap<usize, usize>,
+}
+
+struct PageFrame {
+    sent_at: Instant,
+    lossy: bool,
+    stream: usize,
+    /// the stream's bytes handed to SCTP up to and including this frame
+    end_offset: usize,
+    /// when SCTP was first seen to have delivered it to the browser (its peer acknowledged it)
+    delivered_at: Option<Instant>,
 }
 
 pub struct SendGate {
@@ -50,9 +68,11 @@ pub struct SendGate {
     inflight_limit: AtomicUsize,
     chunk_bytes: AtomicUsize,
     window_bytes: AtomicUsize,
-    /// `MAX_DELIVERY_LAG_MS` + the path's minimum RTT, in microseconds
-    max_delivery_lag_us: AtomicU64,
     page: Mutex<PageQueue>,
+    /// [`SendGate::max_network_lag`] in microseconds
+    max_network_lag_us: AtomicU64,
+    /// one multi-chunk bulk message at a time (FIFO), see [`SendGate::message_turn`]
+    message_turn: tokio::sync::Mutex<()>,
     changed: Notify,
 }
 
@@ -65,8 +85,9 @@ impl Default for SendGate {
             inflight_limit: AtomicUsize::new(usize::MAX),
             chunk_bytes: AtomicUsize::new(MAX_CHUNK_BYTES),
             window_bytes: AtomicUsize::new(crate::subscription::BACKED_UP_BYTES),
-            max_delivery_lag_us: AtomicU64::new((MAX_DELIVERY_LAG_MS * 1000.0) as u64),
             page: Mutex::default(),
+            max_network_lag_us: AtomicU64::new(((NETWORK_LAG_MAX_EXTRA_RTT_MS + NETWORK_LAG_MARGIN_MS) * 1000.0) as u64),
+            message_turn: tokio::sync::Mutex::new(()),
             changed: Notify::new(),
         }
     }
@@ -103,33 +124,85 @@ impl SendGate {
         };
         let window = (budget_bytes_per_sec * WINDOW_RTTS * rtt_ms / 1000.0) as usize;
         self.window_bytes.store(window.clamp(crate::subscription::BACKED_UP_BYTES, MAX_WINDOW_BYTES), Ordering::Relaxed);
-        let max_lag_ms = min_rtt_ms.unwrap_or(0.0) + MAX_DELIVERY_LAG_MS;
-        self.max_delivery_lag_us.store((max_lag_ms * 1000.0) as u64, Ordering::Relaxed);
+        let network_rtt_ms = match (min_rtt_ms, high_rtt_ms) {
+            (Some(min), Some(high)) => high.clamp(min, min + NETWORK_LAG_MAX_EXTRA_RTT_MS),
+            _ => NETWORK_LAG_MAX_EXTRA_RTT_MS,
+        };
+        self.max_network_lag_us.store(((network_rtt_ms + NETWORK_LAG_MARGIN_MS) * 1000.0) as u64, Ordering::Relaxed);
+    }
+
+    /// How long a frame may wait in SCTP undelivered before channels stop sending.
+    pub fn max_network_lag(&self) -> Duration {
+        Duration::from_micros(self.max_network_lag_us.load(Ordering::Relaxed))
+    }
+
+    /// How long the oldest frame SCTP hasn't delivered to the browser has been in it.
+    pub fn network_lag(&self, now: Instant) -> Duration {
+        let page = self.page.lock().unwrap();
+        page.unpassed.values().filter(|frame| frame.delivered_at.is_none()).map(|frame| frame.sent_at).min().map_or(Duration::ZERO, |at| now.duration_since(at))
     }
 
     /// How far behind the page may be before channels stop sending.
-    pub fn max_delivery_lag(&self) -> Duration {
-        Duration::from_micros(self.max_delivery_lag_us.load(Ordering::Relaxed))
+    pub fn max_page_lag(&self) -> Duration {
+        Duration::from_secs_f64(MAX_PAGE_LAG_MS / 1000.0)
+    }
+
+    /// The right to send one message bigger than a bulk chunk, held until it is sent whole; waiters get it in arrival
+    /// order. Big messages of several streams sent at once interleave their chunks, so each takes as long as all of them
+    /// together (three 200 KB clouds and a map on a 500 KB/s link: every one arrived ~1.7 s old); one at a time, each
+    /// takes its own size / rate, and a stream that waited sends its newest sample.
+    pub async fn message_turn(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.message_turn.lock().await
     }
 
     /// A frame went to the page; returns its place in the frontend's send order.
-    pub fn frame_sent(&self, now: Instant) -> u64 {
+    pub fn frame_sent(&self, stream: usize, bytes: usize, lossy: bool) -> u64 {
         let mut page = self.page.lock().unwrap();
         let order = page.next;
         page.next += 1;
-        page.unpassed.insert(order, now);
+        let sent = page.sent_bytes.entry(stream).or_default();
+        *sent += bytes;
+        let end_offset = *sent;
+        page.unpassed.insert(order, PageFrame { sent_at: Instant::now(), lossy, stream, end_offset, delivered_at: None });
         order
     }
 
-    /// The page acked the frame sent `order`-th: it is past everything sent before it too.
-    pub fn frame_acked(&self, order: u64) {
+    /// SCTP holds `outstanding` bytes of `stream` its peer hasn't acknowledged: the frames before them reached the browser.
+    pub fn observe_delivered(&self, stream: usize, outstanding: usize, now: Instant) {
         let mut page = self.page.lock().unwrap();
-        page.unpassed = page.unpassed.split_off(&(order + 1));
-        page.passed = page.passed.max(order + 1);
+        let delivered = page.sent_bytes.get(&stream).copied().unwrap_or(0).saturating_sub(outstanding);
+        for frame in page.unpassed.values_mut() {
+            if frame.stream == stream && frame.end_offset <= delivered && frame.delivered_at.is_none() {
+                frame.delivered_at = Some(now);
+            }
+        }
     }
 
-    /// The page has gotten past every frame sent before this place in the send order: any of them still unacked was
-    /// lost. It only grows, so a change means the page made progress.
+    /// Reads every channel's unacknowledged bytes (`observe_delivered`).
+    pub async fn refresh_delivered(&self) {
+        let channels: Vec<(usize, Arc<dyn DataChannel>)> = self.channels.lock().unwrap().iter().map(|(id, channel)| (*id, channel.clone())).collect();
+        for (id, channel) in channels {
+            let outstanding = channel.outstanding_bytes().await.unwrap_or(0);
+            self.observe_delivered(id, outstanding, Instant::now());
+        }
+    }
+
+    /// The page acked these frames of one channel (in send order): it is past every lossy frame sent before them too.
+    pub fn frames_acked(&self, orders: impl IntoIterator<Item = u64>) {
+        let mut page = self.page.lock().unwrap();
+        let mut newest = None;
+        for order in orders {
+            page.unpassed.remove(&order);
+            newest = Some(order);
+        }
+        if let Some(newest) = newest {
+            page.unpassed.retain(|order, frame| *order > newest || !frame.lossy);
+            page.passed = page.passed.max(newest + 1);
+        }
+    }
+
+    /// The page has gotten past every lossy frame sent before this place in the send order: any of them still unacked
+    /// was lost. It only grows, so a change means the page made progress.
     pub fn passed(&self) -> u64 {
         self.page.lock().unwrap().passed
     }
@@ -142,9 +215,11 @@ impl SendGate {
         }
     }
 
-    /// How long the oldest frame the page hasn't gotten past has been out: the network's queue plus the page's.
-    pub fn delivery_lag(&self, now: Instant) -> Duration {
-        self.page.lock().unwrap().unpassed.values().next().map_or(Duration::ZERO, |sent_at| now.duration_since(*sent_at))
+    /// How long the page has had the oldest frame it hasn't gotten past: from when SCTP delivered it to the browser, so the
+    /// network's own delay (a Wi-Fi path's RTT swinging 60-480 ms) doesn't count, only the page's backlog.
+    pub fn page_lag(&self, now: Instant) -> Duration {
+        let page = self.page.lock().unwrap();
+        page.unpassed.values().filter_map(|frame| frame.delivered_at).min().map_or(Duration::ZERO, |at| now.duration_since(at))
     }
 
     /// Bytes a channel may have in SCTP (sent, not yet acknowledged) before it waits.
@@ -220,6 +295,7 @@ impl SendGate {
 
     pub fn forget(&self, stream: usize) {
         self.channels.lock().unwrap().remove(&stream);
+        self.page.lock().unwrap().sent_bytes.remove(&stream);
         self.report_outstanding(stream, 0);
     }
 }
@@ -305,25 +381,47 @@ mod tests {
     }
 
     #[test]
-    fn delivery_lag_is_the_oldest_frame_the_page_has_not_gotten_past() {
+    fn page_lag_counts_from_delivery_to_the_browser_and_acks_pass_lossy_frames() {
         let gate = SendGate::default();
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
-        assert_eq!(gate.delivery_lag(at(0)), Duration::ZERO);
-        let lost = gate.frame_sent(at(0));
-        let first = gate.frame_sent(at(10));
-        let second = gate.frame_sent(at(20));
-        assert_eq!(gate.delivery_lag(at(100)), Duration::from_millis(100));
-        // an ack of a later frame (any channel) means the page is past the earlier ones: lost or acked soon
-        gate.frame_acked(first);
-        assert_eq!(gate.delivery_lag(at(100)), Duration::from_millis(80), "only {second} is still ahead of the page");
-        gate.frame_acked(lost);
-        assert_eq!(gate.delivery_lag(at(100)), Duration::from_millis(80), "a late ack of an older frame changes nothing");
+        let (tf, cloud) = (1, 2);
+        assert_eq!(gate.page_lag(at(0)), Duration::ZERO);
+        let reliable = gate.frame_sent(tf, 100, false);
+        let lost = gate.frame_sent(cloud, 1000, true);
+        let first = gate.frame_sent(cloud, 1000, true);
+        let second = gate.frame_sent(cloud, 1000, true);
+        assert_eq!(gate.page_lag(at(400)), Duration::ZERO, "nothing has reached the browser yet: the network's delay");
+        gate.observe_delivered(tf, 0, at(100));
+        gate.observe_delivered(cloud, 1000, at(150));
+        assert_eq!(gate.page_lag(at(400)), Duration::from_millis(300), "delivered at 100 ms, not yet acked");
+        // an ack of a later frame (any channel) means the page is past the earlier lossy ones: lost or acked soon
+        gate.frames_acked([first]);
+        assert_eq!(gate.page_lag(at(400)), Duration::from_millis(300), "a reliable frame still counts");
+        gate.frames_acked([reliable]);
+        assert_eq!(gate.page_lag(at(400)), Duration::ZERO, "{second} hasn't reached the browser");
+        gate.observe_delivered(cloud, 0, at(200));
+        assert_eq!(gate.page_lag(at(400)), Duration::from_millis(200));
+        gate.frames_acked([lost]);
+        assert_eq!(gate.page_lag(at(400)), Duration::from_millis(200), "a late ack of an older frame changes nothing");
         gate.frames_dropped([second]);
-        assert_eq!(gate.delivery_lag(at(100)), Duration::ZERO, "a closed channel's frames don't hold the rest");
-        assert_eq!(gate.max_delivery_lag(), Duration::from_millis(MAX_DELIVERY_LAG_MS as u64));
-        gate.set_window(1e6, Some(40.0), Some(80.0));
-        assert_eq!(gate.max_delivery_lag(), Duration::from_millis(40 + MAX_DELIVERY_LAG_MS as u64), "the path's minimum RTT on top");
+        assert_eq!(gate.page_lag(at(400)), Duration::ZERO, "a closed channel's frames don't hold the rest");
+    }
+
+    #[test]
+    fn network_lag_is_the_oldest_frame_still_in_sctp() {
+        let gate = SendGate::default();
+        gate.set_window(1e6, Some(40.0), Some(300.0));
+        assert_eq!(gate.max_network_lag(), Duration::from_millis(550), "recent highest RTT + 250 ms");
+        gate.set_window(1e6, Some(40.0), Some(5000.0));
+        assert_eq!(gate.max_network_lag(), Duration::from_millis(790), "at most min + 500 ms + 250 ms");
+        let t0 = Instant::now();
+        gate.frame_sent(1, 100, false);
+        gate.frame_sent(2, 100, true);
+        assert!(gate.network_lag(t0 + Duration::from_secs(1)) >= Duration::from_millis(990));
+        gate.observe_delivered(1, 0, t0);
+        gate.observe_delivered(2, 0, t0);
+        assert_eq!(gate.network_lag(t0 + Duration::from_secs(1)), Duration::ZERO, "both reached the browser");
     }
 
     #[test]

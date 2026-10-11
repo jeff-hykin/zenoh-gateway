@@ -97,9 +97,12 @@ struct BandwidthStats {
     network_blocked_fraction: f64,
     /// share of the interval senders waited for the page (its JS behind on what arrived) rather than the network
     page_blocked_fraction: f64,
-    /// how far behind the page is (the oldest frame it hasn't gotten past), and how far it may get before channels wait
-    delivery_lag_ms: f64,
-    max_delivery_lag_ms: f64,
+    /// how long the page has had the oldest frame it hasn't gotten past, and how long before channels wait
+    page_lag_ms: f64,
+    max_page_lag_ms: f64,
+    /// how long the oldest frame SCTP hasn't delivered has been in it, and how long before channels wait
+    network_lag_ms: f64,
+    max_network_lag_ms: f64,
     constrained: bool,
 }
 
@@ -269,10 +272,9 @@ impl PeerState {
         let strict_present = subscriptions.iter().any(|shared| shared.is_strict());
         self.gate.configure((budget - reserved).max(0.0), min_rtt_ms, allocator::DELAY_THRESHOLD_MS, strict_present);
         self.gate.set_window(budget, min_rtt_ms, high_rtt_ms);
-        let paced_streams = subscriptions.iter().filter(|shared| !shared.reserved() && !shared.on_track()).count().max(1);
-        let fair_share = (budget - video_estimate.min(budget) - reserved).max(0.0) / paced_streams as f64;
+        let bulk_budget = (budget - video_estimate.min(budget) - reserved).max(0.0);
         for (shared, allocation) in subscriptions.iter().zip(allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video)) {
-            shared.apply(allocation, fair_share);
+            shared.apply(allocation, bulk_budget);
         }
         *self.bandwidth.lock().unwrap() = BandwidthStats {
             data_estimate_bytes_per_sec: estimator.data_bytes_per_sec,
@@ -291,8 +293,10 @@ impl PeerState {
             sent_bytes_per_sec: estimator.sent_bytes_per_sec,
             network_blocked_fraction: estimator.network_blocked_fraction,
             page_blocked_fraction: estimator.page_blocked_fraction,
-            delivery_lag_ms: self.gate.delivery_lag(now).as_secs_f64() * 1000.0,
-            max_delivery_lag_ms: self.gate.max_delivery_lag().as_secs_f64() * 1000.0,
+            page_lag_ms: self.gate.page_lag(now).as_secs_f64() * 1000.0,
+            max_page_lag_ms: self.gate.max_page_lag().as_secs_f64() * 1000.0,
+            network_lag_ms: self.gate.network_lag(now).as_secs_f64() * 1000.0,
+            max_network_lag_ms: self.gate.max_network_lag().as_secs_f64() * 1000.0,
             constrained: total_demand > budget,
         };
     }
