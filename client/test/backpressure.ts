@@ -4,13 +4,16 @@
 // of point clouds and maps plus a small pose stream, and a page that spends `bytes / PAGE_BYTES_PER_SEC` of main-thread
 // time on each bulk message (a phone decoding clouds). Prints the link latency the Controller's drive hold reads (heartbeat RTT, or the silence since the last one)
 // and message ages per 5 s window, and fails if either keeps growing.
+// LINK=wifi adds Wi-Fi + Tailscale-like jitter: every 200 ms the path's delay jumps to a new level within 0-210 ms each way
+// (RTT 60-480 ms; packets stay in order). CLOUD_BYTES / MAP_BYTES set the load (see examples/load_server.rs).
 // Usage: deno run --allow-all --unstable-net client/test/backpressure.ts [seconds]
 
 import { launch } from "jsr:@astral/astral@0.5.6"
 
 const seconds = Number(Deno.args[0] ?? 30)
 const pageBytesPerSec = Number(Deno.env.get("PAGE_BYTES_PER_SEC") ?? 800_000)
-const link = { bytesPerSec: 1_000_000, queueLimitBytes: 2_000_000, oneWayDelayMs: 30 }
+const wifi = Deno.env.get("LINK") === "wifi"
+const link = { bytesPerSec: 1_000_000, queueLimitBytes: 2_000_000, oneWayDelayMs: 30, jitterMs: wifi ? 210 : 0, jitterPeriodMs: 200 }
 
 const root = new URL("../..", import.meta.url).pathname
 const scratch = await Deno.makeTempDir({ prefix: "zenoh-gateway-backpressure-" })
@@ -43,6 +46,17 @@ function shapedDirection(bytesPerSec: number, queueLimitBytes: number, delayMs: 
     let queuedBytes = 0
     let freeAt = 0
     let draining = false
+    // the delay level of the current jitter period; a packet never overtakes the one before it
+    let jitter = 0
+    let jitterDrawnAt = -Infinity
+    let lastDeliverAt = 0
+    const delayNow = (now: number) => {
+        if (now - jitterDrawnAt >= link.jitterPeriodMs) {
+            jitterDrawnAt = now
+            jitter = Math.random() * link.jitterMs
+        }
+        return delayMs + jitter
+    }
     const drain = () => {
         const now = performance.now()
         while (queue.length > 0) {
@@ -55,7 +69,8 @@ function shapedDirection(bytesPerSec: number, queueLimitBytes: number, delayMs: 
             queue.shift()
             queuedBytes -= data.length
             freeAt = leaves
-            setTimeout(() => deliver(data), Math.max(0, leaves + delayMs - performance.now()))
+            lastDeliverAt = Math.max(lastDeliverAt, leaves + delayNow(leaves))
+            setTimeout(() => deliver(data), Math.max(0, lastDeliverAt - performance.now()))
         }
         draining = false
     }
@@ -136,8 +151,8 @@ try {
         const client = await connect(url, { heartbeatHz: 5, heartbeatMisses: 50 })
         const started = performance.now()
         const windowOf = () => Math.floor((performance.now() - started) / 5000)
-        const windows: { rtt: number[]; bulkAge: number[]; poseAge: number[]; bulkBytes: number; dropped: number }[] = []
-        const windowNow = () => (windows[windowOf()] ??= { rtt: [], bulkAge: [], poseAge: [], bulkBytes: 0, dropped: 0 })
+        const windows: { rtt: number[]; bulkAge: number[]; poseAge: number[]; tfAge: number[]; bulkBytes: number; dropped: number }[] = []
+        const windowNow = () => (windows[windowOf()] ??= { rtt: [], bulkAge: [], poseAge: [], tfAge: [], bulkBytes: 0, dropped: 0 })
         const age = (timestamp: number) => client.now() - timestamp
         for (const key of ["robot/cloud0", "robot/cloud1", "robot/cloud2", "robot/map"]) {
             client.subscribe(key, { delivery: "latest" }, (message: { bytes: Uint8Array; timestamp: number }) => {
@@ -152,6 +167,14 @@ try {
             })
         }
         client.subscribe("robot/pose", { delivery: "latest" }, (message: { timestamp: number }) => windowNow().poseAge.push(age(message.timestamp)))
+        // the Controller's tf feed is reliable
+        let tfSeq = -1
+        let tfOutOfOrder = 0
+        client.subscribe("robot/tf", { delivery: "reliable" }, (message: { timestamp: number; seq: number }) => {
+            tfOutOfOrder += message.seq <= tfSeq ? 1 : 0
+            tfSeq = message.seq
+            windowNow().tfAge.push(age(message.timestamp))
+        })
         // the Controller's link latency: the heartbeat's round trip, or how long since the last one came back
         let lastRtt: number | null = null
         let lastRttAt = performance.now()
@@ -167,37 +190,54 @@ try {
         clearInterval(sampler)
         const congestion = client.congestion
         const bandwidth = client.gatewayStats?.bandwidth ?? null
+        const channels = Object.fromEntries(Object.entries(client.stats as Record<string, { gateway: { stats: unknown; allocation: unknown } | null }>).map(([key, stats]) => [key, { stats: stats.gateway?.stats, allocation: stats.gateway?.allocation }]))
         client.close()
         const percentile = (values: number[], q: number) => {
             const sorted = [...values].sort((a, b) => a - b)
             // no sample in a window: the page was too busy to run the sampler's timer at all
             return sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]) : null
         }
+        // the whole run after the first window (startup)
+        const steady = windows.slice(1, Math.floor(seconds / 5))
+        const all = (pick: (window: typeof windows[number]) => number[]) => steady.flatMap(pick)
         return {
             congestion,
             bandwidth,
+            channels,
+            tfOutOfOrder,
+            steady: {
+                rttP50: percentile(all((window) => window.rtt), 0.5),
+                rttP95: percentile(all((window) => window.rtt), 0.95),
+                bulkAgeP50: percentile(all((window) => window.bulkAge), 0.5),
+                bulkAgeP95: percentile(all((window) => window.bulkAge), 0.95),
+                tfAgeP95: percentile(all((window) => window.tfAge), 0.95),
+                bulkKBps: Math.round(steady.reduce((sum, window) => sum + window.bulkBytes, 0) / (steady.length * 5000)),
+            },
             windows: windows.slice(0, Math.floor(seconds / 5)).map((window) => ({
                 rttP50: percentile(window.rtt, 0.5),
                 rttP95: percentile(window.rtt, 0.95),
                 bulkAgeP50: percentile(window.bulkAge, 0.5),
                 bulkAgeP95: percentile(window.bulkAge, 0.95),
                 poseAgeP95: percentile(window.poseAge, 0.95),
+                tfAgeP95: percentile(window.tfAge, 0.95),
                 bulkKBps: Math.round(window.bulkBytes / 5000),
             })),
         }
     }, { args: [proxyUrl, seconds, pageBytesPerSec] })
-    console.log(`link ${link.bytesPerSec / 1e6} MB/s, page ${pageBytesPerSec / 1e3} KB/s of bulk:`)
+    console.log(`link ${link.bytesPerSec / 1e6} MB/s${wifi ? " with wifi jitter" : ""}, page ${pageBytesPerSec / 1e3} KB/s of bulk:`)
     for (const [index, window] of windows.windows.entries()) {
-        console.log(`  ${index * 5}-${index * 5 + 5} s  link latency p50 ${window.rttP50} p95 ${window.rttP95} ms | bulk age p50 ${window.bulkAgeP50} p95 ${window.bulkAgeP95} ms | pose age p95 ${window.poseAgeP95} ms | bulk ${window.bulkKBps} KB/s`)
+        console.log(`  ${index * 5}-${index * 5 + 5} s  link latency p50 ${window.rttP50} p95 ${window.rttP95} ms | bulk age p50 ${window.bulkAgeP50} p95 ${window.bulkAgeP95} ms | pose age p95 ${window.poseAgeP95} ms | tf age p95 ${window.tfAgeP95} ms | bulk ${window.bulkKBps} KB/s`)
     }
+    console.log(`  steady (5 s on): ${JSON.stringify(windows.steady)}, tf out of order ${windows.tfOutOfOrder}`)
     if (windows.congestion) {
         console.log(`  congestion: ${JSON.stringify(windows.congestion)}`)
     }
     if (Deno.env.get("VERBOSE")) {
         console.log(`  bandwidth: ${JSON.stringify(windows.bandwidth)}`)
+        console.log(`  channels: ${JSON.stringify(windows.channels)}`)
     }
     const last = windows.windows.at(-1)!
-    for (const [ok, what] of [[(last.rttP95 ?? Infinity) < 1000, "link latency p95 < 1 s (the Controller holds driving above it)"], [(last.bulkAgeP50 ?? Infinity) < 2500, "bulk age p50 < 2.5 s"], [(last.poseAgeP95 ?? Infinity) < 1000, "pose age p95 < 1 s"]] as const) {
+    for (const [ok, what] of [[(last.rttP95 ?? Infinity) < 1000, "link latency p95 < 1 s (the Controller holds driving above it)"], [(last.bulkAgeP50 ?? Infinity) < 1000, "bulk age p50 < 1 s"], [(last.poseAgeP95 ?? Infinity) < 1000, "pose age p95 < 1 s"], [(last.tfAgeP95 ?? Infinity) < 2500, "tf (reliable) age p95 < 2.5 s"], [windows.tfOutOfOrder === 0, "tf in order"]] as const) {
         console.log(`${ok ? "PASS" : "FAIL"} ${what}`)
         failed ||= !ok
     }

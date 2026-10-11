@@ -288,7 +288,7 @@ async fn a_slow_link_keeps_control_and_data_fresh() {
     let last = windows.last().unwrap();
     assert!(last.heartbeat_p95 < 500.0, "heartbeats wait behind bulk data: {last:?}");
     assert!(last.small_age_p95 < 500.0, "a small stream waits behind bulk data: {last:?}");
-    assert!(last.bulk_age_p50 < 1500.0, "bulk data arrives stale: {last:?}");
+    assert!(last.bulk_age_p50 < 1000.0, "bulk data arrives stale: {last:?}");
     assert!(last.bulk_bytes_per_sec > 300_000.0, "the link carries too little: {last:?}");
 }
 
@@ -298,5 +298,5 @@ async fn a_slow_page_keeps_control_and_data_fresh() {
     report("page consumes 400 KB/s, 1 MB/s link", &windows);
     let last = windows.last().unwrap();
     assert!(last.heartbeat_p95 < 500.0, "heartbeats wait behind bulk data: {last:?}");
-    assert!(last.bulk_age_p50 < 1500.0, "bulk data arrives stale: {last:?}");
+    assert!(last.bulk_age_p50 < 1000.0, "bulk data arrives stale: {last:?}");
 }
