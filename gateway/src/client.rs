@@ -929,7 +929,8 @@ fn channel_init(delivery: Delivery, max_age_ms: Option<f64>) -> RTCDataChannelIn
     match (delivery, max_age_ms) {
         (Delivery::Reliable, _) => RTCDataChannelInit { ordered: true, ..Default::default() },
         (Delivery::Latest, Some(age)) => RTCDataChannelInit { ordered: false, max_packet_life_time: Some(age.round().clamp(1.0, 65535.0) as u16), ..Default::default() },
-        (Delivery::Latest, None) => RTCDataChannelInit { ordered: false, max_retransmits: Some(0), ..Default::default() },
+        // as the JS client: a lost chunk is retransmitted for 1 s rather than losing its whole message
+        (Delivery::Latest, None) => RTCDataChannelInit { ordered: false, max_packet_life_time: Some(1000), ..Default::default() },
     }
 }
 

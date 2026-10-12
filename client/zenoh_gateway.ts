@@ -249,9 +249,14 @@ const gatherTimeoutMs = 3000
 const openTimeoutMs = 10000
 const pingTimeoutMs = 3000
 const reconnectDelayMs = 1000
-// consumption acks let the gateway stop sending while this page's JS is behind
+// consumption acks let the gateway stop sending while this page's JS is behind; at most one per channel per ackDelayMs
+// unless 16 KB were consumed (at 5 ms, a 100 Hz tf alone acked every frame: ~8 KB/s of a 100 kbit/s uplink)
 const ackEveryBytes = 16 * 1024
-const ackDelayMs = 5
+const ackDelayMs = 50
+// gateway stats (~1 KB per channel) take at most this share of the frontend's budget: polled every second, they were all
+// of a 100 kbit/s link and held the control channel's answers behind them
+const statsBudgetShare = 0.05
+const maxStatsIntervalMs = 10_000
 // clock sync keeps the lowest-RTT sample among the most recent ones
 const clockWindow = 16
 const initialClockPings = 5
@@ -259,15 +264,19 @@ const putHeaderBytes = 8
 // incomplete chunked messages kept per subscription before the oldest is dropped
 const maxPartialMessages = 8
 
+// a lossy channel without maxAge retransmits a lost chunk for this long: with none, losing any one of a 200 KB cloud's
+// ~140 packets lost the whole message (3% got through at 2% loss), its bandwidth spent all the same
+const defaultPacketLifetimeMs = 1000
+// a reliable publisher's puts waiting in the page (the channel backed up) are dropped past this age, unless its
+// latencyLimit says otherwise: on a slow uplink commands otherwise queued without bound and reached the robot seconds late
+const reliablePublisherMaxBacklogMs = 2000
+
 /** Delivery -> data channel reliability (SPEC "Delivery -> transport mapping"). */
 function channelInit(delivery: Delivery | undefined, maxAge: number | undefined): RTCDataChannelInit {
     if (delivery === "reliable") {
         return { ordered: true }
     }
-    if (maxAge) {
-        return { ordered: false, maxPacketLifeTime: Math.min(65535, Math.round(maxAge)) }
-    }
-    return { ordered: false, maxRetransmits: 0 }
+    return { ordered: false, maxPacketLifeTime: Math.min(65535, Math.round(maxAge || defaultPacketLifetimeMs)) }
 }
 
 function toBytes(value: Bytesish): Uint8Array {
@@ -840,8 +849,8 @@ export class Publisher extends Endpoint {
     /** why the gateway is dropping this publisher's puts right now (another client's lease), else null */
     blocked: string | null = null
     #last: Uint8Array | null = null
-    /** stamped frames waiting for the channel (reliable: all, latest: only the newest) */
-    #pending: Uint8Array<ArrayBuffer>[] = []
+    /** stamped frames waiting for the channel, with when they were put (reliable: all, latest: only the newest) */
+    #pending: { frame: Uint8Array<ArrayBuffer>; at: number }[] = []
     #repeatTimer: ReturnType<typeof setInterval> | null = null
     #tripListeners = new Set<(reason: string) => void>()
 
@@ -926,17 +935,28 @@ export class Publisher extends Endpoint {
                 this.dropped += this.#pending.length
                 this.#pending = []
             }
-            this.#pending.push(frame)
+            this.#pending.push({ frame, at: performance.now() })
+            this.#dropStale()
             return
         }
         channel.send(frame)
         this.sent++
     }
 
+    /** A reliable publisher's oldest waiting puts, past its backlog limit (order is kept). */
+    #dropStale(): void {
+        const oldest = performance.now() - (this.options.latencyLimit ?? reliablePublisherMaxBacklogMs)
+        while (this.#pending.length > 1 && this.#pending[0].at < oldest) {
+            this.#pending.shift()
+            this.dropped++
+        }
+    }
+
     #flush(): void {
         const channel = this.channel
+        this.#dropStale()
         while (this.#pending.length > 0 && channel?.readyState === "open" && this.rejectionReason === null && channel.bufferedAmount <= backedUpBytes) {
-            channel.send(this.#pending.shift() as Uint8Array<ArrayBuffer>)
+            channel.send(this.#pending.shift()!.frame)
             this.sent++
         }
     }
@@ -1078,6 +1098,8 @@ export class ZenohGateway {
     #closed = false
     #generation = 0
     #statsTimer: ReturnType<typeof setInterval> | null = null
+    /** when the next gateway stats may be asked for (`statsBudgetShare`) */
+    #statsDueAt = 0
     /** each subscription's drops so far, and when they were counted (for `congestion`) */
     #dropTotals = new Map<number, number>()
     #dropsCountedAt = 0
@@ -1582,7 +1604,16 @@ export class ZenohGateway {
             }
             return
         }
+        if (performance.now() < this.#statsDueAt) {
+            return
+        }
+        // one at a time, and a timed-out one backs off: its reply still comes, and asking every second while a slow link
+        // held them filled the link with stale stats
+        this.#statsDueAt = Infinity
         const response = await this._request({ op: "stats" }, pingTimeoutMs).catch(() => null)
+        const budget = Number((response?.bandwidth as { budgetBytesPerSec?: number } | undefined)?.budgetBytesPerSec ?? 0)
+        const share = response && budget > 0 ? (JSON.stringify(response).length / (statsBudgetShare * budget)) * 1000 : 0
+        this.#statsDueAt = performance.now() + (response ? Math.min(maxStatsIntervalMs, share) : maxStatsIntervalMs)
         if (response) {
             this.gatewayStats = { clock: response.clock, heartbeat: response.heartbeat, bandwidth: response.bandwidth ?? null } as GatewayStats
             this.#updateCongestion((response.bandwidth ?? null) as Record<string, unknown> | null, (response.channels as GatewayChannelStats[] | undefined) ?? [])
