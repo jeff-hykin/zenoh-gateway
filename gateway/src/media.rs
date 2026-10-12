@@ -33,9 +33,9 @@ use webrtc::rtp_transceiver::RtpSender;
 /// Every format a track can have, with the payload type the gateway offers it at.
 const FORMATS: [(&str, u8); 5] = [("video/H264", 102), ("video/VP8", 96), ("video/VP9", 98), ("video/AV1", 45), (OPUS, 111)];
 const OPUS: &str = "audio/opus";
-/// Google Congestion Control bounds, bits/s. It starts where the data-channel estimator starts
-/// (`allocator::INITIAL_ESTIMATE`, 1 MB/s), since video is allocated no more than this estimate. The ceiling is only a
-/// sanity bound (at 50 Mbit/s it capped 8 HD cameras on an idle link): streams' `maxBitrate` bounds what video asks for.
+/// Google Congestion Control bounds, bits/s. It starts where the link estimator starts (`allocator::INITIAL_ESTIMATE`,
+/// 512 kbit/s), since video is allocated no more than that estimate. The ceiling is only a sanity bound (at 50 Mbit/s it
+/// capped 8 HD cameras on an idle link): the link estimate and 1.5 x what video sent bound what video gets.
 const GCC_INITIAL_BPS: f64 = crate::allocator::INITIAL_ESTIMATE * 8.0;
 const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
@@ -77,14 +77,39 @@ pub fn track_mime(channel: Channel) -> Option<&'static str> {
 }
 
 /// Forwards to GCC and publishes its target bitrate where the allocator can read it.
+/// A connection's video rates, bits/s as f64 bits: GCC's target (published by its estimator) and the most the allocator
+/// lets video take (the pacer's ceiling).
+#[derive(Default)]
+pub struct VideoRate {
+    gcc_bps: AtomicU64,
+    cap_bps: AtomicU64,
+}
+
+impl VideoRate {
+    pub fn gcc_bytes_per_sec(&self) -> f64 {
+        f64::from_bits(self.gcc_bps.load(Ordering::Relaxed)) / 8.0
+    }
+
+    pub fn set_cap_bytes_per_sec(&self, bytes_per_sec: f64) {
+        self.cap_bps.store((bytes_per_sec * 8.0).to_bits(), Ordering::Relaxed);
+    }
+
+    fn cap_bps(&self) -> f64 {
+        match f64::from_bits(self.cap_bps.load(Ordering::Relaxed)) {
+            cap if cap > 0.0 => cap,
+            _ => f64::INFINITY,
+        }
+    }
+}
+
 struct ReportingEstimator {
     inner: Gcc,
-    target_bps: Arc<AtomicU64>,
+    rate: Arc<VideoRate>,
 }
 
 impl ReportingEstimator {
     fn publish(&self) {
-        self.target_bps.store(self.inner.target_bitrate().to_bits(), Ordering::Relaxed);
+        self.rate.gcc_bps.store(self.inner.target_bitrate().to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -96,8 +121,10 @@ impl BandwidthEstimator for ReportingEstimator {
 
     /// What the pacer drains at: a multiple of the estimate, as libwebrtc paces; the allocator keeps the encoders near the
     /// estimate itself. Paced at exactly the estimate, keyframes queued and held video seconds behind its data channel.
+    /// Never above a multiple of the allocator's video cap: paced off GCC alone, a keyframe burst into a 100 kbit/s link
+    /// at 1.3 Mbit/s and held the strict streams behind it for seconds.
     fn target_bitrate(&self) -> f64 {
-        self.inner.target_bitrate() * PACING_FACTOR
+        self.inner.target_bitrate().min(self.rate.cap_bps()) * PACING_FACTOR
     }
 
     fn handle_timeout(&mut self, now: Instant) {
@@ -160,23 +187,19 @@ impl Interceptor for KeyframeRequests {
     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
 }
 
-/// Track formats, RTCP reports, NACK and TWCC-fed GCC; returns the GCC target (f64 bits/s as bits in an AtomicU64).
-pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<AtomicU64>)> {
+/// Track formats, RTCP reports, NACK and TWCC-fed GCC; returns the connection's video rates.
+pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
     let mut media_engine = MediaEngine::default();
     for (mime, payload_type) in FORMATS {
         let kind = if mime == OPUS { RtpCodecKind::Audio } else { RtpCodecKind::Video };
         media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: rtp_codec(mime), payload_type }, kind)?;
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let target_bps = Arc::new(AtomicU64::new(GCC_INITIAL_BPS.to_bits()));
-    let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), target_bps: target_bps.clone() };
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(0f64.to_bits()) });
+    let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone() };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default());
-    Ok((media_engine, registry, target_bps))
-}
-
-pub fn gcc_target_bytes_per_sec(target_bps: &AtomicU64) -> f64 {
-    f64::from_bits(target_bps.load(Ordering::Relaxed)) / 8.0
+    Ok((media_engine, registry, rate))
 }
 
 pub struct MediaTrack {

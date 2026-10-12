@@ -29,12 +29,21 @@ pub const UNCONSUMED_WINDOW: usize = 256 * 1024;
 /// A lossy channel blocked only by the ack window probes after this (doubling while unacked), in case its tail was lost.
 const FIRST_PROBE_AFTER: Duration = Duration::from_millis(50);
 const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(1);
-/// An allocation never paces a key slower than this (a starved key still trickles).
-const MIN_ALLOCATED_HZ: f64 = 0.05;
+/// A stream granted nothing sends nothing until it is granted some (squeezed out: at a 0.05 Hz floor a 400 KB map alone
+/// took 20 KB/s of a 12 KB/s link, and a camera's 24 KB frame held the strict streams 2 s behind it).
+const MIN_ALLOCATED_HZ: f64 = 0.0;
+/// A squeezed-out stream's spacing; a new allocation wakes it (`apply`).
+const SQUEEZED_OUT_INTERVAL: Duration = Duration::from_secs(3600);
 /// Weight of the newest sample in rate and size averages.
 const EWMA_GAIN: f64 = 0.5;
 /// Per-frame overhead on the wire besides the payload (frame header + key, SCTP/DTLS/UDP).
 const FRAME_OVERHEAD_BYTES: f64 = 90.0;
+/// What each frame costs the link beyond its own bytes (SCTP chunk + common header, DTLS record, UDP, IP): counted in
+/// what a stream sent, so the estimate and the reservations are in the link's bytes (100+ small frames a second are a
+/// third of a 250 kbit/s link, and counted as payload they overloaded it).
+pub const PACKET_OVERHEAD_BYTES: u64 = 80;
+/// A video stream's price is at most this times its measured frame size (scaled by quality).
+const VIDEO_PRICE_HEADROOM: f64 = 1.5;
 /// A video stream's picture size until its first frame.
 const DEFAULT_VIDEO_SOURCE: (u32, u32) = (640, 480);
 /// A `reliable` key's samples that have waited this long are dropped while a newer one waits behind them (a page that
@@ -130,8 +139,11 @@ struct SubState {
     encoded_bytes: BTreeMap<u16, f64>,
     /// source resolution of a video stream
     video_source: Option<(u32, u32)>,
+    /// a video stream's encoded bytes per frame (average) and the quality it encoded at last
+    video_frame_bytes: Option<(f64, f64)>,
     /// counters as of the allocator's previous look
     accounted_bytes_sent: u64,
+    accounted_frames_sent: u64,
     accounted_blocked_ms: f64,
     accounted_page_blocked_ms: f64,
 }
@@ -150,7 +162,10 @@ fn ewma(previous: f64, sample: f64) -> f64 {
 /// What the allocator learns from one subscription since its previous look.
 pub struct Usage {
     pub demand: Demand,
+    /// on the wire: its frames plus `PACKET_OVERHEAD_BYTES` each
     pub bytes_sent: u64,
+    /// its frames alone
+    pub frame_bytes: u64,
     pub network_blocked_ms: f64,
     /// time it waited for the page to catch up (ack window, delivery lag)
     pub page_blocked_ms: f64,
@@ -311,18 +326,19 @@ impl SubShared {
         self.allocated_key_hz(rate, &state.allocation).unwrap_or(wanted)
     }
 
-    /// What a video key is granted: (quality, bits/s, frames/s); before the first allocation, the most it may ask for.
+    /// What a video key is granted: (quality, bits/s, frames/s). Before the first allocation, its floor picture: a camera
+    /// with no grant once fell back to the most it may ask for and took a 100 kbit/s link down.
     pub fn video_grant(&self, key: &str) -> (f64, f64, f64) {
         let hz = self.key_hz(key);
         let state = self.state.lock().unwrap();
         let allocation = &state.allocation;
-        let quality = allocation.quality.unwrap_or(self.tuning().quality_range.1);
-        let bitrate = if allocation.hz > 0.0 {
-            allocation.budget_bytes_per_sec * 8.0 * (hz / allocation.hz).min(1.0)
-        } else {
-            self.tuning().video_policy.frame_bytes(state.video_source.unwrap_or(DEFAULT_VIDEO_SOURCE), hz, quality) * 8.0 * hz
-        };
-        (quality, bitrate, hz)
+        if allocation.hz > 0.0 && allocation.budget_bytes_per_sec > 0.0 {
+            let quality = allocation.quality.unwrap_or(self.tuning().quality_range.1);
+            return (quality, allocation.budget_bytes_per_sec * 8.0 * (hz / allocation.hz).min(1.0), hz);
+        }
+        let quality = self.tuning().quality_range.0;
+        let floor = self.tuning().video_policy.frame_bytes(state.video_source.unwrap_or(DEFAULT_VIDEO_SOURCE), hz, quality);
+        (quality, floor * 8.0 * hz, hz)
     }
 
     /// Per-key Hz cap from the allocation (None = no allocation cap).
@@ -337,6 +353,7 @@ impl SubShared {
     /// Spacing between two sends of a key: maxHz, tightened by the allocation.
     fn key_interval(&self, queue: &KeyQueue, allocation: &Allocation) -> Option<Duration> {
         match self.allocated_key_hz(queue.rate_hz, allocation) {
+            Some(hz) if hz <= 0.0 => Some(SQUEEZED_OUT_INTERVAL),
             Some(hz) => Some(Duration::from_secs_f64(1.0 / hz).max(self.tuning().min_interval.unwrap_or_default())),
             None => self.tuning().min_interval,
         }
@@ -352,9 +369,10 @@ impl SubShared {
         EncodeOptions { quality, options: self.encode_options.clone() }
     }
 
-    /// Reserved at its measured rate, never paced or shrunk: reliable, strict-priority and audio streams.
+    /// Reserved at its measured rate, never paced or shrunk: strict-priority and audio streams. (Reliable ones shrink
+    /// last, see `allocator`, their queue bounded by `RELIABLE_MAX_BACKLOG`.)
     pub fn reserved(&self) -> bool {
-        self.delivery.reliable || self.is_strict() || self.channel == Channel::Audio
+        self.is_strict() || self.channel == Channel::Audio
     }
 
     pub fn note_video_source(&self, width: u32, height: u32) {
@@ -370,7 +388,10 @@ impl SubShared {
             queue.arrivals = 0;
             max_hz += self.tuning().max_hz.map_or(queue.rate_hz, |max| max.min(queue.rate_hz));
         }
-        let bytes_sent = state.stats.bytes_sent - state.accounted_bytes_sent;
+        let frames_sent = state.stats.frames_sent - state.accounted_frames_sent;
+        state.accounted_frames_sent = state.stats.frames_sent;
+        let frame_bytes = state.stats.bytes_sent - state.accounted_bytes_sent;
+        let bytes_sent = frame_bytes + frames_sent * PACKET_OVERHEAD_BYTES;
         let network_blocked_ms = state.stats.blocked_on_network_ms - state.accounted_blocked_ms;
         state.accounted_bytes_sent = state.stats.bytes_sent;
         state.accounted_blocked_ms = state.stats.blocked_on_network_ms;
@@ -379,14 +400,24 @@ impl SubShared {
         let payload_bytes = state.payload_bytes;
         let price: crate::allocator::Price = match &self.codec {
             None => {
-                let message_bytes = if state.message_bytes > 0.0 { state.message_bytes } else { payload_bytes + FRAME_OVERHEAD_BYTES };
+                let message_bytes = if state.message_bytes > 0.0 { state.message_bytes + PACKET_OVERHEAD_BYTES as f64 } else { payload_bytes + FRAME_OVERHEAD_BYTES };
                 Box::new(move |_| message_bytes)
             }
             Some(_) if matches!(self.channel, Channel::Video(_)) => {
                 let source = state.video_source.unwrap_or(DEFAULT_VIDEO_SOURCE);
                 let keys = state.keys.values().filter(|queue| queue.rate_hz > 0.0).count().max(1);
                 let (policy, frame_hz) = (self.tuning().video_policy, max_hz / keys as f64);
-                Box::new(move |quality| policy.frame_bytes(source, frame_hz, quality))
+                let model = move |quality: f64| policy.frame_bytes(source, frame_hz, quality);
+                // what its frames measured, with room to grow 1.5x per allocation: a simple or still picture encodes far
+                // below the model, and priced by the model alone it never showed the link more (a solid 320x240 camera
+                // at 10 Hz was held to 5 fps on localhost)
+                // (never below the full picture's floor: grants follow the price and the picture's size follows the grant, so a
+                // solid picture's tiny frames shrank it to half size)
+                let (measured, full_size) = (state.video_frame_bytes, policy.full_size_floor_bytes(source));
+                Box::new(move |quality| match measured {
+                    Some((at, bytes)) => model(quality).min((VIDEO_PRICE_HEADROOM * bytes * model(quality) / model(at).max(1e-9)).max(full_size)),
+                    None => model(quality),
+                })
             }
             Some(codec) => {
                 // measured sizes per quality, scaled between qualities by the encoding's own estimate
@@ -409,8 +440,9 @@ impl SubShared {
             tradeoff: self.tuning().tradeoff,
             price,
             fixed_bytes_per_sec: self.reserved().then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
+            shrinks_last: self.delivery.reliable,
         };
-        Usage { demand, bytes_sent, network_blocked_ms, page_blocked_ms, on_track: self.on_track() }
+        Usage { demand, bytes_sent, frame_bytes, network_blocked_ms, page_blocked_ms, on_track: self.on_track() }
     }
 
     /// `bulk_budget`: what the frontend's paced streams share. A message goes out at that rate while its grant sets how
@@ -467,6 +499,8 @@ impl SubShared {
         state.stats.video_height = height;
         state.stats.quality = Some(quality);
         state.stats.keyframes += keyframe as u64;
+        let average = ewma(state.video_frame_bytes.map_or(0.0, |(_, average)| average), bytes as f64);
+        state.video_frame_bytes = Some((quality, average));
         *if shared_encode { &mut state.stats.shared_encodes } else { &mut state.stats.encodes } += 1;
     }
 
@@ -552,7 +586,11 @@ impl SubShared {
             let Some(head) = queue.items.front() else {
                 continue;
             };
-            if let (Some(interval), Some(last_sent)) = (self.key_interval(queue, &state.allocation), queue.last_sent) {
+            let interval = self.key_interval(queue, &state.allocation);
+            if interval == Some(SQUEEZED_OUT_INTERVAL) {
+                continue;
+            }
+            if let (Some(interval), Some(last_sent)) = (interval, queue.last_sent) {
                 let ready_at = last_sent + interval;
                 if ready_at > now {
                     wake_at = Some(wake_at.map_or(ready_at, |w| w.min(ready_at)));
@@ -731,11 +769,11 @@ impl Pacer {
         };
         // the page (or the path to it) is this far behind: anything sent now would wait behind it, and so would the
         // heartbeat replies and control answers that share its event loop and the path
-        let (max_lag, max_network_lag) = (shared.gate.max_page_lag(), shared.gate.max_network_lag());
+        let max_lag = shared.gate.max_page_lag();
         shared.gate.refresh_delivered().await;
         let lagging = |shared: &SubShared| {
             let now = Instant::now();
-            shared.gate.page_lag(now) > max_lag || shared.gate.network_lag(now) > max_network_lag
+            shared.gate.page_lag(now) > max_lag || shared.gate.network_lagging(now)
         };
         if outstanding < window && unconsumed < unconsumed_window && !lagging(shared) {
             return;
@@ -745,7 +783,9 @@ impl Pacer {
         while (outstanding > resume_bytes || shared.unconsumed_bytes() >= unconsumed_window || lagging(shared))
             && !shared.closed.load(Ordering::Relaxed)
         {
-            let waiting_on_network = outstanding > resume_bytes;
+            // held by the network-lag gate is waiting on the network too: booked to the page, it never cut the estimate
+            // (after a drop from 20 to 1 Mbit/s it stayed at 1.1 MB/s, and the window it sized held 500 ms of queue)
+            let waiting_on_network = outstanding > resume_bytes || shared.gate.network_lagging(Instant::now());
             let wait_started = Instant::now();
             tokio::select! {
                 _ = shared.drained.notified() => {}

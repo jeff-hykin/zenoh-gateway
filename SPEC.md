@@ -51,7 +51,8 @@ const cmd = z.publisher("cmd_vel", {
     delivery: "latest",
     priority: Priority.REAL_TIME,
     repeatMs: 100,          // client-side: re-send the last value on a timer
-    latencyLimit: 300,      // ms; the gateway drops puts older than this (clock-corrected). default: none
+    latencyLimit: 300,      // ms; the gateway drops puts older than this (clock-corrected). default: none;
+                            // a reliable publisher's puts waiting in the page past it (default 2 s) are dropped too
 })
 cmd.put(bytes)                    // or cmd.put(bytes, { timestamp: z.now() - delay })
 await cmd.setDeadman(stopBytes)   // throws if connect() had no heartbeat
@@ -153,7 +154,7 @@ the small messages these carry (big streams belong on subscriptions). Every requ
 | options | data channel init | gateway behavior when the channel is backed up |
 |---|---|---|
 | `delivery: "reliable"` | ordered, fully reliable | queue every sample; a sample that waited 2 s goes when a newer one of its key waits behind it |
-| `delivery: "latest"` | unordered, maxRetransmits 0 | keep only the newest sample per key |
+| `delivery: "latest"` | unordered, maxPacketLifeTime 1000 ms (a lost chunk is retransmitted for 1 s: with no retransmits, a 200 KB message got through 3% of the time at 2% loss) | keep only the newest sample per key |
 | `+ maxAge: M` | latest: unordered, maxPacketLifeTime M | also drop anything older than M |
 
 "Backed up" = the channel's unacknowledged bytes are above its send window, or the page has not yet
@@ -265,7 +266,7 @@ and the client reassembles. The page acks frames, not messages, so a big message
 consumption window. On `latest`, a message that can't arrive whole is dropped whole, never delivered
 partially: the gateway finishes a chunked message it started (so big messages make progress even when
 newer ones keep arriving) unless it outlives `maxAge` (`abandonedPartial`); SCTP drops lost chunks
-(`maxRetransmits: 0` / `maxPacketLifeTime`); and the client discards incomplete messages once a newer
+(`maxPacketLifeTime`: 1 s, or `maxAge`); and the client discards incomplete messages once a newer
 one completes or more than 8 are pending (`partialDropped`).
 
 ## Encodings and channels
@@ -483,10 +484,11 @@ gateway keeps the path's queues short and lets urgent streams skip what queue re
   bulk never bursts whole messages into the link.
 - **Delay trigger.** The browser reports its RTT with every clock-sync sample (each heartbeat, else
   the 1 s control ping: configure `heartbeatHz` for a fast trigger). The queue delay of a 250 ms
-  interval is its smallest RTT minus the 30 s minimum. When it exceeds `5 ms + 2 × median` of the queue delays of the
-  last 30 s (`delayThresholdMs` in stats) for two intervals in a row, a queue is
-  standing on the path (a Wi-Fi or VPN path whose RTT swings by tens of ms with no load raises its
-  own threshold; a lone spike is ignored): the data
+  interval is its smallest RTT minus the 60 s minimum. When it exceeds `5 ms +` the spread (p90 − p10) of the queue delays of the last 10 s (at most
+  500 ms: Wi-Fi + Tailscale swung 60–480 ms with nothing queued; `delayThresholdMs` in stats) for two intervals in a
+  row, a queue is standing on the path (a Wi-Fi or VPN path whose RTT swings by tens of ms with no load raises its own
+  threshold; a lone spike is ignored; a standing queue raises every sample, not the spread: measured as twice the
+  median level, one raised the threshold from 70 ms to 1.5 s while it grew): the link
   estimate drops 15% at once and probing pauses 1 s; then it probes up 10% per interval below 90% of
   the level that caused the queue and 2% above it, and 10% again once that level is 5 s old (on Wi-Fi
   one early stall had held probing at 2% for good; before any congestion: 50% per interval, a slow
@@ -500,25 +502,34 @@ bulk streams (10 MB/s wanted) the bulk gets ~1.7 MB/s and the strict p99 is ≈ 
 stream without strict priority under that load: p99 ≈ 0.4–0.5 s.
 
 Per frontend, every 250 ms:
-1. **Estimate.** Data channels: a delivery-rate estimator over what the `sub` channels pushed into SCTP
-   and how long their senders waited on SCTP (webrtc-rs doesn't expose the congestion window), plus the
-   delay trigger above: blocked on the network more than 20% of the interval → estimate = 0.9 ×
-   measured rate (at most 15% down per step: a long round trip blocks the first intervals before
-   the window knows the RTT); otherwise, while streams want more, probe up (start
-   1 MB/s). Video: GCC's target bitrate (TWCC feedback, bounded at 2 Gbit/s: a 50 Mbit/s bound had capped 8 HD cameras on
-   an idle link), counted while a video track is in use; video
-   tracks are paced by the GCC pacer (at 2.5 × the GCC target, as libwebrtc paces), not the bulk gate. Budget = min(`--max-bandwidth-bytes-per-sec`
-   if set, target fraction × (data estimate + video estimate)).
-   GCC starts at 8 Mb/s, the data estimate's starting point. Video streams together get at most
-   the video estimate (GCC's target): their bytes leave through
-   the GCC-paced track, so data-channel capacity is no use to them (granting it made encoders
-   outrun the pacer and queue); data streams are then allocated what remains.
+1. **Estimate.** One estimate of the frontend's link, video and data together (`dataEstimateBytesPerSec`; two
+   estimates of one link, added, had let the allocator hand out 2–36× what a slow link carried, so nothing was ever
+   squeezed): a delivery-rate estimator over what every stream sent and how long data senders waited on SCTP (webrtc-rs
+   doesn't expose the congestion window), plus the delay trigger above and a backlog trigger (over the last second,
+   handed to SCTP more than 1.3 × what the browser acknowledged + 4 KB: a queue growing gradually widens the delay
+   spread it is measured against, and Wi-Fi jitter hides it); on either, while the streams were filling the link, the
+   estimate drops to 0.9 × what the browser acknowledged over the last second (at most −75% at once; −15% otherwise):
+   blocked on the network more than 20% of the
+   interval, or GCC (below) under 85% of what video sent → estimate = 0.9 × measured rate (at most 15% down per step: a
+   long round trip blocks the first intervals before the window knows the RTT); otherwise, while streams want more and
+   sent at least half the estimate (an estimate only grows on a link that carried it), probe up (start 64 KB/s, so a
+   slow link isn't flooded at the start; at least 2 KB/s). Budget = min(`--max-bandwidth-bytes-per-sec` if set, target
+   fraction × the estimate). Video: GCC's target bitrate (TWCC feedback, `videoEstimateBytesPerSec`), which caps
+   video's share of the budget and never adds to it (GCC grows 8%/s while video sends less: added, it read 10 MB/s on
+   a 1 MB/s link); video tracks are paced by the GCC pacer (at 2.5 × the GCC target, as libwebrtc paces), not the
+   bulk gate. Video streams together get at most that: their bytes leave through the GCC-paced track, so data-channel
+   capacity is no use to them (granting it made encoders outrun the pacer and queue); data streams are then allocated
+   what remains of the budget.
 2. **Demand.** Each subscription wants `price(encodeOptions.quality) × Hz`, Hz being each key's measured source
    rate capped by `maxHz`, summed over its keys. Price = bytes per message: measured for raw streams
    and data-channel encodings (per quality, scaled by the encoding's `estimated_bytes` between measured
    qualities, which is also the prior before anything was measured), from the video policy for video
-   (`maxBitrate` / rate at quality 1, the floor picture at 0). Strict-priority and reliable streams can't drop messages: they are reserved at
-   their measured rate and never shrunk.
+   (`maxBitrate` / rate at quality 1, the floor picture at 0), at most 1.5 × its measured frame size once it has
+   frames (a simple or still picture encodes far below the policy, and priced by it alone never showed the link
+   more: a solid 320x240 camera at 10 Hz was held to 5 fps on localhost). Strict-priority streams are reserved at their measured rate and never shrunk;
+   reliable streams shrink only after every other stream is at 0 (paced at their grant, a reliable key's samples
+   that waited 2 s are dropped while a newer one waits: a 100 Hz tf reserved in full was twice a 100 kbit/s link and
+   took the strict streams down with it).
 3. **Shrink.** If the rest want more than the budget left, they shrink like CSS flex items: the deficit
    is split in proportion to `demand / bandwidthPriority` (so 10 / 10 / 0.1 means the 0.1 stream takes
    ~100x the cut); a stream that reaches 0 stops there and the rest shrink further. Priority-0 streams
@@ -527,8 +538,11 @@ Per frontend, every 250 ms:
    `r^t` (choosing the best quality among the bounds and 0.1 steps that fits) and its Hz by the rest,
    `t = qualityToHzTradeoff`: 0 keeps quality and drops Hz, 1 keeps Hz and drops quality. When quality
    hits `minQuality`, Hz gives.
-5. **Apply.** Each key's send interval becomes `1 / (its wanted Hz × granted fraction)` (at least
-   0.05 Hz); data transcoders encode at the granted quality, video encoders at the granted bitrate.
+5. **Apply.** Each key's send interval becomes `1 / (its wanted Hz × granted fraction)`; a stream granted nothing
+   sends nothing until a later allocation grants it some (squeezed out: a 0.05 Hz trickle of a 400 KB map alone was
+   more than a 100 kbit/s link, and a camera's 24 KB frame held the strict streams 2 s behind it). Data transcoders
+   encode at the granted quality, video encoders at the granted bitrate; the video pacer drains at 2.5 × min(GCC, the
+   video cap), so a keyframe waits in the gateway rather than in the link's queue.
 
 Stats: each subscription's `allocation` (`demandBytesPerSec`,
 `budgetBytesPerSec`, `hz`, `hzFraction`, `quality`, `constrained`) and the frontend's `bandwidth`
@@ -539,7 +553,8 @@ Stats: each subscription's `allocation` (`demandBytesPerSec`,
 
 ## Congestion
 
-`z.congestion` (JS client), refreshed with each stats poll (`statsIntervalMs`, 1 s), says whether the link keeps up so a
+`z.congestion` (JS client), refreshed with each stats poll (`statsIntervalMs`, 1 s, stretched so stats take at most 5% of
+the frontend's budget, up to 10 s: ~1 KB per channel, polled every second they were all of a 100 kbit/s link), says whether the link keeps up so a
 page can show "link degraded, dropping N/s" instead of letting its user find out from stale data:
 
 - `degraded`: the subscriptions want more than the frontend's budget (`bandwidth.constrained`), so the gateway sends

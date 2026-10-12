@@ -60,6 +60,12 @@ impl VideoPolicy {
         self.max_resolution.map_or(1.0, |(max_width, max_height)| (max_width as f64 / width as f64).min(max_height as f64 / height as f64).min(1.0))
     }
 
+    /// The least a frame at full size (fitted into `max_resolution`) takes: `min_bits_per_pixel`. A grant below it shrinks
+    /// the picture (`size`).
+    pub(crate) fn full_size_floor_bytes(&self, source: (u32, u32)) -> f64 {
+        self.min_bits_per_pixel * source.0 as f64 * source.1 as f64 * self.fit(source).powi(2) / 8.0
+    }
+
     /// The allocator's price of one frame at `quality`: from the smallest picture at `min_bits_per_pixel` (0) to the
     /// most a frame may take at `frame_hz` frames/s (1).
     pub(crate) fn frame_bytes(&self, source: (u32, u32), frame_hz: f64, quality: f64) -> f64 {

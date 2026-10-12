@@ -33,6 +33,10 @@ pub const MAX_PAGE_LAG_MS: f64 = 250.0;
 /// bound a tf feed sat 13 s in SCTP on a jittery path while bulk kept its unordered queue full.
 const NETWORK_LAG_MARGIN_MS: f64 = 250.0;
 const NETWORK_LAG_MAX_EXTRA_RTT_MS: f64 = 500.0;
+/// A frame lost on the way stays in SCTP until its retransmission timer (at least 1 s, rtc-sctp's RTO_MIN) resends or
+/// abandons it, so the gate allows this much more: at 2% loss it was shut nearly all the time and clouds got 7 of 369
+/// messages out.
+const LOSS_NETWORK_LAG_EXTRA: Duration = Duration::from_millis(1000);
 
 /// Every frame of a frontend's `sub` channels the page hasn't gotten past, in send order. The page is one event loop, so
 /// its backlog is all its channels' together. An ack of any frame means the page is past every *lossy* frame sent before
@@ -46,6 +50,10 @@ struct PageQueue {
     passed: u64,
     /// frame bytes handed to SCTP so far, by stream
     sent_bytes: HashMap<usize, usize>,
+    /// of those, how many its peer has acknowledged, by stream
+    delivered_bytes: HashMap<usize, usize>,
+    /// acknowledged bytes over every stream, ever (the estimator's delivery rate)
+    delivered_total: u64,
 }
 
 struct PageFrame {
@@ -104,6 +112,11 @@ impl Drop for StrictTurn<'_> {
 }
 
 impl SendGate {
+    /// Bytes of every `sub` channel the browser has acknowledged, ever.
+    pub fn delivered_total(&self) -> u64 {
+        self.page.lock().unwrap().delivered_total
+    }
+
     /// From the allocator: the budget sets bulk chunk size and the in-flight limit, budget x (min RTT + `slack_ms`), about
     /// one bandwidth-delay product. The limit only protects strict streams: without one (`!limit_inflight`) there is none.
     pub fn configure(&self, budget_bytes_per_sec: f64, min_rtt_ms: Option<f64>, slack_ms: f64, limit_inflight: bool) {
@@ -142,6 +155,11 @@ impl SendGate {
         page.unpassed.values().filter(|frame| frame.delivered_at.is_none()).map(|frame| frame.sent_at).min().map_or(Duration::ZERO, |at| now.duration_since(at))
     }
 
+    /// The path holds a frame longer than it should: past `max_network_lag` plus `LOSS_NETWORK_LAG_EXTRA`.
+    pub fn network_lagging(&self, now: Instant) -> bool {
+        self.network_lag(now) > self.max_network_lag() + LOSS_NETWORK_LAG_EXTRA
+    }
+
     /// How far behind the page may be before channels stop sending.
     pub fn max_page_lag(&self) -> Duration {
         Duration::from_secs_f64(MAX_PAGE_LAG_MS / 1000.0)
@@ -171,6 +189,8 @@ impl SendGate {
     pub fn observe_delivered(&self, stream: usize, outstanding: usize, now: Instant) {
         let mut page = self.page.lock().unwrap();
         let delivered = page.sent_bytes.get(&stream).copied().unwrap_or(0).saturating_sub(outstanding);
+        let previous = page.delivered_bytes.insert(stream, delivered).unwrap_or(0);
+        page.delivered_total += delivered.saturating_sub(previous) as u64;
         for frame in page.unpassed.values_mut() {
             if frame.stream == stream && frame.end_offset <= delivered && frame.delivered_at.is_none() {
                 frame.delivered_at = Some(now);
@@ -295,7 +315,10 @@ impl SendGate {
 
     pub fn forget(&self, stream: usize) {
         self.channels.lock().unwrap().remove(&stream);
-        self.page.lock().unwrap().sent_bytes.remove(&stream);
+        let mut page = self.page.lock().unwrap();
+        page.sent_bytes.remove(&stream);
+        page.delivered_bytes.remove(&stream);
+        drop(page);
         self.report_outstanding(stream, 0);
     }
 }
@@ -422,6 +445,16 @@ mod tests {
         gate.observe_delivered(1, 0, t0);
         gate.observe_delivered(2, 0, t0);
         assert_eq!(gate.network_lag(t0 + Duration::from_secs(1)), Duration::ZERO, "both reached the browser");
+    }
+
+    #[test]
+    fn a_lost_frame_may_wait_for_the_retransmission_timer() {
+        let gate = SendGate::default();
+        gate.set_window(1e6, Some(40.0), Some(300.0));
+        let t0 = Instant::now();
+        gate.frame_sent(1, 100, true);
+        assert!(!gate.network_lagging(t0 + Duration::from_millis(1200)), "lost, waiting on the retransmission timer");
+        assert!(gate.network_lagging(t0 + Duration::from_millis(1600)));
     }
 
     #[test]
