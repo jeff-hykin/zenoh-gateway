@@ -42,7 +42,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState};
@@ -418,13 +419,13 @@ impl Shared {
             return;
         }
         self.set_state(ConnectionState::Lost);
-        self.requests.lock().unwrap().clear();
-        for endpoint in self.endpoints.lock().unwrap().values() {
+        self.requests.lock().clear();
+        for endpoint in self.endpoints.lock().values() {
             if let Some(publisher) = endpoint.publisher.as_ref().filter(|publisher| publisher.deadman_armed.load(Ordering::Acquire)) {
                 publisher.trip("disconnected".into());
             }
         }
-        for (_, lease) in self.leases.lock().unwrap().drain() {
+        for (_, lease) in self.leases.lock().drain() {
             lease.end("disconnected".into());
         }
     }
@@ -435,25 +436,25 @@ impl Shared {
         };
         let id = message["id"].as_u64().unwrap_or_default();
         let Some(event) = message["event"].as_str() else {
-            if let Some((group, ending)) = self.pending_leases.lock().unwrap().remove(&id).filter(|_| message["ok"] == true)
-                && let Some(previous) = self.leases.lock().unwrap().insert(group, ending)
+            if let Some((group, ending)) = self.pending_leases.lock().remove(&id).filter(|_| message["ok"] == true)
+                && let Some(previous) = self.leases.lock().insert(group, ending)
             {
                 previous.end("renewed".into());
             }
-            if let Some(reply) = self.requests.lock().unwrap().remove(&id) {
+            if let Some(reply) = self.requests.lock().remove(&id) {
                 let _ = reply.send(message);
             }
             return;
         };
         if let Some((event, id_field)) = api::EVENT_IDS.iter().find(|(name, _)| *name == event) {
             let id = message[*id_field].as_u64().unwrap_or_default();
-            let routes = self.api_routes.lock().unwrap();
+            let routes = self.api_routes.lock();
             match routes.get(&(*event, id)) {
                 Some(route) => {
                     let _ = route.send(message);
                 }
                 None => {
-                    let mut early = self.api_early.lock().unwrap();
+                    let mut early = self.api_early.lock();
                     // ids are never reused, so a stray event for a handle long gone only costs memory: cap it
                     if early.len() < 1000 {
                         early.entry((*event, id)).or_default().push(message);
@@ -467,14 +468,14 @@ impl Shared {
             // revoked
             "closed" => return self.lost(),
             "leaseLost" => {
-                if let Some(lease) = self.leases.lock().unwrap().remove(message["group"].as_str().unwrap_or_default()) {
+                if let Some(lease) = self.leases.lock().remove(message["group"].as_str().unwrap_or_default()) {
                     lease.end(reason);
                 }
                 return;
             }
             _ => {}
         }
-        let mut endpoints = self.endpoints.lock().unwrap();
+        let mut endpoints = self.endpoints.lock();
         let Some(endpoint) = endpoints.get_mut(&id) else {
             return;
         };
@@ -526,7 +527,7 @@ async fn route_track(shared: Arc<Shared>, track: Arc<dyn TrackRemote>) {
     let same = |a: &Arc<dyn TrackRemote>| std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(&track));
     let mut found = None;
     for _ in 0..100 {
-        let slots = shared.media.lock().unwrap().clone();
+        let slots = shared.media.lock().clone();
         for slot in slots {
             if let Ok(Some(receiver)) = slot.transceiver.receiver().await
                 && same(receiver.track())
@@ -546,7 +547,7 @@ async fn route_track(shared: Arc<Shared>, track: Arc<dyn TrackRemote>) {
     while let Some(event) = track.poll().await {
         if let TrackRemoteEvent::OnRtpPacket(packet) = event {
             slot.ssrc.store(packet.header.ssrc, Ordering::Relaxed);
-            let sink = slot.sink.lock().unwrap().clone();
+            let sink = slot.sink.lock().clone();
             // a consumer that falls behind loses packets; its stream then waits for a keyframe
             if let Some(sink) = sink {
                 let _ = sink.try_send(packet);
@@ -577,10 +578,10 @@ impl Inner {
         body["id"] = json!(id);
         let op = body["op"].as_str().unwrap_or_default().to_owned();
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.shared.requests.lock().unwrap().insert(id, reply_tx);
+        self.shared.requests.lock().insert(id, reply_tx);
         self.control.send_text(&body.to_string()).await.map_err(|error| anyhow!("{op}: {error}"))?;
         let reply = tokio::time::timeout(timeout, reply_rx).await;
-        self.shared.requests.lock().unwrap().remove(&id);
+        self.shared.requests.lock().remove(&id);
         let reply = reply.map_err(|_| anyhow!("{op} timed out"))?.map_err(|_| anyhow!("{op}: connection lost"))?;
         ensure!(reply["ok"] == true, "zenoh-gateway: {}", reply["error"].as_str().unwrap_or("error"));
         Ok(reply)
@@ -589,12 +590,12 @@ impl Inner {
     /// Clock-sync ping over `control`, which also reports our estimate to the gateway.
     async fn ping(&self) -> Result<()> {
         let (offset, rtt) = {
-            let clock = self.shared.clock.lock().unwrap();
+            let clock = self.shared.clock.lock();
             (clock.offset_ms, clock.rtt_ms)
         };
         let t0 = now_ms();
         let reply = self.request(json!({"op": "ping", "t0": t0, "offsetMs": offset, "rttMs": rtt}), PING_TIMEOUT).await?;
-        self.shared.clock.lock().unwrap().add(t0, reply["t1"].as_f64().unwrap_or(f64::NAN), reply["t2"].as_f64().unwrap_or(f64::NAN), now_ms());
+        self.shared.clock.lock().add(t0, reply["t1"].as_f64().unwrap_or(f64::NAN), reply["t2"].as_f64().unwrap_or(f64::NAN), now_ms());
         Ok(())
     }
 
@@ -602,7 +603,7 @@ impl Inner {
     /// renegotiated over `control` (SPEC "Video").
     async fn media_slot(&self, codec: &str, kind: RtpCodecKind, reuse: bool) -> Result<Arc<MediaSlot>> {
         let free = reuse.then(|| {
-            let mut free = self.free_slots.lock().unwrap();
+            let mut free = self.free_slots.lock();
             free.iter().position(|slot| slot.codec == codec).map(|index| free.remove(index))
         });
         if let Some(slot) = free.flatten() {
@@ -619,7 +620,7 @@ impl Inner {
         let mid = transceiver.mid().await?.context("the transceiver has no mid")?;
         ensure!(reply["mid"] == mid.as_str(), "gateway bound mid {}, expected {mid}", reply["mid"]);
         let slot = Arc::new(MediaSlot { mid, codec: codec.to_owned(), transceiver, track: OnceLock::new(), ssrc: AtomicU32::new(0), sink: Mutex::new(None) });
-        self.shared.media.lock().unwrap().push(slot.clone());
+        self.shared.media.lock().push(slot.clone());
         Ok(slot)
     }
 
@@ -631,7 +632,7 @@ impl Inner {
     {
         let (id, key) = (label["id"].as_u64().unwrap_or_default(), label["key"].as_str().unwrap_or_default().to_owned());
         let (accepted_tx, accepted_rx) = oneshot::channel();
-        self.shared.endpoints.lock().unwrap().insert(id, Endpoint { accepted: Some(accepted_tx), publisher });
+        self.shared.endpoints.lock().insert(id, Endpoint { accepted: Some(accepted_tx), publisher });
         let opened = async {
             let channel = self.connection.create_data_channel(&label.to_string(), Some(init)).await.map_err(|error| anyhow!("creating the channel: {error}"))?;
             let (opened_tx, opened_rx) = oneshot::channel();
@@ -662,15 +663,15 @@ impl Inner {
         };
         let result = opened.await;
         if result.is_err() {
-            self.shared.endpoints.lock().unwrap().remove(&id);
+            self.shared.endpoints.lock().remove(&id);
         }
         result
     }
 
     fn release_slot(&self, slot: Arc<MediaSlot>) {
-        slot.sink.lock().unwrap().take();
+        slot.sink.lock().take();
         if *self.shared.state.borrow() != ConnectionState::Lost {
-            self.free_slots.lock().unwrap().push(slot);
+            self.free_slots.lock().push(slot);
         }
     }
 }
@@ -790,12 +791,12 @@ impl Client {
 
     /// Gateway clock minus this client's (unix ms), from the lowest-RTT recent sample.
     pub fn clock_offset_ms(&self) -> Option<f64> {
-        self.inner.shared.clock.lock().unwrap().offset_ms
+        self.inner.shared.clock.lock().offset_ms
     }
 
     /// The latest round trip to the gateway.
     pub fn rtt_ms(&self) -> Option<f64> {
-        self.inner.shared.clock.lock().unwrap().rtt_ms
+        self.inner.shared.clock.lock().rtt_ms
     }
 
     /// Keys live under `filter` (SPEC "Topic enumeration"); `probe_ms` (default 600) also catches
@@ -864,7 +865,7 @@ impl Client {
         if let Some(slot) = &slot {
             label["mid"] = json!(slot.mid);
             let (packets_tx, packets_rx) = mpsc::channel(1024);
-            *slot.sink.lock().unwrap() = Some(packets_tx);
+            *slot.sink.lock() = Some(packets_tx);
             packets = Some(packets_rx);
         }
         let task = SubscriptionTask { kind, slot: slot.clone(), messages: messages_tx, packets, client: Arc::downgrade(inner) };
@@ -895,9 +896,9 @@ impl Client {
         ensure!(self.inner.options.heartbeat_hz > 0.0, "a lease needs a heartbeat (ClientOptions::heartbeat_hz)");
         let (id, ending) = (self.inner.next_id.fetch_add(1, Ordering::Relaxed), Arc::new(Ending::new()));
         // registered by the control reader as it reads the reply (renewing a lease held before)
-        self.inner.shared.pending_leases.lock().unwrap().insert(id, (group.to_owned(), ending.clone()));
+        self.inner.shared.pending_leases.lock().insert(id, (group.to_owned(), ending.clone()));
         let reply = self.inner.request_as(id, json!({"op": "lease", "group": group, "keys": keys, "maxSeconds": max_seconds}), PING_TIMEOUT).await;
-        self.inner.shared.pending_leases.lock().unwrap().remove(&id);
+        self.inner.shared.pending_leases.lock().remove(&id);
         let reply = reply?;
         let keys = serde_json::from_value(reply["keys"].clone())?;
         Ok(Lease { group: group.to_owned(), keys, expires_in_ms: reply["expiresInMs"].as_u64(), ending, client: Arc::downgrade(&self.inner) })
@@ -952,14 +953,14 @@ async fn run_control(channel: Arc<dyn DataChannel>, shared: Arc<Shared>, opened:
 
 /// Beats `{t0, offsetMs, rttMs}`; each `{t0, t1, t2}` reply is a clock sample.
 async fn run_heartbeat(channel: Arc<dyn DataChannel>, shared: Arc<Shared>, paused: Arc<AtomicBool>, hz: f64) {
-    let mut ticker = tokio::time::interval(Duration::from_secs_f64(1.0 / hz));
+    let mut ticker = tokio::time::interval(crate::secs(1.0 / hz).max(Duration::from_millis(1)));
     loop {
         tokio::select! {
             event = channel.poll() => match event {
                 Some(DataChannelEvent::OnMessage(message)) => {
                     if let Ok(reply) = serde_json::from_slice::<Value>(&message.data) {
                         let time = |name: &str| reply[name].as_f64().unwrap_or(f64::NAN);
-                        shared.clock.lock().unwrap().add(time("t0"), time("t1"), time("t2"), now_ms());
+                        shared.clock.lock().add(time("t0"), time("t1"), time("t2"), now_ms());
                     }
                 }
                 Some(DataChannelEvent::OnClose) | None => break,
@@ -968,7 +969,7 @@ async fn run_heartbeat(channel: Arc<dyn DataChannel>, shared: Arc<Shared>, pause
             _ = ticker.tick() => {
                 if !paused.load(Ordering::Relaxed) {
                     let beat = {
-                        let clock = shared.clock.lock().unwrap();
+                        let clock = shared.clock.lock();
                         json!({"t0": now_ms(), "offsetMs": clock.offset_ms, "rttMs": clock.rtt_ms})
                     };
                     let _ = channel.send_text(&beat.to_string()).await;
@@ -1005,7 +1006,7 @@ async fn run_publisher_channel(channel: Arc<dyn DataChannel>, opened: oneshot::S
             }
             DataChannelEvent::OnMessage(message) => {
                 if let Ok(update) = serde_json::from_slice::<Value>(&message.data) {
-                    *state.blocked.lock().unwrap() = update["blocked"].as_str().map(str::to_owned);
+                    *state.blocked.lock() = update["blocked"].as_str().map(str::to_owned);
                 }
             }
             DataChannelEvent::OnClose => break,
@@ -1064,7 +1065,7 @@ impl futures::Stream for Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         if let Some(inner) = self.client.upgrade() {
-            inner.shared.endpoints.lock().unwrap().remove(&self.id);
+            inner.shared.endpoints.lock().remove(&self.id);
         }
         close_in_background(&self.channel);
     }
@@ -1383,7 +1384,7 @@ async fn repeat_puts(channel: Arc<dyn DataChannel>, state: Arc<PubState>, delive
     let mut ticker = tokio::time::interval(every);
     loop {
         ticker.tick().await;
-        let last = state.last.lock().unwrap().clone();
+        let last = state.last.lock().clone();
         if state.tripped.reason().is_some() {
             break;
         }
@@ -1417,7 +1418,7 @@ impl Publisher {
     pub async fn put_at(&self, bytes: impl AsRef<[u8]>, timestamp_ms: f64) -> Result<()> {
         self.check()?;
         if self.repeat.is_some() {
-            *self.state.last.lock().unwrap() = Some(bytes.as_ref().to_vec());
+            *self.state.last.lock() = Some(bytes.as_ref().to_vec());
         }
         send_put(&self.channel, self.delivery, bytes.as_ref(), timestamp_ms).await
     }
@@ -1449,7 +1450,7 @@ impl Publisher {
 
     /// Why the gateway is dropping this publisher's puts right now (another client's lease), None while it isn't.
     pub fn blocked(&self) -> Option<String> {
-        self.state.blocked.lock().unwrap().clone()
+        self.state.blocked.lock().clone()
     }
 
     /// Waits until the deadman fires and returns the reason.
@@ -1464,7 +1465,7 @@ impl Drop for Publisher {
             repeat.abort();
         }
         if let Some(inner) = self.client.upgrade() {
-            inner.shared.endpoints.lock().unwrap().remove(&self.id);
+            inner.shared.endpoints.lock().remove(&self.id);
         }
         close_in_background(&self.channel);
     }
@@ -1501,7 +1502,7 @@ impl Lease {
         self.ending.end("released".into());
         let inner = self.client.upgrade().context("the client is gone")?;
         {
-            let mut leases = inner.shared.leases.lock().unwrap();
+            let mut leases = inner.shared.leases.lock();
             if leases.get(&self.group).is_some_and(|held| Arc::ptr_eq(held, &self.ending)) {
                 leases.remove(&self.group);
             }

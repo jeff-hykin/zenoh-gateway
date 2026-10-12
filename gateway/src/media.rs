@@ -22,7 +22,8 @@ use rtc::rtp_transceiver::rtp_sender::RTCRtpHeaderExtensionCapability;
 use rtc::rtp_transceiver::rtp_sender::{RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use webrtc::data_channel::DataChannel;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -516,7 +517,7 @@ struct SessionFrame {
 impl EncodeSession {
     /// Whether a member granted `bitrate` can share this session: the others' grants and its own are close.
     fn fits(&self, member: u64, bitrate: f64) -> bool {
-        let grants = self.grants.lock().unwrap();
+        let grants = self.grants.lock();
         let others = grants.iter().filter(|(id, _)| **id != member).map(|(_, (bps, _))| *bps);
         let (low, high) = others.fold((bitrate, bitrate), |(low, high), bps| (low.min(bps), high.max(bps)));
         high <= low.max(1.0) * SHARE_RATIO
@@ -527,12 +528,12 @@ impl VideoSessions {
     /// The session `member` encodes in at `grant`: `current` while it still fits (unless it is alone there and an older
     /// session of the same stream and policy fits too), else the oldest such session that fits, else a new one.
     fn place(&self, current: Option<Arc<EncodeSession>>, member: u64, (codec, format, key): (&str, VideoFormat, &str), policy: VideoPolicy, grant: (f64, f64)) -> Arc<EncodeSession> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         let same_stream = |session: &&Arc<EncodeSession>| session.codec == codec && session.format == format && session.key == key && session.policy == policy;
         let oldest_fit = sessions.iter().filter(same_stream).filter(|session| session.fits(member, grant.0)).min_by_key(|session| session.id).cloned();
         let session = match (current, oldest_fit) {
             // the policy changes when the subscription is updated (updateSubscription)
-            (Some(current), oldest) if current.policy == policy && current.fits(member, grant.0) && (current.grants.lock().unwrap().len() > 1 || oldest.as_ref().is_none_or(|oldest| oldest.id >= current.id)) => current,
+            (Some(current), oldest) if current.policy == policy && current.fits(member, grant.0) && (current.grants.lock().len() > 1 || oldest.as_ref().is_none_or(|oldest| oldest.id >= current.id)) => current,
             (current, oldest) => {
                 if let Some(current) = current {
                     Self::leave_locked(&mut sessions, &current, member);
@@ -546,16 +547,16 @@ impl VideoSessions {
                 })
             }
         };
-        session.grants.lock().unwrap().insert(member, grant);
+        session.grants.lock().insert(member, grant);
         session
     }
 
     fn leave(&self, session: &Arc<EncodeSession>, member: u64) {
-        Self::leave_locked(&mut self.sessions.lock().unwrap(), session, member);
+        Self::leave_locked(&mut self.sessions.lock(), session, member);
     }
 
     fn leave_locked(sessions: &mut Vec<Arc<EncodeSession>>, session: &Arc<EncodeSession>, member: u64) {
-        let mut grants = session.grants.lock().unwrap();
+        let mut grants = session.grants.lock();
         grants.remove(&member);
         if grants.is_empty() {
             sessions.retain(|other| !Arc::ptr_eq(other, session));
@@ -564,7 +565,7 @@ impl VideoSessions {
 
     #[cfg(test)]
     fn count(&self) -> usize {
-        self.sessions.lock().unwrap().len()
+        self.sessions.lock().len()
     }
 }
 
@@ -615,7 +616,7 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         } else {
             false
         };
-        let grants: Vec<(f64, f64)> = session.grants.lock().unwrap().values().copied().collect();
+        let grants: Vec<(f64, f64)> = session.grants.lock().values().copied().collect();
         let bitrate = grants.iter().map(|grant| grant.0).fold(f64::INFINITY, f64::min);
         let hz = grants.iter().map(|grant| grant.1).fold(0.0, f64::max);
         let floor = session.policy.min_resolution_scale;
@@ -757,7 +758,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             let frame = &logged.frame;
             shared.note_video_source(logged.source.0, logged.source.1);
             let now = Instant::now();
-            let duration = last_write.map_or(Duration::from_secs_f64(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
+            let duration = last_write.map_or(crate::secs(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
             last_write = Some(now);
             let meta = metadata(frame, logged.source, quality);
             if !track.is_current() {

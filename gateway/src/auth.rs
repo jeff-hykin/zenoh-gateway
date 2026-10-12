@@ -3,7 +3,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use zenoh::key_expr::keyexpr;
@@ -325,21 +325,21 @@ impl Leases {
             (asked, limit) => asked.or(limit),
         };
         let expires_in = secs.map(|secs| Duration::try_from_secs_f64(secs).map_err(|_| format!("maxSeconds must be positive, got {secs}"))).transpose()?;
-        let mut held = self.held.lock().unwrap();
+        let mut held = self.held.lock();
         let now = Instant::now();
         held.retain(|_, lease| lease.expires.is_none_or(|at| at > now));
         if let Some((name, _)) = held.iter().find(|(name, lease)| lease.holder != peer && (*name == group || overlaps(&lease.keys, &keys))) {
             return Err(format!("lease {group:?} conflicts with {name:?}, held by another client"));
         }
         let serial = self.serials.fetch_add(1, Ordering::Relaxed);
-        held.insert(group.to_owned(), Held { holder: peer, keys: keys.clone(), expires: expires_in.map(|after| now + after), serial });
+        held.insert(group.to_owned(), Held { holder: peer, keys: keys.clone(), expires: expires_in.and_then(|after| now.checked_add(after)), serial });
         self.changed();
         Ok((keys, expires_in, serial))
     }
 
     /// Ends `group` if `which(holder, serial)` says so, returning the holder.
     pub fn end(&self, group: &str, which: impl Fn(u64, u64) -> bool) -> Option<u64> {
-        let mut held = self.held.lock().unwrap();
+        let mut held = self.held.lock();
         let holder = held.get(group).filter(|lease| which(lease.holder, lease.serial))?.holder;
         held.remove(group);
         self.changed();
@@ -348,7 +348,7 @@ impl Leases {
 
     /// Ends every lease `peer` holds, returning their groups.
     pub fn release_all(&self, peer: u64) -> Vec<String> {
-        let mut held = self.held.lock().unwrap();
+        let mut held = self.held.lock();
         let groups: Vec<String> = held.iter().filter(|(_, lease)| lease.holder == peer).map(|(group, _)| group.clone()).collect();
         held.retain(|_, lease| lease.holder != peer);
         if !groups.is_empty() {
@@ -364,12 +364,12 @@ impl Leases {
     /// The live leases: group and keys.
     pub fn held(&self) -> Vec<(String, Vec<String>)> {
         let now = Instant::now();
-        self.held.lock().unwrap().iter().filter(|(_, lease)| lease.expires.is_none_or(|at| at > now)).map(|(group, lease)| (group.clone(), lease.keys.clone())).collect()
+        self.held.lock().iter().filter(|(_, lease)| lease.expires.is_none_or(|at| at > now)).map(|(group, lease)| (group.clone(), lease.keys.clone())).collect()
     }
 
     /// Why `peer` may not publish on `key` right now: another client's live lease covers it.
     pub fn blocker(&self, peer: u64, key: &str) -> Option<String> {
-        let held = self.held.lock().unwrap();
+        let held = self.held.lock();
         let now = Instant::now();
         held.iter()
             .find(|(_, lease)| lease.holder != peer && lease.expires.is_none_or(|at| at > now) && overlaps(&lease.keys, &[key.to_owned()]))

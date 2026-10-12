@@ -4,7 +4,8 @@
 //! - each bulk stream is paced by a [`TokenBucket`] at its granted rate, in chunks of a few ms of the budget.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use webrtc::data_channel::DataChannel;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -114,7 +115,7 @@ impl Drop for StrictTurn<'_> {
 impl SendGate {
     /// Bytes of every `sub` channel the browser has acknowledged, ever.
     pub fn delivered_total(&self) -> u64 {
-        self.page.lock().unwrap().delivered_total
+        self.page.lock().delivered_total
     }
 
     /// From the allocator: the budget sets bulk chunk size and the in-flight limit, budget x (min RTT + `slack_ms`), about
@@ -151,7 +152,7 @@ impl SendGate {
 
     /// How long the oldest frame SCTP hasn't delivered to the browser has been in it.
     pub fn network_lag(&self, now: Instant) -> Duration {
-        let page = self.page.lock().unwrap();
+        let page = self.page.lock();
         page.unpassed.values().filter(|frame| frame.delivered_at.is_none()).map(|frame| frame.sent_at).min().map_or(Duration::ZERO, |at| now.duration_since(at))
     }
 
@@ -175,7 +176,7 @@ impl SendGate {
 
     /// A frame went to the page; returns its place in the frontend's send order.
     pub fn frame_sent(&self, stream: usize, bytes: usize, lossy: bool) -> u64 {
-        let mut page = self.page.lock().unwrap();
+        let mut page = self.page.lock();
         let order = page.next;
         page.next += 1;
         let sent = page.sent_bytes.entry(stream).or_default();
@@ -187,7 +188,7 @@ impl SendGate {
 
     /// SCTP holds `outstanding` bytes of `stream` its peer hasn't acknowledged: the frames before them reached the browser.
     pub fn observe_delivered(&self, stream: usize, outstanding: usize, now: Instant) {
-        let mut page = self.page.lock().unwrap();
+        let mut page = self.page.lock();
         let delivered = page.sent_bytes.get(&stream).copied().unwrap_or(0).saturating_sub(outstanding);
         let previous = page.delivered_bytes.insert(stream, delivered).unwrap_or(0);
         page.delivered_total += delivered.saturating_sub(previous) as u64;
@@ -200,7 +201,7 @@ impl SendGate {
 
     /// Reads every channel's unacknowledged bytes (`observe_delivered`).
     pub async fn refresh_delivered(&self) {
-        let channels: Vec<(usize, Arc<dyn DataChannel>)> = self.channels.lock().unwrap().iter().map(|(id, channel)| (*id, channel.clone())).collect();
+        let channels: Vec<(usize, Arc<dyn DataChannel>)> = self.channels.lock().iter().map(|(id, channel)| (*id, channel.clone())).collect();
         for (id, channel) in channels {
             let outstanding = channel.outstanding_bytes().await.unwrap_or(0);
             self.observe_delivered(id, outstanding, Instant::now());
@@ -209,7 +210,7 @@ impl SendGate {
 
     /// The page acked these frames of one channel (in send order): it is past every lossy frame sent before them too.
     pub fn frames_acked(&self, orders: impl IntoIterator<Item = u64>) {
-        let mut page = self.page.lock().unwrap();
+        let mut page = self.page.lock();
         let mut newest = None;
         for order in orders {
             page.unpassed.remove(&order);
@@ -224,12 +225,12 @@ impl SendGate {
     /// The page has gotten past every lossy frame sent before this place in the send order: any of them still unacked
     /// was lost. It only grows, so a change means the page made progress.
     pub fn passed(&self) -> u64 {
-        self.page.lock().unwrap().passed
+        self.page.lock().passed
     }
 
     /// Frames of a closed channel the page will never ack.
     pub fn frames_dropped(&self, orders: impl IntoIterator<Item = u64>) {
-        let mut page = self.page.lock().unwrap();
+        let mut page = self.page.lock();
         for order in orders {
             page.unpassed.remove(&order);
         }
@@ -238,7 +239,7 @@ impl SendGate {
     /// How long the page has had the oldest frame it hasn't gotten past: from when SCTP delivered it to the browser, so the
     /// network's own delay (a Wi-Fi path's RTT swinging 60-480 ms) doesn't count, only the page's backlog.
     pub fn page_lag(&self, now: Instant) -> Duration {
-        let page = self.page.lock().unwrap();
+        let page = self.page.lock();
         page.unpassed.values().filter_map(|frame| frame.delivered_at).min().map_or(Duration::ZERO, |at| now.duration_since(at))
     }
 
@@ -262,7 +263,7 @@ impl SendGate {
     }
 
     pub fn report_outstanding(&self, stream: usize, bytes: usize) {
-        set_outstanding(&mut self.outstanding.lock().unwrap(), stream, bytes);
+        set_outstanding(&mut self.outstanding.lock(), stream, bytes);
         self.changed.notify_waiters();
     }
 
@@ -271,7 +272,7 @@ impl SendGate {
         if self.strict_busy.load(Ordering::Acquire) > 0 {
             return false;
         }
-        let mut outstanding = self.outstanding.lock().unwrap();
+        let mut outstanding = self.outstanding.lock();
         let total: usize = outstanding.values().sum();
         if total >= self.inflight_limit.load(Ordering::Relaxed) {
             return false;
@@ -281,17 +282,17 @@ impl SendGate {
     }
 
     pub fn register(&self, stream: usize, channel: Arc<dyn DataChannel>) {
-        self.channels.lock().unwrap().insert(stream, channel);
+        self.channels.lock().insert(stream, channel);
     }
 
     /// Re-reads every bulk channel's outstanding bytes (idle streams don't report while SCTP drains them).
     async fn refresh_all(&self) {
-        let channels: Vec<(usize, Arc<dyn DataChannel>)> = self.channels.lock().unwrap().iter().map(|(id, channel)| (*id, channel.clone())).collect();
+        let channels: Vec<(usize, Arc<dyn DataChannel>)> = self.channels.lock().iter().map(|(id, channel)| (*id, channel.clone())).collect();
         let mut readings = Vec::with_capacity(channels.len());
         for (id, channel) in channels {
             readings.push((id, channel.outstanding_bytes().await.unwrap_or(0)));
         }
-        let mut outstanding = self.outstanding.lock().unwrap();
+        let mut outstanding = self.outstanding.lock();
         for (id, bytes) in readings {
             set_outstanding(&mut outstanding, id, bytes);
         }
@@ -314,8 +315,8 @@ impl SendGate {
     }
 
     pub fn forget(&self, stream: usize) {
-        self.channels.lock().unwrap().remove(&stream);
-        let mut page = self.page.lock().unwrap();
+        self.channels.lock().remove(&stream);
+        let mut page = self.page.lock();
         page.sent_bytes.remove(&stream);
         page.delivered_bytes.remove(&stream);
         drop(page);
@@ -365,7 +366,7 @@ impl TokenBucket {
     pub fn take(&mut self, bytes: usize, now: Instant) -> Duration {
         let Some(rate) = self.rate else { return Duration::ZERO };
         self.refill(now);
-        let wait = if self.tokens >= 0.0 { Duration::ZERO } else { Duration::from_secs_f64(-self.tokens / rate) };
+        let wait = if self.tokens >= 0.0 { Duration::ZERO } else { crate::secs(-self.tokens / rate) };
         self.tokens -= bytes as f64;
         wait
     }

@@ -25,7 +25,7 @@ pub struct IceServer {
 /// coturn's TURN REST API credentials (`use-auth-secret`): username `"<unix expiry>:<user>"`, credential
 /// base64(HMAC-SHA1(secret, username)), valid for `ttl`.
 pub fn turn_credentials(secret: &str, user: &str, ttl: Duration, now: SystemTime) -> (String, String) {
-    let expiry = (now + ttl).duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let expiry = now.checked_add(ttl).unwrap_or(now).duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let username = format!("{expiry}:{user}");
     let mut mac = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
     mac.update(username.as_bytes());

@@ -5,7 +5,8 @@ use super::{Channel, Compress, DecodedFrame, EncodeOptions, EncodingOutput, Enco
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::Mutex;
 
 /// Encoded results kept for sharing (they are small).
 const ENCODED_CAPACITY: usize = 64;
@@ -28,7 +29,7 @@ impl<K: PartialEq, T> WorkCache<K, T> {
     /// Runs `compute` unless someone already did (or is doing) it; `true` = shared result.
     fn get_or_compute(&self, key: K, compute: impl FnOnce() -> Result<T, String>) -> (Result<Arc<T>, String>, bool) {
         let (cell, shared) = {
-            let mut entries = self.entries.lock().unwrap();
+            let mut entries = self.entries.lock();
             match entries.iter().find(|(existing, _)| *existing == key) {
                 Some((_, cell)) => (cell.clone(), true),
                 None => {

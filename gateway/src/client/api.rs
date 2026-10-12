@@ -232,7 +232,7 @@ struct Route {
 impl Drop for Route {
     fn drop(&mut self) {
         if let Some(inner) = self.client.upgrade() {
-            inner.shared.api_routes.lock().unwrap().remove(&self.key);
+            inner.shared.api_routes.lock().remove(&self.key);
         }
     }
 }
@@ -244,8 +244,8 @@ impl Client {
 
     fn route(&self, event: &'static str, id: u64) -> (Route, mpsc::UnboundedReceiver<Value>) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let mut routes = self.inner.shared.api_routes.lock().unwrap();
-        for message in self.inner.shared.api_early.lock().unwrap().remove(&(event, id)).unwrap_or_default() {
+        let mut routes = self.inner.shared.api_routes.lock();
+        for message in self.inner.shared.api_early.lock().remove(&(event, id)).unwrap_or_default() {
             let _ = sender.send(message);
         }
         routes.insert((event, id), sender);
