@@ -17,7 +17,8 @@ use std::net::SocketAddr;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::ToSocketAddrs;
@@ -272,7 +273,7 @@ impl ServerBuilder {
         if let Some(name) = self.zenoh_signalling {
             ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");
             let tasks = signalling::serve(&inner, &name).await?;
-            *inner.signalling.lock().unwrap() = tasks;
+            *inner.signalling.lock() = tasks;
             info!("answering offers over zenoh on {SIGNALLING_PREFIX}/{name}/offer");
         }
         Ok(Server { inner })
@@ -408,7 +409,7 @@ impl Server {
         if self.inner.shut_down.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        for task in self.inner.signalling.lock().unwrap().drain(..) {
+        for task in self.inner.signalling.lock().drain(..) {
             task.abort();
         }
         self.inner.gateway.shutdown().await;

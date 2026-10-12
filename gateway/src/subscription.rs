@@ -11,7 +11,8 @@ use log::{debug, warn};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
@@ -274,12 +275,12 @@ impl SubShared {
     }
 
     pub fn tuning(&self) -> Tuning {
-        *self.tuning.lock().unwrap()
+        *self.tuning.lock()
     }
 
     /// Applies new options to the running subscription (`updateSubscription`); the next frame uses them.
     pub fn retune(&self, opts: &SubOpts) {
-        *self.tuning.lock().unwrap() = Tuning::new(opts, self.codecs.video_policy);
+        *self.tuning.lock() = Tuning::new(opts, self.codecs.video_policy);
         self.data_ready.notify_one();
     }
 
@@ -289,11 +290,11 @@ impl SubShared {
     }
 
     pub fn stats(&self) -> SubStats {
-        self.state.lock().unwrap().stats.clone()
+        self.state.lock().stats.clone()
     }
 
     pub fn allocation(&self) -> Allocation {
-        self.state.lock().unwrap().allocation.clone()
+        self.state.lock().allocation.clone()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -309,12 +310,12 @@ impl SubShared {
 
     /// Quality to transcode at now: the allocation's, or the best allowed before the first one.
     pub fn current_quality(&self) -> f64 {
-        self.state.lock().unwrap().allocation.quality.unwrap_or(self.tuning().quality_range.1)
+        self.state.lock().allocation.quality.unwrap_or(self.tuning().quality_range.1)
     }
 
     /// Granted Hz for one key of this stream (video encoders size their bitrate by it).
     pub fn key_hz(&self, key: &str) -> f64 {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         let rate = state.keys.get(key).map_or(0.0, |queue| queue.rate_hz);
         // never above the source's own rate: the encoder spreads its bitrate over this many frames a second
         let wanted = match (self.tuning().max_hz, rate > 0.0) {
@@ -330,7 +331,7 @@ impl SubShared {
     /// with no grant once fell back to the most it may ask for and took a 100 kbit/s link down.
     pub fn video_grant(&self, key: &str) -> (f64, f64, f64) {
         let hz = self.key_hz(key);
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         let allocation = &state.allocation;
         if allocation.hz > 0.0 && allocation.budget_bytes_per_sec > 0.0 {
             let quality = allocation.quality.unwrap_or(self.tuning().quality_range.1);
@@ -354,7 +355,9 @@ impl SubShared {
     fn key_interval(&self, queue: &KeyQueue, allocation: &Allocation) -> Option<Duration> {
         match self.allocated_key_hz(queue.rate_hz, allocation) {
             Some(hz) if hz <= 0.0 => Some(SQUEEZED_OUT_INTERVAL),
-            Some(hz) => Some(Duration::from_secs_f64(1.0 / hz).max(self.tuning().min_interval.unwrap_or_default())),
+            // a decayed rate (a key that stopped arriving) can be so small that 1/hz is past any Duration: squeezed out
+            Some(hz) if 1.0 / hz >= SQUEEZED_OUT_INTERVAL.as_secs_f64() => Some(SQUEEZED_OUT_INTERVAL),
+            Some(hz) => Some(crate::secs(1.0 / hz).max(self.tuning().min_interval.unwrap_or_default())),
             None => self.tuning().min_interval,
         }
     }
@@ -376,12 +379,12 @@ impl SubShared {
     }
 
     pub fn note_video_source(&self, width: u32, height: u32) {
-        self.state.lock().unwrap().video_source = Some((width, height));
+        self.state.lock().video_source = Some((width, height));
     }
 
     /// Measures rates since the previous call and describes what this stream wants.
     pub fn usage(&self, interval_secs: f64) -> Usage {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let mut max_hz = 0.0;
         for queue in state.keys.values_mut() {
             queue.rate_hz = ewma(queue.rate_hz, queue.arrivals as f64 / interval_secs.max(1e-3));
@@ -452,13 +455,13 @@ impl SubShared {
         // reserved streams aren't paced
         let paced = !self.reserved() && allocation.demand_bytes_per_sec > 0.0;
         let rate = paced.then_some(allocation.budget_bytes_per_sec.max(bulk_budget) * PACING_SLACK);
-        self.bucket.lock().unwrap().set_rate(rate, 2 * self.gate.chunk_bytes());
-        self.state.lock().unwrap().allocation = allocation;
+        self.bucket.lock().set_rate(rate, 2 * self.gate.chunk_bytes());
+        self.state.lock().allocation = allocation;
         self.data_ready.notify_one();
     }
 
     pub(crate) fn record_encode(&self, bucket: u16, quality: f64, encoded_len: usize, shared: bool) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let previous = state.encoded_bytes.get(&bucket).copied().unwrap_or(0.0);
         state.encoded_bytes.insert(bucket, ewma(previous, encoded_len as f64 + FRAME_OVERHEAD_BYTES));
         state.stats.quality = Some(quality);
@@ -466,7 +469,7 @@ impl SubShared {
     }
 
     pub fn record_encoding_error(&self, error: &str) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.stats.encoding_errors += 1;
         if state.stats.last_encoding_error.as_deref() != Some(error) {
             warn!("encoding {}: {error}", self.codec.as_ref().map_or("?", |codec| codec.name()));
@@ -476,7 +479,7 @@ impl SubShared {
 
     /// The video pipeline's per-frame costs and the CPU governor's ceiling on the picture's scale.
     pub fn record_video_timing(&self, decode_ms: Option<f64>, encode_ms: Option<f64>, cpu_scale_cap: f64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.stats.decode_ms = decode_ms;
         state.stats.encode_ms = encode_ms.or(state.stats.encode_ms);
         state.stats.cpu_scale_cap = Some(cpu_scale_cap);
@@ -484,14 +487,14 @@ impl SubShared {
 
     /// Audio packets went to the track.
     pub fn record_media_bytes(&self, bytes: usize) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.stats.bytes_sent += bytes as u64;
         state.stats.sent += 1;
     }
 
     /// A video frame went to the track.
     pub fn record_video_frame(&self, bytes: usize, (width, height): (u32, u32), quality: f64, keyframe: bool, shared_encode: bool, keyframe_requests: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.stats.keyframe_requests = keyframe_requests;
         state.stats.bytes_sent += bytes as u64;
         state.stats.sent += 1;
@@ -511,7 +514,7 @@ impl SubShared {
         let payload_len = sample.payload().len();
         self.sample_priority.store(sample.priority() as u8, Ordering::Relaxed);
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             let seq = state.next_seq;
             state.next_seq = state.next_seq.wrapping_add(1);
             state.stats.received += 1;
@@ -562,10 +565,10 @@ impl SubShared {
 
     /// The key to send next and, when `take`, its sample (taken off the queue).
     fn next(&self, now: Instant, take: bool) -> (Option<(String, Option<Pending>)>, Option<Instant>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let state = &mut *state;
         if let Some(max_age_ms) = self.delivery.max_age_ms {
-            let max_age = Duration::from_secs_f64(max_age_ms / 1000.0);
+            let max_age = crate::secs(max_age_ms / 1000.0);
             for queue in state.keys.values_mut() {
                 while queue.items.front().is_some_and(|item| now.duration_since(item.arrived) > max_age) {
                     state.stats.unqueue(&queue.items.pop_front().unwrap());
@@ -618,7 +621,7 @@ impl SubShared {
 
     /// Page consumed every frame up to `frame_id` (4-byte little endian message on the sub channel).
     fn ack(&self, frame_id: u32) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let mut acked = Vec::new();
         while let Some(&(sent_frame_id, len, order)) = state.unconsumed.front() {
             if !seq_at_or_before(sent_frame_id, frame_id) {
@@ -642,7 +645,7 @@ impl SubShared {
     /// tail by the probe in `Pacer::wait_writable`: nothing is forgotten by age, or a page more than that far behind
     /// would stop holding the gateway back and its backlog would grow without bound.
     fn unconsumed_bytes(&self) -> usize {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if self.delivery.reliable {
             return state.stats.unconsumed_bytes;
         }
@@ -659,7 +662,7 @@ impl SubShared {
 
     /// Bytes on the wire per message, as last measured (0 before the first).
     fn typical_message_bytes(&self) -> f64 {
-        self.state.lock().unwrap().message_bytes
+        self.state.lock().message_bytes
     }
 
     /// Waits for new data or until `wake_at` (a key's pacing), whichever comes first.
@@ -710,11 +713,14 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     debug!("subscribed {:?} with {:?}", label.key, shared.delivery);
 
     shared.gate.register(shared.stream_id, dc.clone());
-    let sender = match track {
-        Some(track) if track.mime.starts_with("audio/") => tokio::spawn(crate::audio::send_loop(dc.clone(), shared.clone(), track)),
-        Some(track) => tokio::spawn(crate::media::send_loop(dc.clone(), shared.clone(), track)),
-        None => tokio::spawn(send_loop(dc.clone(), shared.clone())),
+    let sending: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = match track {
+        Some(track) if track.mime.starts_with("audio/") => Box::pin(crate::audio::send_loop(dc.clone(), shared.clone(), track)),
+        Some(track) => Box::pin(crate::media::send_loop(dc.clone(), shared.clone(), track)),
+        None => Box::pin(send_loop(dc.clone(), shared.clone())),
     };
+    // a sender that panics ends this subscription (the loop below sees `closed`), not the gateway
+    let closing = shared.clone();
+    let sender = crate::spawn_isolated(format!("sender {:?}", label.key), sending, async move { closing.close() });
     // A browser that vanishes (killed, crashed, lid closed) never closes its channels; the peer is
     // dropped instead and closes this subscription, which must end it even though `poll` never
     // returns. Without this, every such browser left its streams decoding and encoding forever.
@@ -735,7 +741,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     }
     shared.close();
     let _ = sender.await;
-    shared.gate.frames_dropped(shared.state.lock().unwrap().unconsumed.drain(..).map(|(_, _, order)| order));
+    shared.gate.frames_dropped(shared.state.lock().unconsumed.drain(..).map(|(_, _, order)| order));
     shared.gate.forget(shared.stream_id);
     drop(subscriber);
     debug!("unsubscribed {:?}", label.key);
@@ -762,7 +768,7 @@ impl Pacer {
             let _ = dc.set_buffered_amount_low_threshold(resume_bytes as u32).await;
         }
         let unconsumed = {
-            let mut state = shared.state.lock().unwrap();
+            let mut state = shared.state.lock();
             state.stats.outstanding_bytes = outstanding;
             state.stats.window_bytes = window;
             state.stats.unconsumed_bytes
@@ -778,7 +784,7 @@ impl Pacer {
         if outstanding < window && unconsumed < unconsumed_window && !lagging(shared) {
             return;
         }
-        shared.state.lock().unwrap().stats.backed_up = true;
+        shared.state.lock().stats.backed_up = true;
         let mut probe_timer_from = Instant::now();
         while (outstanding > resume_bytes || shared.unconsumed_bytes() >= unconsumed_window || lagging(shared))
             && !shared.closed.load(Ordering::Relaxed)
@@ -793,7 +799,7 @@ impl Pacer {
             }
             let waited_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
             {
-                let mut state = shared.state.lock().unwrap();
+                let mut state = shared.state.lock();
                 if waiting_on_network {
                     state.stats.blocked_on_network_ms += waited_ms;
                 } else {
@@ -814,13 +820,13 @@ impl Pacer {
             let probe_after = if lagging(shared) { self.probe_interval.max(max_lag) } else { self.probe_interval };
             let window_only = outstanding <= resume_bytes;
             if window_only && !shared.delivery.reliable && Instant::now() >= probe_timer_from + probe_after {
-                shared.state.lock().unwrap().stats.probes += 1;
+                shared.state.lock().stats.probes += 1;
                 // if this probe isn't acked either, the page is busy rather than the tail lost
                 self.probe_interval = (self.probe_interval * 2).min(MAX_PROBE_INTERVAL);
                 break;
             }
         }
-        let mut state = shared.state.lock().unwrap();
+        let mut state = shared.state.lock();
         state.stats.outstanding_bytes = outstanding;
         state.stats.backed_up = false;
     }
@@ -976,7 +982,7 @@ impl MessageSender {
             // a lossy channel stops a chunked message that outlived maxAge; otherwise it finishes
             // what it started, so big messages make progress even when newer ones keep arriving
             if chunk_index > 0 && !shared.delivery.reliable && shared.expired(item, Instant::now()) {
-                shared.state.lock().unwrap().stats.abandoned_partial += 1;
+                shared.state.lock().stats.abandoned_partial += 1;
                 return Sent::Partial;
             }
             let frame_id = self.next_frame_id;
@@ -985,18 +991,18 @@ impl MessageSender {
             let frame = frame::encode(&header, frame::chunk(payload, chunk_index, chunk_bytes));
             let frame_len = frame.len();
             if strict_turn.is_none() {
-                let wait = shared.bucket.lock().unwrap().take(frame_len, Instant::now());
+                let wait = shared.bucket.lock().take(frame_len, Instant::now());
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
                 let gated = shared.gate.wait_bulk_turn(shared.stream_id, frame_len).await;
-                shared.state.lock().unwrap().stats.paced_ms += (wait + gated).as_secs_f64() * 1000.0;
+                shared.state.lock().stats.paced_ms += (wait + gated).as_secs_f64() * 1000.0;
             }
             if let Err(error) = dc.send(frame).await {
                 if shared.closed.load(Ordering::Relaxed) {
                     return Sent::Closed;
                 }
-                shared.state.lock().unwrap().stats.dropped_send_error += 1;
+                shared.state.lock().stats.dropped_send_error += 1;
                 if !self.warned_send_error {
                     warn!("send on {key:?} failed ({frame_len} bytes): {error}");
                     self.warned_send_error = true;
@@ -1005,7 +1011,7 @@ impl MessageSender {
             }
             message_bytes += frame_len;
             {
-                let mut state = shared.state.lock().unwrap();
+                let mut state = shared.state.lock();
                 let order = shared.gate.frame_sent(shared.stream_id, frame_len, !shared.delivery.reliable);
                 state.unconsumed.push_back((frame_id, frame_len, order));
                 state.stats.unconsumed_bytes += frame_len;
@@ -1014,14 +1020,14 @@ impl MessageSender {
             }
             self.pacer.wait_writable(dc, shared).await;
             if strict_turn.is_none() {
-                shared.gate.report_outstanding(shared.stream_id, shared.state.lock().unwrap().stats.outstanding_bytes);
+                shared.gate.report_outstanding(shared.stream_id, shared.state.lock().stats.outstanding_bytes);
             }
             if shared.closed.load(Ordering::Relaxed) {
                 return Sent::Closed;
             }
         }
         drop(strict_turn);
-        let mut state = shared.state.lock().unwrap();
+        let mut state = shared.state.lock();
         state.stats.sent += 1;
         state.stats.max_send_lag_ms = state.stats.max_send_lag_ms.max(now_unix_ms() - item.timestamp_ms);
         state.message_bytes = ewma(state.message_bytes, message_bytes as f64);
@@ -1049,14 +1055,28 @@ mod tests {
     fn video_hz_is_max_hz_capped_at_the_source_rate() {
         let capped = shared(r#"{"maxHz":30}"#);
         assert_eq!(capped.key_hz("cam"), 30.0, "no measured rate yet");
-        capped.state.lock().unwrap().keys.entry("cam".into()).or_default().rate_hz = 4.5;
+        capped.state.lock().keys.entry("cam".into()).or_default().rate_hz = 4.5;
         assert_eq!(capped.key_hz("cam"), 4.5, "a 4.5 Hz source is encoded as 4.5 Hz, not 30");
         let uncapped = shared(r#"{}"#);
-        uncapped.state.lock().unwrap().keys.entry("cam".into()).or_default().rate_hz = 12.0;
+        uncapped.state.lock().keys.entry("cam".into()).or_default().rate_hz = 12.0;
         assert_eq!(uncapped.key_hz("cam"), 12.0);
         // retune changes it on the running subscription
         uncapped.retune(&SubOpts::parse(&serde_json::json!({"maxHz": 5})).unwrap());
         assert_eq!(uncapped.key_hz("cam"), 5.0);
+    }
+
+    #[test]
+    fn decayed_rate_does_not_panic_under_constrained_allocation() {
+        let sub = shared(r#"{}"#);
+        {
+            let mut state = sub.state.lock();
+            let queue = state.keys.entry("map".into()).or_default();
+            queue.rate_hz = 1e-30;
+            queue.last_sent = Some(Instant::now());
+            queue.items.push_back(pending(1, 3, Instant::now()));
+            state.allocation = Allocation { constrained: true, hz_fraction: 0.5, ..Default::default() };
+        }
+        let _ = sub.pick(Instant::now());
     }
 
     #[test]
@@ -1083,7 +1103,7 @@ mod tests {
     }
 
     fn insert(shared: &SubShared, key: &str, item: Pending, cap: Option<usize>) {
-        let mut state = shared.state.lock().unwrap();
+        let mut state = shared.state.lock();
         state.stats.queued += 1;
         state.stats.queued_bytes += item.payload.len();
         let queue = state.keys.entry(key.to_owned()).or_default();
@@ -1111,7 +1131,7 @@ mod tests {
     fn ack_releases_window() {
         let shared = shared(r#"{}"#);
         {
-            let mut state = shared.state.lock().unwrap();
+            let mut state = shared.state.lock();
             for seq in [5u32, 6, 9] {
                 state.unconsumed.push_back((seq, 100, shared.gate.frame_sent(0, 100, true)));
                 state.stats.unconsumed_bytes += 100;

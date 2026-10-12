@@ -11,7 +11,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::liveliness::LivelinessToken;
@@ -80,15 +81,15 @@ impl ApiState {
     /// Finalizes queries the frontend forgot (dropping a `Query` sends the final reply).
     /// Undeclares everything (the frontend is gone).
     pub(crate) fn clear(&self) {
-        self.queryables.lock().unwrap().clear();
-        self.queries.lock().unwrap().clear();
-        self.tokens.lock().unwrap().clear();
-        self.liveliness_subscribers.lock().unwrap().clear();
-        self.matching.lock().unwrap().clear();
+        self.queryables.lock().clear();
+        self.queries.lock().clear();
+        self.tokens.lock().clear();
+        self.liveliness_subscribers.lock().clear();
+        self.matching.lock().clear();
     }
 
     fn reap_queries(&self) {
-        self.queries.lock().unwrap().retain(|_, (_, since)| since.elapsed() < QUERY_LIFETIME);
+        self.queries.lock().retain(|_, (_, since)| since.elapsed() < QUERY_LIFETIME);
     }
 }
 
@@ -186,7 +187,8 @@ fn consolidation(value: &Option<String>) -> Result<Option<ConsolidationMode>, St
 }
 
 fn timestamp(session: &Session, ms: Option<f64>) -> Option<Timestamp> {
-    ms.map(|ms| Timestamp::new(NTP64::from(Duration::from_secs_f64(ms.max(0.0) / 1000.0)), session.zid().into()))
+    // NTP64 holds 32-bit seconds: a time past 2106 (or NaN) gets zenoh's own timestamp instead
+    ms.filter(|ms| (0.0..4_294_967_295_000.0).contains(ms)).map(|ms| Timestamp::new(NTP64::from(Duration::from_secs_f64(ms / 1000.0)), session.zid().into()))
 }
 
 fn timestamp_ms(timestamp: Option<&Timestamp>) -> Option<f64> {
@@ -368,23 +370,23 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                     if let Some(attachment) = query.attachment() {
                         event["attachment"] = json!(encode(attachment));
                     }
-                    queries.lock().unwrap().insert(query_id, (query, Instant::now()));
+                    queries.lock().insert(query_id, (query, Instant::now()));
                     let _ = events.send(event);
                 })
                 .await
                 .map_err(error)?;
-            api.queryables.lock().unwrap().insert(queryable_id, queryable);
+            api.queryables.lock().insert(queryable_id, queryable);
             Ok(json!({"queryableId": queryable_id}))
         }
         "undeclareQueryable" => {
-            let queryable = api.queryables.lock().unwrap().remove(&request.queryable_id.unwrap_or_default()).ok_or("no such queryable")?;
+            let queryable = api.queryables.lock().remove(&request.queryable_id.unwrap_or_default()).ok_or("no such queryable")?;
             queryable.undeclare().await.map_err(error)?;
             Ok(json!({}))
         }
         "reply" | "replyErr" | "replyDel" => {
             let query_id = request.query_id.ok_or("queryId missing")?;
             // a reply goes out while the query stays open for more (finalizeQuery ends it)
-            let query = api.queries.lock().unwrap().get(&query_id).map(|(query, _)| query.clone()).ok_or("no such query (finalized or expired)")?;
+            let query = api.queries.lock().get(&query_id).map(|(query, _)| query.clone()).ok_or("no such query (finalized or expired)")?;
             match request.op.as_str() {
                 "reply" => {
                     let key = if request.key.is_empty() { query.key_expr().to_string() } else { request.key.clone() };
@@ -419,18 +421,18 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
         }
         "finalizeQuery" => {
             // dropping the last copy of a Query sends its final reply
-            api.queries.lock().unwrap().remove(&request.query_id.unwrap_or_default());
+            api.queries.lock().remove(&request.query_id.unwrap_or_default());
             Ok(json!({}))
         }
         "declareToken" => {
             access.check(Action::LivelinessToken, &request.key)?;
             let token = session.liveliness().declare_token(&request.key).await.map_err(error)?;
             let token_id = api.next();
-            api.tokens.lock().unwrap().insert(token_id, token);
+            api.tokens.lock().insert(token_id, token);
             Ok(json!({"tokenId": token_id}))
         }
         "undeclareToken" => {
-            let token = api.tokens.lock().unwrap().remove(&request.token_id.unwrap_or_default()).ok_or("no such token")?;
+            let token = api.tokens.lock().remove(&request.token_id.unwrap_or_default()).ok_or("no such token")?;
             token.undeclare().await.map_err(error)?;
             Ok(json!({}))
         }
@@ -452,11 +454,11 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                 })
                 .await
                 .map_err(error)?;
-            api.liveliness_subscribers.lock().unwrap().insert(sub_id, subscriber);
+            api.liveliness_subscribers.lock().insert(sub_id, subscriber);
             Ok(json!({"subId": sub_id}))
         }
         "livelinessUnsubscribe" => {
-            let subscriber = api.liveliness_subscribers.lock().unwrap().remove(&request.sub_id.unwrap_or_default()).ok_or("no such liveliness subscriber")?;
+            let subscriber = api.liveliness_subscribers.lock().remove(&request.sub_id.unwrap_or_default()).ok_or("no such liveliness subscriber")?;
             subscriber.undeclare().await.map_err(error)?;
             Ok(json!({}))
         }
@@ -511,11 +513,11 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                 let listener = publisher.matching_listener().callback(on_change).wait().map_err(error)?;
                 MatchingEntity::Publisher(publisher, listener)
             };
-            api.matching.lock().unwrap().insert(listener_id, entity);
+            api.matching.lock().insert(listener_id, entity);
             Ok(json!({"listenerId": listener_id}))
         }
         "undeclareMatchingListener" => {
-            api.matching.lock().unwrap().remove(&request.listener_id.unwrap_or_default()).ok_or("no such matching listener")?;
+            api.matching.lock().remove(&request.listener_id.unwrap_or_default()).ok_or("no such matching listener")?;
             Ok(json!({}))
         }
         "info" => {

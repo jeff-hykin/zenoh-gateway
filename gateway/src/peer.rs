@@ -18,7 +18,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
@@ -239,14 +240,14 @@ impl PeerState {
     }
 
     fn subscriptions(&self) -> Vec<Arc<SubShared>> {
-        let channels = self.channels.lock().unwrap();
+        let channels = self.channels.lock();
         channels.values().filter_map(|entry| if let ChannelStats::Sub(shared) = &entry.stats { Some(shared.clone()) } else { None }).collect()
     }
 
     /// (queue delay, minimum RTT): the smallest RTT since `since` minus the window's minimum. A
     /// standing queue raises every sample; scheduling noise in the browser only some of them.
     fn queue_delay(&self, since: Instant) -> (Option<f64>, Option<f64>) {
-        let samples = self.rtt_samples.lock().unwrap();
+        let samples = self.rtt_samples.lock();
         let minimum = samples.iter().map(|(_, rtt)| *rtt).reduce(f64::min);
         let newest = samples.iter().filter(|(at, _)| *at >= since).map(|(_, rtt)| *rtt).reduce(f64::min);
         (newest.zip(minimum).map(|(newest, minimum)| newest - minimum), minimum)
@@ -254,14 +255,14 @@ impl PeerState {
 
     /// The highest RTT over the last `WINDOW_RTT_WINDOW` (what a send window must cover).
     fn high_rtt(&self, now: Instant) -> Option<f64> {
-        let samples = self.rtt_samples.lock().unwrap();
+        let samples = self.rtt_samples.lock();
         samples.iter().filter(|(at, _)| now.duration_since(*at) <= WINDOW_RTT_WINDOW).map(|(_, rtt)| *rtt).reduce(f64::max)
     }
 
     /// One allocation round: measure, update the estimate, divide the budget among streams.
     fn allocate(&self, interval_secs: f64) {
         let now = Instant::now();
-        let since = std::mem::replace(&mut *self.last_allocation.lock().unwrap(), now);
+        let since = std::mem::replace(&mut *self.last_allocation.lock(), now);
         let (queue_delay_ms, min_rtt_ms) = self.queue_delay(since);
         let high_rtt_ms = self.high_rtt(now);
         let subscriptions = self.subscriptions();
@@ -281,7 +282,7 @@ impl PeerState {
         let data_frame_bytes = data_usages().map(|usage| usage.frame_bytes).sum::<u64>() as f64;
         let wire_scale = {
             // the latest interval that sent anything (acks of a burst keep arriving after it)
-            let mut scale = self.wire_scale.lock().unwrap();
+            let mut scale = self.wire_scale.lock();
             if data_frame_bytes > 0.0 {
                 *scale = (data_sent / data_frame_bytes).max(1.0);
             }
@@ -290,7 +291,7 @@ impl PeerState {
         let delivered_total = self.gate.delivered_total();
         let delivered = delivered_total.saturating_sub(self.delivered_total.swap(delivered_total, Ordering::Relaxed)) as f64 * wire_scale + video_sent * interval_secs;
         let estimator = {
-            let mut estimator = self.estimator.lock().unwrap();
+            let mut estimator = self.estimator.lock();
             estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, page_blocked_secs: page_blocked_ms / 1000.0, active_senders: active, data_demand: total_demand, queue_delay_ms, video_overuse, delivered_bytes: delivered });
             estimator.clone()
         };
@@ -311,7 +312,7 @@ impl PeerState {
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
             shared.apply(allocation, bulk_budget);
         }
-        *self.bandwidth.lock().unwrap() = BandwidthStats {
+        *self.bandwidth.lock() = BandwidthStats {
             data_estimate_bytes_per_sec: estimator.data_bytes_per_sec,
             video_estimate_bytes_per_sec: video_estimate,
             video_sent_bytes_per_sec: video_sent,
@@ -344,12 +345,12 @@ impl PeerState {
     /// Clock sample reported by the browser (it has all four NTP timestamps).
     fn record_clock(&self, offset_ms: Option<f64>, rtt_ms: Option<f64>) {
         if let Some(offset) = offset_ms.filter(|v| v.is_finite()) {
-            *self.clock_offset_ms.lock().unwrap() = Some(offset);
+            *self.clock_offset_ms.lock() = Some(offset);
         }
         if let Some(rtt) = rtt_ms.filter(|v| v.is_finite() && *v >= 0.0) {
-            *self.rtt_ms.lock().unwrap() = Some(rtt);
+            *self.rtt_ms.lock() = Some(rtt);
             let now = Instant::now();
-            let mut samples = self.rtt_samples.lock().unwrap();
+            let mut samples = self.rtt_samples.lock();
             samples.push_back((now, rtt));
             while samples.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_BASELINE_WINDOW) {
                 samples.pop_front();
@@ -361,7 +362,7 @@ impl PeerState {
     /// (a page creates its channels together with `control`).
     async fn send_event(&self, event: Value) {
         for _ in 0..200 {
-            let control = self.control.lock().unwrap().clone();
+            let control = self.control.lock().clone();
             if let Some(control) = control {
                 let _ = control.send_text(&event.to_string()).await;
                 return;
@@ -381,7 +382,7 @@ impl PeerState {
     }
 
     fn find_publisher(&self, pub_id: u64) -> Option<(String, Arc<PubShared>)> {
-        let channels = self.channels.lock().unwrap();
+        let channels = self.channels.lock();
         channels.values().find_map(|entry| match &entry.stats {
             ChannelStats::Pub(shared) if entry.label.id == Some(pub_id) => Some((entry.label.key.clone(), shared.clone())),
             _ => None,
@@ -390,7 +391,7 @@ impl PeerState {
 
     /// Publishes every armed deadman once (REAL_TIME, blocking, reliable) and trips its stream.
     async fn fire_deadmen(&self, reason: &str) {
-        let armed: Vec<(u64, Deadman)> = self.deadmen.lock().unwrap().drain().collect();
+        let armed: Vec<(u64, Deadman)> = self.deadmen.lock().drain().collect();
         for (pub_id, deadman) in armed {
             if let Some(blocked) = self.leases.blocker(self.peer_id, &deadman.key) {
                 warn!("peer {}: deadman on {:?} not fired: {blocked}", self.peer_id, deadman.key);
@@ -398,7 +399,7 @@ impl PeerState {
             }
             // trip first, so a put racing in behind the deadman can't undo it
             deadman.shared.tripped.store(true, Ordering::Release);
-            deadman.shared.stats.lock().unwrap().deadman_armed = false;
+            deadman.shared.stats.lock().deadman_armed = false;
             let result = self
                 .session
                 .put(deadman.key.as_str(), deadman.bytes)
@@ -411,7 +412,7 @@ impl PeerState {
                 Ok(()) => info!("peer {}: deadman fired on {:?} ({reason})", self.peer_id, deadman.key),
                 Err(error) => warn!("peer {}: deadman on {:?} failed: {error}", self.peer_id, deadman.key),
             }
-            let control = self.control.lock().unwrap().clone();
+            let control = self.control.lock().clone();
             if let Some(control) = control {
                 let event = json!({"event": "tripped", "id": pub_id, "reason": reason});
                 let _ = control.send_text(&event.to_string()).await;
@@ -462,7 +463,7 @@ impl Gateway {
         let Some(range) = self.connect_config.udp_ports.clone() else {
             return Ok(None);
         };
-        let mut in_use = self.udp_ports_in_use.lock().unwrap();
+        let mut in_use = self.udp_ports_in_use.lock();
         let used: HashSet<u16> = in_use.values().copied().collect();
         let port = range.clone().find(|port| !used.contains(port) && std::net::UdpSocket::bind(("0.0.0.0", *port)).is_ok());
         let port = port.ok_or_else(|| anyhow::anyhow!("no free UDP port in {range:?} for another connection"))?;
@@ -471,7 +472,7 @@ impl Gateway {
     }
 
     async fn lease_lost(&self, holder: u64, group: &str, reason: &str) {
-        let state = self.peers.lock().unwrap().get(&holder).map(|entry| entry.state.clone());
+        let state = self.peers.lock().get(&holder).map(|entry| entry.state.clone());
         if let Some(state) = state {
             state.lease_lost(group, reason).await;
         }
@@ -479,8 +480,8 @@ impl Gateway {
 
     /// Every open subscription: its key expression and encoding.
     pub fn subscriptions(&self) -> Vec<(String, Option<String>)> {
-        let peers = self.peers.lock().unwrap();
-        let channels = peers.values().flat_map(|entry| entry.state.channels.lock().unwrap().values().filter_map(|channel| match &channel.stats {
+        let peers = self.peers.lock();
+        let channels = peers.values().flat_map(|entry| entry.state.channels.lock().values().filter_map(|channel| match &channel.stats {
             ChannelStats::Sub(shared) => Some((channel.label.key.clone(), shared.codec.as_ref().map(|codec| codec.name().to_owned()))),
             _ => None,
         }).collect::<Vec<_>>());
@@ -500,7 +501,7 @@ impl Gateway {
 
     /// Closes every connection made with `token`.
     pub fn revoke(&self, token: &str) -> usize {
-        let revoked: Vec<u64> = self.peers.lock().unwrap().iter().filter(|(_, entry)| entry.state.token.as_deref() == Some(token)).map(|(id, _)| *id).collect();
+        let revoked: Vec<u64> = self.peers.lock().iter().filter(|(_, entry)| entry.state.token.as_deref() == Some(token)).map(|(id, _)| *id).collect();
         for peer_id in &revoked {
             self.drop_peer(*peer_id, "revoked");
         }
@@ -512,7 +513,7 @@ impl Gateway {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
         let result = self.answer_as(peer_id, offer, token, grant).await;
         if result.is_err() {
-            self.udp_ports_in_use.lock().unwrap().remove(&peer_id);
+            self.udp_ports_in_use.lock().remove(&peer_id);
         }
         result
     }
@@ -563,24 +564,29 @@ impl Gateway {
             .await
             .ok_or_else(|| anyhow::anyhow!("no local description"))?;
         let connection: Arc<dyn PeerConnection> = Arc::new(peer_connection);
-        *state.connection.lock().unwrap() = Some(connection.clone());
-        tokio::spawn(run_allocator(Arc::downgrade(&state)));
-        self.peers.lock().unwrap().insert(peer_id, PeerEntry { connection, state });
+        *state.connection.lock() = Some(connection.clone());
+        let gateway = Arc::downgrade(self);
+        crate::spawn_isolated(format!("peer {peer_id}: allocator"), run_allocator(Arc::downgrade(&state)), async move {
+            if let Some(gateway) = gateway.upgrade() {
+                gateway.drop_peer(peer_id, "internal error");
+            }
+        });
+        self.peers.lock().insert(peer_id, PeerEntry { connection, state });
         info!("peer {peer_id}: answered");
         Ok(local)
     }
 
     fn drop_peer(&self, peer_id: u64, reason: &'static str) {
-        self.udp_ports_in_use.lock().unwrap().remove(&peer_id);
+        self.udp_ports_in_use.lock().remove(&peer_id);
         self.leases.release_all(peer_id);
-        if let Some(entry) = self.peers.lock().unwrap().remove(&peer_id) {
+        if let Some(entry) = self.peers.lock().remove(&peer_id) {
             info!("peer {peer_id}: gone ({reason})");
             entry.state.gone.store(true, Ordering::Relaxed);
             entry.state.api.clear();
-            entry.state.connection.lock().unwrap().take();
-            entry.state.tracks.lock().unwrap().clear();
+            entry.state.connection.lock().take();
+            entry.state.tracks.lock().clear();
             // the channels of a browser that vanished never report their own close
-            for channel in entry.state.channels.lock().unwrap().values() {
+            for channel in entry.state.channels.lock().values() {
                 if let ChannelStats::Sub(shared) = &channel.stats {
                     shared.close();
                 }
@@ -588,7 +594,7 @@ impl Gateway {
             tokio::spawn(async move {
                 entry.state.fire_deadmen(reason).await;
                 // a browser can take ~30 s to notice a closed connection by itself
-                let control = entry.state.control.lock().unwrap().clone();
+                let control = entry.state.control.lock().clone();
                 if let Some(control) = control {
                     let _ = control.send_text(&json!({"event": "closed", "reason": reason}).to_string()).await;
                     // closing right away would drop it unsent
@@ -606,7 +612,7 @@ impl Gateway {
 
     /// Fires every frontend's deadmen ("shutdown") and closes its connection.
     pub async fn shutdown(&self) {
-        let peers: Vec<PeerEntry> = self.peers.lock().unwrap().drain().map(|(_, entry)| entry).collect();
+        let peers: Vec<PeerEntry> = self.peers.lock().drain().map(|(_, entry)| entry).collect();
         for entry in &peers {
             entry.state.fire_deadmen("shutdown").await;
         }
@@ -653,7 +659,7 @@ impl PeerConnectionEventHandler for Handler {
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         debug!("peer {}: {state}", self.peer_id);
-        *self.state.connection_state.lock().unwrap() = Some(state);
+        *self.state.connection_state.lock() = Some(state);
         match state {
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                 if let Some(gateway) = self.gateway.upgrade() {
@@ -665,7 +671,7 @@ impl PeerConnectionEventHandler for Handler {
                 let (gateway, state, peer_id) = (self.gateway.clone(), self.state.clone(), self.peer_id);
                 tokio::spawn(async move {
                     tokio::time::sleep(DISCONNECTED_GRACE).await;
-                    let still_down = *state.connection_state.lock().unwrap() != Some(RTCPeerConnectionState::Connected);
+                    let still_down = *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected);
                     if still_down && let Some(gateway) = gateway.upgrade() {
                         gateway.drop_peer(peer_id, "disconnected");
                     }
@@ -677,7 +683,10 @@ impl PeerConnectionEventHandler for Handler {
 
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
         // Must not block here: the driver waits for this to return.
-        tokio::spawn(run_channel(dc, self.gateway.clone(), self.state.clone()));
+        let closing = dc.clone();
+        crate::spawn_isolated(format!("peer {}: channel", self.peer_id), run_channel(dc, self.gateway.clone(), self.state.clone()), async move {
+            let _ = closing.close().await;
+        });
     }
 }
 
@@ -685,9 +694,9 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     let peer_id = state.peer_id;
     let raw_label = dc.label().await.unwrap_or_default();
     if raw_label == "control" {
-        *state.control.lock().unwrap() = Some(dc.clone());
+        *state.control.lock() = Some(dc.clone());
         run_control(dc, state.clone()).await;
-        *state.control.lock().unwrap() = None;
+        *state.control.lock() = None;
         // the client keeps `control` open for its whole life, so its close means the browser left
         if let Some(gateway) = gateway.upgrade() {
             gateway.drop_peer(peer_id, "disconnected");
@@ -705,7 +714,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     let session = state.session.clone();
     let entry_id = state.next_channel.fetch_add(1, Ordering::Relaxed);
     let register = |opts: Value, stats: ChannelStats| {
-        state.channels.lock().unwrap().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
+        state.channels.lock().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
     let rejected = match label.kind.as_str() {
         "sub" => match state.access().check(crate::auth::Action::Subscribe, &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
@@ -760,14 +769,14 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
             let _ = dc.close().await;
         }
     }
-    if state.channels.lock().unwrap().remove(&entry_id).is_some_and(|entry| matches!(entry.stats, ChannelStats::Sub(_))) {
+    if state.channels.lock().remove(&entry_id).is_some_and(|entry| matches!(entry.stats, ChannelStats::Sub(_))) {
         state.leases.changed();
     }
     // a publisher stream that goes away takes its deadman with it (the client cleared or closed it)
     if label.kind == "pub"
         && let Some(id) = label.id
     {
-        state.deadmen.lock().unwrap().remove(&id);
+        state.deadmen.lock().remove(&id);
     }
 }
 
@@ -780,7 +789,7 @@ fn update_subscription(state: &PeerState, request: &ControlRequest) -> Value {
     let result = (|| -> Result<Value, String> {
         let sub_id = request.sub_id.ok_or("updateSubscription needs subId")?;
         let Some(Value::Object(changes)) = &request.opts else { return Err("updateSubscription needs opts (an object)".into()) };
-        let mut channels = state.channels.lock().unwrap();
+        let mut channels = state.channels.lock();
         let entry = channels
             .values_mut()
             .find(|entry| entry.label.kind == "sub" && entry.label.id == Some(sub_id))
@@ -835,7 +844,7 @@ fn bind_track(state: &PeerState, resolved: &Resolved, label: &Label) -> Result<O
     };
     let channel = resolved.channel.as_str();
     let mid = label.mid.as_deref().ok_or_else(|| format!("channel {channel}: the label needs the mid of a renegotiated transceiver"))?;
-    let track = state.tracks.lock().unwrap().get(mid).cloned().ok_or_else(|| format!("no track for mid {mid:?} (renegotiate with the channel first)"))?;
+    let track = state.tracks.lock().get(mid).cloned().ok_or_else(|| format!("no track for mid {mid:?} (renegotiate with the channel first)"))?;
     if track.mime != mime {
         return Err(format!("track {mid:?} carries {}, channel {channel} needs {mime}", track.mime));
     }
@@ -878,7 +887,7 @@ struct ClockSample {
 /// `{t0, offsetMs?, rttMs?}` in, `{t0, t1, t2}` (gateway receive/send times) out.
 async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc<PeerState>) {
     let already_configured = {
-        let mut heartbeat = state.heartbeat.lock().unwrap();
+        let mut heartbeat = state.heartbeat.lock();
         let already_configured = heartbeat.configured;
         if !already_configured {
             *heartbeat = HeartbeatStats { configured: true, hz: opts.hz, misses: opts.misses, ..Default::default() };
@@ -900,7 +909,7 @@ async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc
                     let t1 = now_unix_ms();
                     last_beat = tokio::time::Instant::now();
                     fired_since_last_beat = false;
-                    state.heartbeat.lock().unwrap().beats += 1;
+                    state.heartbeat.lock().beats += 1;
                     if let Ok(sample) = serde_json::from_slice::<ClockSample>(&message.data) {
                         state.record_clock(sample.offset_ms, sample.rtt_ms);
                         let reply = json!({"t0": sample.t0, "t1": t1, "t2": now_unix_ms()});
@@ -912,7 +921,7 @@ async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc
             },
             _ = tokio::time::sleep_until(last_beat + deadline), if !fired_since_last_beat => {
                 fired_since_last_beat = true;
-                state.heartbeat.lock().unwrap().deadlines_missed += 1;
+                state.heartbeat.lock().deadlines_missed += 1;
                 warn!("peer {}: heartbeat missed for {deadline:?}", state.peer_id);
                 state.fire_deadmen("heartbeat").await;
                 for group in state.leases.release_all(state.peer_id) {
@@ -1016,9 +1025,9 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 ok(&request.id, json!({"t0": request.t0, "t1": t1, "t2": now_unix_ms()}))
             }
             "stats" => {
-                let clock = json!({"offsetMs": *state.clock_offset_ms.lock().unwrap(), "rttMs": *state.rtt_ms.lock().unwrap()});
-                let heartbeat = serde_json::to_value(state.heartbeat.lock().unwrap().clone()).unwrap_or_default();
-                let bandwidth = serde_json::to_value(state.bandwidth.lock().unwrap().clone()).unwrap_or_default();
+                let clock = json!({"offsetMs": *state.clock_offset_ms.lock(), "rttMs": *state.rtt_ms.lock()});
+                let heartbeat = serde_json::to_value(state.heartbeat.lock().clone()).unwrap_or_default();
+                let bandwidth = serde_json::to_value(state.bandwidth.lock().clone()).unwrap_or_default();
                 ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
@@ -1034,8 +1043,8 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             }
             "clearDeadman" => {
                 let pub_id = request.pub_id.unwrap_or_default();
-                if let Some(deadman) = state.deadmen.lock().unwrap().remove(&pub_id) {
-                    deadman.shared.stats.lock().unwrap().deadman_armed = false;
+                if let Some(deadman) = state.deadmen.lock().remove(&pub_id) {
+                    deadman.shared.stats.lock().deadman_armed = false;
                 }
                 ok(&request.id, json!({}))
             }
@@ -1059,7 +1068,7 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
         },
         Some(Err(error)) => return fail(&request.id, error),
     };
-    let Some(connection) = state.connection.lock().unwrap().clone() else {
+    let Some(connection) = state.connection.lock().clone() else {
         return fail(&request.id, "peer is gone");
     };
     let _negotiating = state.negotiation.lock().await;
@@ -1067,7 +1076,7 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
         Ok((answer, track)) => {
             let mid = track.map(|track| {
                 let mid = track.mid.clone();
-                state.tracks.lock().unwrap().insert(mid.clone(), track);
+                state.tracks.lock().insert(mid.clone(), track);
                 mid
             });
             ok(&request.id, json!({"sdp": answer, "mid": mid}))
@@ -1081,7 +1090,7 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
 
 /// Takes (or renews) a lease; it ends at maxSeconds, when the heartbeat stops, or on disconnect.
 fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
-    if !state.heartbeat.lock().unwrap().configured {
+    if !state.heartbeat.lock().configured {
         return fail(&request.id, "a lease needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })");
     }
     let group = request.group.clone().unwrap_or_default();
@@ -1127,7 +1136,7 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
     let Some(pub_id) = request.pub_id else {
         return fail(&request.id, "setDeadman needs pubId");
     };
-    if !state.heartbeat.lock().unwrap().configured {
+    if !state.heartbeat.lock().configured {
         return fail(&request.id, "setDeadman needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })");
     }
     let bytes = match base64::engine::general_purpose::STANDARD.decode(request.bytes.as_deref().unwrap_or_default()) {
@@ -1149,8 +1158,8 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
     if shared.tripped.load(Ordering::Acquire) {
         return fail(&request.id, "publisher is tripped; create a new one");
     }
-    shared.stats.lock().unwrap().deadman_armed = true;
-    state.deadmen.lock().unwrap().insert(pub_id, Deadman { key, bytes, shared });
+    shared.stats.lock().deadman_armed = true;
+    state.deadmen.lock().insert(pub_id, Deadman { key, bytes, shared });
     ok(&request.id, json!({}))
 }
 
@@ -1164,7 +1173,7 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
 async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) -> anyhow::Result<Vec<Value>> {
     let found: Arc<Mutex<BTreeMap<String, BTreeSet<&'static str>>>> = Arc::default();
     let note = |found: &Mutex<BTreeMap<String, BTreeSet<&'static str>>>, key: &str, source: &'static str| {
-        found.lock().unwrap().entry(key.to_owned()).or_default().insert(source);
+        found.lock().entry(key.to_owned()).or_default().insert(source);
     };
     let sink = found.clone();
     // probe 0 = tokens only: no subscription, so publishers that only send while matched (matching
@@ -1195,7 +1204,7 @@ async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) ->
     }
     tokio::time::sleep(probe).await;
     drop(probe_subscriber);
-    let found = found.lock().unwrap();
+    let found = found.lock();
     Ok(found.iter().map(|(key, sources)| json!({"key": key, "sources": sources})).collect())
 }
 
@@ -1211,7 +1220,7 @@ async fn handle_list_topics(session: &zenoh::Session, request: &ControlRequest, 
 }
 
 fn collect_stats(state: &PeerState) -> Vec<Value> {
-    let channels = state.channels.lock().unwrap();
+    let channels = state.channels.lock();
     channels
         .values()
         .map(|entry| {

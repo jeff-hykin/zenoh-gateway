@@ -4940,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "zenoh-gateway"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4952,6 +4952,7 @@ dependencies = [
  "log",
  "openh264",
  "openh264-sys2",
+ "parking_lot",
  "rav1e",
  "reqwest",
  "serde",

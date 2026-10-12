@@ -1,6 +1,6 @@
 [package]
 name = "zenoh-gateway"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2024"
 rust-version = "1.88"
 description = "View and drive a zenoh system from a browser over WebRTC (data channels, H.264 video, bandwidth allocation, deadmen): an embeddable server with pluggable codecs"
@@ -31,6 +31,8 @@ async-trait = "0.1"
 anyhow = "1"
 log = "0.4"
 futures = "0.3"
+# locks that a panic cannot poison: one panicked task must not take every later lock() down with it
+parking_lot = "0.12"
 # subscribe option compress: "zstd" (builds its C sources)
 zstd = "0.13"
 # audio tracks: libopus transpiled to Rust (no C toolchain, so it cross-compiles like the rest)

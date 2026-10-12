@@ -203,7 +203,7 @@ impl SubOpts {
 
     /// Minimum spacing between two sends of the same key, from `maxHz`.
     pub fn min_interval(&self) -> Option<Duration> {
-        self.max_hz.map(|hz| Duration::from_secs_f64(1.0 / hz))
+        self.max_hz.map(|hz| crate::secs(1.0 / hz))
     }
 
     /// Every option with its default filled in, for stats.
@@ -253,7 +253,7 @@ impl HeartbeatOpts {
 
     /// Silence longer than this means the frontend is gone.
     pub fn deadline(&self) -> Duration {
-        Duration::from_secs_f64(self.misses as f64 / self.hz)
+        crate::secs(self.misses as f64 / self.hz)
     }
 }
 
@@ -383,6 +383,9 @@ mod tests {
         assert_eq!(full.quality_range(), (0.3, 0.9));
         assert_eq!((full.normalized()["bandwidthPriority"].as_f64(), full.normalized()["qualityToHzTradeoff"].as_f64()), (Some(2.0), Some(0.7)));
         assert_eq!(full.min_interval(), Some(Duration::from_millis(50)));
+        // a page can ask for any positive number: none of them may panic a Duration
+        assert_eq!(sub(r#"{"maxHz":1e-300}"#).unwrap().min_interval(), Some(Duration::from_secs(86_400)));
+        assert_eq!(HeartbeatOpts::parse(&json!({"hz":1e-300,"misses":3})).unwrap().deadline(), Duration::from_secs(86_400));
     }
 
     #[test]

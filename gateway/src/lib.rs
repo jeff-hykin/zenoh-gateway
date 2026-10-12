@@ -67,3 +67,44 @@ pub use server::{Authorize, DEFAULT_PORT, HEALTH_PATH, ICE_PATH, RunningServer, 
 /// The zenoh version this crate is built against (for [`ServerBuilder::session`] and
 /// [`ServerBuilder::zenoh_config`]).
 pub use zenoh;
+
+/// Spawns `task`; a panic in it is logged and runs `on_panic` (closing only what the task served) instead of
+/// leaving that part of the gateway dead. The returned handle finishes after both.
+pub(crate) fn spawn_isolated(what: String, task: impl Future<Output = ()> + Send + 'static, on_panic: impl Future<Output = ()> + Send + 'static) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(task);
+    tokio::spawn(async move {
+        if let Err(error) = handle.await && error.is_panic() {
+            log::error!("{what} panicked, closing it: {error}");
+            on_panic.await;
+        }
+    })
+}
+
+/// Seconds as a `Duration` that cannot panic: NaN or negative is zero, beyond a day is a day (so `Instant + it` cannot overflow either).
+pub(crate) fn secs(seconds: f64) -> std::time::Duration {
+    std::time::Duration::from_secs_f64(if seconds > 0.0 { seconds.min(86_400.0) } else { 0.0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn secs_never_panics() {
+        assert_eq!(super::secs(f64::NAN), Duration::ZERO);
+        assert_eq!(super::secs(-1.0), Duration::ZERO);
+        assert_eq!(super::secs(1.0 / 1e-30), Duration::from_secs(86_400));
+        assert_eq!(super::secs(f64::INFINITY), Duration::from_secs(86_400));
+        assert_eq!(super::secs(0.25), Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn a_panicked_task_runs_only_its_own_cleanup() {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        super::spawn_isolated("test".into(), async { panic!("boom") }, async move { closed_tx.send(()).unwrap() }).await.unwrap();
+        closed_rx.await.expect("on_panic ran");
+        let (unused_tx, unused_rx) = tokio::sync::oneshot::channel::<()>();
+        super::spawn_isolated("test".into(), async {}, async move { drop(unused_tx) }).await.unwrap();
+        drop(unused_rx);
+    }
+}

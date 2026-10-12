@@ -5,7 +5,8 @@ use crate::subscription::now_unix_ms;
 use log::{debug, warn};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use zenoh::qos::{CongestionControl, Priority};
 
@@ -40,7 +41,7 @@ pub struct PubShared {
 
 impl PubShared {
     pub fn snapshot(&self) -> PubStats {
-        let mut stats = self.stats.lock().unwrap().clone();
+        let mut stats = self.stats.lock().clone();
         stats.tripped = self.tripped.load(Ordering::Acquire);
         stats
     }
@@ -86,7 +87,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
                     let _ = dc.send_text(&serde_json::json!({"blocked": blocked}).to_string()).await;
                 }
                 {
-                    let mut stats = shared.stats.lock().unwrap();
+                    let mut stats = shared.stats.lock();
                     stats.received += 1;
                     if shared.tripped.load(Ordering::Acquire) {
                         stats.rejected_tripped += 1;
@@ -101,7 +102,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
                         continue;
                     }
                     let sent_at_ms = f64::from_le_bytes(message.data[..PUT_HEADER_LEN].try_into().unwrap());
-                    match *clock_offset_ms.lock().unwrap() {
+                    match *clock_offset_ms.lock() {
                         Some(offset_ms) => {
                             let age = age_ms(sent_at_ms, offset_ms, now_unix_ms());
                             stats.last_age_ms = Some(age);
@@ -114,7 +115,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
                     }
                 }
                 let result = publisher.put(message.data[PUT_HEADER_LEN..].to_vec()).await;
-                let mut stats = shared.stats.lock().unwrap();
+                let mut stats = shared.stats.lock();
                 match result {
                     Ok(()) => stats.put += 1,
                     Err(error) => {
