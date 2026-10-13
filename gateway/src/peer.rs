@@ -159,8 +159,6 @@ struct PeerState {
     link: Mutex<LinkModel>,
     /// `SendGate::acked_total` at the last allocation
     acked_total: AtomicU64,
-    /// wire bytes per frame byte sent lately (`subscription::PACKET_OVERHEAD_BYTES`), to read acknowledged frame bytes
-    wire_scale: Mutex<f64>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
     /// flips to true when the peer is dropped: its channel tasks end on it, since a closed connection's data channels
@@ -233,7 +231,6 @@ impl PeerState {
             gate: Arc::default(),
             link: Mutex::new(LinkModel::default()),
             acked_total: AtomicU64::new(0),
-            wire_scale: Mutex::new(1.0),
             bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, ..Default::default() }),
             gone: AtomicBool::new(false),
             gone_signal: tokio::sync::watch::Sender::new(false),
@@ -265,19 +262,9 @@ impl PeerState {
         let blocked_ms: f64 = data_usages().map(|usage| usage.blocked_ms).sum();
         let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.blocked_ms > 0.0).count();
         let total_demand: f64 = usages.iter().map(|usage| usage.demand.wants()).sum();
-        // acked frame bytes, scaled to the wire as what was sent was (frames + per-packet overhead)
-        let data_sent = data_usages().map(|usage| usage.bytes_sent).sum::<u64>() as f64;
-        let data_frame_bytes = data_usages().map(|usage| usage.frame_bytes).sum::<u64>() as f64;
-        let wire_scale = {
-            // the latest interval that sent anything (acks of a burst keep arriving after it)
-            let mut scale = self.wire_scale.lock();
-            if data_frame_bytes > 0.0 {
-                *scale = (data_sent / data_frame_bytes).max(1.0);
-            }
-            *scale
-        };
+        // (the gate counts each frame as it is on the wire: payload plus per-packet overhead)
         let acked_total = self.gate.acked_total();
-        let acked = acked_total.saturating_sub(self.acked_total.swap(acked_total, Ordering::Relaxed)) as f64 * wire_scale;
+        let acked = acked_total.saturating_sub(self.acked_total.swap(acked_total, Ordering::Relaxed)) as f64;
         // video got through as far as GCC (which reads the video's own transport feedback) says the path takes it
         let video_through = if has_video { video_sent.min(self.video_rate.gcc_bytes_per_sec() * interval_secs) } else { 0.0 };
         let delivered = acked + video_through;

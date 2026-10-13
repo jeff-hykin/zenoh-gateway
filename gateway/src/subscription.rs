@@ -149,8 +149,6 @@ pub struct Usage {
     pub demand: Demand,
     /// on the wire: its frames plus `PACKET_OVERHEAD_BYTES` each
     pub bytes_sent: u64,
-    /// its frames alone
-    pub frame_bytes: u64,
     /// time it waited on the in-flight window
     pub blocked_ms: f64,
     /// sent on an RTP track (video, audio), not the data channel
@@ -431,7 +429,7 @@ impl SubShared {
             fixed_bytes_per_sec: self.reserved().then(|| bytes_sent as f64 / interval_secs.max(1e-3)),
             shrinks_last: self.delivery.reliable,
         };
-        Usage { demand, bytes_sent, frame_bytes, blocked_ms, on_track: self.on_track() }
+        Usage { demand, bytes_sent, blocked_ms, on_track: self.on_track() }
     }
 
     /// The grant sets how often a message starts (`key_interval`) and its quality; a message itself goes out at the
@@ -902,7 +900,7 @@ impl MessageSender {
             message_bytes += frame_len;
             {
                 let mut state = shared.state.lock();
-                let order = shared.gate.frame_sent(shared.stream_id, frame_len, !shared.delivery.reliable);
+                let order = shared.gate.frame_sent(shared.stream_id, frame_len + PACKET_OVERHEAD_BYTES as usize, !shared.delivery.reliable);
                 state.unconsumed.push_back((frame_id, frame_len, order));
                 state.stats.unconsumed_bytes += frame_len;
                 state.stats.frames_sent += 1;
