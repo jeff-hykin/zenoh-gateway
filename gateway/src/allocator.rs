@@ -178,6 +178,11 @@ pub struct LinkModel {
     stalled_rounds: u32,
     #[serde(skip)]
     cycle: usize,
+    #[serde(skip)]
+    round_started: Option<std::time::Instant>,
+    /// something in this round waited on the window or pacing
+    #[serde(skip)]
+    round_link_limited: bool,
 }
 
 /// The first guess, 512 kbit/s: low enough not to flood a slow link (1 MB/s plus video filled a 2 Mbit/s link's queue
@@ -215,6 +220,8 @@ impl Default for LinkModel {
             startup_level: 0.0,
             stalled_rounds: 0,
             cycle: 0,
+            round_started: None,
+            round_link_limited: false,
         }
     }
 }
@@ -238,6 +245,14 @@ impl LinkModel {
         }
         let round_secs = secs.max(self.min_rtt_ms.unwrap_or(0.0) / 1000.0);
         let window = crate::secs(BANDWIDTH_ROUNDS * round_secs);
+        // a round is at least a round trip: what is delivered now was sent a round trip ago, so judging growth or moving
+        // the gain cycle every 250 ms on a 400 ms path ended startup before its doubling showed
+        let new_round = self.round_started.is_none_or(|started| now.duration_since(started).as_secs_f64() >= round_secs);
+        if new_round {
+            self.round_started = Some(now);
+            self.round_link_limited = false;
+        }
+        self.round_link_limited |= link_limited;
         self.extra_acked_samples.push_back((now, round.extra_acked));
         for samples in [&mut self.samples, &mut self.extra_acked_samples] {
             while samples.front().is_some_and(|(at, _)| now.duration_since(*at) > window) {
@@ -252,7 +267,7 @@ impl LinkModel {
             self.bandwidth_bytes_per_sec = measured.max(INITIAL_BANDWIDTH);
             if measured >= STARTUP_GROWTH * self.startup_level {
                 (self.startup_level, self.stalled_rounds) = (measured, 0);
-            } else if link_limited && measured > 0.0 {
+            } else if new_round && self.round_link_limited && measured > 0.0 {
                 self.stalled_rounds += 1;
             }
             if self.stalled_rounds >= STARTUP_ROUNDS {
@@ -263,7 +278,9 @@ impl LinkModel {
             if measured > 0.0 {
                 self.bandwidth_bytes_per_sec = measured;
             }
-            self.cycle = (self.cycle + 1) % PROBE_GAINS.len();
+            if new_round {
+                self.cycle = (self.cycle + 1) % PROBE_GAINS.len();
+            }
         }
         self.gain = if self.starting_up { STARTUP_GAIN } else { PROBE_GAINS[self.cycle] };
     }
@@ -276,7 +293,9 @@ impl LinkModel {
             if self.probe_rtt_until.is_none() && (drained || self.probe_rtt_rounds >= 1) {
                 self.probe_rtt_until = Some(now + PROBE_RTT_TIME);
             }
-            self.probe_rtt_rounds += 1;
+            if self.round_started.is_none_or(|started| started == now) {
+                self.probe_rtt_rounds += 1;
+            }
             if let Some(rtt) = round_rtt_ms.filter(|_| self.probe_rtt_until.is_some()) {
                 self.probe_min_rtt = Some(self.probe_min_rtt.map_or(rtt, |least| least.min(rtt)));
             }
