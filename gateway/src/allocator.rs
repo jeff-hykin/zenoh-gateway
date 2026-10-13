@@ -303,8 +303,8 @@ impl LinkModel {
         self.probing_rtt
     }
 
-    /// The pacing rate (bytes/s) and the most that may be in flight (bytes). `queue_limit`: the longest strict streams
-    /// may wait behind bulk in the link's queue (`None`: no strict stream, so BBR's headroom whole).
+    /// The pacing rate (bytes/s) and the most that may be in flight (bytes). `queue_limit`: the longest strict streams'
+    /// data may wait behind bulk in the link's queue (`None`: no strict stream, so BBR's headroom whole).
     pub fn pacing(&self, queue_limit: Option<std::time::Duration>) -> (f64, usize) {
         let window = match (self.probing_rtt(), self.min_rtt_ms) {
             (true, _) => MIN_WINDOW,

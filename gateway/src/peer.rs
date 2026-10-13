@@ -309,18 +309,12 @@ impl PeerState {
         };
     }
 
-    /// The longest a strict message may wait behind bulk in the link's queue, set by the page's own streams: one period of
-    /// its fastest strict stream (a command then never waits past the next one's due time), and never past its heartbeat
-    /// deadline. `None` without either: BBR's headroom whole.
+    /// The longest a strict stream's data may wait behind bulk in the link's queue, set by the page's own strict
+    /// subscriptions (their maxAge, else one period: `SubShared::queue_limit`), the tightest of them. `None` without any
+    /// strict subscription: BBR's headroom whole. (Only robot-to-page data crosses this queue; what the page publishes,
+    /// cmd_vel and heartbeats, travels the other way.)
     fn queue_limit(&self, subscriptions: &[Arc<SubShared>]) -> Option<Duration> {
-        let fastest_strict = subscriptions.iter().filter(|shared| shared.is_strict()).map(|shared| shared.fastest_key_hz()).fold(0.0, f64::max);
-        let period = (fastest_strict > 0.0).then(|| crate::secs(1.0 / fastest_strict));
-        let heartbeat = self.heartbeat.lock();
-        let deadline = (heartbeat.configured && heartbeat.hz > 0.0).then(|| crate::secs(heartbeat.misses as f64 / heartbeat.hz));
-        match (period, deadline) {
-            (Some(period), Some(deadline)) => Some(period.min(deadline)),
-            (one, other) => one.or(other),
-        }
+        subscriptions.iter().filter(|shared| shared.is_strict()).filter_map(|shared| shared.queue_limit()).min()
     }
 
     /// What the streams may use: the link's bandwidth x its gain, within the cap.

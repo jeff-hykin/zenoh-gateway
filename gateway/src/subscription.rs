@@ -278,9 +278,13 @@ impl SubShared {
         self.closed.load(Ordering::Relaxed)
     }
 
-    /// A strict stream's fastest key rate (Hz), measured.
-    pub fn fastest_key_hz(&self) -> f64 {
-        self.state.lock().keys.values().map(|queue| queue.rate_hz).fold(0.0, f64::max)
+    /// How long this stream's data may wait in the link's queue: its maxAge (older is useless to the page), else one
+    /// period of its fastest key (a sample then never waits past the next one's arrival); `None` before either is known.
+    pub fn queue_limit(&self) -> Option<Duration> {
+        let max_age = self.delivery.max_age_ms.map(|max_age_ms| crate::secs(max_age_ms / 1000.0));
+        let fastest = self.state.lock().keys.values().map(|queue| queue.rate_hz).fold(0.0, f64::max);
+        let period = (fastest > 0.0).then(|| crate::secs(1.0 / fastest));
+        max_age.into_iter().chain(period).min()
     }
 
     /// Strict-priority tier: its priority (subscribe option, else as published) is
