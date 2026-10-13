@@ -38,6 +38,8 @@ const DEFAULT_LIST_PROBE_MS: u64 = 600;
 const LIVELINESS_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// A connection that stays `disconnected` this long is treated as gone.
 const DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
+/// An answered connection that hasn't connected this long after is treated as gone (ICE may never report `failed`).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest a shutdown waits for one browser connection to close.
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often each frontend's bandwidth is re-estimated and re-allocated.
@@ -181,6 +183,11 @@ struct PeerState {
     wire_scale: Mutex<f64>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
+    /// flips to true when the peer is dropped: its channel tasks end on it, since a closed connection's data channels
+    /// never report their own close (each one left waiting held this state and the connection, ~2 MB a browser)
+    gone_signal: tokio::sync::watch::Sender<bool>,
+    /// reached `connected` at least once
+    ever_connected: AtomicBool,
     gateway: Weak<Gateway>,
     /// the bearer token it connected with, and what it may do
     token: Option<String>,
@@ -193,6 +200,21 @@ struct PeerState {
     api_events: tokio::sync::mpsc::UnboundedSender<Value>,
 }
 
+/// PeerStates alive: a browser connection's state must go when the connection does.
+static LIVE_PEER_STATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many browser connections' states are alive (dropped ones included until their tasks end): for leak tests.
+#[doc(hidden)]
+pub fn live_peer_states() -> usize {
+    LIVE_PEER_STATES.load(Ordering::Relaxed)
+}
+
+impl Drop for PeerState {
+    fn drop(&mut self) {
+        LIVE_PEER_STATES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl PeerState {
     fn new(
         peer_id: u64,
@@ -203,6 +225,7 @@ impl PeerState {
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<Value>) {
         let config = gateway.allocation;
         let (api_events, api_events_receiver) = tokio::sync::mpsc::unbounded_channel();
+        LIVE_PEER_STATES.fetch_add(1, Ordering::Relaxed);
         let state = PeerState {
             api: api::ApiState::default(),
             api_events,
@@ -235,8 +258,15 @@ impl PeerState {
             wire_scale: Mutex::new(1.0),
             bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, target_fraction: config.target_fraction, ..Default::default() }),
             gone: AtomicBool::new(false),
+            gone_signal: tokio::sync::watch::Sender::new(false),
+            ever_connected: AtomicBool::new(false),
         };
         (state, api_events_receiver)
+    }
+
+    /// Resolves once the peer is dropped.
+    async fn wait_gone(&self) {
+        let _ = self.gone_signal.subscribe().wait_for(|gone| *gone).await;
     }
 
     fn subscriptions(&self) -> Vec<Arc<SubShared>> {
@@ -571,8 +601,20 @@ impl Gateway {
                 gateway.drop_peer(peer_id, "internal error");
             }
         });
+        let watched = state.clone();
         self.peers.lock().insert(peer_id, PeerEntry { connection, state });
         info!("peer {peer_id}: answered");
+        // a browser that gave up before connecting (a phone retrying over a bad link) may never move ICE to `failed`
+        let gateway = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(CONNECT_TIMEOUT) => {}
+                () = watched.wait_gone() => return,
+            }
+            if !watched.ever_connected.load(Ordering::Relaxed) && let Some(gateway) = gateway.upgrade() {
+                gateway.drop_peer(peer_id, "never connected");
+            }
+        });
         Ok(local)
     }
 
@@ -582,9 +624,11 @@ impl Gateway {
         if let Some(entry) = self.peers.lock().remove(&peer_id) {
             info!("peer {peer_id}: gone ({reason})");
             entry.state.gone.store(true, Ordering::Relaxed);
+            entry.state.gone_signal.send_replace(true);
             entry.state.api.clear();
             entry.state.connection.lock().take();
             entry.state.tracks.lock().clear();
+            entry.state.gate.forget_all();
             // the channels of a browser that vanished never report their own close
             for channel in entry.state.channels.lock().values() {
                 if let ChannelStats::Sub(shared) = &channel.stats {
@@ -660,6 +704,9 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         debug!("peer {}: {state}", self.peer_id);
         *self.state.connection_state.lock() = Some(state);
+        if state == RTCPeerConnectionState::Connected {
+            self.state.ever_connected.store(true, Ordering::Relaxed);
+        }
         match state {
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                 if let Some(gateway) = self.gateway.upgrade() {
@@ -695,7 +742,10 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     let raw_label = dc.label().await.unwrap_or_default();
     if raw_label == "control" {
         *state.control.lock() = Some(dc.clone());
-        run_control(dc, state.clone()).await;
+        tokio::select! {
+            () = run_control(dc, state.clone()) => {}
+            () = state.wait_gone() => {}
+        }
         *state.control.lock() = None;
         // the client keeps `control` open for its whole life, so its close means the browser left
         if let Some(gateway) = gateway.upgrade() {
@@ -716,7 +766,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     let register = |opts: Value, stats: ChannelStats| {
         state.channels.lock().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
-    let rejected = match label.kind.as_str() {
+    let work = async { match label.kind.as_str() {
         "sub" => match state.access().check(crate::auth::Action::Subscribe, &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
             let resolved = opts.resolve_encoding(&state.codecs)?;
             let track = bind_track(&state, &resolved, &label)?;
@@ -752,6 +802,11 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
             Err(error) => Some(error),
         },
         other => Some(format!("unknown channel type {other:?}")),
+    } };
+    // a dropped peer's channels never report their close: without this each waited forever, holding the peer's state
+    let rejected = tokio::select! {
+        rejected = work => rejected,
+        () = state.wait_gone() => None,
     };
     if let Some(error) = rejected {
         warn!("peer {peer_id}: rejected channel {raw_label}: {error}");

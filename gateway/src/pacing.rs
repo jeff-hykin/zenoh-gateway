@@ -314,6 +314,14 @@ impl SendGate {
         }
     }
 
+    /// Lets go of every channel: they hold the peer connection, whose handler holds the peer state that holds this gate.
+    pub fn forget_all(&self) {
+        self.channels.lock().clear();
+        self.outstanding.lock().clear();
+        *self.page.lock() = PageQueue::default();
+        self.changed.notify_waiters();
+    }
+
     pub fn forget(&self, stream: usize) {
         self.channels.lock().remove(&stream);
         let mut page = self.page.lock();

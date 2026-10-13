@@ -66,6 +66,14 @@ zune-jpeg = "0.5"
 name = "client"
 required-features = ["client"]
 
+[[test]]
+name = "backpressure"
+required-features = ["client"]
+
+[[test]]
+name = "leak"
+required-features = ["client"]
+
 [[example]]
 name = "relay_sketch"
 required-features = ["client"]
