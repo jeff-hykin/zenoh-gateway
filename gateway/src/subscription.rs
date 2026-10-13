@@ -118,6 +118,8 @@ struct SubState {
     /// (frameId, frame bytes, place in the frontend's send order) in send order, until the page acks a frameId at or past it
     unconsumed: VecDeque<(u32, usize, u64)>,
     allocation: Allocation,
+    /// the link model is probing for bandwidth this round (see `apply`)
+    probing: bool,
     payload_bytes: f64,
     /// bytes on the wire per message (untranscoded)
     message_bytes: f64,
@@ -340,8 +342,8 @@ impl SubShared {
 
     /// Spacing between two sends of a key: maxHz, tightened by the allocation. A key granted nothing sends nothing until
     /// it is granted some (at a 0.05 Hz floor a 400 KB map alone took 20 KB/s of a 12 KB/s link); a new allocation wakes it.
-    fn key_interval(&self, queue: &KeyQueue, allocation: &Allocation) -> Spacing {
-        match self.allocated_key_hz(queue.rate_hz, allocation) {
+    fn key_interval(&self, queue: &KeyQueue, allocation: &Allocation, probing: bool) -> Spacing {
+        match self.allocated_key_hz(queue.rate_hz, allocation).filter(|_| !probing) {
             Some(hz) if hz <= 0.0 => Spacing::Never,
             Some(hz) => Spacing::Every(crate::secs(1.0 / hz).max(self.tuning().min_interval.unwrap_or_default())),
             None => self.tuning().min_interval.map_or(Spacing::Any, Spacing::Every),
@@ -444,8 +446,13 @@ impl SubShared {
 
     /// The grant sets how often a message starts (`key_interval`) and its quality; a message itself goes out at the
     /// frontend's pacing rate (paced at its grant, a 400 KB map granted 50 KB/s took 8 s to send and arrived 8 s old).
-    pub fn apply(&self, allocation: Allocation) {
-        self.state.lock().allocation = allocation;
+    /// `probing`: the link model is asking for more than its estimate; the grant's spacing is lifted for the round (the
+    /// frontend's pacing and window still cap the total), so what gets through measures the link, not the shares.
+    pub fn apply(&self, allocation: Allocation, probing: bool) {
+        let mut state = self.state.lock();
+        state.allocation = allocation;
+        state.probing = probing;
+        drop(state);
         self.data_ready.notify_one();
     }
 
@@ -587,7 +594,7 @@ impl SubShared {
             let Some(head) = queue.items.front() else {
                 continue;
             };
-            match (self.key_interval(queue, &state.allocation), queue.last_sent) {
+            match (self.key_interval(queue, &state.allocation, state.probing), queue.last_sent) {
                 (Spacing::Never, _) => continue,
                 (Spacing::Every(interval), Some(last_sent)) if last_sent + interval > now => {
                     let ready_at = last_sent + interval;

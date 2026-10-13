@@ -287,7 +287,7 @@ impl PeerState {
         let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
         self.video_rate.set_cap_bytes_per_sec(video_granted);
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
-            shared.apply(allocation);
+            shared.apply(allocation, link.probing_bandwidth());
         }
         *self.bandwidth.lock() = BandwidthStats {
             data_estimate_bytes_per_sec: link.bandwidth_bytes_per_sec,

@@ -178,6 +178,9 @@ pub struct LinkModel {
     stalled_rounds: u32,
     #[serde(skip)]
     cycle: usize,
+    /// the bandwidth when the current round began (what a probe must beat)
+    #[serde(skip)]
+    probe_level: f64,
     #[serde(skip)]
     round_started: Option<std::time::Instant>,
     /// something in this round waited on the window or pacing
@@ -220,6 +223,7 @@ impl Default for LinkModel {
             startup_level: 0.0,
             stalled_rounds: 0,
             cycle: 0,
+            probe_level: 0.0,
             round_started: None,
             round_link_limited: false,
         }
@@ -279,7 +283,13 @@ impl LinkModel {
                 self.bandwidth_bytes_per_sec = measured;
             }
             if new_round {
-                self.cycle = (self.cycle + 1) % PROBE_GAINS.len();
+                // a probe that found 25% more probes again (BBR v2's probe-up): after a drop and recovery the estimate
+                // climbs in seconds, not at 25% per eight rounds
+                let found_more = self.cycle == 0 && measured >= STARTUP_GROWTH * self.probe_level;
+                if !found_more {
+                    self.cycle = (self.cycle + 1) % PROBE_GAINS.len();
+                }
+                self.probe_level = self.bandwidth_bytes_per_sec;
             }
         }
         self.gain = if self.starting_up { STARTUP_GAIN } else { PROBE_GAINS[self.cycle] };
@@ -316,6 +326,12 @@ impl LinkModel {
         if !self.starting_up && self.min_rtt_at.is_some_and(|at| now.duration_since(at) > MIN_RTT_WINDOW) {
             self.probing_rtt = true;
         }
+    }
+
+    /// Asking for more than the estimate (starting up, or a probe round): the streams then send beyond their shares,
+    /// so the link is really tested (spaced by their grants, they never showed it could carry more).
+    pub fn probing_bandwidth(&self) -> bool {
+        self.gain > 1.0
     }
 
     pub fn probing_rtt(&self) -> bool {

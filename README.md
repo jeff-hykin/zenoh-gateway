@@ -100,7 +100,7 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 |---|---|---|
 | `delivery` | `"latest"` | `"latest"`: drop old frames; `"reliable"`: lossless, ordered (not for video or audio channels) |
 | `priority` | as published | zenoh priority 1–7 (`Priority.*`); ≤ INTERACTIVE_HIGH (2) makes it strict |
-| `maxAge` | none | ms; drop anything older (also the SCTP packet lifetime on `"latest"`) |
+| `maxAge` | none | ms; drop anything older (also the SCTP packet lifetime on `"latest"`), and the most it may wait queued in the network (see "Bandwidth allocation") |
 | `maxHz` | none | never send a key faster |
 | `bandwidthPriority` | 1 | when bandwidth is short, a higher number keeps more bandwidth and quality (each stream gives up in proportion to demand / priority); 0 gives up everything first |
 | `minQuality` | 0 | the least quality the allocator picks for an encoded stream (the most is `encodeOptions.quality`) |
@@ -367,13 +367,15 @@ new publisher is needed. Background tabs throttle timers to ≥ 1 s, so keep `mi
 
 ## Bandwidth allocation
 
-Per browser, every 250 ms: measure the path as BBR does (bandwidth = the most it delivered in a round lately, round
-trip = the least send-to-ack time; GCC for video), budget bandwidth × a gain (capped by `max_bandwidth_bytes_per_sec`),
-reserve strict-priority streams, and shrink the rest like
-CSS flex items by `demand / bandwidthPriority` (higher priority keeps more; priority-0 streams shrink first). An encoded stream granted a fraction r of its demand shrinks its message size by
-`r^qualityToHzTradeoff` and its rate by the rest. Bulk sends are paced at the budget and never have more than 2 × bandwidth × round trip unacked
-by the page, so queues stay short and strict streams don't wait behind them. Each subscription's `allocation` (demand, budget, hz, quality,
-constrained) is in `z.stats`. Full algorithm and measurements: SPEC.md "Bandwidth allocation".
+Per browser, every 250 ms: measure the link as BBR does (bandwidth = the most delivered per round lately; round trip =
+the least send-to-ack time; GCC for video), split bandwidth × gain across subscriptions like CSS flex items by
+`demand / bandwidthPriority` (strict-priority streams reserved, priority-0 shrink first), and pace bulk sends at it.
+
+**Set `maxAge` on anything latency-sensitive.** Data the gateway has let out waits in the network's queues (Wi-Fi,
+router), where nothing can jump ahead. How much it lets out is set by the subscriptions' `maxAge`, averaged by their
+share of the bandwidth. Without one, a subscription has no say, and the gateway queues for throughput.
+
+`allocation` per subscription and `bandwidth` per connection are in `z.stats`; details in SPEC.md "Bandwidth allocation".
 
 ## Nix / cross compiling
 
