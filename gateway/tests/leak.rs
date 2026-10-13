@@ -106,6 +106,13 @@ async fn connections_that_come_and_go_leave_nothing_behind() {
         wait_for("after 12 connections", Duration::from_secs(60), || zenoh_gateway::live_peer_states() == 0).await;
         eprintln!("after {} connections: RSS {:.0} MB, no live peer states", 12 * (batch + 1), rss_mb());
     }
+    // offers that fail once their connection is built (here a malformed SDP) must not leave it running
+    let http = reqwest::Client::new();
+    for _ in 0..5 {
+        let response = http.post(format!("{url}/offer")).json(&serde_json::json!({"type": "offer", "sdp": "v=0\r\n"})).send().await.unwrap();
+        assert!(!response.status().is_success(), "a malformed offer is refused");
+    }
+    wait_for("after 5 failed offers", Duration::from_secs(10), || zenoh_gateway::live_peer_states() == 0).await;
     putter.abort();
     running.shutdown().await.unwrap();
 }

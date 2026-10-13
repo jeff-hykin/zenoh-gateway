@@ -35,6 +35,8 @@ use zenoh::qos::{CongestionControl, Priority, Reliability};
 const MAX_MESSAGE_SIZE: u32 = 256 * 1024;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_LIST_PROBE_MS: u64 = 600;
+/// A page's probeMs is capped: its `**` subscriber recorded every key and kept the peer alive until it ended.
+const MAX_LIST_PROBE_MS: u64 = 10_000;
 const LIVELINESS_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// A connection that stays `disconnected` this long is treated as gone.
 const DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
@@ -541,11 +543,7 @@ impl Gateway {
     /// Non-trickle signaling: take an offer, return an answer with all our candidates in it.
     pub async fn answer(self: &Arc<Self>, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
-        let result = self.answer_as(peer_id, offer, token, grant).await;
-        if result.is_err() {
-            self.udp_ports_in_use.lock().remove(&peer_id);
-        }
-        result
+        self.answer_as(peer_id, offer, token, grant).await
     }
 
     async fn answer_as(self: &Arc<Self>, peer_id: u64, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
@@ -554,6 +552,7 @@ impl Gateway {
         let (media_engine, interceptors, video_rate) = media::media_setup()?;
         let (state, mut api_events) = PeerState::new(peer_id, self, video_rate, token, grant);
         let state = Arc::new(state);
+        let mut pending = PendingPeer { gateway: Arc::downgrade(self), peer_id, state: state.clone(), connection: None, armed: true };
         let forwarder = Arc::downgrade(&state);
         tokio::spawn(async move {
             while let Some(event) = api_events.recv().await {
@@ -570,11 +569,11 @@ impl Gateway {
             .into_iter()
             .map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential })
             .collect();
-        let handler = Arc::new(Handler { gateway: Arc::downgrade(self), peer_id, gathered_tx, state: state.clone() });
+        let handler = Arc::new(Handler { gateway: Arc::downgrade(self), peer_id, gathered_tx, state: Arc::downgrade(&state) });
         let setting_engine = SettingEngineBuilder::new()
             .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
             .build();
-        let peer_connection = PeerConnectionBuilder::new()
+        let peer_connection: Arc<dyn PeerConnection> = Arc::new(PeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).build())
             .with_setting_engine(setting_engine)
             .with_media_engine(media_engine)
@@ -582,7 +581,8 @@ impl Gateway {
             .with_handler(handler)
             .with_udp_addrs(vec![format!("0.0.0.0:{port}"), format!("127.0.0.1:{port}")])
             .build()
-            .await?;
+            .await?);
+        pending.connection = Some(peer_connection.clone());
         peer_connection.set_remote_description(offer).await?;
         let answer = peer_connection.create_answer(None).await?;
         peer_connection.set_local_description(answer).await?;
@@ -593,7 +593,7 @@ impl Gateway {
             .local_description()
             .await
             .ok_or_else(|| anyhow::anyhow!("no local description"))?;
-        let connection: Arc<dyn PeerConnection> = Arc::new(peer_connection);
+        let connection = peer_connection;
         *state.connection.lock() = Some(connection.clone());
         let gateway = Arc::downgrade(self);
         crate::spawn_isolated(format!("peer {peer_id}: allocator"), run_allocator(Arc::downgrade(&state)), async move {
@@ -602,8 +602,13 @@ impl Gateway {
             }
         });
         let watched = state.clone();
+        pending.armed = false;
         self.peers.lock().insert(peer_id, PeerEntry { connection, state });
         info!("peer {peer_id}: answered");
+        // failed or closed while gathering: drop_peer ran before the peer was in `peers` and did nothing
+        if matches!(*watched.connection_state.lock(), Some(RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed)) {
+            self.drop_peer(peer_id, "disconnected");
+        }
         // a browser that gave up before connecting (a phone retrying over a bad link) may never move ICE to `failed`
         let gateway = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -624,17 +629,18 @@ impl Gateway {
         if let Some(entry) = self.peers.lock().remove(&peer_id) {
             info!("peer {peer_id}: gone ({reason})");
             entry.state.gone.store(true, Ordering::Relaxed);
-            entry.state.gone_signal.send_replace(true);
-            entry.state.api.clear();
-            entry.state.connection.lock().take();
-            entry.state.tracks.lock().clear();
-            entry.state.gate.forget_all();
-            // the channels of a browser that vanished never report their own close
+            // the channels of a browser that vanished never report their own close; closed before the gone signal,
+            // which cancels the channel tasks (a subscription cancelled first would never be closed)
             for channel in entry.state.channels.lock().values() {
                 if let ChannelStats::Sub(shared) = &channel.stats {
                     shared.close();
                 }
             }
+            entry.state.gone_signal.send_replace(true);
+            entry.state.api.clear();
+            entry.state.connection.lock().take();
+            entry.state.tracks.lock().clear();
+            entry.state.gate.forget_all();
             tokio::spawn(async move {
                 entry.state.fire_deadmen(reason).await;
                 // a browser can take ~30 s to notice a closed connection by itself
@@ -686,11 +692,40 @@ async fn run_allocator(state: Weak<PeerState>) {
     }
 }
 
+/// A connection being answered that never made it into `peers` (an error, or the HTTP request dropped mid-answer):
+/// dropping it closes the connection, whose driver otherwise ran on holding all of it, and frees its UDP port.
+struct PendingPeer {
+    gateway: Weak<Gateway>,
+    peer_id: u64,
+    state: Arc<PeerState>,
+    connection: Option<Arc<dyn PeerConnection>>,
+    armed: bool,
+}
+
+impl Drop for PendingPeer {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(gateway) = self.gateway.upgrade() {
+            gateway.udp_ports_in_use.lock().remove(&self.peer_id);
+        }
+        self.state.gone.store(true, Ordering::Relaxed);
+        self.state.gone_signal.send_replace(true);
+        if let (Some(connection), Ok(runtime)) = (self.connection.take(), tokio::runtime::Handle::try_current()) {
+            runtime.spawn(async move {
+                let _ = connection.close().await;
+            });
+        }
+    }
+}
+
 struct Handler {
     gateway: std::sync::Weak<Gateway>,
     peer_id: u64,
     gathered_tx: mpsc::Sender<()>,
-    state: Arc<PeerState>,
+    /// weak: the connection holds this handler, and a strong state here made every channel the state keeps a cycle
+    state: Weak<PeerState>,
 }
 
 #[async_trait::async_trait]
@@ -703,9 +738,11 @@ impl PeerConnectionEventHandler for Handler {
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         debug!("peer {}: {state}", self.peer_id);
-        *self.state.connection_state.lock() = Some(state);
-        if state == RTCPeerConnectionState::Connected {
-            self.state.ever_connected.store(true, Ordering::Relaxed);
+        if let Some(peer) = self.state.upgrade() {
+            *peer.connection_state.lock() = Some(state);
+            if state == RTCPeerConnectionState::Connected {
+                peer.ever_connected.store(true, Ordering::Relaxed);
+            }
         }
         match state {
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
@@ -718,7 +755,7 @@ impl PeerConnectionEventHandler for Handler {
                 let (gateway, state, peer_id) = (self.gateway.clone(), self.state.clone(), self.peer_id);
                 tokio::spawn(async move {
                     tokio::time::sleep(DISCONNECTED_GRACE).await;
-                    let still_down = *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected);
+                    let still_down = state.upgrade().is_some_and(|state| *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected));
                     if still_down && let Some(gateway) = gateway.upgrade() {
                         gateway.drop_peer(peer_id, "disconnected");
                     }
@@ -731,7 +768,13 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
         // Must not block here: the driver waits for this to return.
         let closing = dc.clone();
-        crate::spawn_isolated(format!("peer {}: channel", self.peer_id), run_channel(dc, self.gateway.clone(), self.state.clone()), async move {
+        let Some(state) = self.state.upgrade().filter(|state| !state.gone.load(Ordering::Relaxed)) else {
+            tokio::spawn(async move {
+                let _ = closing.close().await;
+            });
+            return;
+        };
+        crate::spawn_isolated(format!("peer {}: channel", self.peer_id), run_channel(dc, self.gateway.clone(), state), async move {
             let _ = closing.close().await;
         });
     }
@@ -1268,7 +1311,7 @@ async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) ->
 
 async fn handle_list_topics(session: &zenoh::Session, request: &ControlRequest, grant: &Grant) -> Value {
     let filter = if request.key.is_empty() { "**" } else { &request.key };
-    match list_topics(session, filter, Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS))).await {
+    match list_topics(session, filter, Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS).min(MAX_LIST_PROBE_MS))).await {
         Ok(mut topics) => {
             topics.retain(|topic| grant.allows(crate::auth::Action::List, topic["key"].as_str().unwrap_or_default()).is_ok());
             ok(&request.id, json!({"topics": topics}))
