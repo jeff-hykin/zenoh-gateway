@@ -638,7 +638,7 @@ impl Gateway {
             tokio::spawn(async move {
                 entry.state.fire_deadmen(reason).await;
                 // a browser can take ~30 s to notice a closed connection by itself
-                let control = entry.state.control.lock().clone();
+                let control = entry.state.control.lock().take();
                 if let Some(control) = control {
                     let _ = control.send_text(&json!({"event": "closed", "reason": reason}).to_string()).await;
                     // closing right away would drop it unsent
@@ -746,7 +746,10 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
             () = run_control(dc, state.clone()) => {}
             () = state.wait_gone() => {}
         }
-        *state.control.lock() = None;
+        // a dropped peer's control is drop_peer's to close with a "closed" event (gone is set before the signal)
+        if !state.gone.load(Ordering::Relaxed) {
+            *state.control.lock() = None;
+        }
         // the client keeps `control` open for its whole life, so its close means the browser left
         if let Some(gateway) = gateway.upgrade() {
             gateway.drop_peer(peer_id, "disconnected");
