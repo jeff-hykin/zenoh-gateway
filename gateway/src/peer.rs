@@ -274,7 +274,7 @@ impl PeerState {
             link.clone()
         };
         let budget = self.budget(&link);
-        let (_, window) = link.pacing();
+        let (_, window) = link.pacing(self.queue_limit(&subscriptions));
         self.gate.configure(link.bandwidth_bytes_per_sec, budget, window);
         let video_estimate = if has_video { self.video_rate.gcc_bytes_per_sec() } else { 0.0 };
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
@@ -309,9 +309,23 @@ impl PeerState {
         };
     }
 
+    /// The longest a strict message may wait behind bulk in the link's queue, set by the page's own streams: one period of
+    /// its fastest strict stream (a command then never waits past the next one's due time), and never past its heartbeat
+    /// deadline. `None` without either: BBR's headroom whole.
+    fn queue_limit(&self, subscriptions: &[Arc<SubShared>]) -> Option<Duration> {
+        let fastest_strict = subscriptions.iter().filter(|shared| shared.is_strict()).map(|shared| shared.fastest_key_hz()).fold(0.0, f64::max);
+        let period = (fastest_strict > 0.0).then(|| crate::secs(1.0 / fastest_strict));
+        let heartbeat = self.heartbeat.lock();
+        let deadline = (heartbeat.configured && heartbeat.hz > 0.0).then(|| crate::secs(heartbeat.misses as f64 / heartbeat.hz));
+        match (period, deadline) {
+            (Some(period), Some(deadline)) => Some(period.min(deadline)),
+            (one, other) => one.or(other),
+        }
+    }
+
     /// What the streams may use: the link's bandwidth x its gain, within the cap.
     fn budget(&self, link: &LinkModel) -> f64 {
-        let (rate, _) = link.pacing();
+        let (rate, _) = link.pacing(None);
         self.config.max_bandwidth.map_or(rate, |cap| cap.min(rate))
     }
 

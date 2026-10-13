@@ -89,7 +89,7 @@ pub struct SendGate {
 
 impl Default for SendGate {
     fn default() -> Self {
-        let (rate, window) = crate::allocator::LinkModel::default().pacing();
+        let (rate, window) = crate::allocator::LinkModel::default().pacing(None);
         SendGate {
             strict_busy: AtomicUsize::new(0),
             path: Mutex::new(Path {

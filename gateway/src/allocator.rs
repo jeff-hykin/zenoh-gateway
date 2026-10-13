@@ -142,7 +142,7 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
 ///   bandwidth x the least round trip alone held a jittery link to a fraction of what it carries.
 ///
 /// Streams are budgeted bandwidth x gain and paced at it, and what is in flight is held to bandwidth x round trip plus a
-/// headroom of (`WINDOW_GAIN` - 1) x that + the ack aggregation, at most `MAX_QUEUE_DELAY` of the bandwidth. The gain is `STARTUP_GAIN` while the bandwidth keeps growing (by `STARTUP_GROWTH` within `STARTUP_ROUNDS`
+/// headroom of (`WINDOW_GAIN` - 1) x that + the ack aggregation, at most `queue_limit` of the bandwidth. The gain is `STARTUP_GAIN` while the bandwidth keeps growing (by `STARTUP_GROWTH` within `STARTUP_ROUNDS`
 /// link-limited rounds), then cycles through `PROBE_GAINS`: a round asking 25% more, one draining what that queued,
 /// six at the estimate. Nothing reacts to a delay or a loss, so Wi-Fi jitter can't move it; a link that slows delivers
 /// less and its old maximum ages out within `BANDWIDTH_ROUNDS`, while the window keeps the queue about a round trip long.
@@ -190,9 +190,6 @@ const STARTUP_ROUNDS: u32 = 3;
 const PROBE_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 const BANDWIDTH_ROUNDS: f64 = 10.0;
 const WINDOW_GAIN: f64 = 2.0;
-/// The longest a strict message should wait behind bulk in the link's queue: on a fast link that is plenty of bytes for
-/// BBR's headroom, on a 500 kbit/s one a few KB (a full round trip of headroom held commands ~0.5 s there).
-const MAX_QUEUE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const MIN_RTT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 const PROBE_RTT_TIME: std::time::Duration = std::time::Duration::from_millis(200);
 /// Bytes in flight before any round trip is measured, and the least ever: RFC 6928's 10 packets, BBR's 4.
@@ -306,17 +303,19 @@ impl LinkModel {
         self.probing_rtt
     }
 
-    /// The pacing rate (bytes/s) and the most that may be in flight (bytes).
-    pub fn pacing(&self) -> (f64, usize) {
+    /// The pacing rate (bytes/s) and the most that may be in flight (bytes). `queue_limit`: the longest strict streams
+    /// may wait behind bulk in the link's queue (`None`: no strict stream, so BBR's headroom whole).
+    pub fn pacing(&self, queue_limit: Option<std::time::Duration>) -> (f64, usize) {
         let window = match (self.probing_rtt(), self.min_rtt_ms) {
             (true, _) => MIN_WINDOW,
             (false, Some(rtt)) => {
                 // what the link holds, plus BBR's headroom (startup's grows with its pacing, so it can double; acks in
-                // bursts need the aggregation), but never more headroom than `MAX_QUEUE_DELAY` of the bandwidth: the
-                // headroom is what stands queued, and strict streams wait behind it
+                // bursts need the aggregation), but never more headroom than `queue_limit` of the bandwidth: the headroom
+                // is what stands queued, and strict streams wait behind it
                 let held = self.bandwidth_bytes_per_sec * rtt / 1000.0;
                 let headroom = (self.gain.max(WINDOW_GAIN) - 1.0) * held + self.extra_acked;
-                ((held + headroom.min(self.bandwidth_bytes_per_sec * MAX_QUEUE_DELAY.as_secs_f64())) as usize).max(MIN_WINDOW)
+                let most = queue_limit.map_or(f64::INFINITY, |limit| self.bandwidth_bytes_per_sec * limit.as_secs_f64());
+                ((held + headroom.min(most)) as usize).max(MIN_WINDOW)
             }
             (false, None) => INITIAL_WINDOW,
         };
@@ -425,7 +424,7 @@ mod tests {
         let mut now = start;
         for round in rounds {
             now = start + Duration::from_millis(250 * round as u64);
-            let (rate, _) = model.pacing();
+            let (rate, _) = model.pacing(None);
             model.update(now, 0.25, sample(rate.min(capacity), link_limited, 20.0), 0.0, rate.min(capacity));
         }
         now
@@ -438,7 +437,7 @@ mod tests {
         run(&mut model, start, 0..40, 2_500_000.0, true);
         assert!(!model.starting_up);
         assert!((2_000_000.0..=2_500_000.0).contains(&model.bandwidth_bytes_per_sec), "{model:?}");
-        assert_eq!(model.pacing().1, (2.0 * model.bandwidth_bytes_per_sec * 0.020) as usize, "2 x bandwidth x round trip");
+        assert_eq!(model.pacing(None).1, (2.0 * model.bandwidth_bytes_per_sec * 0.020) as usize, "2 x bandwidth x round trip");
     }
 
     #[test]

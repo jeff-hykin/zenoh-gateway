@@ -278,6 +278,11 @@ impl SubShared {
         self.closed.load(Ordering::Relaxed)
     }
 
+    /// A strict stream's fastest key rate (Hz), measured.
+    pub fn fastest_key_hz(&self) -> f64 {
+        self.state.lock().keys.values().map(|queue| queue.rate_hz).fold(0.0, f64::max)
+    }
+
     /// Strict-priority tier: its priority (subscribe option, else as published) is
     /// `STRICT_PRIORITY` or more urgent. Strict streams bypass allocation and pacing and preempt bulk streams.
     pub fn is_strict(&self) -> bool {
