@@ -78,14 +78,16 @@ impl VideoPolicy {
         least + (most - least) * quality.clamp(0.0, 1.0)
     }
 
-    /// Even output size for `bitrate_bps` at `fps`: the source's (fitted into `max_resolution`), shrunk only to keep
+    /// Even output size (a scaled width a multiple of 16) for `bitrate_bps` at `fps`: the source's (fitted into `max_resolution`), shrunk only to keep
     /// `min_bits_per_pixel` and to `scale_cap` (the CPU governor's), never below `min_resolution_scale`.
     pub(crate) fn size(&self, source: (u32, u32), bitrate_bps: f64, fps: f64, scale_cap: f64) -> (u32, u32) {
         let fit = self.fit(source);
         let affordable = (bitrate_bps / (fps.max(0.1) * source.0 as f64 * source.1 as f64 * self.min_bits_per_pixel)).sqrt();
         let scale = fit.min(affordable).min(scale_cap).max(self.min_resolution_scale.min(fit));
-        let even = |value: u32| (((value as f64 * scale).round() as u32) & !1).max(MIN_DIMENSION);
-        (even(source.0), even(source.1))
+        let scaled = |value: u32, step: u32| (((value as f64 * scale).round() as u32) & !(step - 1)).max(MIN_DIMENSION);
+        let (width, height) = (scaled(source.0, 2), scaled(source.1, 2));
+        // a scaled width is a whole number of macroblocks: phone decoders sheared 1362-wide H.264 (seen on the R1)
+        if width == source.0 & !1 { (width, height) } else { (scaled(source.0, 16), height) }
     }
 }
 
@@ -369,7 +371,8 @@ mod tests {
         assert_eq!(policy.size(hd, 3e6, 60.0, 1.0), (1280, 720));
         assert_eq!(policy.size((321, 241), 1e9, 60.0, 1.0), (320, 240), "even sizes");
         let (width, _) = policy.size(hd, 2.76e6 / 4.0, 60.0, 1.0);
-        assert!((638..=642).contains(&width), "a quarter of the bits: half the width, {width}");
+        assert!((624..=640).contains(&width), "a quarter of the bits: half the width, {width}");
+        assert_eq!(policy.size((1920, 1536), 1e9, 60.0, 0.71), (1360, 1090), "a scaled width is a multiple of 16");
         assert_eq!(policy.size(hd, 1e3, 60.0, 1.0), (320, 180), "never below min_resolution_scale");
         assert_eq!(policy.size(hd, 1e9, 60.0, 0.5), (640, 360), "the CPU governor's cap");
         let boxed = VideoPolicy { max_resolution: Some((640, 640)), ..policy };
@@ -420,7 +423,7 @@ mod tests {
         assert!(!encode(&mut encoder, &frame, 2e6, false).keyframe, "a new bitrate applies in place");
         assert!(encode(&mut encoder, &frame, 2e6, true).keyframe, "asked for");
         let low = encode(&mut encoder, &frame, 1e3, false);
-        assert_eq!((low.width, low.height), (162, 122), "10 kbit/s (the floor) at 10 Hz keeps 0.05 bits per pixel at about half the width");
+        assert_eq!((low.width, low.height), (160, 122), "10 kbit/s (the floor) at 10 Hz keeps 0.05 bits per pixel at about half the width");
         assert!(encoder.encode(&DecodedFrame::data(1u8), &target(&VideoPolicy::default(), (8, 8), 1.0, 1e6, 10.0, 1.0, false)).is_err(), "takes pictures only");
     }
 
