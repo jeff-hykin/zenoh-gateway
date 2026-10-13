@@ -187,9 +187,7 @@ const STARTUP_GROWTH: f64 = 1.25;
 const STARTUP_ROUNDS: u32 = 3;
 const PROBE_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 const BANDWIDTH_ROUNDS: f64 = 10.0;
-/// One bandwidth-delay product is what the link holds; the ack aggregation is what acks arriving in bursts need on top
-/// (BBR's 2 x covers both at once, and the second product stood as a queue strict streams waited behind).
-const WINDOW_GAIN: f64 = 1.0;
+const WINDOW_GAIN: f64 = 2.0;
 const MIN_RTT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 const PROBE_RTT_TIME: std::time::Duration = std::time::Duration::from_millis(200);
 /// Bytes in flight before any round trip is measured, and the least ever: RFC 6928's 10 packets, BBR's 4.
@@ -302,7 +300,8 @@ impl LinkModel {
     pub fn pacing(&self) -> (f64, usize) {
         let window = match (self.probing_rtt(), self.min_rtt_ms) {
             (true, _) => MIN_WINDOW,
-            (false, Some(rtt)) => ((WINDOW_GAIN * self.bandwidth_bytes_per_sec * rtt / 1000.0 + self.extra_acked) as usize).max(MIN_WINDOW),
+            // (startup's window grows with its pacing, as BBR's does: held to the steady gain, it couldn't double)
+            (false, Some(rtt)) => ((self.gain.max(WINDOW_GAIN) * self.bandwidth_bytes_per_sec * rtt / 1000.0 + self.extra_acked) as usize).max(MIN_WINDOW),
             (false, None) => INITIAL_WINDOW,
         };
         (self.bandwidth_bytes_per_sec * self.gain, window)
@@ -423,7 +422,7 @@ mod tests {
         run(&mut model, start, 0..40, 2_500_000.0, true);
         assert!(!model.starting_up);
         assert!((2_000_000.0..=2_500_000.0).contains(&model.bandwidth_bytes_per_sec), "{model:?}");
-        assert_eq!(model.pacing().1, (model.bandwidth_bytes_per_sec * 0.020) as usize, "bandwidth x round trip");
+        assert_eq!(model.pacing().1, (2.0 * model.bandwidth_bytes_per_sec * 0.020) as usize, "2 x bandwidth x round trip");
     }
 
     #[test]
