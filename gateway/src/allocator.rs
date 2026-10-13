@@ -168,6 +168,8 @@ pub struct LinkModel {
     #[serde(skip)]
     probing_rtt: bool,
     #[serde(skip)]
+    probe_rtt_rounds: u32,
+    #[serde(skip)]
     probe_rtt_until: Option<std::time::Instant>,
     /// startup: the bandwidth last seen growing, and the rounds since; then the place in `PROBE_GAINS`
     #[serde(skip)]
@@ -211,6 +213,7 @@ impl Default for LinkModel {
             samples: Default::default(),
             min_rtt_at: None,
             probing_rtt: false,
+            probe_rtt_rounds: 0,
             probe_rtt_until: None,
             startup_level: 0.0,
             stalled_rounds: 0,
@@ -228,8 +231,9 @@ impl LinkModel {
         }
         self.update_round_trip(now, round.min_rtt_ms, round.drained);
         self.delivered_bytes_per_sec = delivered_bytes_per_sec;
-        let link_limited = round.link_limited_rate.is_some();
-        if let Some(rate) = round.link_limited_rate {
+        // (rounds spent re-measuring the round trip hold the window down on purpose: they say nothing about the link)
+        let link_limited = round.link_limited_rate.is_some() && !self.probing_rtt;
+        if let Some(rate) = round.link_limited_rate.filter(|_| link_limited) {
             self.samples.push_back((now, rate + video_bytes_per_sec));
         }
         if let Some(rate) = round.app_limited_rate.map(|rate| rate + video_bytes_per_sec).filter(|rate| *rate > self.bandwidth_bytes_per_sec) {
@@ -269,15 +273,18 @@ impl LinkModel {
 
     fn update_round_trip(&mut self, now: std::time::Instant, round_rtt_ms: Option<f64>, drained: bool) {
         if self.probing_rtt {
-            // the clock starts once what is in flight is down to the minimum window
-            if self.probe_rtt_until.is_none() && drained {
+            // the clock starts once what is in flight is down to the minimum window, or after one round regardless: strict
+            // streams bypass the window and can keep more than it in flight, and a probe waiting on them never ended (the
+            // R1 sat in one with a 5 KB window until its estimate fell to 46 KB/s)
+            if self.probe_rtt_until.is_none() && (drained || self.probe_rtt_rounds >= 1) {
                 self.probe_rtt_until = Some(now + PROBE_RTT_TIME);
             }
+            self.probe_rtt_rounds += 1;
             if let Some(rtt) = round_rtt_ms.filter(|_| self.probe_rtt_until.is_some()) {
                 self.probe_min_rtt = Some(self.probe_min_rtt.map_or(rtt, |least| least.min(rtt)));
             }
             if self.probe_rtt_until.is_some_and(|until| now >= until) {
-                self.probing_rtt = false;
+                (self.probing_rtt, self.probe_rtt_rounds) = (false, 0);
                 self.probe_rtt_until = None;
                 if let Some(least) = self.probe_min_rtt.take() {
                     (self.min_rtt_ms, self.min_rtt_at) = (Some(least), Some(now));
