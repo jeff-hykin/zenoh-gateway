@@ -143,7 +143,7 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
 ///
 /// Streams are budgeted bandwidth x gain and paced at it, and what is in flight is held to bandwidth x the typical (median)
 /// round trip plus a
-/// headroom of (gain - 1) x that + the ack aggregation, at most `latency_limit` of the bandwidth. The gain is `STARTUP_GAIN` while the bandwidth keeps growing (by `STARTUP_GROWTH` within `STARTUP_ROUNDS`
+/// headroom of (gain - 1) x that + the ack aggregation, at most `latency_target` of the bandwidth while the path is faster than that. The gain is `STARTUP_GAIN` while the bandwidth keeps growing (by `STARTUP_GROWTH` within `STARTUP_ROUNDS`
 /// link-limited rounds), then cycles through `PROBE_GAINS`: a round asking 25% more, one draining what that queued,
 /// six at the estimate. Nothing reacts to a delay or a loss, so Wi-Fi jitter can't move it; a link that slows delivers
 /// less and its old maximum ages out within `BANDWIDTH_ROUNDS`, while the window keeps the queue about a round trip long.
@@ -157,12 +157,20 @@ pub struct LinkModel {
     pub min_rtt_ms: Option<f64>,
     /// the median round trip lately (`RoundSamples::typical_rtt_ms`)
     pub typical_rtt_ms: Option<f64>,
+    /// the path's own round trip: the median measured while ProbeRTT has the queue drained (averaged with the previous),
+    /// so a queue of ours can't pass for it
+    pub path_rtt_ms: Option<f64>,
     pub extra_acked: f64,
     #[serde(skip)]
     extra_acked_samples: std::collections::VecDeque<(std::time::Instant, f64)>,
-    /// the least round trip seen during the ProbeRTT under way
+    /// the least round trip seen during the ProbeRTT under way, and its rounds' medians
     #[serde(skip)]
     probe_min_rtt: Option<f64>,
+    #[serde(skip)]
+    probe_median_rtts: Vec<f64>,
+    /// when the last ProbeRTT ended (or the model started)
+    #[serde(skip)]
+    probed_rtt_at: Option<std::time::Instant>,
     /// (when, bytes/s) of the rounds that count toward the bandwidth
     #[serde(skip)]
     samples: std::collections::VecDeque<(std::time::Instant, f64)>,
@@ -194,17 +202,11 @@ pub struct LinkModel {
 /// The first guess, 512 kbit/s: low enough not to flood a slow link (1 MB/s plus video filled a 2 Mbit/s link's queue
 /// and SCTP's backoff silenced the page for 20 s), and startup doubles it every round.
 pub const INITIAL_BANDWIDTH: f64 = 64_000.0;
-/// A 500 kbit/s link, where `slow_link_latency` applies.
+/// A 500 kbit/s link: on a path slower than the latency target, faster links may keep more in flight by the square root
+/// of their speed over this.
 pub const SLOW_LINK: f64 = 62_500.0;
-/// What `ServerBuilder::slow_link_latency` defaults to.
-pub const DEFAULT_SLOW_LINK_LATENCY: std::time::Duration = std::time::Duration::from_millis(300);
-
-/// The longest data may be in flight (queued plus crossing) at `bandwidth` bytes/s: `slow_link_latency` on a `SLOW_LINK`,
-/// more on faster links by the square root of their speed (by default 2 Mbit/s 600 ms, 20 Mbit/s 1.9 s): the slower the
-/// link, the more latency counts against throughput.
-pub fn latency_limit_for(bandwidth: f64, slow_link_latency: std::time::Duration) -> std::time::Duration {
-    crate::secs(slow_link_latency.as_secs_f64() * (bandwidth.max(1.0) / SLOW_LINK).sqrt())
-}
+/// What `ServerBuilder::latency_target` defaults to.
+pub const DEFAULT_LATENCY_TARGET: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// BBR's constants.
 const STARTUP_GAIN: f64 = 2.0 / std::f64::consts::LN_2;
@@ -214,6 +216,9 @@ const PROBE_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 const BANDWIDTH_ROUNDS: f64 = 10.0;
 const MIN_RTT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 const PROBE_RTT_TIME: std::time::Duration = std::time::Duration::from_millis(200);
+/// ProbeRTT runs at least this often (not only when the least round trip went stale) to re-measure the path's own round
+/// trip, which picks between latency and throughput (`window`).
+const PROBE_RTT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Bytes in flight before any round trip is measured, and the least ever: RFC 6928's 10 packets, BBR's 4.
 const INITIAL_WINDOW: usize = 10 * 1200;
 const MIN_WINDOW: usize = 4 * 1200;
@@ -227,9 +232,12 @@ impl Default for LinkModel {
             starting_up: true,
             min_rtt_ms: None,
             typical_rtt_ms: None,
+            path_rtt_ms: None,
             extra_acked: 0.0,
             extra_acked_samples: Default::default(),
             probe_min_rtt: None,
+            probe_median_rtts: Vec::new(),
+            probed_rtt_at: None,
             samples: Default::default(),
             min_rtt_at: None,
             probing_rtt: false,
@@ -252,7 +260,7 @@ impl LinkModel {
         if secs <= 0.0 {
             return;
         }
-        self.update_round_trip(now, round.min_rtt_ms, round.drained);
+        self.update_round_trip(now, &round);
         if round.typical_rtt_ms.is_some() {
             self.typical_rtt_ms = round.typical_rtt_ms;
         }
@@ -313,7 +321,9 @@ impl LinkModel {
         self.gain = if self.starting_up { STARTUP_GAIN } else { PROBE_GAINS[self.cycle] };
     }
 
-    fn update_round_trip(&mut self, now: std::time::Instant, round_rtt_ms: Option<f64>, drained: bool) {
+    fn update_round_trip(&mut self, now: std::time::Instant, round: &crate::pacing::RoundSamples) {
+        let (round_rtt_ms, drained) = (round.min_rtt_ms, round.drained);
+        self.probed_rtt_at.get_or_insert(now);
         if self.probing_rtt {
             // the clock starts once what is in flight is down to the minimum window, or after one round regardless: strict
             // streams bypass the window and can keep more than it in flight, and a probe waiting on them never ended (the
@@ -327,12 +337,21 @@ impl LinkModel {
             if let Some(rtt) = round_rtt_ms.filter(|_| self.probe_rtt_until.is_some()) {
                 self.probe_min_rtt = Some(self.probe_min_rtt.map_or(rtt, |least| least.min(rtt)));
             }
+            if let Some(median) = round.median_rtt_ms.filter(|_| self.probe_rtt_until.is_some()) {
+                self.probe_median_rtts.push(median);
+            }
             if self.probe_rtt_until.is_some_and(|until| now >= until) {
                 (self.probing_rtt, self.probe_rtt_rounds) = (false, 0);
                 self.probe_rtt_until = None;
                 if let Some(least) = self.probe_min_rtt.take() {
                     (self.min_rtt_ms, self.min_rtt_at) = (Some(least), Some(now));
                 }
+                let mut medians = std::mem::take(&mut self.probe_median_rtts);
+                medians.sort_by(f64::total_cmp);
+                if let Some(&median) = medians.get(medians.len() / 2) {
+                    self.path_rtt_ms = Some(self.path_rtt_ms.map_or(median, |previous| (previous + median) / 2.0));
+                }
+                self.probed_rtt_at = Some(now);
             }
             return;
         }
@@ -341,7 +360,9 @@ impl LinkModel {
         {
             (self.min_rtt_ms, self.min_rtt_at) = (Some(rtt), Some(now));
         }
-        if !self.starting_up && self.min_rtt_at.is_some_and(|at| now.duration_since(at) > MIN_RTT_WINDOW) {
+        let stale = self.min_rtt_at.is_some_and(|at| now.duration_since(at) > MIN_RTT_WINDOW);
+        let due = self.probed_rtt_at.is_some_and(|at| now.duration_since(at) > PROBE_RTT_INTERVAL);
+        if !self.starting_up && (stale || due) {
             self.probing_rtt = true;
         }
     }
@@ -356,26 +377,39 @@ impl LinkModel {
         self.probing_rtt
     }
 
-    /// The pacing rate (bytes/s) and the most that may be in flight (bytes). `latency_limit`: the longest data may be in
-    /// flight (`None`: no limit).
-    pub fn pacing(&self, latency_limit: Option<std::time::Duration>) -> (f64, usize) {
-        let window = match (self.probing_rtt(), self.typical_rtt_ms.or(self.min_rtt_ms)) {
-            (true, _) => MIN_WINDOW,
+    /// The pacing rate (bytes/s) and the most that may be in flight (bytes), see `window`.
+    pub fn pacing(&self, latency_target: Option<std::time::Duration>) -> (f64, usize) {
+        (self.bandwidth_bytes_per_sec * self.gain, self.window(latency_target).0)
+    }
+
+    /// The most that may be in flight (bytes), and whether `latency_target` set it. Two modes:
+    /// - the path's own round trip under the target: latency first, nothing in flight longer than the target (beyond the
+    ///   path itself it would stand queued);
+    /// - the path alone at or over it (Wi-Fi whose delay swings to 400 ms): throughput first, the target scaled by the
+    ///   square root of the speed over `SLOW_LINK` (a 2.4 Mbit/s link 600 ms), never under the path's own round trip (a
+    ///   cap under what the path takes only starved it).
+    ///
+    /// A round the target limits delivers less than the link could, so it must not lower the bandwidth (the gate counts
+    /// it as app-limited), else the bandwidth, the target's bytes and what got through fell together.
+    pub fn window(&self, latency_target: Option<std::time::Duration>) -> (usize, bool) {
+        match (self.probing_rtt(), self.typical_rtt_ms.or(self.min_rtt_ms)) {
+            (true, _) => (MIN_WINDOW, false),
             (false, Some(rtt)) => {
                 // what the link holds over a typical round trip (not the least: on a path whose delay swings, bandwidth x
-                // the least let a tenth of the bandwidth through, the estimate fell with it and the window with that),
-                // plus the gain's headroom (startup's, so it can double) and the ack aggregation; never more than
-                // `latency_limit` of the bandwidth (but at least the least round trip's): in flight longer, data stood
-                // queued, and the typical round trip grows with that queue
+                // the least let a tenth of the bandwidth through), plus the gain's headroom (startup's, so it can double)
+                // and the ack aggregation
                 let held = self.bandwidth_bytes_per_sec * rtt / 1000.0;
                 let wanted = held + (self.gain.max(1.0) - 1.0) * held + self.extra_acked;
-                let least_rtt = self.min_rtt_ms.unwrap_or(rtt) / 1000.0;
-                let most = latency_limit.map_or(f64::INFINITY, |limit| self.bandwidth_bytes_per_sec * limit.as_secs_f64().max(least_rtt));
-                (wanted.min(most) as usize).max(MIN_WINDOW)
+                let path_rtt = self.path_rtt_ms.or(self.min_rtt_ms).unwrap_or(rtt) / 1000.0;
+                let most = latency_target.map_or(f64::INFINITY, |target| {
+                    let target = target.as_secs_f64();
+                    let limit = if path_rtt < target { target } else { (target * (self.bandwidth_bytes_per_sec / SLOW_LINK).sqrt()).max(path_rtt) };
+                    self.bandwidth_bytes_per_sec * limit
+                });
+                ((wanted.min(most) as usize).max(MIN_WINDOW), most < wanted)
             }
-            (false, None) => INITIAL_WINDOW,
-        };
-        (self.bandwidth_bytes_per_sec * self.gain, window)
+            (false, None) => (INITIAL_WINDOW, false),
+        }
     }
 }
 
@@ -472,7 +506,7 @@ mod tests {
     fn sample(rate: f64, link_limited: bool, rtt_ms: f64) -> crate::pacing::RoundSamples {
         let rate = Some(rate);
         let (link_limited_rate, app_limited_rate) = if link_limited { (rate, None) } else { (None, rate) };
-        crate::pacing::RoundSamples { link_limited_rate, app_limited_rate, min_rtt_ms: Some(rtt_ms), typical_rtt_ms: Some(rtt_ms), extra_acked: 0.0, drained: true }
+        crate::pacing::RoundSamples { link_limited_rate, app_limited_rate, min_rtt_ms: Some(rtt_ms), typical_rtt_ms: Some(rtt_ms), median_rtt_ms: Some(rtt_ms), extra_acked: 0.0, drained: true }
     }
 
     /// Rounds of 250 ms on a link that carries `capacity` bytes/s: delivered is what the budget allowed, up to it.
@@ -508,15 +542,17 @@ mod tests {
     }
 
     #[test]
-    fn slower_links_queue_less() {
-        let ms = |bandwidth: f64| latency_limit_for(bandwidth, DEFAULT_SLOW_LINK_LATENCY).as_secs_f64() * 1000.0;
-        assert!((ms(62_500.0) - 300.0).abs() < 1.0 && (ms(250_000.0) - 600.0).abs() < 1.0, "500 kbit/s 300 ms, 2 Mbit/s 600 ms");
+    fn latency_first_under_the_target_throughput_first_over_it() {
         let mut model = LinkModel::default();
         run(&mut model, Instant::now(), 0..40, 62_500.0, true);
         model.typical_rtt_ms = Some(2000.0);
-        let window = model.pacing(Some(Duration::from_millis(300))).1 as f64;
-        let most = model.bandwidth_bytes_per_sec * 0.3;
-        assert!(window <= most.max(MIN_WINDOW as f64) + 1.0, "a queue doesn't hold itself up: {window} > {most}");
+        let target = Some(Duration::from_millis(300));
+        let (window, capped) = model.window(target);
+        assert!(capped && (window as f64) <= (model.bandwidth_bytes_per_sec * 0.3).max(MIN_WINDOW as f64) + 1.0, "a queue doesn't hold itself up: {window}");
+        model.path_rtt_ms = Some(400.0);
+        let (window, _) = model.window(target);
+        let at_least = model.bandwidth_bytes_per_sec * 0.4;
+        assert!(window as f64 >= at_least - 1.0, "a path slower than the target alone: never capped under it ({window} < {at_least})");
     }
 
     #[test]

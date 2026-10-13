@@ -22,9 +22,9 @@ const CHUNK_MS: f64 = 4.0;
 /// A lost frame is given up on after max(2 x RTT, this), as TCP's retransmission timer bottoms out at 200 ms (Linux).
 const MIN_LOSS_TIMEOUT: Duration = Duration::from_millis(200);
 /// The page acks a channel's frames at most this long after they arrive (client `ackDelayMs`), so a rate is sampled over
-/// at least `MIN_SAMPLE_TIME`: 5x the ack delay keeps the error from late acks under ~20%.
+/// at least `MIN_SAMPLE_TIME`, and the ack delay is added to each sample's time: never above the link, at most ~9% under.
 const ACK_DELAY: Duration = Duration::from_millis(50);
-const MIN_SAMPLE_TIME: Duration = Duration::from_millis(5 * ACK_DELAY.as_millis() as u64);
+const MIN_SAMPLE_TIME: Duration = Duration::from_millis(10 * ACK_DELAY.as_millis() as u64);
 /// Acks are remembered this long to sample a rate over (longer than any round trip worth sampling over).
 const ACK_HISTORY: Duration = Duration::from_secs(2);
 /// The typical round trip is the median over this long.
@@ -51,6 +51,8 @@ pub struct RoundSamples {
     /// the median send-to-ack time over the last `TYPICAL_RTT_WINDOW`: what the window must cover on a path whose delay
     /// swings (Wi-Fi: 20-400 ms), where a window of bandwidth x the least delivered a tenth of the bandwidth
     pub typical_rtt_ms: Option<f64>,
+    /// the median send-to-ack time of this round's acks
+    pub median_rtt_ms: Option<f64>,
     /// the most acks ran ahead of bandwidth x time this round (bytes): they arrive in bursts (the page acks in batches,
     /// Wi-Fi aggregates frames), so the window needs this on top of bandwidth x round trip
     pub extra_acked: f64,
@@ -67,6 +69,8 @@ struct Path {
     acked_total: u64,
     /// (when, send-to-ack ms) of recent acks
     rtts: std::collections::VecDeque<(Instant, f64)>,
+    /// send-to-ack times (ms) of this round's acks
+    round_rtts: Vec<f64>,
     /// (when, acked_total) after each ack, for `ACK_HISTORY`
     ack_history: std::collections::VecDeque<(Instant, u64)>,
     /// the next bulk frame waited on the window or the pacing rate
@@ -77,6 +81,8 @@ struct Path {
     epoch_started: Instant,
     epoch_acked: f64,
     window: usize,
+    /// the window is the latency limit's, not the link's (see `configure`)
+    latency_capped: bool,
     /// bytes/s; tokens may go negative by one frame
     rate: f64,
     tokens: f64,
@@ -105,12 +111,14 @@ impl Default for SendGate {
                 acked_total: 0,
                 rtts: Default::default(),
                 ack_history: Default::default(),
+                round_rtts: Vec::new(),
                 held: false,
                 round: RoundSamples::default(),
                 bandwidth: crate::allocator::INITIAL_BANDWIDTH,
                 epoch_started: Instant::now(),
                 epoch_acked: 0.0,
                 window,
+                latency_capped: false,
                 rate,
                 tokens: 0.0,
                 refilled: Instant::now(),
@@ -166,13 +174,15 @@ impl Path {
 
 impl SendGate {
     /// From the allocator: the link's bandwidth and the pacing rate (bytes/s), and the most that may be in flight.
-    pub fn configure(&self, bandwidth: f64, rate: f64, window: usize) {
+    /// `latency_capped`: the latency limit set the window, so waiting on it isn't the link holding the sender back.
+    pub fn configure(&self, bandwidth: f64, rate: f64, window: usize, latency_capped: bool) {
         let mut path = self.path.lock();
         let now = Instant::now();
         path.refill(now);
         path.bandwidth = bandwidth;
         path.rate = rate;
         path.window = window;
+        path.latency_capped = latency_capped;
         self.chunk_bytes.store(chunk_for(rate), Ordering::Relaxed);
         drop(path);
         self.changed.notify_waiters();
@@ -203,7 +213,10 @@ impl SendGate {
         let mut recent: Vec<f64> = path.rtts.iter().filter(|(at, _)| now.duration_since(*at) <= TYPICAL_RTT_WINDOW).map(|(_, rtt)| *rtt).collect();
         recent.sort_by(f64::total_cmp);
         let typical_rtt_ms = recent.get(recent.len() / 2).copied();
-        RoundSamples { drained, typical_rtt_ms, ..std::mem::take(&mut path.round) }
+        let mut round_rtts = std::mem::take(&mut path.round_rtts);
+        round_rtts.sort_by(f64::total_cmp);
+        let median_rtt_ms = round_rtts.get(round_rtts.len() / 2).copied();
+        RoundSamples { drained, typical_rtt_ms, median_rtt_ms, ..std::mem::take(&mut path.round) }
     }
 
     /// The right to send one message bigger than a bulk chunk, held until it is sent whole; waiters get it in arrival
@@ -245,6 +258,7 @@ impl SendGate {
                 path.acked_total += frame.bytes as u64;
                 let rtt = now.duration_since(frame.sent_at).as_secs_f64() * 1000.0;
                 path.rtts.push_back((now, rtt));
+                path.round_rtts.push(rtt);
                 path.round.min_rtt_ms = Some(path.round.min_rtt_ms.map_or(rtt, |least| least.min(rtt)));
                 newest_acked = Some(frame);
             }
@@ -263,7 +277,9 @@ impl SendGate {
             let span = min_rtt.max(MIN_SAMPLE_TIME.as_secs_f64());
             let start = path.ack_history.iter().rev().find(|(at, _)| now.duration_since(*at).as_secs_f64() >= span).copied();
             if let Some((at, acked_then)) = start {
-                let rate = (acked_total - acked_then) as f64 / now.duration_since(at).as_secs_f64();
+                // (over the time plus the ack delay: what this ack covers may have arrived that much earlier, and the highest
+                // sample wins, so the unpadded time read the link 1.3x fast on a 500 kbit/s link)
+                let rate = (acked_total - acked_then) as f64 / (now.duration_since(at) + ACK_DELAY).as_secs_f64();
                 let slot = if frame.link_limited { &mut path.round.link_limited_rate } else { &mut path.round.app_limited_rate };
                 *slot = Some(slot.map_or(rate, |most| most.max(rate)));
             }
@@ -315,7 +331,7 @@ impl SendGate {
                 let window = path.window.max(2 * self.chunk_bytes());
                 let window_open = path.in_flight == 0 || path.in_flight + bytes <= window;
                 if self.strict_busy.load(Ordering::Acquire) > 0 || !window_open {
-                    path.held |= !window_open;
+                    path.held |= !window_open && !path.latency_capped;
                     // woken by an ack or a strict turn ending; looked at again after the loss timeout for a lost tail
                     (true, MIN_LOSS_TIMEOUT)
                 } else if path.tokens < 0.0 {
@@ -363,7 +379,7 @@ mod tests {
 
     fn gate(rate: f64, window: usize) -> SendGate {
         let gate = SendGate::default();
-        gate.configure(rate, rate, window);
+        gate.configure(rate, rate, window, false);
         gate
     }
 
