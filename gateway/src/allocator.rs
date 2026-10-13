@@ -498,10 +498,11 @@ mod tests {
     #[test]
     fn the_probe_cycle_asks_more_then_drains() {
         let mut model = LinkModel::default();
-        run(&mut model, Instant::now(), 0..40, 1_000_000.0, true);
-        let gains: Vec<f64> = (0..8)
-            .map(|_| {
-                model.update(Instant::now(), 0.25, sample(1_000_000.0, true, 20.0), 0.0, 1_000_000.0);
+        let start = Instant::now();
+        let now = run(&mut model, start, 0..40, 1_000_000.0, true);
+        let gains: Vec<f64> = (1..=8)
+            .map(|round| {
+                model.update(now + Duration::from_millis(250 * round), 0.25, sample(1_000_000.0, true, 20.0), 0.0, 1_000_000.0);
                 model.gain
             })
             .collect();
