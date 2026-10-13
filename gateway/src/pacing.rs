@@ -58,6 +58,8 @@ pub struct RoundSamples {
     pub extra_acked: f64,
     /// what is in flight was within the window when the round ended
     pub drained: bool,
+    /// a frame waited on the window this round (the link's or the latency target's)
+    pub window_waited: bool,
 }
 
 struct Path {
@@ -332,6 +334,7 @@ impl SendGate {
                 let window_open = path.in_flight == 0 || path.in_flight + bytes <= window;
                 if self.strict_busy.load(Ordering::Acquire) > 0 || !window_open {
                     path.held |= !window_open && !path.latency_capped;
+                    path.round.window_waited |= !window_open;
                     // woken by an ack or a strict turn ending; looked at again after the loss timeout for a lost tail
                     (true, MIN_LOSS_TIMEOUT)
                 } else if path.tokens < 0.0 {

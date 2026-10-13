@@ -282,7 +282,9 @@ impl LinkModel {
             self.round_started = Some(now);
             self.round_link_limited = false;
         }
-        self.round_link_limited |= link_limited;
+        // (startup ends when growth stalls while the window holds the sender back, the latency target's window too: a
+        // round it holds back isn't a link-limited sample, and a 250 kbit/s link never left startup's first guess)
+        self.round_link_limited |= link_limited || (self.starting_up && round.window_waited);
         self.extra_acked_samples.push_back((now, round.extra_acked));
         for samples in [&mut self.samples, &mut self.extra_acked_samples] {
             while samples.front().is_some_and(|(at, _)| now.duration_since(*at) > window) {
@@ -404,7 +406,8 @@ impl LinkModel {
                 let most = latency_target.map_or(f64::INFINITY, |target| {
                     let target = target.as_secs_f64();
                     let limit = if path_rtt < target { target } else { (target * (self.bandwidth_bytes_per_sec / SLOW_LINK).sqrt()).max(path_rtt) };
-                    self.bandwidth_bytes_per_sec * limit
+                    // (times the gain, so a probe can still show the link carries more)
+                    self.bandwidth_bytes_per_sec * self.gain.max(1.0) * limit
                 });
                 ((wanted.min(most) as usize).max(MIN_WINDOW), most < wanted)
             }
@@ -506,7 +509,7 @@ mod tests {
     fn sample(rate: f64, link_limited: bool, rtt_ms: f64) -> crate::pacing::RoundSamples {
         let rate = Some(rate);
         let (link_limited_rate, app_limited_rate) = if link_limited { (rate, None) } else { (None, rate) };
-        crate::pacing::RoundSamples { link_limited_rate, app_limited_rate, min_rtt_ms: Some(rtt_ms), typical_rtt_ms: Some(rtt_ms), median_rtt_ms: Some(rtt_ms), extra_acked: 0.0, drained: true }
+        crate::pacing::RoundSamples { link_limited_rate, app_limited_rate, min_rtt_ms: Some(rtt_ms), typical_rtt_ms: Some(rtt_ms), median_rtt_ms: Some(rtt_ms), extra_acked: 0.0, drained: true, window_waited: link_limited }
     }
 
     /// Rounds of 250 ms on a link that carries `capacity` bytes/s: delivered is what the budget allowed, up to it.
