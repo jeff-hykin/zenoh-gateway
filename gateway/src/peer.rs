@@ -313,8 +313,8 @@ impl PeerState {
         };
     }
 
-    /// The longest data may wait behind bulk in the link's queue, set by the page's own streams: their latency tolerances
-    /// (`SubShared::latency_tolerance`), averaged weighted by the bandwidth each was granted. On a slow link, where the
+    /// The longest data may wait behind bulk in the link's queue, set by the page's own streams: the latency tolerances
+    /// they state (maxAge, `SubShared::latency_tolerance`), averaged weighted by the bandwidth each was granted. On a slow link, where the
     /// small urgent streams hold most of the grant, it is tight; on a fast one carrying mostly video, loose. `None` with
     /// nothing granted: BBR's headroom whole. (Only robot-to-page data crosses this queue; what the page publishes,
     /// cmd_vel and heartbeats, travels the other way.)

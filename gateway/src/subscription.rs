@@ -279,15 +279,13 @@ impl SubShared {
     }
 
     /// How long this stream's data can tolerate waiting in the link's queue (seconds): its maxAge (older is useless to the
-    /// page), else one period of its fastest key (a sample then never waits past the next one's arrival), and never less
-    /// than one of its messages takes to cross at `bandwidth` (a 400 KB map can't arrive sooner anyway). `None` before
-    /// its rate is known.
+    /// page), never less than one of its messages takes to cross at `bandwidth` (a 400 KB map can't arrive sooner
+    /// anyway). `None` without a maxAge: no opinion (its rate says how fast a sensor runs, not how urgent it is).
     pub fn latency_tolerance(&self, bandwidth: f64) -> Option<f64> {
+        let max_age = self.delivery.max_age_ms? / 1000.0;
         let state = self.state.lock();
-        let fastest = state.keys.values().map(|queue| queue.rate_hz).fold(0.0, f64::max);
-        let tolerance = self.delivery.max_age_ms.map(|max_age_ms| max_age_ms / 1000.0).or((fastest > 0.0).then(|| 1.0 / fastest))?;
         let message_bytes = state.video_frame_bytes.map_or(state.message_bytes, |(_, bytes)| bytes);
-        Some(tolerance.max(message_bytes / bandwidth.max(1.0)))
+        Some(max_age.max(message_bytes / bandwidth.max(1.0)))
     }
 
     /// Strict-priority tier: its priority (subscribe option, else as published) is
