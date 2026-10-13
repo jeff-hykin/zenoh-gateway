@@ -1,87 +1,87 @@
-//! Keeping one frontend's shared path short, so a strict-priority stream never waits behind bulk data (SPEC "Pacing"):
-//! - bulk streams send chunk by chunk through a per-frontend [`SendGate`]: no chunk starts while a strict stream is
-//!   sending, and bulk bytes in SCTP stay under a small in-flight limit (a strict frame waits behind ~one chunk);
-//! - each bulk stream is paced by a [`TokenBucket`] at its granted rate, in chunks of a few ms of the budget.
+//! One frontend's shared send path (SPEC "Pacing"). Every data frame is in flight from when it is handed to SCTP until
+//! the page acks it: the page is part of the path, so a page that falls behind holds the sender back the same way a slow
+//! link does. Bulk frames wait while:
+//! - a strict stream is sending (strict streams never wait);
+//! - what is in flight has reached the window (`allocator::LinkModel::window_bytes`);
+//! - the frontend's pacing rate hasn't earned them yet (one token bucket for all its frames).
+//!
+//! A lossy frame is passed when the page acks a frame sent after it (SCTP sends unordered chunks first and in order, so
+//! it was lost), or, when the page has acked nothing for the retransmission timeout, once it is that old (a lost tail).
+//! Never by age alone while acks still come: frames waiting in a queue would count as lost and let more in.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use parking_lot::Mutex;
-use webrtc::data_channel::DataChannel;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-/// Bulk chunk size bounds; the chunk is sized to `CHUNK_MS` of the frontend's budget.
+/// Bulk chunk size bounds; the chunk is `CHUNK_MS` of the pacing rate, so a strict frame waits behind about that long.
 pub const MIN_CHUNK_BYTES: usize = 4 * 1024;
 pub const MAX_CHUNK_BYTES: usize = crate::frame::CHUNK_BYTES;
 const CHUNK_MS: f64 = 4.0;
-/// Re-check while waiting, in case a wakeup is missed (outstanding bytes drain without an event).
-const GATE_BACKSTOP: Duration = Duration::from_millis(5);
-/// Token-bucket rate = granted rate x this, so a message finishes a little before the next is due.
-pub const PACING_SLACK: f64 = 1.25;
-/// A channel's send window ([`SendGate::window_bytes`]) is the budget times this many round trips, within bounds.
-const WINDOW_RTTS: f64 = 2.0;
-pub const MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
-/// The RTT the window covers is at most the path's minimum plus this, so the window's own queue can't grow it.
-const WINDOW_MAX_EXTRA_RTT_MS: f64 = 500.0;
-/// Channels wait while the page is further behind than this ([`SendGate::page_lag`]): the backlog a frontend's page may
-/// hold. Bytes alone can't bound it: a window sized for the network is seconds of backlog for a phone that decodes
-/// slower than the link delivers, and its heartbeat replies wait behind all of it in its one event loop.
-pub const MAX_PAGE_LAG_MS: f64 = 250.0;
-/// Channels also wait while a frame has been in SCTP undelivered for longer than the path's recent highest RTT (at most
-/// its minimum + `NETWORK_LAG_MAX_EXTRA_RTT_MS`) plus this ([`SendGate::network_lag`]). SCTP sends unordered chunks
-/// before ordered ones, so a `reliable` stream's frames wait behind every lossy chunk queued after them: without this
-/// bound a tf feed sat 13 s in SCTP on a jittery path while bulk kept its unordered queue full.
-const NETWORK_LAG_MARGIN_MS: f64 = 250.0;
-const NETWORK_LAG_MAX_EXTRA_RTT_MS: f64 = 500.0;
-/// A frame lost on the way stays in SCTP until its retransmission timer (at least 1 s, rtc-sctp's RTO_MIN) resends or
-/// abandons it, so the gate allows this much more: at 2% loss it was shut nearly all the time and clouds got 7 of 369
-/// messages out.
-const LOSS_NETWORK_LAG_EXTRA: Duration = Duration::from_millis(1000);
+/// A lost frame is given up on after max(2 x RTT, this), as TCP's retransmission timer bottoms out at 200 ms (Linux).
+const MIN_LOSS_TIMEOUT: Duration = Duration::from_millis(200);
+/// Ack round trips are kept this long for their minimum.
+const RTT_WINDOW: Duration = Duration::from_secs(10);
 
-/// Every frame of a frontend's `sub` channels the page hasn't gotten past, in send order. The page is one event loop, so
-/// its backlog is all its channels' together. An ack of any frame means the page is past every *lossy* frame sent before
-/// it (SCTP sends unordered chunks first and in order, so one sent earlier and still unacked was lost); a reliable frame
-/// is never lost but can wait in SCTP behind lossy ones sent after it, so only its own channel's ack passes it.
-#[derive(Default)]
-struct PageQueue {
-    next: u64,
-    unpassed: std::collections::BTreeMap<u64, PageFrame>,
-    /// the page has gotten past every frame sent before this one
-    passed: u64,
-    /// frame bytes handed to SCTP so far, by stream
-    sent_bytes: HashMap<usize, usize>,
-    /// of those, how many its peer has acknowledged, by stream
-    delivered_bytes: HashMap<usize, usize>,
-    /// acknowledged bytes over every stream, ever (the estimator's delivery rate)
-    delivered_total: u64,
+struct Frame {
+    stream: usize,
+    bytes: usize,
+    lossy: bool,
+    sent_at: Instant,
+    /// for its delivery-rate sample: what had been acked when it was sent, when the latest of that was acked, the send
+    /// time of the first frame of that flight, and whether the sender was held back by the link (not its own spacing)
+    acked_before: u64,
+    acked_before_at: Instant,
+    flight_started: Instant,
+    link_limited: bool,
 }
 
-struct PageFrame {
-    sent_at: Instant,
-    lossy: bool,
-    stream: usize,
-    /// the stream's bytes handed to SCTP up to and including this frame
-    end_offset: usize,
-    /// when SCTP was first seen to have delivered it to the browser (its peer acknowledged it)
-    delivered_at: Option<Instant>,
+/// One round of delivery-rate samples (draft-cheng-iccrg-delivery-rate-estimation): the highest from frames sent while
+/// the link held the sender back, and from the rest (only telling when higher than the estimate).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RoundSamples {
+    pub link_limited_rate: Option<f64>,
+    pub app_limited_rate: Option<f64>,
+    pub min_rtt_ms: Option<f64>,
+    /// the most acks ran ahead of bandwidth x time this round (bytes): they arrive in bursts (the page acks in batches,
+    /// Wi-Fi aggregates frames), so the window needs this on top of bandwidth x round trip
+    pub extra_acked: f64,
+    /// what is in flight was within the window when the round ended
+    pub drained: bool,
+}
+
+struct Path {
+    /// frames the page hasn't gotten past, by place in the send order
+    frames: BTreeMap<u64, Frame>,
+    next: u64,
+    in_flight: usize,
+    /// bytes the page acked, ever
+    acked_total: u64,
+    /// (when, send-to-ack ms) of recent acks
+    rtts: std::collections::VecDeque<(Instant, f64)>,
+    last_ack_at: Option<Instant>,
+    /// send time of the frame the latest ack covered (the start of the flight now being acked)
+    flight_started: Instant,
+    /// the next bulk frame waited on the window or the pacing rate
+    held: bool,
+    round: RoundSamples,
+    /// the bandwidth the link model last gave, and the current ack epoch: since when, and what was acked in it
+    bandwidth: f64,
+    epoch_started: Instant,
+    epoch_acked: f64,
+    window: usize,
+    /// bytes/s; tokens may go negative by one frame
+    rate: f64,
+    tokens: f64,
+    refilled: Instant,
 }
 
 pub struct SendGate {
     /// strict streams currently sending a message
     strict_busy: AtomicUsize,
-    /// bulk bytes outstanding in SCTP, by subscription
-    outstanding: Mutex<HashMap<usize, usize>>,
-    /// each bulk subscription's channel, so a waiter can refresh everyone's outstanding bytes
-    channels: Mutex<HashMap<usize, Arc<dyn DataChannel>>>,
-    inflight_limit: AtomicUsize,
+    path: Mutex<Path>,
     chunk_bytes: AtomicUsize,
-    window_bytes: AtomicUsize,
-    page: Mutex<PageQueue>,
-    /// [`SendGate::max_network_lag`] in microseconds
-    max_network_lag_us: AtomicU64,
-    /// the path's recent round trip (see `set_window`) in microseconds: the page's acks cross it too
-    network_rtt_us: AtomicU64,
     /// one multi-chunk bulk message at a time (FIFO), see [`SendGate::message_turn`]
     message_turn: tokio::sync::Mutex<()>,
     changed: Notify,
@@ -89,20 +89,36 @@ pub struct SendGate {
 
 impl Default for SendGate {
     fn default() -> Self {
+        let (rate, window) = crate::allocator::LinkModel::default().pacing();
         SendGate {
             strict_busy: AtomicUsize::new(0),
-            outstanding: Mutex::new(HashMap::new()),
-            channels: Mutex::new(HashMap::new()),
-            inflight_limit: AtomicUsize::new(usize::MAX),
-            chunk_bytes: AtomicUsize::new(MAX_CHUNK_BYTES),
-            window_bytes: AtomicUsize::new(crate::subscription::BACKED_UP_BYTES),
-            page: Mutex::default(),
-            max_network_lag_us: AtomicU64::new(((NETWORK_LAG_MAX_EXTRA_RTT_MS + NETWORK_LAG_MARGIN_MS) * 1000.0) as u64),
-            network_rtt_us: AtomicU64::new((NETWORK_LAG_MAX_EXTRA_RTT_MS * 1000.0) as u64),
+            path: Mutex::new(Path {
+                frames: BTreeMap::new(),
+                next: 0,
+                in_flight: 0,
+                acked_total: 0,
+                rtts: Default::default(),
+                last_ack_at: None,
+                flight_started: Instant::now(),
+                held: false,
+                round: RoundSamples::default(),
+                bandwidth: crate::allocator::INITIAL_BANDWIDTH,
+                epoch_started: Instant::now(),
+                epoch_acked: 0.0,
+                window,
+                rate,
+                tokens: 0.0,
+                refilled: Instant::now(),
+            }),
+            chunk_bytes: AtomicUsize::new(chunk_for(rate)),
             message_turn: tokio::sync::Mutex::new(()),
             changed: Notify::new(),
         }
     }
+}
+
+fn chunk_for(rate: f64) -> usize {
+    ((rate * CHUNK_MS / 1000.0) as usize).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES)
 }
 
 /// Holds the gate shut for bulk streams while a strict stream sends.
@@ -115,152 +131,78 @@ impl Drop for StrictTurn<'_> {
     }
 }
 
+impl Path {
+    fn refill(&mut self, now: Instant) {
+        // at most one chunk's worth saved up while idle, so an idle frontend can't burst
+        let capacity = chunk_for(self.rate) as f64;
+        self.tokens = (self.tokens + self.rate * now.duration_since(self.refilled).as_secs_f64()).min(capacity);
+        self.refilled = now;
+    }
+
+    /// A lost tail: with the page silent for the loss timeout, lossy frames that old will never be acked.
+    fn expire_lost(&mut self, now: Instant) {
+        let high_rtt = self.rtts.iter().map(|(_, rtt)| *rtt).reduce(f64::max).unwrap_or(0.0);
+        let timeout = crate::secs(2.0 * high_rtt / 1000.0).max(MIN_LOSS_TIMEOUT);
+        if self.last_ack_at.is_some_and(|at| now.duration_since(at) <= timeout) {
+            return;
+        }
+        let lost: Vec<u64> = self.frames.iter().filter(|(_, frame)| frame.lossy && now.duration_since(frame.sent_at) > timeout).map(|(order, _)| *order).collect();
+        for order in lost {
+            self.remove(order);
+        }
+    }
+
+    fn remove(&mut self, order: u64) -> Option<Frame> {
+        let frame = self.frames.remove(&order)?;
+        self.in_flight -= frame.bytes;
+        Some(frame)
+    }
+}
+
 impl SendGate {
-    /// Bytes of every `sub` channel the browser has acknowledged, ever.
-    pub fn delivered_total(&self) -> u64 {
-        self.page.lock().delivered_total
-    }
-
-    /// From the allocator: the budget sets bulk chunk size and the in-flight limit, budget x (min RTT + `slack_ms`), about
-    /// one bandwidth-delay product. The limit only protects strict streams: without one (`!limit_inflight`) there is none.
-    pub fn configure(&self, budget_bytes_per_sec: f64, min_rtt_ms: Option<f64>, slack_ms: f64, limit_inflight: bool) {
-        let chunk = ((budget_bytes_per_sec * CHUNK_MS / 1000.0) as usize).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES);
-        let window = budget_bytes_per_sec * (min_rtt_ms.unwrap_or(50.0) + slack_ms) / 1000.0;
-        self.chunk_bytes.store(chunk, Ordering::Relaxed);
-        let limit = if limit_inflight { (window as usize).max(2 * chunk) } else { usize::MAX };
-        self.inflight_limit.store(limit, Ordering::Relaxed);
+    /// From the allocator: the link's bandwidth and the pacing rate (bytes/s), and the most that may be in flight.
+    pub fn configure(&self, bandwidth: f64, rate: f64, window: usize) {
+        let mut path = self.path.lock();
+        let now = Instant::now();
+        path.refill(now);
+        path.bandwidth = bandwidth;
+        path.rate = rate;
+        path.window = window;
+        self.chunk_bytes.store(chunk_for(rate), Ordering::Relaxed);
+        drop(path);
         self.changed.notify_waiters();
-    }
-
-    /// From the allocator: each channel's send window, about two bandwidth-delay products at the path's recent highest
-    /// RTT (a fixed 64 KB held a Wi-Fi path with 400 ms RTT swings to ~150 KB/s, and SCTP's cwnd never grew past it).
-    pub fn set_window(&self, budget_bytes_per_sec: f64, min_rtt_ms: Option<f64>, high_rtt_ms: Option<f64>) {
-        let rtt_ms = match (min_rtt_ms, high_rtt_ms) {
-            (Some(min), Some(high)) => high.min(min + WINDOW_MAX_EXTRA_RTT_MS),
-            (min, high) => high.or(min).unwrap_or(0.0),
-        };
-        let window = (budget_bytes_per_sec * WINDOW_RTTS * rtt_ms / 1000.0) as usize;
-        self.window_bytes.store(window.clamp(crate::subscription::BACKED_UP_BYTES, MAX_WINDOW_BYTES), Ordering::Relaxed);
-        let network_rtt_ms = match (min_rtt_ms, high_rtt_ms) {
-            (Some(min), Some(high)) => high.clamp(min, min + NETWORK_LAG_MAX_EXTRA_RTT_MS),
-            _ => NETWORK_LAG_MAX_EXTRA_RTT_MS,
-        };
-        self.max_network_lag_us.store(((network_rtt_ms + NETWORK_LAG_MARGIN_MS) * 1000.0) as u64, Ordering::Relaxed);
-        self.network_rtt_us.store((network_rtt_ms * 1000.0) as u64, Ordering::Relaxed);
-    }
-
-    /// How long a frame may wait in SCTP undelivered before channels stop sending.
-    pub fn max_network_lag(&self) -> Duration {
-        Duration::from_micros(self.max_network_lag_us.load(Ordering::Relaxed))
-    }
-
-    /// How long the oldest frame SCTP hasn't delivered to the browser has been in it.
-    pub fn network_lag(&self, now: Instant) -> Duration {
-        let page = self.page.lock();
-        page.unpassed.values().filter(|frame| frame.delivered_at.is_none()).map(|frame| frame.sent_at).min().map_or(Duration::ZERO, |at| now.duration_since(at))
-    }
-
-    /// The path holds a frame longer than it should: past `max_network_lag` plus `LOSS_NETWORK_LAG_EXTRA`.
-    pub fn network_lagging(&self, now: Instant) -> bool {
-        self.network_lag(now) > self.max_network_lag() + LOSS_NETWORK_LAG_EXTRA
-    }
-
-    /// How far behind the page may be before channels stop sending: `MAX_PAGE_LAG_MS` plus the path's round trip, since
-    /// page lag runs until the page's ack arrives, which crosses the network back (on the R1's Wi-Fi, 60-650 ms of network
-    /// read as a 564 ms page lag, and the senders waited on a page that was keeping up).
-    pub fn max_page_lag(&self) -> Duration {
-        Duration::from_secs_f64(MAX_PAGE_LAG_MS / 1000.0) + Duration::from_micros(self.network_rtt_us.load(Ordering::Relaxed))
-    }
-
-    /// The right to send one message bigger than a bulk chunk, held until it is sent whole; waiters get it in arrival
-    /// order. Big messages of several streams sent at once interleave their chunks, so each takes as long as all of them
-    /// together (three 200 KB clouds and a map on a 500 KB/s link: every one arrived ~1.7 s old); one at a time, each
-    /// takes its own size / rate, and a stream that waited sends its newest sample.
-    pub async fn message_turn(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.message_turn.lock().await
-    }
-
-    /// A frame went to the page; returns its place in the frontend's send order.
-    pub fn frame_sent(&self, stream: usize, bytes: usize, lossy: bool) -> u64 {
-        let mut page = self.page.lock();
-        let order = page.next;
-        page.next += 1;
-        let sent = page.sent_bytes.entry(stream).or_default();
-        *sent += bytes;
-        let end_offset = *sent;
-        page.unpassed.insert(order, PageFrame { sent_at: Instant::now(), lossy, stream, end_offset, delivered_at: None });
-        order
-    }
-
-    /// SCTP holds `outstanding` bytes of `stream` its peer hasn't acknowledged: the frames before them reached the browser.
-    pub fn observe_delivered(&self, stream: usize, outstanding: usize, now: Instant) {
-        let mut page = self.page.lock();
-        let delivered = page.sent_bytes.get(&stream).copied().unwrap_or(0).saturating_sub(outstanding);
-        let previous = page.delivered_bytes.insert(stream, delivered).unwrap_or(0);
-        page.delivered_total += delivered.saturating_sub(previous) as u64;
-        for frame in page.unpassed.values_mut() {
-            if frame.stream == stream && frame.end_offset <= delivered && frame.delivered_at.is_none() {
-                frame.delivered_at = Some(now);
-            }
-        }
-    }
-
-    /// Reads every channel's unacknowledged bytes (`observe_delivered`).
-    pub async fn refresh_delivered(&self) {
-        let channels: Vec<(usize, Arc<dyn DataChannel>)> = self.channels.lock().iter().map(|(id, channel)| (*id, channel.clone())).collect();
-        for (id, channel) in channels {
-            let outstanding = channel.outstanding_bytes().await.unwrap_or(0);
-            self.observe_delivered(id, outstanding, Instant::now());
-        }
-    }
-
-    /// The page acked these frames of one channel (in send order): it is past every lossy frame sent before them too.
-    pub fn frames_acked(&self, orders: impl IntoIterator<Item = u64>) {
-        let mut page = self.page.lock();
-        let mut newest = None;
-        for order in orders {
-            page.unpassed.remove(&order);
-            newest = Some(order);
-        }
-        if let Some(newest) = newest {
-            page.unpassed.retain(|order, frame| *order > newest || !frame.lossy);
-            page.passed = page.passed.max(newest + 1);
-        }
-    }
-
-    /// The page has gotten past every lossy frame sent before this place in the send order: any of them still unacked
-    /// was lost. It only grows, so a change means the page made progress.
-    pub fn passed(&self) -> u64 {
-        self.page.lock().passed
-    }
-
-    /// Frames of a closed channel the page will never ack.
-    pub fn frames_dropped(&self, orders: impl IntoIterator<Item = u64>) {
-        let mut page = self.page.lock();
-        for order in orders {
-            page.unpassed.remove(&order);
-        }
-    }
-
-    /// How long the page has had the oldest frame it hasn't gotten past: from when SCTP delivered it to the browser, so the
-    /// network's own delay (a Wi-Fi path's RTT swinging 60-480 ms) doesn't count, only the page's backlog.
-    pub fn page_lag(&self, now: Instant) -> Duration {
-        let page = self.page.lock();
-        page.unpassed.values().filter_map(|frame| frame.delivered_at).min().map_or(Duration::ZERO, |at| now.duration_since(at))
-    }
-
-    /// Bytes a channel may have in SCTP (sent, not yet acknowledged) before it waits.
-    pub fn window_bytes(&self) -> usize {
-        self.window_bytes.load(Ordering::Relaxed)
-    }
-
-    /// The bulk in-flight limit, if any.
-    pub fn inflight_limit(&self) -> Option<usize> {
-        Some(self.inflight_limit.load(Ordering::Relaxed)).filter(|limit| *limit != usize::MAX)
     }
 
     pub fn chunk_bytes(&self) -> usize {
         self.chunk_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes the page has acked, ever.
+    pub fn acked_total(&self) -> u64 {
+        self.path.lock().acked_total
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.path.lock().in_flight
+    }
+
+    /// The round's samples since the previous call: delivery rates, the least send-to-ack time (the path's round trip,
+    /// if a frame didn't queue), and how far acks ran ahead of the bandwidth.
+    pub fn take_round(&self) -> RoundSamples {
+        let mut path = self.path.lock();
+        let now = Instant::now();
+        while path.rtts.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW) {
+            path.rtts.pop_front();
+        }
+        let drained = path.in_flight <= path.window.max(2 * self.chunk_bytes());
+        RoundSamples { drained, ..std::mem::take(&mut path.round) }
+    }
+
+    /// The right to send one message bigger than a bulk chunk, held until it is sent whole; waiters get it in arrival
+    /// order. Big messages of several streams sent at once interleave their chunks, so each takes as long as all of them
+    /// together; one at a time, each takes its own size / rate, and a stream that waited sends its newest sample.
+    pub async fn message_turn(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.message_turn.lock().await
     }
 
     pub fn strict_turn(&self) -> StrictTurn<'_> {
@@ -268,121 +210,151 @@ impl SendGate {
         StrictTurn(self)
     }
 
-    pub fn report_outstanding(&self, stream: usize, bytes: usize) {
-        set_outstanding(&mut self.outstanding.lock(), stream, bytes);
+    /// A frame went to SCTP; returns its place in the frontend's send order. Every frame spends tokens, so bulk yields to
+    /// what strict streams sent.
+    pub fn frame_sent(&self, stream: usize, bytes: usize, lossy: bool) -> u64 {
+        let mut path = self.path.lock();
+        let now = Instant::now();
+        path.refill(now);
+        path.tokens -= bytes as f64;
+        let order = path.next;
+        path.next += 1;
+        path.in_flight += bytes;
+        if path.frames.is_empty() {
+            // nothing in flight: a new flight starts now (an idle gap isn't delivery time)
+            path.flight_started = now;
+        }
+        let frame = Frame {
+            stream,
+            bytes,
+            lossy,
+            sent_at: now,
+            acked_before: path.acked_total,
+            acked_before_at: path.last_ack_at.filter(|_| !path.frames.is_empty()).unwrap_or(now),
+            flight_started: path.flight_started,
+            link_limited: std::mem::take(&mut path.held),
+        };
+        path.frames.insert(order, frame);
+        order
+    }
+
+    /// The page acked these frames of one channel (in send order): it is past every lossy frame sent before them too.
+    pub fn frames_acked(&self, orders: impl IntoIterator<Item = u64>) {
+        let mut path = self.path.lock();
+        let now = Instant::now();
+        path.last_ack_at = Some(now);
+        let mut newest = None;
+        let acked_before = path.acked_total;
+        let mut newest_acked: Option<Frame> = None;
+        for order in orders {
+            if let Some(frame) = path.remove(order) {
+                path.acked_total += frame.bytes as u64;
+                let rtt = now.duration_since(frame.sent_at).as_secs_f64() * 1000.0;
+                path.rtts.push_back((now, rtt));
+                path.round.min_rtt_ms = Some(path.round.min_rtt_ms.map_or(rtt, |least| least.min(rtt)));
+                newest_acked = Some(frame);
+            }
+            newest = Some(order);
+        }
+        // one rate sample per ack, from the newest frame it covers: what was acked since that frame was sent, over the
+        // longer of its flight's send time and ack time, and never over less than a round trip (an ack burst isn't a rate)
+        if let Some(frame) = newest_acked {
+            let delivered = (path.acked_total - frame.acked_before) as f64;
+            let interval = frame.sent_at.duration_since(frame.flight_started).max(now.duration_since(frame.acked_before_at)).as_secs_f64();
+            let min_rtt = path.rtts.iter().map(|(_, rtt)| *rtt).reduce(f64::min).unwrap_or(0.0) / 1000.0;
+            if interval > 0.0 && interval >= min_rtt {
+                let rate = delivered / interval;
+                let slot = if frame.link_limited { &mut path.round.link_limited_rate } else { &mut path.round.app_limited_rate };
+                *slot = Some(slot.map_or(rate, |most| most.max(rate)));
+            }
+            path.flight_started = frame.sent_at;
+        }
+        // ack aggregation, as Linux's BBR measures it: acked since the epoch began beyond bandwidth x its length; an epoch
+        // whose acks fell behind the bandwidth starts over
+        let acked = (path.acked_total - acked_before) as f64;
+        if acked > 0.0 {
+            let expected = path.bandwidth * now.duration_since(path.epoch_started).as_secs_f64();
+            if path.epoch_acked <= expected {
+                (path.epoch_started, path.epoch_acked) = (now, 0.0);
+            }
+            path.epoch_acked += acked;
+            let expected = path.bandwidth * now.duration_since(path.epoch_started).as_secs_f64();
+            let extra = (path.epoch_acked - expected).clamp(0.0, path.window as f64);
+            path.round.extra_acked = path.round.extra_acked.max(extra);
+        }
+        if let Some(newest) = newest {
+            let lost: Vec<u64> = path.frames.range(..newest).filter(|(_, frame)| frame.lossy).map(|(order, _)| *order).collect();
+            for order in lost {
+                path.remove(order);
+            }
+        }
+        drop(path);
         self.changed.notify_waiters();
     }
 
-    /// Admits `bytes` of bulk if the gate is open, counting them at once so senders woken together can't all burst.
-    fn try_admit(&self, stream: usize, bytes: usize) -> bool {
-        if self.strict_busy.load(Ordering::Acquire) > 0 {
-            return false;
+    /// Frames of a closed channel the page will never ack.
+    pub fn frames_dropped(&self, orders: impl IntoIterator<Item = u64>) {
+        let mut path = self.path.lock();
+        for order in orders {
+            path.remove(order);
         }
-        let mut outstanding = self.outstanding.lock();
-        let total: usize = outstanding.values().sum();
-        if total >= self.inflight_limit.load(Ordering::Relaxed) {
-            return false;
-        }
-        *outstanding.entry(stream).or_default() += bytes;
-        true
+        drop(path);
+        self.changed.notify_waiters();
     }
 
-    pub fn register(&self, stream: usize, channel: Arc<dyn DataChannel>) {
-        self.channels.lock().insert(stream, channel);
-    }
-
-    /// Re-reads every bulk channel's outstanding bytes (idle streams don't report while SCTP drains them).
-    async fn refresh_all(&self) {
-        let channels: Vec<(usize, Arc<dyn DataChannel>)> = self.channels.lock().iter().map(|(id, channel)| (*id, channel.clone())).collect();
-        let mut readings = Vec::with_capacity(channels.len());
-        for (id, channel) in channels {
-            readings.push((id, channel.outstanding_bytes().await.unwrap_or(0)));
-        }
-        let mut outstanding = self.outstanding.lock();
-        for (id, bytes) in readings {
-            set_outstanding(&mut outstanding, id, bytes);
-        }
-    }
-
-    /// Waits until a bulk chunk of `bytes` from `stream` may go.
-    pub async fn wait_bulk_turn(&self, stream: usize, bytes: usize) -> Duration {
-        let started = Instant::now();
+    /// Waits until a bulk frame of `bytes` may go; returns how long it waited on the window (the rest is pacing).
+    pub async fn wait_bulk_turn(&self, bytes: usize) -> Duration {
+        let mut on_window = Duration::ZERO;
         loop {
             let notified = self.changed.notified();
-            if self.try_admit(stream, bytes) {
-                return started.elapsed();
-            }
+            let wait = {
+                let mut path = self.path.lock();
+                let now = Instant::now();
+                path.expire_lost(now);
+                path.refill(now);
+                // (at least two chunks: one on the wire, one queued behind it)
+                let window = path.window.max(2 * self.chunk_bytes());
+                let window_open = path.in_flight == 0 || path.in_flight + bytes <= window;
+                if self.strict_busy.load(Ordering::Acquire) > 0 || !window_open {
+                    path.held |= !window_open;
+                    // woken by an ack or a strict turn ending; looked at again after the loss timeout for a lost tail
+                    (true, MIN_LOSS_TIMEOUT)
+                } else if path.tokens < 0.0 {
+                    path.held = true;
+                    (false, crate::secs(-path.tokens / path.rate.max(1.0)))
+                } else {
+                    return on_window;
+                }
+            };
+            let started = Instant::now();
             tokio::select! {
                 _ = notified => {}
-                _ = tokio::time::sleep(GATE_BACKSTOP) => {}
+                _ = tokio::time::sleep(wait.1) => {}
             }
-            self.refresh_all().await;
+            if wait.0 {
+                on_window += started.elapsed();
+            }
         }
     }
 
-    /// Lets go of every channel: they hold the peer connection, whose handler holds the peer state that holds this gate.
+    /// Lets go of every frame (the peer is gone).
     pub fn forget_all(&self) {
-        self.channels.lock().clear();
-        self.outstanding.lock().clear();
-        *self.page.lock() = PageQueue::default();
+        let mut path = self.path.lock();
+        path.frames.clear();
+        path.in_flight = 0;
+        drop(path);
         self.changed.notify_waiters();
     }
 
+    /// A closed channel's frames.
     pub fn forget(&self, stream: usize) {
-        self.channels.lock().remove(&stream);
-        let mut page = self.page.lock();
-        page.sent_bytes.remove(&stream);
-        page.delivered_bytes.remove(&stream);
-        drop(page);
-        self.report_outstanding(stream, 0);
-    }
-}
-
-fn set_outstanding(outstanding: &mut HashMap<usize, usize>, stream: usize, bytes: usize) {
-    if bytes == 0 {
-        outstanding.remove(&stream);
-    } else {
-        outstanding.insert(stream, bytes);
-    }
-}
-
-/// Smooth pacing at a rate; `None` rate = unpaced.
-#[derive(Debug)]
-pub struct TokenBucket {
-    rate: Option<f64>,
-    tokens: f64,
-    capacity: f64,
-    refilled: Instant,
-}
-
-impl Default for TokenBucket {
-    fn default() -> Self {
-        TokenBucket { rate: None, tokens: 0.0, capacity: MAX_CHUNK_BYTES as f64, refilled: Instant::now() }
-    }
-}
-
-impl TokenBucket {
-    pub fn set_rate(&mut self, rate: Option<f64>, capacity: usize) {
-        self.refill(Instant::now());
-        self.rate = rate.map(|rate| rate.max(1000.0));
-        self.capacity = capacity as f64;
-        self.tokens = self.tokens.min(self.capacity);
-    }
-
-    fn refill(&mut self, now: Instant) {
-        if let Some(rate) = self.rate {
-            self.tokens = (self.tokens + rate * now.duration_since(self.refilled).as_secs_f64()).min(self.capacity);
+        let mut path = self.path.lock();
+        let orders: Vec<u64> = path.frames.iter().filter(|(_, frame)| frame.stream == stream).map(|(order, _)| *order).collect();
+        for order in orders {
+            path.remove(order);
         }
-        self.refilled = now;
-    }
-
-    /// Takes `bytes` (may go into debt by one chunk); returns how long to wait before sending.
-    pub fn take(&mut self, bytes: usize, now: Instant) -> Duration {
-        let Some(rate) = self.rate else { return Duration::ZERO };
-        self.refill(now);
-        let wait = if self.tokens >= 0.0 { Duration::ZERO } else { crate::secs(-self.tokens / rate) };
-        self.tokens -= bytes as f64;
-        wait
+        drop(path);
+        self.changed.notify_waiters();
     }
 }
 
@@ -390,111 +362,80 @@ impl TokenBucket {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bucket_paces_at_its_rate() {
-        let mut bucket = TokenBucket::default();
-        let start = Instant::now();
-        assert_eq!(bucket.take(10_000, start), Duration::ZERO, "unpaced");
-        bucket.set_rate(Some(100_000.0), 10_000);
-        bucket.tokens = 0.0;
-        bucket.refilled = start;
-        assert_eq!(bucket.take(10_000, start), Duration::ZERO, "first chunk goes, into debt");
-        let wait = bucket.take(10_000, start);
-        assert!((wait.as_secs_f64() - 0.1).abs() < 1e-6, "next waits 10 KB / 100 KB/s: {wait:?}");
-        assert!(bucket.take(10_000, start + Duration::from_millis(100)) > Duration::ZERO);
+    fn gate(rate: f64, window: usize) -> SendGate {
+        let gate = SendGate::default();
+        gate.configure(rate, rate, window);
+        gate
     }
 
     #[test]
-    fn send_window_covers_two_round_trips_at_the_highest_rtt() {
-        let gate = SendGate::default();
-        assert_eq!(gate.window_bytes(), crate::subscription::BACKED_UP_BYTES, "64 KB before any RTT is known");
-        gate.set_window(1_000_000.0, Some(10.0), Some(400.0));
-        assert_eq!(gate.window_bytes(), 800_000, "1 MB/s x 2 x 400 ms");
-        gate.set_window(1_000_000.0, Some(10.0), Some(2000.0));
-        assert_eq!(gate.window_bytes(), 1_020_000, "at most the minimum RTT + 500 ms");
-        gate.set_window(100_000.0, Some(10.0), Some(20.0));
-        assert_eq!(gate.window_bytes(), crate::subscription::BACKED_UP_BYTES, "never below 64 KB");
-        gate.set_window(1e9, Some(10.0), Some(400.0));
-        assert_eq!(gate.window_bytes(), MAX_WINDOW_BYTES);
-    }
-
-    #[test]
-    fn page_lag_counts_from_delivery_to_the_browser_and_acks_pass_lossy_frames() {
-        let gate = SendGate::default();
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let (tf, cloud) = (1, 2);
-        assert_eq!(gate.page_lag(at(0)), Duration::ZERO);
-        let reliable = gate.frame_sent(tf, 100, false);
-        let lost = gate.frame_sent(cloud, 1000, true);
-        let first = gate.frame_sent(cloud, 1000, true);
-        let second = gate.frame_sent(cloud, 1000, true);
-        assert_eq!(gate.page_lag(at(400)), Duration::ZERO, "nothing has reached the browser yet: the network's delay");
-        gate.observe_delivered(tf, 0, at(100));
-        gate.observe_delivered(cloud, 1000, at(150));
-        assert_eq!(gate.page_lag(at(400)), Duration::from_millis(300), "delivered at 100 ms, not yet acked");
-        // an ack of a later frame (any channel) means the page is past the earlier lossy ones: lost or acked soon
-        gate.frames_acked([first]);
-        assert_eq!(gate.page_lag(at(400)), Duration::from_millis(300), "a reliable frame still counts");
-        gate.frames_acked([reliable]);
-        assert_eq!(gate.page_lag(at(400)), Duration::ZERO, "{second} hasn't reached the browser");
-        gate.observe_delivered(cloud, 0, at(200));
-        assert_eq!(gate.page_lag(at(400)), Duration::from_millis(200));
+    fn in_flight_counts_until_the_page_acks_and_an_ack_passes_earlier_lossy_frames() {
+        let gate = gate(1e6, 10_000);
+        let reliable = gate.frame_sent(1, 100, false);
+        let lost = gate.frame_sent(2, 1000, true);
+        let acked = gate.frame_sent(2, 1000, true);
+        let later = gate.frame_sent(2, 1000, true);
+        assert_eq!(gate.in_flight(), 3100);
+        gate.frames_acked([acked]);
+        assert_eq!(gate.in_flight(), 1100, "the lossy frame before it was lost; the reliable one still waits for its own ack");
+        assert_eq!(gate.acked_total(), 1000, "a lost frame isn't delivered");
         gate.frames_acked([lost]);
-        assert_eq!(gate.page_lag(at(400)), Duration::from_millis(200), "a late ack of an older frame changes nothing");
-        gate.frames_dropped([second]);
-        assert_eq!(gate.page_lag(at(400)), Duration::ZERO, "a closed channel's frames don't hold the rest");
+        assert_eq!(gate.in_flight(), 1100, "a late ack of a passed frame changes nothing");
+        gate.frames_acked([reliable]);
+        gate.frames_dropped([later]);
+        assert_eq!(gate.in_flight(), 0);
+        assert!(gate.take_round().min_rtt_ms.is_some());
     }
 
     #[test]
-    fn network_lag_is_the_oldest_frame_still_in_sctp() {
-        let gate = SendGate::default();
-        gate.set_window(1e6, Some(40.0), Some(300.0));
-        assert_eq!(gate.max_network_lag(), Duration::from_millis(550), "recent highest RTT + 250 ms");
-        gate.set_window(1e6, Some(40.0), Some(5000.0));
-        assert_eq!(gate.max_network_lag(), Duration::from_millis(790), "at most min + 500 ms + 250 ms");
-        let t0 = Instant::now();
-        gate.frame_sent(1, 100, false);
-        gate.frame_sent(2, 100, true);
-        assert!(gate.network_lag(t0 + Duration::from_secs(1)) >= Duration::from_millis(990));
-        gate.observe_delivered(1, 0, t0);
-        gate.observe_delivered(2, 0, t0);
-        assert_eq!(gate.network_lag(t0 + Duration::from_secs(1)), Duration::ZERO, "both reached the browser");
-    }
-
-    #[test]
-    fn a_lost_frame_may_wait_for_the_retransmission_timer() {
-        let gate = SendGate::default();
-        gate.set_window(1e6, Some(40.0), Some(300.0));
-        let t0 = Instant::now();
+    fn a_lost_tail_times_out() {
+        let gate = gate(1e6, 10_000);
         gate.frame_sent(1, 100, true);
-        assert!(!gate.network_lagging(t0 + Duration::from_millis(1200)), "lost, waiting on the retransmission timer");
-        assert!(gate.network_lagging(t0 + Duration::from_millis(1600)));
+        gate.frame_sent(2, 100, false);
+        let mut path = gate.path.lock();
+        let later = Instant::now() + MIN_LOSS_TIMEOUT + Duration::from_millis(1);
+        path.last_ack_at = Some(later);
+        path.expire_lost(later);
+        assert_eq!(path.in_flight, 200, "acks still coming: a frame that waits in a queue isn't lost");
+        path.last_ack_at = None;
+        path.expire_lost(later);
+        assert_eq!(path.in_flight, 100, "the page silent: the lossy tail is lost; the reliable frame never is (SCTP resends it)");
+    }
+
+    #[tokio::test]
+    async fn bulk_waits_for_the_window_and_strict_turns() {
+        // a window under two chunks counts as two chunks (8 KB at this rate)
+        let gate = std::sync::Arc::new(gate(1e6, 2000));
+        assert_eq!(gate.wait_bulk_turn(5000).await, Duration::ZERO, "an empty window always admits one frame");
+        let first = gate.frame_sent(1, 5000, false);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let waiting = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.wait_bulk_turn(5000).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished(), "10 KB > the 8 KB window");
+        gate.frames_acked([first]);
+        assert!(waiting.await.unwrap() >= Duration::from_millis(15));
+        let turn = gate.strict_turn();
+        assert!(tokio::time::timeout(Duration::from_millis(20), gate.wait_bulk_turn(10)).await.is_err(), "bulk waits while strict sends");
+        drop(turn);
+        assert_eq!(gate.wait_bulk_turn(10).await, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn bulk_is_paced_at_the_rate() {
+        let gate = gate(100_000.0, usize::MAX);
+        gate.frame_sent(1, 10_000, true);
+        let started = Instant::now();
+        gate.wait_bulk_turn(10_000).await;
+        let waited = started.elapsed().as_secs_f64();
+        assert!((0.09..0.2).contains(&waited), "10 KB at 100 KB/s: {waited}");
     }
 
     #[test]
-    fn gate_sizes_chunks_and_blocks_bulk_during_strict_turns() {
-        let gate = SendGate::default();
-        gate.configure(1_000_000.0, Some(10.0), 5.0, true);
-        assert_eq!(gate.chunk_bytes(), MIN_CHUNK_BYTES);
-        assert_eq!(gate.inflight_limit.load(Ordering::Relaxed), 15_000);
-        assert!(gate.try_admit(1, 10_000));
-        assert!(gate.try_admit(2, 10_000), "below the limit when admitted");
-        assert!(!gate.try_admit(3, 1000), "admitted bytes count at once, before any send");
-        gate.forget(1);
-        gate.forget(2);
-        let turn = gate.strict_turn();
-        assert!(!gate.try_admit(1, 1000));
-        drop(turn);
-        assert!(gate.try_admit(1, 1000));
-        gate.configure(1e9, Some(1.0), 5.0, true);
-        assert_eq!(gate.chunk_bytes(), MAX_CHUNK_BYTES);
-        // a jittery path widens the window by its jitter allowance
-        gate.configure(1_000_000.0, Some(10.0), 50.0, true);
-        assert_eq!(gate.inflight_limit(), Some(60_000));
-        // no strict stream to protect: no limit
-        gate.configure(1_000_000.0, Some(10.0), 50.0, false);
-        assert_eq!(gate.inflight_limit(), None);
-        assert!(gate.try_admit(1, 10_000_000));
+    fn chunks_are_a_few_ms_of_the_rate() {
+        assert_eq!(chunk_for(1_000_000.0), MIN_CHUNK_BYTES);
+        assert_eq!(chunk_for(1e9), MAX_CHUNK_BYTES);
     }
 }

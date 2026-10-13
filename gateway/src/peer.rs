@@ -1,6 +1,6 @@
 //! One browser = one PeerConnection; each data channel it opens is dispatched by its label.
 
-use crate::allocator::{self, Estimator};
+use crate::allocator::{self, LinkModel};
 use crate::api;
 use crate::auth::{Grant, Leases};
 use crate::ice::{self, IceServer};
@@ -15,7 +15,7 @@ use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -46,22 +46,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often each frontend's bandwidth is re-estimated and re-allocated.
 const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
-/// The RTT baseline is the minimum over this window (a standing queue lasting longer would become the baseline).
-const RTT_BASELINE_WINDOW: Duration = Duration::from_secs(60);
-/// The video pacer's floor (32 kbit/s), whatever the allocator lets video take.
-const VIDEO_HEADROOM_BYTES_PER_SEC: f64 = 4_000.0;
-/// GCC below this fraction of what video sent is congestion for the whole link.
-const VIDEO_OVERUSE_FRACTION: f64 = 0.85;
-/// The send window covers the highest RTT over this window.
-const WINDOW_RTT_WINDOW: Duration = Duration::from_secs(10);
 
 /// Gateway-wide allocation settings (builder options / command-line flags).
 #[derive(Debug, Clone, Copy)]
 pub struct AllocationConfig {
     /// cap on each frontend's budget, bytes/s
     pub max_bandwidth: Option<f64>,
-    /// fraction of the estimate the allocator hands out (`--bandwidth-target-fraction`)
-    pub target_fraction: f64,
 }
 
 /// How the gateway's side of each connection reaches browsers (builder options / command-line flags).
@@ -81,45 +71,36 @@ pub struct ConnectConfig {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BandwidthStats {
-    /// the link's capacity estimate, video and data together (see allocator::Estimator)
+    /// the link's bandwidth, video and data together: the most it delivered in a round lately (`allocator::LinkModel`)
     data_estimate_bytes_per_sec: f64,
-    /// most the video tracks may take: GCC's target from TWCC feedback (only while a video track is in use; GCC grows while
-    /// video sends less, so it caps video's share of the link estimate, never adds to it)
+    /// what the page acked plus what video sent, last round
+    delivered_bytes_per_sec: f64,
+    /// most the video tracks may take: GCC's target from TWCC feedback (only while a video track is in use)
     video_estimate_bytes_per_sec: f64,
     /// what the video tracks sent
     video_sent_bytes_per_sec: f64,
     /// `--max-bandwidth-bytes-per-sec`
     cap_bytes_per_sec: Option<f64>,
-    /// min(cap, target fraction x the link estimate): what the allocator divides
+    /// min(cap, bandwidth x gain): what the allocator divides and the pacing rate
     budget_bytes_per_sec: f64,
-    target_fraction: f64,
-    /// latest RTT minus its 60 s minimum (the delay trigger's input)
-    queue_delay_ms: Option<f64>,
+    /// the link model's gain this round, and whether it is still starting up
+    gain: f64,
+    starting_up: bool,
+    /// least send-to-ack time over 10 s, how far acks ran ahead of the bandwidth lately, and whether the window is down
+    /// to its minimum to re-measure the round trip
     min_rtt_ms: Option<f64>,
-    delay_events: u64,
-    backlog_events: u64,
-    blocked_events: u64,
-    video_overuse_events: u64,
-    /// queue delay that counts as congestion (5 ms + the spread of the path's queue delays over 10 s, at most 505 ms)
-    delay_threshold_ms: f64,
-    /// bulk bytes allowed in flight (`null`: no strict stream to protect, so no limit)
-    bulk_inflight_limit: Option<usize>,
-    /// bytes/s reserved for strict-priority and reliable streams
+    extra_acked_bytes: f64,
+    probing_rtt: bool,
+    /// bytes sent the page hasn't acked, and the most allowed
+    in_flight_bytes: usize,
+    window_bytes: usize,
+    /// bytes/s strict-priority and audio streams sent (never squeezed)
     reserved_bytes_per_sec: f64,
     bulk_chunk_bytes: usize,
     demand_bytes_per_sec: f64,
     sent_bytes_per_sec: f64,
-    /// what the browser acknowledged over the last second (data channels, plus what video sent)
-    delivered_bytes_per_sec: f64,
+    /// share of the round bulk senders waited on the window (the link or the page behind)
     network_blocked_fraction: f64,
-    /// share of the interval senders waited for the page (its JS behind on what arrived) rather than the network
-    page_blocked_fraction: f64,
-    /// how long the page has had the oldest frame it hasn't gotten past, and how long before channels wait
-    page_lag_ms: f64,
-    max_page_lag_ms: f64,
-    /// how long the oldest frame SCTP hasn't delivered has been in it, and how long before channels wait
-    network_lag_ms: f64,
-    max_network_lag_ms: f64,
     constrained: bool,
 }
 
@@ -175,12 +156,9 @@ struct PeerState {
     video_rate: Arc<media::VideoRate>,
     config: AllocationConfig,
     gate: Arc<SendGate>,
-    /// (when, rtt ms) reported by the browser's clock sync
-    rtt_samples: Mutex<VecDeque<(Instant, f64)>>,
-    last_allocation: Mutex<Instant>,
-    estimator: Mutex<Estimator>,
-    /// `SendGate::delivered_total` at the last allocation
-    delivered_total: AtomicU64,
+    link: Mutex<LinkModel>,
+    /// `SendGate::acked_total` at the last allocation
+    acked_total: AtomicU64,
     /// wire bytes per frame byte sent lately (`subscription::PACKET_OVERHEAD_BYTES`), to read acknowledged frame bytes
     wire_scale: Mutex<f64>,
     bandwidth: Mutex<BandwidthStats>,
@@ -253,12 +231,10 @@ impl PeerState {
             video_rate,
             config,
             gate: Arc::default(),
-            rtt_samples: Mutex::new(VecDeque::new()),
-            last_allocation: Mutex::new(Instant::now()),
-            estimator: Mutex::new(Estimator::default()),
-            delivered_total: AtomicU64::new(0),
+            link: Mutex::new(LinkModel::default()),
+            acked_total: AtomicU64::new(0),
             wire_scale: Mutex::new(1.0),
-            bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, target_fraction: config.target_fraction, ..Default::default() }),
+            bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, ..Default::default() }),
             gone: AtomicBool::new(false),
             gone_signal: tokio::sync::watch::Sender::new(false),
             ever_connected: AtomicBool::new(false),
@@ -276,40 +252,20 @@ impl PeerState {
         channels.values().filter_map(|entry| if let ChannelStats::Sub(shared) = &entry.stats { Some(shared.clone()) } else { None }).collect()
     }
 
-    /// (queue delay, minimum RTT): the smallest RTT since `since` minus the window's minimum. A
-    /// standing queue raises every sample; scheduling noise in the browser only some of them.
-    fn queue_delay(&self, since: Instant) -> (Option<f64>, Option<f64>) {
-        let samples = self.rtt_samples.lock();
-        let minimum = samples.iter().map(|(_, rtt)| *rtt).reduce(f64::min);
-        let newest = samples.iter().filter(|(at, _)| *at >= since).map(|(_, rtt)| *rtt).reduce(f64::min);
-        (newest.zip(minimum).map(|(newest, minimum)| newest - minimum), minimum)
-    }
-
-    /// The highest RTT over the last `WINDOW_RTT_WINDOW` (what a send window must cover).
-    fn high_rtt(&self, now: Instant) -> Option<f64> {
-        let samples = self.rtt_samples.lock();
-        samples.iter().filter(|(at, _)| now.duration_since(*at) <= WINDOW_RTT_WINDOW).map(|(_, rtt)| *rtt).reduce(f64::max)
-    }
-
-    /// One allocation round: measure, update the estimate, divide the budget among streams.
+    /// One allocation round: measure what reached the page, update the link model, pace and divide its budget.
     fn allocate(&self, interval_secs: f64) {
         let now = Instant::now();
-        let since = std::mem::replace(&mut *self.last_allocation.lock(), now);
-        let (queue_delay_ms, min_rtt_ms) = self.queue_delay(since);
-        let high_rtt_ms = self.high_rtt(now);
         let subscriptions = self.subscriptions();
         let usages: Vec<subscription::Usage> = subscriptions.iter().map(|shared| shared.usage(interval_secs)).collect();
         let data_usages = || usages.iter().filter(|usage| !usage.on_track);
-        let sent: u64 = usages.iter().map(|usage| usage.bytes_sent).sum();
-        let video_sent = usages.iter().filter(|usage| usage.on_track).map(|usage| usage.bytes_sent).sum::<u64>() as f64 / interval_secs.max(1e-3);
+        let per_sec = |bytes: f64| bytes / interval_secs.max(1e-3);
+        let sent = usages.iter().map(|usage| usage.bytes_sent).sum::<u64>() as f64;
+        let video_sent = usages.iter().filter(|usage| usage.on_track).map(|usage| usage.bytes_sent).sum::<u64>() as f64;
         let has_video = usages.iter().any(|usage| usage.on_track);
-        let gcc = self.video_rate.gcc_bytes_per_sec();
-        let video_overuse = has_video && video_sent > VIDEO_HEADROOM_BYTES_PER_SEC && gcc < VIDEO_OVERUSE_FRACTION * video_sent;
-        let blocked_ms: f64 = data_usages().map(|usage| usage.network_blocked_ms).sum();
-        let page_blocked_ms: f64 = data_usages().map(|usage| usage.page_blocked_ms).sum();
-        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.network_blocked_ms > 0.0 || usage.page_blocked_ms > 0.0).count();
+        let blocked_ms: f64 = data_usages().map(|usage| usage.blocked_ms).sum();
+        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.blocked_ms > 0.0).count();
         let total_demand: f64 = usages.iter().map(|usage| usage.demand.wants()).sum();
-        // acknowledged frame bytes, scaled to the wire as what was sent was (frames + per-packet overhead)
+        // acked frame bytes, scaled to the wire as what was sent was (frames + per-packet overhead)
         let data_sent = data_usages().map(|usage| usage.bytes_sent).sum::<u64>() as f64;
         let data_frame_bytes = data_usages().map(|usage| usage.frame_bytes).sum::<u64>() as f64;
         let wire_scale = {
@@ -320,58 +276,56 @@ impl PeerState {
             }
             *scale
         };
-        let delivered_total = self.gate.delivered_total();
-        let delivered = delivered_total.saturating_sub(self.delivered_total.swap(delivered_total, Ordering::Relaxed)) as f64 * wire_scale + video_sent * interval_secs;
-        let estimator = {
-            let mut estimator = self.estimator.lock();
-            estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, page_blocked_secs: page_blocked_ms / 1000.0, active_senders: active, data_demand: total_demand, queue_delay_ms, video_overuse, delivered_bytes: delivered, high_rtt_ms });
-            estimator.clone()
+        let acked_total = self.gate.acked_total();
+        let acked = acked_total.saturating_sub(self.acked_total.swap(acked_total, Ordering::Relaxed)) as f64 * wire_scale;
+        // video got through as far as GCC (which reads the video's own transport feedback) says the path takes it
+        let video_through = if has_video { video_sent.min(self.video_rate.gcc_bytes_per_sec() * interval_secs) } else { 0.0 };
+        let delivered = acked + video_through;
+        let link = {
+            let mut link = self.link.lock();
+            link.update(now, interval_secs, self.gate.take_round(), per_sec(video_through), per_sec(delivered));
+            link.clone()
         };
-        let video_estimate = if has_video { gcc } else { 0.0 };
-        let usable = estimator.data_bytes_per_sec * self.config.target_fraction;
-        let budget = self.config.max_bandwidth.map_or(usable, |cap| cap.min(usable));
-        self.video_rate.set_cap_bytes_per_sec(video_estimate.min(budget).max(VIDEO_HEADROOM_BYTES_PER_SEC));
+        let budget = self.budget(&link);
+        let (_, window) = link.pacing();
+        self.gate.configure(link.bandwidth_bytes_per_sec, budget, window);
+        let video_estimate = if has_video { self.video_rate.gcc_bytes_per_sec() } else { 0.0 };
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
-        // the in-flight limit only protects strict streams' latency; without one it only costs throughput
-        let strict_present = subscriptions.iter().any(|shared| shared.is_strict());
-        self.gate.configure((budget - reserved).max(0.0), min_rtt_ms, allocator::DELAY_THRESHOLD_MS, strict_present);
-        self.gate.set_window(budget, min_rtt_ms, high_rtt_ms);
         let allocations = allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video);
         let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
-        let bulk_budget = (budget - video_granted - reserved).max(0.0);
+        self.video_rate.set_cap_bytes_per_sec(video_granted);
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
-            shared.apply(allocation, bulk_budget);
+            shared.apply(allocation);
         }
         *self.bandwidth.lock() = BandwidthStats {
-            data_estimate_bytes_per_sec: estimator.data_bytes_per_sec,
+            data_estimate_bytes_per_sec: link.bandwidth_bytes_per_sec,
+            delivered_bytes_per_sec: link.delivered_bytes_per_sec,
             video_estimate_bytes_per_sec: video_estimate,
-            video_sent_bytes_per_sec: video_sent,
+            video_sent_bytes_per_sec: per_sec(video_sent),
             cap_bytes_per_sec: self.config.max_bandwidth,
             budget_bytes_per_sec: budget,
-            target_fraction: self.config.target_fraction,
-            queue_delay_ms,
-            min_rtt_ms,
-            delay_events: estimator.delay_events,
-            backlog_events: estimator.backlog_events,
-            blocked_events: estimator.blocked_events,
-            video_overuse_events: estimator.video_overuse_events,
-            delay_threshold_ms: estimator.delay_threshold_ms,
-            bulk_inflight_limit: self.gate.inflight_limit(),
+            gain: link.gain,
+            starting_up: link.starting_up,
+            min_rtt_ms: link.min_rtt_ms,
+            extra_acked_bytes: link.extra_acked,
+            probing_rtt: link.probing_rtt(),
+            in_flight_bytes: self.gate.in_flight(),
+            window_bytes: window,
             reserved_bytes_per_sec: reserved,
             bulk_chunk_bytes: self.gate.chunk_bytes(),
             demand_bytes_per_sec: total_demand,
-            sent_bytes_per_sec: estimator.sent_bytes_per_sec,
-            delivered_bytes_per_sec: estimator.delivered_bytes_per_sec,
-            network_blocked_fraction: estimator.network_blocked_fraction,
-            page_blocked_fraction: estimator.page_blocked_fraction,
-            page_lag_ms: self.gate.page_lag(now).as_secs_f64() * 1000.0,
-            max_page_lag_ms: self.gate.max_page_lag().as_secs_f64() * 1000.0,
-            network_lag_ms: self.gate.network_lag(now).as_secs_f64() * 1000.0,
-            max_network_lag_ms: self.gate.max_network_lag().as_secs_f64() * 1000.0,
+            sent_bytes_per_sec: per_sec(sent),
+            network_blocked_fraction: (blocked_ms / 1000.0 / (interval_secs * active.max(1) as f64)).min(1.0),
             constrained: total_demand > budget,
         };
+    }
+
+    /// What the streams may use: the link's bandwidth x its gain, within the cap.
+    fn budget(&self, link: &LinkModel) -> f64 {
+        let (rate, _) = link.pacing();
+        self.config.max_bandwidth.map_or(rate, |cap| cap.min(rate))
     }
 
     /// Clock sample reported by the browser (it has all four NTP timestamps).
@@ -381,12 +335,6 @@ impl PeerState {
         }
         if let Some(rtt) = rtt_ms.filter(|v| v.is_finite() && *v >= 0.0) {
             *self.rtt_ms.lock() = Some(rtt);
-            let now = Instant::now();
-            let mut samples = self.rtt_samples.lock();
-            samples.push_back((now, rtt));
-            while samples.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_BASELINE_WINDOW) {
-                samples.pop_front();
-            }
         }
     }
 
@@ -683,9 +631,6 @@ async fn run_allocator(state: Weak<PeerState>) {
         if state.gone.load(Ordering::Relaxed) {
             break;
         }
-        // what the browser acknowledged, read now: senders only read it while sending, and a burst's last reading
-        // before its acks came in would look like a growing backlog
-        state.gate.refresh_delivered().await;
         let now = Instant::now();
         state.allocate(now.duration_since(last).as_secs_f64());
         last = now;

@@ -52,7 +52,6 @@ pub type Authorize = dyn Fn(Option<&str>, &HeaderMap) -> Result<Grant, String> +
 /// let server = zenoh_gateway::Server::builder()
 ///     .connect("tcp/192.168.1.2:7447")
 ///     .serve_dir("examples")
-///     .bandwidth_target_fraction(0.75)
 ///     .build()
 ///     .await?;
 /// let running = server.bind(("0.0.0.0", 7448)).await?;
@@ -68,7 +67,6 @@ pub struct ServerBuilder {
     connect: Vec<String>,
     serve_dir: Option<PathBuf>,
     max_bandwidth_bytes_per_sec: Option<f64>,
-    bandwidth_target_fraction: f64,
     encodings: Vec<Arc<dyn MessageEncoding>>,
     authorize: Option<Arc<Authorize>>,
     lease_groups: HashMap<String, Vec<String>>,
@@ -86,7 +84,6 @@ impl Default for ServerBuilder {
             connect: Vec::new(),
             serve_dir: None,
             max_bandwidth_bytes_per_sec: None,
-            bandwidth_target_fraction: 0.75,
             encodings: Vec::new(),
             authorize: None,
             lease_groups: HashMap::new(),
@@ -138,9 +135,10 @@ impl ServerBuilder {
         self
     }
 
-    /// Share of the estimated bandwidth the allocator hands out, in (0, 1]; the rest keeps queues short. Default 0.75.
-    pub fn bandwidth_target_fraction(mut self, fraction: f64) -> Self {
-        self.bandwidth_target_fraction = fraction;
+    /// No longer used: a link is measured by what it delivers, so handing out a fraction of it only shrank the measure.
+    /// The in-flight window keeps queues short; cap a frontend with [`max_bandwidth_bytes_per_sec`](Self::max_bandwidth_bytes_per_sec).
+    #[deprecated(note = "the link model sends what the link delivers; cap it with max_bandwidth_bytes_per_sec")]
+    pub fn bandwidth_target_fraction(self, _fraction: f64) -> Self {
         self
     }
 
@@ -246,8 +244,6 @@ impl ServerBuilder {
 
     /// Validates the options, registers the encodings and opens the zenoh session (unless one was given).
     pub async fn build(self) -> Result<Server> {
-        let fraction = self.bandwidth_target_fraction;
-        ensure!(fraction > 0.0 && fraction <= 1.0, "bandwidth target fraction must be within (0, 1], got {fraction}");
         if let Some(cap) = self.max_bandwidth_bytes_per_sec {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
@@ -268,7 +264,7 @@ impl ServerBuilder {
         };
         ensure!(self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0), "the UDP port range must be non-empty and above 0");
         let leases = Leases::new(self.lease_groups);
-        let gateway = Gateway::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction }, leases, self.connect_config);
+        let gateway = Gateway::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec }, leases, self.connect_config);
         let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {
             ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");

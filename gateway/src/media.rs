@@ -37,7 +37,7 @@ const OPUS: &str = "audio/opus";
 /// Google Congestion Control bounds, bits/s. It starts where the link estimator starts (`allocator::INITIAL_ESTIMATE`,
 /// 512 kbit/s), since video is allocated no more than that estimate. The ceiling is only a sanity bound (at 50 Mbit/s it
 /// capped 8 HD cameras on an idle link): the link estimate and 1.5 x what video sent bound what video gets.
-const GCC_INITIAL_BPS: f64 = crate::allocator::INITIAL_ESTIMATE * 8.0;
+const GCC_INITIAL_BPS: f64 = crate::allocator::INITIAL_BANDWIDTH * 8.0;
 const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
@@ -91,15 +91,13 @@ impl VideoRate {
         f64::from_bits(self.gcc_bps.load(Ordering::Relaxed)) / 8.0
     }
 
+    /// What the allocator granted video; the pacer never goes below GCC's own floor (RTCP and a keyframe still get out).
     pub fn set_cap_bytes_per_sec(&self, bytes_per_sec: f64) {
-        self.cap_bps.store((bytes_per_sec * 8.0).to_bits(), Ordering::Relaxed);
+        self.cap_bps.store((bytes_per_sec * 8.0).max(GCC_MIN_BPS).to_bits(), Ordering::Relaxed);
     }
 
     fn cap_bps(&self) -> f64 {
-        match f64::from_bits(self.cap_bps.load(Ordering::Relaxed)) {
-            cap if cap > 0.0 => cap,
-            _ => f64::INFINITY,
-        }
+        f64::from_bits(self.cap_bps.load(Ordering::Relaxed))
     }
 }
 
@@ -196,7 +194,7 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
         media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: rtp_codec(mime), payload_type }, kind)?;
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(0f64.to_bits()) });
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()) });
     let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone() };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default());
@@ -761,7 +759,12 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 continue;
             }
         };
-        let (quality, bitrate, hz) = shared.video_grant(&key);
+        let source = match &*decoded {
+            DecodedFrame::Video(image) => (image.width(), image.height()),
+            // (a frame the encoder renders itself: its size once it has encoded one, no floor before)
+            _ => shared.video_source().unwrap_or_default(),
+        };
+        let (quality, bitrate, hz) = shared.video_grant(&key, source);
         let previous = member.session.take();
         let Channel::Video(format) = shared.channel else { return };
         let session = sessions.place(previous.clone(), member.id, (codec.name(), format, &key), shared.tuning().video_policy, (bitrate, hz));

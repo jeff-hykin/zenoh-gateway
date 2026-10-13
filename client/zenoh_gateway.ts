@@ -1645,7 +1645,8 @@ export class ZenohGateway {
         const degraded = bandwidth?.constrained === true
         this.congestion = {
             degraded,
-            limitedBy: !degraded ? null : number("pageBlockedFraction") > number("networkBlockedFraction") ? "page" : "network",
+            // (the gateway counts the page as part of the path: a page behind on its acks holds sending back like a slow link)
+            limitedBy: degraded ? "network" : null,
             droppedPerSec: seconds > 0 ? dropped / seconds : 0,
             sentBytesPerSec: number("sentBytesPerSec"),
             wantedBytesPerSec: number("demandBytesPerSec"),

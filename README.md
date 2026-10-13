@@ -185,7 +185,6 @@ tokio = { version = "1", features = ["full"] }
 let server = zenoh_gateway::Server::builder()
     .connect("tcp/192.168.1.2:7447")       // or .session(existing_session), or .zenoh_config(config)
     .serve_dir("ui")                       // optional static files
-    .bandwidth_target_fraction(0.75)
     .encoding(TextUppercase)               // a message encoding, below
     .build()
     .await?;
@@ -368,12 +367,12 @@ new publisher is needed. Background tabs throttle timers to ≥ 1 s, so keep `mi
 
 ## Bandwidth allocation
 
-Per browser, every 250 ms: estimate the path (delivery rate + a delay trigger from RTT samples for data
-channels, GCC for video), take `bandwidth_target_fraction` of it (capped by
-`max_bandwidth_bytes_per_sec`), reserve strict-priority and reliable streams, and shrink the rest like
+Per browser, every 250 ms: measure the path as BBR does (bandwidth = the most it delivered in a round lately, round
+trip = the least send-to-ack time; GCC for video), budget bandwidth × a gain (capped by `max_bandwidth_bytes_per_sec`),
+reserve strict-priority streams, and shrink the rest like
 CSS flex items by `demand / bandwidthPriority` (higher priority keeps more; priority-0 streams shrink first). An encoded stream granted a fraction r of its demand shrinks its message size by
-`r^qualityToHzTradeoff` and its rate by the rest. Bulk sends are paced so queues stay short and strict
-streams don't wait behind them. Each subscription's `allocation` (demand, budget, hz, quality,
+`r^qualityToHzTradeoff` and its rate by the rest. Bulk sends are paced at the budget and never have more than 2 × bandwidth × round trip unacked
+by the page, so queues stay short and strict streams don't wait behind them. Each subscription's `allocation` (demand, budget, hz, quality,
 constrained) is in `z.stats`. Full algorithm and measurements: SPEC.md "Bandwidth allocation".
 
 ## Nix / cross compiling

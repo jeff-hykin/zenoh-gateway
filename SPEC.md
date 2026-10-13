@@ -240,7 +240,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
 
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
-`bandwidth_target_fraction`, `encoding`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `ice_servers_fn`, `cloudflare_turn`, `udp_ports`,
+`encoding`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `ice_servers_fn`, `cloudflare_turn`, `udp_ports`,
 `video_encoder` (a factory per video format for every encoding without its own encoder, e.g. a hardware one from
 zenoh-dimos-codecs' encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
 `bind(addr)` serves on a background task (`RunningServer::local_addr`, `shutdown()`), `serve(addr)` /
@@ -459,68 +459,43 @@ also sets `jitterBufferTarget = 0`). Locally that took receive -> shown from ~22
 
 ## Bandwidth allocation
 
-All of a frontend's streams share one path (wifi queue, UDP, one SCTP association), so throttling
-"on average" isn't enough: a burst or an overshoot builds a queue that every stream waits in. The
-gateway keeps the path's queues short and lets urgent streams skip what queue remains:
+All of a frontend's streams share one path (Wi-Fi queue, UDP, one SCTP association, the page's event loop), so
+throttling "on average" isn't enough: a burst builds a queue that every stream waits in. The gateway models the path as
+BBR does (Cardwell et al., "BBR: Congestion-Based Congestion Control", 2016) and lets urgent streams skip the queue:
 
-- **Strict-priority tier.** A subscription whose priority (its `priority` option, else the published
-  priority of its samples) is INTERACTIVE_HIGH (2) or more urgent bypasses allocation and pacing: its
-  measured rate is reserved off the top, and while it sends a message no bulk chunk starts.
-- **Target fraction (headroom).** The allocator hands out `bandwidth_target_fraction` (default 0.75)
-  of the estimate, so bulk traffic runs below the path's capacity and its queue stays near empty.
+- **The link model** (`allocator::LinkModel`), every 250 ms (a round):
+  - bandwidth = the most the frontend delivered in one round over the last 10 rounds: bytes the page acked, plus what
+    video sent. A round in which the streams wanted less than their budget only counts if it delivered more (an idle
+    link says nothing about what it could carry). Starts at 64 KB/s, so a slow link isn't flooded.
+  - round trip = the least send-to-ack time over the last 10 s, the page's ack interval included.
+  - gain: 2/ln 2 while starting up (the bandwidth doubles each round), until three rounds that wanted more brought less
+    than 25% growth; then a cycle of 1.25 (ask for more), 0.75 (drain what that queued) and 1 × 6.
+  - Nothing reacts to a delay or a loss, so a Wi-Fi path whose round trip swings 0–400 ms reads as the bandwidth it
+    delivers. A link that slows delivers less, and its old maximum ages out within 10 rounds.
+- **Budget** = min(`--max-bandwidth-bytes-per-sec` if set, bandwidth × gain): what the allocator divides, and the pacing
+  rate.
+- **In flight.** Every data frame counts from when it goes to SCTP until the page acks it (or acks a lossy frame sent
+  after it: SCTP sends unordered chunks first and in order, so it was lost; or, with nothing acked after it, once it is
+  older than max(2 × round trip, 200 ms)). Bulk frames wait while what is in flight would pass 2 × bandwidth × round
+  trip (10 × 1200 B before a round trip is measured, at least 4 × 1200 B). The page is part of the path: a page that
+  falls behind on its acks holds the gateway back the same way a slow link does.
+- **Pacing.** Bulk frames go out at the budget's rate (one token bucket per frontend; strict frames spend from it too, so
+  bulk yields to them), in chunks of 4 ms of the budget (4–64 KiB): a strict message waits behind about one chunk.
+- **Strict-priority tier.** A subscription whose priority (its `priority` option, else the published priority of its
+  samples) is INTERACTIVE_HIGH (2) or more urgent bypasses allocation and pacing: its measured rate is reserved off the
+  top, and while it sends a message no bulk chunk starts.
 - **One big message at a time.** A bulk stream whose messages span more than one chunk takes the frontend's message
   turn (first come, first served) and picks its sample only once it has it, so it sends its newest; it holds the turn
   until the message is sent whole. Interleaved, three 200 KB clouds and a 400 KB map on a 500 KB/s path each took as
-  long as all of them and arrived ~1.7 s old; in turn, each takes its own size / rate. Small messages (one chunk) and
-  strict streams don't wait for the turn.
-- **Pacing.** Bulk streams send through a per-stream token bucket at the bulk budget (their grant sets how often a
-  message starts, not how fast it goes, so a big message granted little goes out quickly and less often instead of
-  trickling for seconds) × 1.25, in
-  chunks of 4 ms of the frontend's budget (4–64 KiB). A per-frontend gate admits a bulk chunk only
-  while the bulk bytes outstanding in SCTP are under `budget × (min RTT + 5 ms)`, when the frontend has a strict stream
-  to protect (none: no in-flight limit, `bulkInflightLimit: null` in stats; at least two chunks,
-  about one bandwidth-delay product), counting a chunk the moment it is admitted so senders woken
-  together can't burst. A strict message waits behind at most the bulk already handed to SCTP, and
-  bulk never bursts whole messages into the link.
-- **Delay trigger.** The browser reports its RTT with every clock-sync sample (each heartbeat, else
-  the 1 s control ping: configure `heartbeatHz` for a fast trigger). The queue delay of a 250 ms
-  interval is its smallest RTT minus the 60 s minimum. When it exceeds `5 ms +` the spread (p90 − p10) of the queue delays of the last 10 s (at most
-  500 ms: Wi-Fi + Tailscale swung 60–480 ms with nothing queued; `delayThresholdMs` in stats) for two intervals in a
-  row, a queue is standing on the path (a Wi-Fi or VPN path whose RTT swings by tens of ms with no load raises its own
-  threshold; a lone spike is ignored; a standing queue raises every sample, not the spread: measured as twice the
-  median level, one raised the threshold from 70 ms to 1.5 s while it grew): the link
-  estimate drops 15% at once and probing pauses 1 s; then it probes up 10% per interval below 90% of
-  the level that caused the queue and 2% above it, and 10% again once that level is 5 s old (on Wi-Fi
-  one early stall had held probing at 2% for good; before any congestion: 50% per interval, a slow
-  start). No loss is needed to react.
+  long as all of them and arrived ~1.7 s old; in turn, each takes its own size / rate. Small messages and strict streams
+  don't wait for the turn.
+- **Video** is paced by GCC (TWCC feedback, `videoEstimateBytesPerSec`) at 2.5 × min(GCC's target, what the allocator
+  granted video), as libwebrtc paces, never below GCC's 50 kbit/s floor. Video streams together get at most GCC's
+  target (their bytes leave through the GCC-paced track, so data-channel capacity is no use to them); data streams are
+  allocated what remains of the budget.
 
-Measured by `test/latency.js` through real queueing: a userspace UDP shaper (in the test process)
-sits between Chrome and the gateway, 2 MB/s gateway→browser with a 1 MB drop-tail queue and 5 ms each
-way (browser→gateway is delayed, not rate limited); a signaling proxy rewrites the SDP so ICE can only
-use the shaper. A strict-priority 200 B stream at 50 Hz, alone: p99 ≈ 7.7 ms; with five 200 KB × 10 Hz
-bulk streams (10 MB/s wanted) the bulk gets ~1.7 MB/s and the strict p99 is ≈ 17 ms (+9 ms). The same
-stream without strict priority under that load: p99 ≈ 0.4–0.5 s.
-
-Per frontend, every 250 ms:
-1. **Estimate.** One estimate of the frontend's link, video and data together (`dataEstimateBytesPerSec`; two
-   estimates of one link, added, had let the allocator hand out 2–36× what a slow link carried, so nothing was ever
-   squeezed): a delivery-rate estimator over what every stream sent and how long data senders waited on SCTP (webrtc-rs
-   doesn't expose the congestion window), plus the delay trigger above and a backlog trigger (over the last second,
-   handed to SCTP more than 1.3 × what the browser acknowledged + 4 KB: a queue growing gradually widens the delay
-   spread it is measured against, and Wi-Fi jitter hides it); on either, while the streams were filling the link, the
-   estimate drops to 0.9 × what the browser acknowledged over the last second (at most −75% at once; −15% otherwise):
-   blocked on the network more than 20% of the
-   interval, or GCC (below) under 85% of what video sent → estimate = 0.9 × measured rate (at most 15% down per step: a
-   long round trip blocks the first intervals before the window knows the RTT); otherwise, while streams want more and
-   sent at least half the estimate (an estimate only grows on a link that carried it), probe up (start 64 KB/s, so a
-   slow link isn't flooded at the start; at least 2 KB/s). Budget = min(`--max-bandwidth-bytes-per-sec` if set, target
-   fraction × the estimate). Video: GCC's target bitrate (TWCC feedback, `videoEstimateBytesPerSec`), which caps
-   video's share of the budget and never adds to it (GCC grows 8%/s while video sends less: added, it read 10 MB/s on
-   a 1 MB/s link); video tracks are paced by the GCC pacer (at 2.5 × the GCC target, as libwebrtc paces), not the
-   bulk gate. Video streams together get at most that: their bytes leave through the GCC-paced track, so data-channel
-   capacity is no use to them (granting it made encoders outrun the pacer and queue); data streams are then allocated
-   what remains of the budget.
-2. **Demand.** Each subscription wants `price(encodeOptions.quality) × Hz`, Hz being each key's measured source
+Per frontend, every 250 ms, after the link model's round:
+1. **Demand.** Each subscription wants `price(encodeOptions.quality) × Hz`, Hz being each key's measured source
    rate capped by `maxHz`, summed over its keys. Price = bytes per message: measured for raw streams
    and data-channel encodings (per quality, scaled by the encoding's `estimated_bytes` between measured
    qualities, which is also the prior before anything was measured), from the video policy for video
@@ -530,26 +505,27 @@ Per frontend, every 250 ms:
    reliable streams shrink only after every other stream is at 0 (paced at their grant, a reliable key's samples
    that waited 2 s are dropped while a newer one waits: a 100 Hz tf reserved in full was twice a 100 kbit/s link and
    took the strict streams down with it).
-3. **Shrink.** If the rest want more than the budget left, they shrink like CSS flex items: the deficit
+2. **Shrink.** If the rest want more than the budget left, they shrink like CSS flex items: the deficit
    is split in proportion to `demand / bandwidthPriority` (so 10 / 10 / 0.1 means the 0.1 stream takes
    ~100x the cut); a stream that reaches 0 stops there and the rest shrink further. Priority-0 streams
    give up everything before any other stream gives up anything.
-4. **Quality vs Hz.** A transcoded stream granted fraction r of its demand shrinks its message size by
+3. **Quality vs Hz.** A transcoded stream granted fraction r of its demand shrinks its message size by
    `r^t` (choosing the best quality among the bounds and 0.1 steps that fits) and its Hz by the rest,
    `t = qualityToHzTradeoff`: 0 keeps quality and drops Hz, 1 keeps Hz and drops quality. When quality
    hits `minQuality`, Hz gives.
-5. **Apply.** Each key's send interval becomes `1 / (its wanted Hz × granted fraction)`; a stream granted nothing
+4. **Apply.** Each key's send interval becomes `1 / (its wanted Hz × granted fraction)`; a stream granted nothing
    sends nothing until a later allocation grants it some (squeezed out: a 0.05 Hz trickle of a 400 KB map alone was
    more than a 100 kbit/s link, and a camera's 24 KB frame held the strict streams 2 s behind it). Data transcoders
    encode at the granted quality, video encoders at the granted bitrate; the video pacer drains at 2.5 × min(GCC, the
    video cap), so a keyframe waits in the gateway rather than in the link's queue.
 
-Stats: each subscription's `allocation` (`demandBytesPerSec`,
-`budgetBytesPerSec`, `hz`, `hzFraction`, `quality`, `constrained`) and the frontend's `bandwidth`
-(`dataEstimateBytesPerSec`, `videoEstimateBytesPerSec`, `capBytesPerSec`, `budgetBytesPerSec`,
-`targetFraction`, `reservedBytesPerSec`, `bulkChunkBytes`, `queueDelayMs`, `minRttMs`, `delayEvents`,
-`demandBytesPerSec`, `sentBytesPerSec`, `networkBlockedFraction`, `constrained`). Per stream,
-`pacedMs` is time spent waiting on the token bucket and the gate.
+Stats: each subscription's `allocation` (`demandBytesPerSec`, `budgetBytesPerSec`, `hz`, `hzFraction`, `quality`,
+`constrained`) and the frontend's `bandwidth` (`dataEstimateBytesPerSec`: the link's bandwidth, video and data;
+`deliveredBytesPerSec`, `videoEstimateBytesPerSec`, `videoSentBytesPerSec`, `capBytesPerSec`, `budgetBytesPerSec`,
+`gain`, `startingUp`, `minRttMs`, `inFlightBytes`, `windowBytes`, `reservedBytesPerSec`, `bulkChunkBytes`,
+`demandBytesPerSec`, `sentBytesPerSec`, `networkBlockedFraction`: share of the round bulk senders waited on the window,
+`constrained`). Per stream, `blockedMs` is time spent waiting on the window and `pacedMs` on the pacing rate or a
+strict stream's turn.
 
 ## Congestion
 
@@ -559,15 +535,11 @@ page can show "link degraded, dropping N/s" instead of letting its user find out
 
 - `degraded`: the subscriptions want more than the frontend's budget (`bandwidth.constrained`), so the gateway sends
   fewer or smaller messages;
-- `limitedBy`: while degraded, `"page"` when senders waited on the page's acks more than on the network
-  (`bandwidth.pageBlockedFraction` vs `networkBlockedFraction`), else `"network"`;
+- `limitedBy`: `"network"` while degraded (the page counts as part of the path, see "In flight"), else `null`;
 - `droppedPerSec`: messages of the constrained subscriptions that never reached the page (replaced by a newer sample,
   older than `maxAge`, or incomplete), per second since the previous poll; an unconstrained subscription's drops are its
   own `maxHz`;
 - `sentBytesPerSec`, `wantedBytesPerSec`: `bandwidth.sentBytesPerSec` and `demandBytesPerSec`.
-
-Waiting on the page doesn't lower the bandwidth estimate: a page is slow per message (a big map holds its event loop a
-while at any rate), so it would drive the estimate down without bound; the delivery-lag limit keeps its backlog short.
 
 Measured by `client/test/backpressure.ts`: headless Chrome through a userspace shaper (1 MB/s gateway→browser, 2 MB
 drop-tail queue, 30 ms each way), three 200 KB point clouds at 10 Hz, a 400 KB map at 1 Hz and a 200 B pose at 20 Hz
