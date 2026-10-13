@@ -141,8 +141,8 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
 ///   bursts (the page acks in batches; Wi-Fi aggregates frames and its round trip swings 0-400 ms), and a window of
 ///   bandwidth x the least round trip alone held a jittery link to a fraction of what it carries.
 ///
-/// Streams are budgeted bandwidth x gain and paced at it, and what is in flight is held to `WINDOW_GAIN` x bandwidth x
-/// round trip + the ack aggregation. The gain is `STARTUP_GAIN` while the bandwidth keeps growing (by `STARTUP_GROWTH` within `STARTUP_ROUNDS`
+/// Streams are budgeted bandwidth x gain and paced at it, and what is in flight is held to bandwidth x round trip plus a
+/// headroom of (`WINDOW_GAIN` - 1) x that + the ack aggregation, at most `MAX_QUEUE_DELAY` of the bandwidth. The gain is `STARTUP_GAIN` while the bandwidth keeps growing (by `STARTUP_GROWTH` within `STARTUP_ROUNDS`
 /// link-limited rounds), then cycles through `PROBE_GAINS`: a round asking 25% more, one draining what that queued,
 /// six at the estimate. Nothing reacts to a delay or a loss, so Wi-Fi jitter can't move it; a link that slows delivers
 /// less and its old maximum ages out within `BANDWIDTH_ROUNDS`, while the window keeps the queue about a round trip long.
@@ -188,6 +188,9 @@ const STARTUP_ROUNDS: u32 = 3;
 const PROBE_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 const BANDWIDTH_ROUNDS: f64 = 10.0;
 const WINDOW_GAIN: f64 = 2.0;
+/// The longest a strict message should wait behind bulk in the link's queue: on a fast link that is plenty of bytes for
+/// BBR's headroom, on a 500 kbit/s one a few KB (a full round trip of headroom held commands ~0.5 s there).
+const MAX_QUEUE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const MIN_RTT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 const PROBE_RTT_TIME: std::time::Duration = std::time::Duration::from_millis(200);
 /// Bytes in flight before any round trip is measured, and the least ever: RFC 6928's 10 packets, BBR's 4.
@@ -300,8 +303,14 @@ impl LinkModel {
     pub fn pacing(&self) -> (f64, usize) {
         let window = match (self.probing_rtt(), self.min_rtt_ms) {
             (true, _) => MIN_WINDOW,
-            // (startup's window grows with its pacing, as BBR's does: held to the steady gain, it couldn't double)
-            (false, Some(rtt)) => ((self.gain.max(WINDOW_GAIN) * self.bandwidth_bytes_per_sec * rtt / 1000.0 + self.extra_acked) as usize).max(MIN_WINDOW),
+            (false, Some(rtt)) => {
+                // what the link holds, plus BBR's headroom (startup's grows with its pacing, so it can double; acks in
+                // bursts need the aggregation), but never more headroom than `MAX_QUEUE_DELAY` of the bandwidth: the
+                // headroom is what stands queued, and strict streams wait behind it
+                let held = self.bandwidth_bytes_per_sec * rtt / 1000.0;
+                let headroom = (self.gain.max(WINDOW_GAIN) - 1.0) * held + self.extra_acked;
+                ((held + headroom.min(self.bandwidth_bytes_per_sec * MAX_QUEUE_DELAY.as_secs_f64())) as usize).max(MIN_WINDOW)
+            }
             (false, None) => INITIAL_WINDOW,
         };
         (self.bandwidth_bytes_per_sec * self.gain, window)
