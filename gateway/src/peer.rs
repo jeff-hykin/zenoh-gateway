@@ -91,6 +91,8 @@ struct BandwidthStats {
     min_rtt_ms: Option<f64>,
     extra_acked_bytes: f64,
     probing_rtt: bool,
+    /// the longest data may wait in the link's queue: the streams' latency tolerances, weighted by their grants
+    queue_limit_ms: Option<f64>,
     /// bytes sent the page hasn't acked, and the most allowed
     in_flight_bytes: usize,
     window_bytes: usize,
@@ -274,13 +276,14 @@ impl PeerState {
             link.clone()
         };
         let budget = self.budget(&link);
-        let (_, window) = link.pacing(self.queue_limit(&subscriptions));
-        self.gate.configure(link.bandwidth_bytes_per_sec, budget, window);
         let video_estimate = if has_video { self.video_rate.gcc_bytes_per_sec() } else { 0.0 };
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
         let allocations = allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video);
+        let queue_limit = Self::queue_limit(&subscriptions, &allocations, link.bandwidth_bytes_per_sec);
+        let (_, window) = link.pacing(queue_limit);
+        self.gate.configure(link.bandwidth_bytes_per_sec, budget, window);
         let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
         self.video_rate.set_cap_bytes_per_sec(video_granted);
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
@@ -298,6 +301,7 @@ impl PeerState {
             min_rtt_ms: link.min_rtt_ms,
             extra_acked_bytes: link.extra_acked,
             probing_rtt: link.probing_rtt(),
+            queue_limit_ms: queue_limit.map(|limit| limit.as_secs_f64() * 1000.0),
             in_flight_bytes: self.gate.in_flight(),
             window_bytes: window,
             reserved_bytes_per_sec: reserved,
@@ -309,12 +313,18 @@ impl PeerState {
         };
     }
 
-    /// The longest a strict stream's data may wait behind bulk in the link's queue, set by the page's own strict
-    /// subscriptions (their maxAge, else one period: `SubShared::queue_limit`), the tightest of them. `None` without any
-    /// strict subscription: BBR's headroom whole. (Only robot-to-page data crosses this queue; what the page publishes,
+    /// The longest data may wait behind bulk in the link's queue, set by the page's own streams: their latency tolerances
+    /// (`SubShared::latency_tolerance`), averaged weighted by the bandwidth each was granted. On a slow link, where the
+    /// small urgent streams hold most of the grant, it is tight; on a fast one carrying mostly video, loose. `None` with
+    /// nothing granted: BBR's headroom whole. (Only robot-to-page data crosses this queue; what the page publishes,
     /// cmd_vel and heartbeats, travels the other way.)
-    fn queue_limit(&self, subscriptions: &[Arc<SubShared>]) -> Option<Duration> {
-        subscriptions.iter().filter(|shared| shared.is_strict()).filter_map(|shared| shared.queue_limit()).min()
+    fn queue_limit(subscriptions: &[Arc<SubShared>], allocations: &[allocator::Allocation], bandwidth: f64) -> Option<Duration> {
+        let weighted = subscriptions.iter().zip(allocations).filter_map(|(shared, allocation)| {
+            let weight = allocation.budget_bytes_per_sec;
+            shared.latency_tolerance(bandwidth).filter(|_| weight > 0.0).map(|tolerance| (weight, tolerance))
+        });
+        let (weights, sum) = weighted.fold((0.0, 0.0), |(weights, sum), (weight, tolerance)| (weights + weight, sum + weight * tolerance));
+        (weights > 0.0).then(|| crate::secs(sum / weights))
     }
 
     /// What the streams may use: the link's bandwidth x its gain, within the cap.
