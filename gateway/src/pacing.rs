@@ -5,8 +5,8 @@
 //! - what is in flight has reached the window (`allocator::LinkModel::window_bytes`);
 //! - the frontend's pacing rate hasn't earned them yet (one token bucket for all its frames).
 //!
-//! A lossy frame is passed when the page acks a frame sent after it (SCTP sends unordered chunks first and in order, so
-//! it was lost), or, when the page has acked nothing for the retransmission timeout, once it is that old (a lost tail).
+//! A lossy frame is passed when the page acks a later frame of its own channel (each channel acks on its own timer, so
+//! another channel's ack says nothing: counted lost, a slow channel's frames held the estimate at a twentieth of the link), or, when the page has acked nothing for the retransmission timeout, once it is that old (a lost tail).
 //! Never by age alone while acks still come: frames waiting in a queue would count as lost and let more in.
 
 use parking_lot::Mutex;
@@ -21,6 +21,12 @@ pub const MAX_CHUNK_BYTES: usize = crate::frame::CHUNK_BYTES;
 const CHUNK_MS: f64 = 4.0;
 /// A lost frame is given up on after max(2 x RTT, this), as TCP's retransmission timer bottoms out at 200 ms (Linux).
 const MIN_LOSS_TIMEOUT: Duration = Duration::from_millis(200);
+/// The page acks a channel's frames at most this long after they arrive (client `ackDelayMs`), so a rate is sampled over
+/// at least `MIN_SAMPLE_TIME`: 5x the ack delay keeps the error from late acks under ~20%.
+const ACK_DELAY: Duration = Duration::from_millis(50);
+const MIN_SAMPLE_TIME: Duration = Duration::from_millis(5 * ACK_DELAY.as_millis() as u64);
+/// Acks are remembered this long to sample a rate over (longer than any round trip worth sampling over).
+const ACK_HISTORY: Duration = Duration::from_secs(2);
 /// Ack round trips are kept this long for their minimum.
 const RTT_WINDOW: Duration = Duration::from_secs(10);
 
@@ -29,11 +35,7 @@ struct Frame {
     bytes: usize,
     lossy: bool,
     sent_at: Instant,
-    /// for its delivery-rate sample: what had been acked when it was sent, when the latest of that was acked, the send
-    /// time of the first frame of that flight, and whether the sender was held back by the link (not its own spacing)
-    acked_before: u64,
-    acked_before_at: Instant,
-    flight_started: Instant,
+    /// the sender was held back by the link (not its own spacing) when it sent this
     link_limited: bool,
 }
 
@@ -60,9 +62,8 @@ struct Path {
     acked_total: u64,
     /// (when, send-to-ack ms) of recent acks
     rtts: std::collections::VecDeque<(Instant, f64)>,
-    last_ack_at: Option<Instant>,
-    /// send time of the frame the latest ack covered (the start of the flight now being acked)
-    flight_started: Instant,
+    /// (when, acked_total) after each ack, for `ACK_HISTORY`
+    ack_history: std::collections::VecDeque<(Instant, u64)>,
     /// the next bulk frame waited on the window or the pacing rate
     held: bool,
     round: RoundSamples,
@@ -98,8 +99,7 @@ impl Default for SendGate {
                 in_flight: 0,
                 acked_total: 0,
                 rtts: Default::default(),
-                last_ack_at: None,
-                flight_started: Instant::now(),
+                ack_history: Default::default(),
                 held: false,
                 round: RoundSamples::default(),
                 bandwidth: crate::allocator::INITIAL_BANDWIDTH,
@@ -139,13 +139,13 @@ impl Path {
         self.refilled = now;
     }
 
-    /// A lost tail: with the page silent for the loss timeout, lossy frames that old will never be acked.
+    /// A lost tail: a lossy frame no later frame of its channel passed, older than twice the slowest recent round trip
+    /// (queueing included, so a frame waiting in a queue isn't counted lost) plus the page's ack delay, never will be.
+    /// Not only while the page is silent: other channels' acks keep coming, and a channel that went quiet after losing
+    /// its last frame held the window full and stalled every stream.
     fn expire_lost(&mut self, now: Instant) {
         let high_rtt = self.rtts.iter().map(|(_, rtt)| *rtt).reduce(f64::max).unwrap_or(0.0);
-        let timeout = crate::secs(2.0 * high_rtt / 1000.0).max(MIN_LOSS_TIMEOUT);
-        if self.last_ack_at.is_some_and(|at| now.duration_since(at) <= timeout) {
-            return;
-        }
+        let timeout = crate::secs(2.0 * high_rtt / 1000.0).max(MIN_LOSS_TIMEOUT) + ACK_DELAY;
         let lost: Vec<u64> = self.frames.iter().filter(|(_, frame)| frame.lossy && now.duration_since(frame.sent_at) > timeout).map(|(order, _)| *order).collect();
         for order in lost {
             self.remove(order);
@@ -220,20 +220,7 @@ impl SendGate {
         let order = path.next;
         path.next += 1;
         path.in_flight += bytes;
-        if path.frames.is_empty() {
-            // nothing in flight: a new flight starts now (an idle gap isn't delivery time)
-            path.flight_started = now;
-        }
-        let frame = Frame {
-            stream,
-            bytes,
-            lossy,
-            sent_at: now,
-            acked_before: path.acked_total,
-            acked_before_at: path.last_ack_at.filter(|_| !path.frames.is_empty()).unwrap_or(now),
-            flight_started: path.flight_started,
-            link_limited: std::mem::take(&mut path.held),
-        };
+        let frame = Frame { stream, bytes, lossy, sent_at: now, link_limited: std::mem::take(&mut path.held) };
         path.frames.insert(order, frame);
         order
     }
@@ -242,7 +229,6 @@ impl SendGate {
     pub fn frames_acked(&self, orders: impl IntoIterator<Item = u64>) {
         let mut path = self.path.lock();
         let now = Instant::now();
-        path.last_ack_at = Some(now);
         let mut newest = None;
         let acked_before = path.acked_total;
         let mut newest_acked: Option<Frame> = None;
@@ -256,18 +242,23 @@ impl SendGate {
             }
             newest = Some(order);
         }
-        // one rate sample per ack, from the newest frame it covers: what was acked since that frame was sent, over the
-        // longer of its flight's send time and ack time, and never over less than a round trip (an ack burst isn't a rate)
-        if let Some(frame) = newest_acked {
-            let delivered = (path.acked_total - frame.acked_before) as f64;
-            let interval = frame.sent_at.duration_since(frame.flight_started).max(now.duration_since(frame.acked_before_at)).as_secs_f64();
+        // one rate sample per ack: what was acked since the ack at least a round trip and `MIN_SAMPLE_TIME` back, over that
+        // time (each channel acks on its own timer, up to `ACK_DELAY` after arrival, so over a round trip alone a burst of
+        // late acks read up to 2x the link); link-limited when the newest frame it covers was held back by the link
+        let acked_total = path.acked_total;
+        path.ack_history.push_back((now, acked_total));
+        while path.ack_history.front().is_some_and(|(at, _)| now.duration_since(*at) > ACK_HISTORY) {
+            path.ack_history.pop_front();
+        }
+        if let Some(frame) = &newest_acked {
             let min_rtt = path.rtts.iter().map(|(_, rtt)| *rtt).reduce(f64::min).unwrap_or(0.0) / 1000.0;
-            if interval > 0.0 && interval >= min_rtt {
-                let rate = delivered / interval;
+            let span = min_rtt.max(MIN_SAMPLE_TIME.as_secs_f64());
+            let start = path.ack_history.iter().rev().find(|(at, _)| now.duration_since(*at).as_secs_f64() >= span).copied();
+            if let Some((at, acked_then)) = start {
+                let rate = (acked_total - acked_then) as f64 / now.duration_since(at).as_secs_f64();
                 let slot = if frame.link_limited { &mut path.round.link_limited_rate } else { &mut path.round.app_limited_rate };
                 *slot = Some(slot.map_or(rate, |most| most.max(rate)));
             }
-            path.flight_started = frame.sent_at;
         }
         // ack aggregation, as Linux's BBR measures it: acked since the epoch began beyond bandwidth x its length; an epoch
         // whose acks fell behind the bandwidth starts over
@@ -282,8 +273,8 @@ impl SendGate {
             let extra = (path.epoch_acked - expected).clamp(0.0, path.window as f64);
             path.round.extra_acked = path.round.extra_acked.max(extra);
         }
-        if let Some(newest) = newest {
-            let lost: Vec<u64> = path.frames.range(..newest).filter(|(_, frame)| frame.lossy).map(|(order, _)| *order).collect();
+        if let Some((newest, stream)) = newest.zip(newest_acked.as_ref().map(|frame| frame.stream)) {
+            let lost: Vec<u64> = path.frames.range(..newest).filter(|(_, frame)| frame.lossy && frame.stream == stream).map(|(order, _)| *order).collect();
             for order in lost {
                 path.remove(order);
             }
@@ -388,18 +379,24 @@ mod tests {
     }
 
     #[test]
+    fn another_channels_ack_passes_no_frame() {
+        let gate = gate(1e6, 10_000);
+        gate.frame_sent(1, 1000, true);
+        let other = gate.frame_sent(2, 1000, true);
+        gate.frames_acked([other]);
+        assert_eq!(gate.in_flight(), 1000, "channel 1 acks on its own timer: its frame isn't lost yet");
+    }
+
+    #[test]
     fn a_lost_tail_times_out() {
         let gate = gate(1e6, 10_000);
         gate.frame_sent(1, 100, true);
         gate.frame_sent(2, 100, false);
         let mut path = gate.path.lock();
-        let later = Instant::now() + MIN_LOSS_TIMEOUT + Duration::from_millis(1);
-        path.last_ack_at = Some(later);
-        path.expire_lost(later);
-        assert_eq!(path.in_flight, 200, "acks still coming: a frame that waits in a queue isn't lost");
-        path.last_ack_at = None;
-        path.expire_lost(later);
-        assert_eq!(path.in_flight, 100, "the page silent: the lossy tail is lost; the reliable frame never is (SCTP resends it)");
+        path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT / 2);
+        assert_eq!(path.in_flight, 200, "younger than the loss timeout: maybe still queued");
+        path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT + ACK_DELAY + Duration::from_millis(1));
+        assert_eq!(path.in_flight, 100, "the lossy tail is lost; the reliable frame never is (SCTP resends it)");
     }
 
     #[tokio::test]

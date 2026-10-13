@@ -161,6 +161,8 @@ struct PeerState {
     link: Mutex<LinkModel>,
     /// `SendGate::acked_total` at the last allocation
     acked_total: AtomicU64,
+    /// `media::VideoRate::received_bytes` as of the previous allocation round
+    video_received: AtomicU64,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
     /// flips to true when the peer is dropped: its channel tasks end on it, since a closed connection's data channels
@@ -233,6 +235,7 @@ impl PeerState {
             gate: Arc::default(),
             link: Mutex::new(LinkModel::default()),
             acked_total: AtomicU64::new(0),
+            video_received: AtomicU64::new(0),
             bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, ..Default::default() }),
             gone: AtomicBool::new(false),
             gone_signal: tokio::sync::watch::Sender::new(false),
@@ -267,8 +270,9 @@ impl PeerState {
         // (the gate counts each frame as it is on the wire: payload plus per-packet overhead)
         let acked_total = self.gate.acked_total();
         let acked = acked_total.saturating_sub(self.acked_total.swap(acked_total, Ordering::Relaxed)) as f64;
-        // video got through as far as GCC (which reads the video's own transport feedback) says the path takes it
-        let video_through = if has_video { video_sent.min(self.video_rate.gcc_bytes_per_sec() * interval_secs) } else { 0.0 };
+        // video got through as far as the browser's transport feedback says it arrived
+        let video_received = self.video_rate.received_bytes();
+        let video_through = video_received.saturating_sub(self.video_received.swap(video_received, Ordering::Relaxed)) as f64;
         let delivered = acked + video_through;
         let link = {
             let mut link = self.link.lock();

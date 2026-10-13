@@ -343,7 +343,11 @@ impl SubShared {
     /// Spacing between two sends of a key: maxHz, tightened by the allocation. A key granted nothing sends nothing until
     /// it is granted some (at a 0.05 Hz floor a 400 KB map alone took 20 KB/s of a 12 KB/s link); a new allocation wakes it.
     fn key_interval(&self, queue: &KeyQueue, allocation: &Allocation, probing: bool) -> Spacing {
-        match self.allocated_key_hz(queue.rate_hz, allocation).filter(|_| !probing) {
+        // a probe lifts a data stream's spacing (the frontend's pacing and window still hold it), never video's (its frames
+        // bypass both: a camera granted nothing woke at full size and put seconds of queue on a slow link) nor a stream
+        // granted nothing
+        let lift = probing && !self.on_track();
+        match self.allocated_key_hz(queue.rate_hz, allocation).filter(|hz| !(lift && *hz > 0.0)) {
             Some(hz) if hz <= 0.0 => Spacing::Never,
             Some(hz) => Spacing::Every(crate::secs(1.0 / hz).max(self.tuning().min_interval.unwrap_or_default())),
             None => self.tuning().min_interval.map_or(Spacing::Any, Spacing::Every),

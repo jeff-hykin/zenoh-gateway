@@ -84,6 +84,8 @@ pub fn track_mime(channel: Channel) -> Option<&'static str> {
 pub struct VideoRate {
     gcc_bps: AtomicU64,
     cap_bps: AtomicU64,
+    /// bytes of video the browser's transport feedback reported arrived, ever
+    received_bytes: AtomicU64,
 }
 
 impl VideoRate {
@@ -94,6 +96,12 @@ impl VideoRate {
     /// What the allocator granted video; the pacer never goes below GCC's own floor (RTCP and a keyframe still get out).
     pub fn set_cap_bytes_per_sec(&self, bytes_per_sec: f64) {
         self.cap_bps.store((bytes_per_sec * 8.0).max(GCC_MIN_BPS).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Bytes of video the browser reported arrived, ever: what video really got through (GCC's target is a guess that
+    /// climbs without limit while no video flows).
+    pub fn received_bytes(&self) -> u64 {
+        self.received_bytes.load(Ordering::Relaxed)
     }
 
     fn cap_bps(&self) -> f64 {
@@ -114,6 +122,8 @@ impl ReportingEstimator {
 
 impl BandwidthEstimator for ReportingEstimator {
     fn on_reports(&mut self, now: Instant, reports: &[PacketReport]) {
+        let arrived: usize = reports.iter().filter(|report| report.arrived).map(|report| report.size).sum();
+        self.rate.received_bytes.fetch_add(arrived as u64, Ordering::Relaxed);
         self.inner.on_reports(now, reports);
         self.publish();
     }
@@ -194,7 +204,7 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
         media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: rtp_codec(mime), payload_type }, kind)?;
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()) });
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), received_bytes: AtomicU64::new(0) });
     let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone() };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default());
