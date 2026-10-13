@@ -67,6 +67,7 @@ pub struct ServerBuilder {
     connect: Vec<String>,
     serve_dir: Option<PathBuf>,
     max_bandwidth_bytes_per_sec: Option<f64>,
+    slow_link_latency: Duration,
     encodings: Vec<Arc<dyn MessageEncoding>>,
     authorize: Option<Arc<Authorize>>,
     lease_groups: HashMap<String, Vec<String>>,
@@ -84,6 +85,7 @@ impl Default for ServerBuilder {
             connect: Vec::new(),
             serve_dir: None,
             max_bandwidth_bytes_per_sec: None,
+            slow_link_latency: crate::allocator::DEFAULT_SLOW_LINK_LATENCY,
             encodings: Vec::new(),
             authorize: None,
             lease_groups: HashMap::new(),
@@ -132,6 +134,14 @@ impl ServerBuilder {
     /// Caps every browser's bandwidth budget (bytes/s) below its estimate, e.g. for a known-slow link. Default: no cap.
     pub fn max_bandwidth_bytes_per_sec(mut self, bytes_per_sec: f64) -> Self {
         self.max_bandwidth_bytes_per_sec = Some(bytes_per_sec);
+        self
+    }
+
+    /// How long data may take to reach a browser on a 500 kbit/s link (default 300 ms); faster links allow more, by the
+    /// square root of their speed (by default 2 Mbit/s 600 ms, 20 Mbit/s 1.9 s), slower ones less. Lower trades
+    /// throughput for latency on slow links. A subscription's `maxAge` tightens it further.
+    pub fn slow_link_latency(mut self, latency: Duration) -> Self {
+        self.slow_link_latency = latency;
         self
     }
 
@@ -247,6 +257,7 @@ impl ServerBuilder {
         if let Some(cap) = self.max_bandwidth_bytes_per_sec {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
+        ensure!(!self.slow_link_latency.is_zero(), "slow link latency must be more than 0");
         self.video_policy.validate()?;
         let codecs = EncodingRegistry::new(self.encodings)?.with_video(self.video_encoders, self.video_policy);
         let mut config = self.zenoh_config.unwrap_or_default();
@@ -264,7 +275,7 @@ impl ServerBuilder {
         };
         ensure!(self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0), "the UDP port range must be non-empty and above 0");
         let leases = Leases::new(self.lease_groups);
-        let gateway = Gateway::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec }, leases, self.connect_config);
+        let gateway = Gateway::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, slow_link_latency: self.slow_link_latency }, leases, self.connect_config);
         let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {
             ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");

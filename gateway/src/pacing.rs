@@ -27,6 +27,8 @@ const ACK_DELAY: Duration = Duration::from_millis(50);
 const MIN_SAMPLE_TIME: Duration = Duration::from_millis(5 * ACK_DELAY.as_millis() as u64);
 /// Acks are remembered this long to sample a rate over (longer than any round trip worth sampling over).
 const ACK_HISTORY: Duration = Duration::from_secs(2);
+/// The typical round trip is the median over this long.
+const TYPICAL_RTT_WINDOW: Duration = Duration::from_secs(2);
 /// Ack round trips are kept this long for their minimum.
 const RTT_WINDOW: Duration = Duration::from_secs(10);
 
@@ -46,6 +48,9 @@ pub struct RoundSamples {
     pub link_limited_rate: Option<f64>,
     pub app_limited_rate: Option<f64>,
     pub min_rtt_ms: Option<f64>,
+    /// the median send-to-ack time over the last `TYPICAL_RTT_WINDOW`: what the window must cover on a path whose delay
+    /// swings (Wi-Fi: 20-400 ms), where a window of bandwidth x the least delivered a tenth of the bandwidth
+    pub typical_rtt_ms: Option<f64>,
     /// the most acks ran ahead of bandwidth x time this round (bytes): they arrive in bursts (the page acks in batches,
     /// Wi-Fi aggregates frames), so the window needs this on top of bandwidth x round trip
     pub extra_acked: f64,
@@ -195,7 +200,10 @@ impl SendGate {
             path.rtts.pop_front();
         }
         let drained = path.in_flight <= path.window.max(2 * self.chunk_bytes());
-        RoundSamples { drained, ..std::mem::take(&mut path.round) }
+        let mut recent: Vec<f64> = path.rtts.iter().filter(|(at, _)| now.duration_since(*at) <= TYPICAL_RTT_WINDOW).map(|(_, rtt)| *rtt).collect();
+        recent.sort_by(f64::total_cmp);
+        let typical_rtt_ms = recent.get(recent.len() / 2).copied();
+        RoundSamples { drained, typical_rtt_ms, ..std::mem::take(&mut path.round) }
     }
 
     /// The right to send one message bigger than a bulk chunk, held until it is sent whole; waiters get it in arrival

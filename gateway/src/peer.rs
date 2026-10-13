@@ -52,6 +52,8 @@ const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
 pub struct AllocationConfig {
     /// cap on each frontend's budget, bytes/s
     pub max_bandwidth: Option<f64>,
+    /// the longest data may be in flight on a 500 kbit/s link (`allocator::latency_limit_for`)
+    pub slow_link_latency: Duration,
 }
 
 /// How the gateway's side of each connection reaches browsers (builder options / command-line flags).
@@ -86,13 +88,14 @@ struct BandwidthStats {
     /// the link model's gain this round, and whether it is still starting up
     gain: f64,
     starting_up: bool,
-    /// least send-to-ack time over 10 s, how far acks ran ahead of the bandwidth lately, and whether the window is down
-    /// to its minimum to re-measure the round trip
+    /// least send-to-ack time over 10 s, the median over 2 s (the window covers that), how far acks ran ahead of the
+    /// bandwidth lately, and whether the window is down to its minimum to re-measure the round trip
     min_rtt_ms: Option<f64>,
+    typical_rtt_ms: Option<f64>,
     extra_acked_bytes: f64,
     probing_rtt: bool,
-    /// the longest data may wait in the link's queue: the streams' latency tolerances, weighted by their grants
-    queue_limit_ms: Option<f64>,
+    /// the longest data may be in flight: by the link's speed, tightened by the streams' latency tolerances
+    latency_limit_ms: f64,
     /// bytes sent the page hasn't acked, and the most allowed
     in_flight_bytes: usize,
     window_bytes: usize,
@@ -285,8 +288,8 @@ impl PeerState {
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
         let allocations = allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video);
-        let queue_limit = Self::queue_limit(&subscriptions, &allocations, link.bandwidth_bytes_per_sec);
-        let (_, window) = link.pacing(queue_limit);
+        let latency_limit = self.latency_limit(&subscriptions, &allocations, link.bandwidth_bytes_per_sec);
+        let (_, window) = link.pacing(Some(latency_limit));
         self.gate.configure(link.bandwidth_bytes_per_sec, budget, window);
         let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
         self.video_rate.set_cap_bytes_per_sec(video_granted);
@@ -303,9 +306,10 @@ impl PeerState {
             gain: link.gain,
             starting_up: link.starting_up,
             min_rtt_ms: link.min_rtt_ms,
+            typical_rtt_ms: link.typical_rtt_ms,
             extra_acked_bytes: link.extra_acked,
             probing_rtt: link.probing_rtt(),
-            queue_limit_ms: queue_limit.map(|limit| limit.as_secs_f64() * 1000.0),
+            latency_limit_ms: latency_limit.as_secs_f64() * 1000.0,
             in_flight_bytes: self.gate.in_flight(),
             window_bytes: window,
             reserved_bytes_per_sec: reserved,
@@ -317,18 +321,18 @@ impl PeerState {
         };
     }
 
-    /// The longest data may wait behind bulk in the link's queue, set by the page's own streams: the latency tolerances
-    /// they state (maxAge, `SubShared::latency_tolerance`), averaged weighted by the bandwidth each was granted. On a slow link, where the
-    /// small urgent streams hold most of the grant, it is tight; on a fast one carrying mostly video, loose. `None` with
-    /// nothing granted: BBR's headroom whole. (Only robot-to-page data crosses this queue; what the page publishes,
-    /// cmd_vel and heartbeats, travels the other way.)
-    fn queue_limit(subscriptions: &[Arc<SubShared>], allocations: &[allocator::Allocation], bandwidth: f64) -> Option<Duration> {
+    /// The longest data may be in flight: `allocator::latency_limit_for` the bandwidth (latency counts for more as the link
+    /// shrinks), tightened by the latency tolerances the page's streams state (maxAge, `SubShared::latency_tolerance`),
+    /// averaged weighted by the bandwidth each was granted. (Only robot-to-page data crosses this queue; what the page
+    /// publishes, cmd_vel and heartbeats, travels the other way.)
+    fn latency_limit(&self, subscriptions: &[Arc<SubShared>], allocations: &[allocator::Allocation], bandwidth: f64) -> Duration {
         let weighted = subscriptions.iter().zip(allocations).filter_map(|(shared, allocation)| {
             let weight = allocation.budget_bytes_per_sec;
             shared.latency_tolerance(bandwidth).filter(|_| weight > 0.0).map(|tolerance| (weight, tolerance))
         });
         let (weights, sum) = weighted.fold((0.0, 0.0), |(weights, sum), (weight, tolerance)| (weights + weight, sum + weight * tolerance));
-        (weights > 0.0).then(|| crate::secs(sum / weights))
+        let by_link = allocator::latency_limit_for(bandwidth, self.config.slow_link_latency);
+        if weights > 0.0 { by_link.min(crate::secs(sum / weights)) } else { by_link }
     }
 
     /// What the streams may use: the link's bandwidth x its gain, within the cap.
