@@ -29,6 +29,9 @@ const cells: Cell[] = [
     { name: "wifi_loss2", seconds: 30, schedule: [[0, 625_000]], delayMs: 30, jitterMs: 210, loss: 0.02 },
     // at 5% loss each way the slowest 5% of messages are the ones resent: p95 lands on a retransmission
     { name: "loss5", seconds: 30, schedule: [[0, 625_000]], delayMs: 30, jitterMs: 0, loss: 0.05, slackMs: 500 },
+    // the R1 on 2.4 GHz Wi-Fi (2026-10-13): ~300 KB/s, 3 ms at best, 60-400 ms typical, frames retried; the estimate
+    // collapsed to 16 KB/s and blamed the page
+    { name: "r1_wifi", seconds: 45, schedule: [[0, 300_000]], delayMs: 2, jitterMs: 400, loss: 0.005, slackMs: 500 },
     { name: "step", seconds: 90, schedule: [[0, 2_500_000], [30, 125_000], [60, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
 ]
 const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell.name)) : cells

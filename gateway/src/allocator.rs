@@ -192,8 +192,10 @@ const FAST_PROBE_GAIN: f64 = 1.10;
 const SLOW_PROBE_GAIN: f64 = 1.02;
 /// RTT above its recent minimum by this much means a queue is building.
 pub const DELAY_THRESHOLD_MS: f64 = 5.0;
-/// Intervals in a row above the threshold before the delay counts as a queue (a lone spike doesn't).
-const DELAY_PERSISTENCE: u32 = 2;
+/// Intervals in a row above the threshold before the delay counts as a queue: a second (Wi-Fi retries swing the delay
+/// 0-400 ms every few hundred ms; at two intervals they counted as a queue every few seconds, whatever was sent, and cut
+/// the R1's 300 KB/s link to 5 KB/s).
+const DELAY_PERSISTENCE: u32 = 4;
 /// How far back the path's usual queue-delay jitter is measured.
 const JITTER_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 /// A queue delay that every sample of the last `STANDING_QUEUE_WINDOW` (at least `STANDING_QUEUE_SAMPLES`) stayed above.
@@ -204,6 +206,9 @@ const STANDING_QUEUE_SAMPLES: usize = 6;
 const MAX_JITTER_ALLOWANCE_MS: f64 = 500.0;
 /// Probing up only while the streams sent at least this fraction of the estimate (the allocator hands out 75% of it).
 const PROBE_UTILIZATION: f64 = 0.5;
+/// What the link delivered over this long bounds a cut for a delay that only persisted (`DELAY_PERSISTENCE`): acks
+/// arrive in bursts on a jittery path, and a 1 s reading took one such cut from 18 to 6 KB/s.
+const SLOW_DELIVERY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 const DELAY_DECREASE: f64 = 0.85;
 /// Blocked on SCTP: down to 0.9 x what went out, but at most this per interval (a long RTT blocks the first intervals).
 const BLOCKED_DECREASE: f64 = 0.85;
@@ -213,6 +218,8 @@ const HOLD_AFTER_CONGESTION: std::time::Duration = std::time::Duration::from_sec
 /// Sent over `DELIVERY_WINDOW` more than this times what was acknowledged (plus `BACKLOG_SLACK_BYTES`) is a growing queue.
 const BACKLOG_RATIO: f64 = 1.3;
 const BACKLOG_SLACK_BYTES: f64 = 4_000.0;
+/// The round trip counted as in flight is at most this (a queue itself raises the RTT).
+const MAX_IN_FLIGHT_RTT_MS: f64 = 500.0;
 /// A delay event on a link the streams were filling cuts to 0.9 x what it delivered over this long, when that is lower than
 /// -15%, at most -75% at once (from a 512 kbit/s start on a 100 kbit/s link, -15% a second took 10 s, and its full queue
 /// stalled even the strict streams meanwhile).
@@ -259,25 +266,36 @@ pub struct Interval {
     pub video_overuse: bool,
     /// bytes the browser acknowledged this interval (data channels, plus what video sent)
     pub delivered_bytes: f64,
+    /// the path's recent highest round trip, if measured: what is in flight over it isn't a backlog
+    pub high_rtt_ms: Option<f64>,
 }
 
 impl Estimator {
     pub fn update(&mut self, interval: Interval) {
-        let Interval { now, secs: interval_secs, sent_bytes, blocked_secs, page_blocked_secs, active_senders, data_demand, queue_delay_ms, video_overuse, delivered_bytes } = interval;
+        let Interval { now, secs: interval_secs, sent_bytes, blocked_secs, page_blocked_secs, active_senders, data_demand, queue_delay_ms, video_overuse, delivered_bytes, high_rtt_ms } = interval;
         if interval_secs <= 0.0 {
             return;
         }
         self.deliveries.push_back((now, delivered_bytes, sent_bytes, interval_secs));
-        while self.deliveries.front().is_some_and(|(at, ..)| now.duration_since(*at) >= DELIVERY_WINDOW) {
+        while self.deliveries.front().is_some_and(|(at, ..)| now.duration_since(*at) >= SLOW_DELIVERY_WINDOW) {
             self.deliveries.pop_front();
         }
-        let (delivered, sent, secs) = self.deliveries.iter().fold((0.0, 0.0, 0.0), |(d, s, t), (_, delivered, sent, secs)| (d + delivered, s + sent, t + secs));
+        let sums = |window: std::time::Duration| {
+            let recent = self.deliveries.iter().filter(|(at, ..)| now.duration_since(*at) < window);
+            recent.fold((0.0, 0.0, 0.0), |(d, s, t), (_, delivered, sent, secs)| (d + delivered, s + sent, t + secs))
+        };
+        let (slow_delivered, _, slow_secs) = sums(SLOW_DELIVERY_WINDOW);
+        let slow_delivered_rate = slow_delivered / slow_secs.max(1e-3);
+        let (delivered, sent, secs) = sums(DELIVERY_WINDOW);
         self.delivered_bytes_per_sec = delivered / secs.max(1e-3);
         // streams that sent less than half the estimate didn't test the link: what it delivered says nothing about it
         let link_tested = sent / secs.max(1e-3) >= 0.5 * self.data_bytes_per_sec;
         // handed to SCTP faster than the browser acknowledges: a queue is growing somewhere, whatever the RTT says (a
         // queue that grows gradually widens the delay spread it is measured against, and on Wi-Fi jitter hides it)
-        let backlog_growing = secs >= 0.75 && sent > BACKLOG_RATIO * delivered + BACKLOG_SLACK_BYTES;
+        // (bytes sent within the last round trip aren't acknowledged yet: at a 400 ms Wi-Fi RTT a burst read as a backlog,
+        // and each such cut, capped by what the first second delivered, took the R1's estimate from 1 MB/s to 9 KB/s)
+        let in_flight = sent / secs.max(1e-3) * high_rtt_ms.unwrap_or(0.0).min(MAX_IN_FLIGHT_RTT_MS) / 1000.0;
+        let backlog_growing = secs >= 0.75 && sent > BACKLOG_RATIO * delivered + BACKLOG_SLACK_BYTES + in_flight;
         let delivered_rate = self.delivered_bytes_per_sec;
         // a link the streams filled: 0.9 x what it delivered; otherwise -15%, but never left above twice what it delivered
         // (after a drop from 20 to 1 Mbit/s, -15% a second from 4.5 MB/s held a 300 ms queue for 15 s)
@@ -288,12 +306,18 @@ impl Estimator {
         self.network_blocked_fraction = (blocked_secs / sender_secs).min(1.0);
         self.page_blocked_fraction = (page_blocked_secs / sender_secs).min(1.0);
         let holding = self.hold_probing_until.is_some_and(|until| now < until);
-        let delayed = self.queue_building(now, queue_delay_ms);
+        let (persisted, standing) = self.queue_building(now, queue_delay_ms);
+        let delayed = persisted || standing;
         if (delayed || backlog_growing) && !holding {
             self.backlog_events += u64::from(backlog_growing && !delayed);
             self.congested_at_bytes_per_sec = self.data_bytes_per_sec;
             self.last_congestion = Some(now);
-            self.data_bytes_per_sec = cut(self.data_bytes_per_sec);
+            self.data_bytes_per_sec = if standing || backlog_growing {
+                cut(self.data_bytes_per_sec)
+            } else {
+                // only the delay says so: -15%, no lower than twice what the link delivered over a few seconds
+                (self.data_bytes_per_sec * DELAY_DECREASE).min((2.0 * slow_delivered_rate).max(MIN_ESTIMATE)).max(self.data_bytes_per_sec * 0.25)
+            };
             self.delay_events += u64::from(delayed);
             self.hold_probing_until = Some(now + HOLD_AFTER_CONGESTION);
         } else if self.network_blocked_fraction > CONGESTED_FRACTION || video_overuse {
@@ -304,7 +328,8 @@ impl Estimator {
             self.data_bytes_per_sec = (0.9 * self.sent_bytes_per_sec).max(self.data_bytes_per_sec * BLOCKED_DECREASE);
         } else if !holding
             && data_demand > self.data_bytes_per_sec * 0.95
-            && self.sent_bytes_per_sec >= self.data_bytes_per_sec * PROBE_UTILIZATION
+            // over the delivery window: big messages go out in bursts, and one quiet interval held probing back for good
+            && sent / secs.max(1e-3) >= self.data_bytes_per_sec * PROBE_UTILIZATION
             && self.page_blocked_fraction <= CONGESTED_FRACTION
         {
             // (held back by the page, the senders never test the network: probing then would only make up a number)
@@ -322,8 +347,9 @@ impl Estimator {
     }
 
     /// Whether this interval's queue delay, and enough before it, stood above the path's jitter.
-    fn queue_building(&mut self, now: std::time::Instant, queue_delay_ms: Option<f64>) -> bool {
-        let Some(delay) = queue_delay_ms else { return false };
+    /// (above the threshold `DELAY_PERSISTENCE` intervals in a row, a standing queue)
+    fn queue_building(&mut self, now: std::time::Instant, queue_delay_ms: Option<f64>) -> (bool, bool) {
+        let Some(delay) = queue_delay_ms else { return (false, false) };
         while self.delay_samples.front().is_some_and(|(at, _)| now.duration_since(*at) > JITTER_WINDOW) {
             self.delay_samples.pop_front();
         }
@@ -340,7 +366,7 @@ impl Estimator {
         // change pushed the threshold to its cap and hid a 300 ms queue for 10 s; jitter rarely keeps its least that high)
         let standing = self.delay_samples.iter().filter(|(at, _)| now.duration_since(*at) <= STANDING_QUEUE_WINDOW);
         let (count, least) = standing.fold((0, f64::INFINITY), |(count, least), (_, delay)| (count + 1, least.min(*delay)));
-        self.over_threshold >= DELAY_PERSISTENCE || (count >= STANDING_QUEUE_SAMPLES && least > STANDING_QUEUE_MS)
+        (self.over_threshold >= DELAY_PERSISTENCE, count >= STANDING_QUEUE_SAMPLES && least > STANDING_QUEUE_MS)
     }
 }
 
@@ -434,7 +460,7 @@ mod tests {
 
     fn sample(now: std::time::Instant, secs: f64, sent_bytes: f64, blocked_secs: f64, active_senders: usize, data_demand: f64, queue_delay_ms: Option<f64>) -> Interval {
         // delivered as sent unless a test says otherwise
-        Interval { now, secs, sent_bytes, blocked_secs, page_blocked_secs: 0.0, active_senders, data_demand, queue_delay_ms, video_overuse: false, delivered_bytes: sent_bytes }
+        Interval { now, secs, sent_bytes, blocked_secs, page_blocked_secs: 0.0, active_senders, data_demand, queue_delay_ms, video_overuse: false, delivered_bytes: sent_bytes, high_rtt_ms: None }
     }
 
     #[test]
@@ -453,7 +479,8 @@ mod tests {
         assert!((estimator.data_bytes_per_sec - 712_800.0 * 1.02).abs() < 1.0, "slowly around it: {estimator:?}");
         estimator.update(sample(now, 0.25, 100_000.0, 0.0, 1, 1000.0, None));
         assert!((estimator.data_bytes_per_sec - 712_800.0 * 1.02).abs() < 1.0, "no probing without demand");
-        estimator.update(sample(now, 0.25, 20_000.0, 0.0, 1, 5e6, None));
+        // (judged over the last second, so a second later)
+        estimator.update(sample(now + std::time::Duration::from_millis(1100), 0.25, 20_000.0, 0.0, 1, 5e6, None));
         assert!((estimator.data_bytes_per_sec - 712_800.0 * 1.02).abs() < 1.0, "no probing on a link that isn't carrying the estimate");
         // 5 s after the last congestion event its level is stale: fast again
         let later = now + STALE_CONGESTION + std::time::Duration::from_millis(1);
@@ -482,14 +509,16 @@ mod tests {
             estimator.update(sample(at(interval), 0.25, 200_000.0, 0.0, 1, 1000.0, Some(1.0 + (interval % 2) as f64)));
         }
         let settled = estimator.data_bytes_per_sec;
-        estimator.update(sample(at(41), 0.25, 200_000.0, 0.0, 1, 1000.0, Some(25.0)));
-        assert_eq!(estimator.data_bytes_per_sec, settled, "one spike is not a queue: {estimator:?}");
-        estimator.update(sample(at(42), 0.25, 200_000.0, 0.0, 1, 1000.0, Some(40.0)));
-        assert!((estimator.data_bytes_per_sec - settled * 0.85).abs() < 1.0, "a second in a row is: cut by 15%: {estimator:?}");
+        for interval in 41..44 {
+            estimator.update(sample(at(interval), 0.25, 200_000.0, 0.0, 1, 1000.0, Some(25.0 + interval as f64)));
+            assert_eq!(estimator.data_bytes_per_sec, settled, "a spike under a second is not a queue: {estimator:?}");
+        }
+        estimator.update(sample(at(44), 0.25, 200_000.0, 0.0, 1, 1000.0, Some(40.0)));
+        assert!((estimator.data_bytes_per_sec - settled * 0.85).abs() < 1.0, "a second of it is: cut by 15%: {estimator:?}");
         assert_eq!(estimator.delay_events, 1);
-        estimator.update(sample(at(43), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0)));
+        estimator.update(sample(at(45), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0)));
         assert!((estimator.data_bytes_per_sec - settled * 0.85).abs() < 1.0, "holds while the queue drains");
-        estimator.update(sample(at(47), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0)));
+        estimator.update(sample(at(49), 0.25, 200_000.0, 0.0, 1, 5e6, Some(1.0)));
         assert!((estimator.data_bytes_per_sec - settled * 0.85 * 1.1).abs() < 1.0, "then probes again, 10% below 90% of the congestion level: {estimator:?}");
     }
 
@@ -554,7 +583,7 @@ mod tests {
         for interval in 0..40 {
             estimator.update(Interval { delivered_bytes: 500.0, ..sample(at(interval), 0.25, 500.0, 0.0, 1, 1000.0, Some(3.0)) });
         }
-        for interval in 40..42 {
+        for interval in 40..44 {
             estimator.update(Interval { delivered_bytes: 500.0, ..sample(at(interval), 0.25, 500.0, 0.0, 1, 1000.0, Some(400.0)) });
         }
         assert_eq!(estimator.data_bytes_per_sec, 16_000.0, "2 x 2 KB/s delivered, but at most -75% at once: {estimator:?}");

@@ -80,6 +80,8 @@ pub struct SendGate {
     page: Mutex<PageQueue>,
     /// [`SendGate::max_network_lag`] in microseconds
     max_network_lag_us: AtomicU64,
+    /// the path's recent round trip (see `set_window`) in microseconds: the page's acks cross it too
+    network_rtt_us: AtomicU64,
     /// one multi-chunk bulk message at a time (FIFO), see [`SendGate::message_turn`]
     message_turn: tokio::sync::Mutex<()>,
     changed: Notify,
@@ -96,6 +98,7 @@ impl Default for SendGate {
             window_bytes: AtomicUsize::new(crate::subscription::BACKED_UP_BYTES),
             page: Mutex::default(),
             max_network_lag_us: AtomicU64::new(((NETWORK_LAG_MAX_EXTRA_RTT_MS + NETWORK_LAG_MARGIN_MS) * 1000.0) as u64),
+            network_rtt_us: AtomicU64::new((NETWORK_LAG_MAX_EXTRA_RTT_MS * 1000.0) as u64),
             message_turn: tokio::sync::Mutex::new(()),
             changed: Notify::new(),
         }
@@ -143,6 +146,7 @@ impl SendGate {
             _ => NETWORK_LAG_MAX_EXTRA_RTT_MS,
         };
         self.max_network_lag_us.store(((network_rtt_ms + NETWORK_LAG_MARGIN_MS) * 1000.0) as u64, Ordering::Relaxed);
+        self.network_rtt_us.store((network_rtt_ms * 1000.0) as u64, Ordering::Relaxed);
     }
 
     /// How long a frame may wait in SCTP undelivered before channels stop sending.
@@ -161,9 +165,11 @@ impl SendGate {
         self.network_lag(now) > self.max_network_lag() + LOSS_NETWORK_LAG_EXTRA
     }
 
-    /// How far behind the page may be before channels stop sending.
+    /// How far behind the page may be before channels stop sending: `MAX_PAGE_LAG_MS` plus the path's round trip, since
+    /// page lag runs until the page's ack arrives, which crosses the network back (on the R1's Wi-Fi, 60-650 ms of network
+    /// read as a 564 ms page lag, and the senders waited on a page that was keeping up).
     pub fn max_page_lag(&self) -> Duration {
-        Duration::from_secs_f64(MAX_PAGE_LAG_MS / 1000.0)
+        Duration::from_secs_f64(MAX_PAGE_LAG_MS / 1000.0) + Duration::from_micros(self.network_rtt_us.load(Ordering::Relaxed))
     }
 
     /// The right to send one message bigger than a bulk chunk, held until it is sent whole; waiters get it in arrival
