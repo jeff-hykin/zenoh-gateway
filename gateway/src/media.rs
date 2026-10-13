@@ -422,19 +422,20 @@ const CPU_EWMA_GAIN: f64 = 0.2;
 /// rebuilds a hardware encoder and costs a keyframe, and a size that followed each 250 ms grant rebuilt the R1's
 /// nvv4l2h264enc 16,000 times in 12 h.
 const SIZE_BAND: f64 = 1.1;
-/// The picture shrinks at most this often, and grows only this long after its last change.
+/// The picture shrinks at most this often, and grows only this long after its last change, except back to full size,
+/// which it does at once (a subscription that started on a low grant stayed small for seconds).
 const SIZE_DOWN_SETTLE: Duration = Duration::from_secs(1);
 const SIZE_UP_SETTLE: Duration = Duration::from_secs(5);
 
 /// The size to encode at: `wanted` (the bitrate policy's) once it is far enough from the size in use and that size has
-/// settled, else the size in use. A new source size is taken at once.
+/// settled, else the size in use. A new source size, and full size, are taken at once.
 fn steady_size(current: Option<((u32, u32), (u32, u32), Instant)>, source: (u32, u32), wanted: (u32, u32), now: Instant) -> ((u32, u32), bool) {
     let Some((_, size, changed_at)) = current.filter(|(current_source, _, _)| *current_source == source) else {
         return (wanted, true);
     };
     let ratio = wanted.0 as f64 / size.0.max(1) as f64;
     let since = now.duration_since(changed_at);
-    let change = (ratio < 1.0 / SIZE_BAND && since >= SIZE_DOWN_SETTLE) || (ratio > SIZE_BAND && since >= SIZE_UP_SETTLE) || (wanted.0 >= source.0 & !1 && size.0 < source.0 & !1 && since >= SIZE_UP_SETTLE);
+    let change = (ratio < 1.0 / SIZE_BAND && since >= SIZE_DOWN_SETTLE) || (ratio > SIZE_BAND && since >= SIZE_UP_SETTLE) || (wanted.0 >= source.0 & !1 && size.0 < source.0 & !1);
     if change { (wanted, true) } else { (size, false) }
 }
 
@@ -597,6 +598,16 @@ struct Member {
     session: Option<Arc<EncodeSession>>,
     next_seq: Option<u64>,
     synced: bool,
+    /// leaves `session` when dropped: a send loop that panicked or was cancelled kept its encoder (and its grant) forever
+    registry: Option<Arc<crate::encoding::registry::EncodingRegistry>>,
+}
+
+impl Drop for Member {
+    fn drop(&mut self) {
+        if let (Some(registry), Some(session)) = (&self.registry, self.session.take()) {
+            registry.video_sessions.leave(&session, self.id);
+        }
+    }
 }
 
 /// A picked, decoded sample to encode.
@@ -715,7 +726,7 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
 pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: TrackClaim) {
     let Some(codec) = shared.codec.clone() else { return };
     let sessions = &shared.codecs.video_sessions;
-    let mut member = Member { id: sessions.next_member.fetch_add(1, Ordering::Relaxed), session: None, next_seq: None, synced: false };
+    let mut member = Member { id: sessions.next_member.fetch_add(1, Ordering::Relaxed), session: None, next_seq: None, synced: false, registry: Some(shared.codecs.clone()) };
     let mut next_frame_id: u32 = 0;
     let mut last_write: Option<Instant> = None;
     let mut warned_write = false;
@@ -829,6 +840,7 @@ mod tests {
         assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0).0, (960, 768), "grows only after it settled");
         assert_eq!(steady_size(at((960, 768), settled), source, (1360, 1088), t0).0, (1360, 1088));
         assert_eq!(steady_size(at((1792, 1434), settled), source, (1920, 1536), t0).0, (1920, 1536), "back to full size");
+        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0).0, (1920, 1536), "full size at once");
         assert_eq!(steady_size(Some(((640, 480), (320, 240), t0)), source, (1920, 1536), t0), ((1920, 1536), true), "a new source: at once");
     }
 
@@ -922,7 +934,7 @@ mod tests {
         let codecs = Arc::new(EncodingRegistry::new([codec.clone()]).unwrap());
         let sessions = &codecs.video_sessions;
         let picture = Arc::new(DecodedFrame::Video(VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap()));
-        let mut viewers: Vec<Member> = (0..3).map(|id| Member { id, session: None, next_seq: None, synced: false }).collect();
+        let mut viewers: Vec<Member> = (0..3).map(|id| Member { id, session: None, next_seq: None, synced: false, registry: None }).collect();
         let grants = [(4e6, 30.0), (4.4e6, 30.0), (1e6, 30.0)];
         let mut sent = vec![Vec::new(); 3];
         for sample in 0..10u64 {

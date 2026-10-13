@@ -540,6 +540,15 @@ impl SubShared {
             };
             queue.items.push_back(pending);
             queue.arrivals += 1;
+            // trimmed here too: a sender blocked on a stalled page never reaches `next`, and the queue grew without bound
+            let max_age = self.delivery.max_age_ms.map(|max_age_ms| crate::secs(max_age_ms / 1000.0));
+            if let Some(limit) = max_age.or(self.delivery.reliable.then_some(RELIABLE_MAX_BACKLOG)) {
+                let now = Instant::now();
+                while queue.items.len() > 1 && queue.items.front().is_some_and(|item| now.duration_since(item.arrived) > limit) {
+                    state.stats.unqueue(&queue.items.pop_front().unwrap());
+                    *if max_age.is_some() { &mut state.stats.dropped_age } else { &mut state.stats.dropped_queue } += 1;
+                }
+            }
             state.payload_bytes = ewma(state.payload_bytes, payload_len as f64);
             if let Some(cap) = self.delivery.queue {
                 while queue.items.len() > cap {
@@ -682,6 +691,17 @@ impl SubShared {
     }
 }
 
+/// Ends a subscription when dropped (`run` cancelled mid-way skipped its cleanup, and the detached sender kept the
+/// channel, its connection and its encoder alive).
+struct Unsubscribe(Arc<SubShared>);
+
+impl Drop for Unsubscribe {
+    fn drop(&mut self) {
+        self.0.close();
+        self.0.gate.forget(self.0.stream_id);
+    }
+}
+
 /// Runs a `sub` channel until it closes. Video and audio channels send frames to `track` instead of `dc`.
 /// `rules`: a grant with an ACL, whose put/delete egress rules decide which samples reach the browser.
 pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>, track: Option<crate::media::TrackClaim>, rules: Option<Arc<crate::Grant>>) {
@@ -713,6 +733,8 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     debug!("subscribed {:?} with {:?}", label.key, shared.delivery);
 
     shared.gate.register(shared.stream_id, dc.clone());
+    // however `run` ends, cancelled with its peer included, the sender stops and the gate lets go of the channel
+    let _unsubscribe = Unsubscribe(shared.clone());
     let sending: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = match track {
         Some(track) if track.mime.starts_with("audio/") => Box::pin(crate::audio::send_loop(dc.clone(), shared.clone(), track)),
         Some(track) => Box::pin(crate::media::send_loop(dc.clone(), shared.clone(), track)),

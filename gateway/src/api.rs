@@ -50,6 +50,8 @@ pub(crate) const OPS: &[&str] = &[
 pub(crate) const SLOW_OPS: &[&str] = &["get", "livelinessGet", "matchingStatus"];
 
 const DEFAULT_GET_TIMEOUT_MS: u64 = 5000;
+/// A page's timeoutMs is capped: the query kept the peer alive until it ended.
+const MAX_GET_TIMEOUT_MS: u64 = 60_000;
 /// A query the frontend never finalizes is answered as final after this (the asker has long given up).
 const QUERY_LIFETIME: Duration = Duration::from_secs(120);
 
@@ -304,7 +306,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                 }
                 _ => request.key.clone(),
             };
-            let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_GET_TIMEOUT_MS));
+            let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_GET_TIMEOUT_MS).min(MAX_GET_TIMEOUT_MS));
             let mut builder = session.get(selector.as_str()).timeout(timeout);
             if let Some(payload) = decode("payload", &request.payload)? {
                 builder = builder.payload(payload);
@@ -464,7 +466,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
         }
         "livelinessGet" => {
             access.check(Action::LivelinessGet, &request.key)?;
-            let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_GET_TIMEOUT_MS));
+            let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_GET_TIMEOUT_MS).min(MAX_GET_TIMEOUT_MS));
             let replies = session.liveliness().get(&request.key).timeout(timeout).await.map_err(error)?;
             let mut tokens = Vec::new();
             while let Ok(reply) = replies.recv_async().await {
