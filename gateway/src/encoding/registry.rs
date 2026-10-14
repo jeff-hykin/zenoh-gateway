@@ -5,20 +5,45 @@ use super::{Channel, Compress, DecodedFrame, EncodeOptions, EncodingOutput, Enco
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock};
-use parking_lot::Mutex;
+use std::sync::Arc;
+use std::time::Duration;
+use parking_lot::{Condvar, Mutex};
 
 /// Encoded results kept for sharing (they are small).
 const ENCODED_CAPACITY: usize = 64;
 /// Decoded frames kept for sharing; they are large (6 MB for a 1080p picture), so few.
 const DECODED_CAPACITY: usize = 8;
+/// What `ServerBuilder::encode_timeout` defaults to.
+pub const DEFAULT_ENCODE_TIMEOUT: Duration = Duration::from_secs(5);
 
-type Shared<T> = Arc<OnceLock<Result<Arc<T>, String>>>;
+/// One result, computed by the caller that asked first; the others wait on it, for a while.
+struct Cell<T> {
+    result: Mutex<Option<Result<Arc<T>, String>>>,
+    ready: Condvar,
+}
 
-/// A tiny FIFO of in-flight or finished results; callers for the same key block on one `OnceLock`, so it computes once.
+impl<T> Cell<T> {
+    fn set(&self, result: Result<Arc<T>, String>) {
+        *self.result.lock() = Some(result);
+        self.ready.notify_all();
+    }
+}
+
+/// Settles a cell whose computation panicked, so its waiters don't wait out the timeout.
+struct SettleOnPanic<'a, T>(&'a Cell<T>);
+
+impl<T> Drop for SettleOnPanic<'_, T> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.set(Err("the shared encode panicked".to_owned()));
+        }
+    }
+}
+
+/// A tiny FIFO of in-flight or finished results; callers for the same key wait on one cell, so it computes once.
 struct WorkCache<K, T> {
     capacity: usize,
-    entries: Mutex<VecDeque<(K, Shared<T>)>>,
+    entries: Mutex<VecDeque<(K, Arc<Cell<T>>)>>,
 }
 
 impl<K: PartialEq, T> WorkCache<K, T> {
@@ -26,14 +51,16 @@ impl<K: PartialEq, T> WorkCache<K, T> {
         WorkCache { capacity, entries: Mutex::new(VecDeque::new()) }
     }
 
-    /// Runs `compute` unless someone already did (or is doing) it; `true` = shared result.
-    fn get_or_compute(&self, key: K, compute: impl FnOnce() -> Result<T, String>) -> (Result<Arc<T>, String>, bool) {
+    /// Runs `compute` unless someone already did (or is doing) it; `true` = shared result. A caller waiting on someone
+    /// else's computation gives up after `timeout` (an encoder that hangs must not take every frontend's thread with
+    /// it), and the entry goes so the next caller computes afresh.
+    fn get_or_compute(&self, key: K, timeout: Duration, compute: impl FnOnce() -> Result<T, String>) -> (Result<Arc<T>, String>, bool) {
         let (cell, shared) = {
             let mut entries = self.entries.lock();
             match entries.iter().find(|(existing, _)| *existing == key) {
                 Some((_, cell)) => (cell.clone(), true),
                 None => {
-                    let cell: Shared<T> = Arc::default();
+                    let cell = Arc::new(Cell { result: Mutex::new(None), ready: Condvar::new() });
                     entries.push_back((key, cell.clone()));
                     while entries.len() > self.capacity {
                         entries.pop_front();
@@ -42,12 +69,23 @@ impl<K: PartialEq, T> WorkCache<K, T> {
                 }
             }
         };
-        let mut computed_here = false;
-        let result = cell.get_or_init(|| {
-            computed_here = true;
-            compute().map(Arc::new)
-        });
-        (result.clone(), shared && !computed_here)
+        if !shared {
+            let settle = SettleOnPanic(&cell);
+            let result = compute().map(Arc::new);
+            drop(settle);
+            cell.set(result.clone());
+            return (result, false);
+        }
+        let mut result = cell.result.lock();
+        cell.ready.wait_while_for(&mut result, |result| result.is_none(), timeout);
+        match result.clone() {
+            Some(result) => (result, true),
+            None => {
+                drop(result);
+                self.entries.lock().retain(|(_, other)| !Arc::ptr_eq(other, &cell));
+                (Err(format!("gave up on another frontend's encode after {timeout:?}")), true)
+            }
+        }
     }
 }
 
@@ -76,6 +114,8 @@ pub struct EncodingRegistry {
     /// the server's default; subscriptions override parts of it
     pub video_policy: VideoPolicy,
     pub video_sessions: crate::media::VideoSessions,
+    /// the longest a decode or encode may take before it is given up on (`ServerBuilder::encode_timeout`)
+    pub encode_timeout: Duration,
 }
 
 /// A subscription's encoding (None = raw bytes), its channel, and what it sends there.
@@ -118,12 +158,18 @@ impl EncodingRegistry {
             video_encoders: HashMap::new(),
             video_policy: VideoPolicy::default(),
             video_sessions: Default::default(),
+            encode_timeout: DEFAULT_ENCODE_TIMEOUT,
         })
     }
 
     /// The server's video encoders (by the format each makes) and default policy.
     pub fn with_video(self, video_encoders: impl IntoIterator<Item = (VideoFormat, VideoEncoderFactory)>, video_policy: VideoPolicy) -> Self {
         EncodingRegistry { video_encoders: video_encoders.into_iter().collect(), video_policy, ..self }
+    }
+
+    /// The longest a decode or encode may take (see [`Self::encode_timeout`]).
+    pub fn with_encode_timeout(self, encode_timeout: Duration) -> Self {
+        EncodingRegistry { encode_timeout, ..self }
     }
 
     /// A new encoder of `format` for a video encoding: its own, else the server's, else the built-in one, else why none.
@@ -147,14 +193,14 @@ impl EncodingRegistry {
 
     /// Blocking: decodes `sample` for `channel` (or reuses another frontend's decode of it). `true` = reused.
     pub fn decode_shared(&self, codec: &dyn MessageEncoding, sample: &EncodingSample<'_>, hash: u64, channel: Channel) -> (Result<Arc<DecodedFrame>, String>, bool) {
-        self.decoded.get_or_compute((codec.name().to_owned(), channel.kind(), hash), || codec.decode(sample, channel).map_err(|error| format!("{error:#}")))
+        self.decoded.get_or_compute((codec.name().to_owned(), channel.kind(), hash), self.encode_timeout, || codec.decode(sample, channel).map_err(|error| format!("{error:#}")))
     }
 
     /// Blocking: a data encoding's bytes for `sample` with `options`, compressed as asked (or another frontend's).
     /// `true` = reused.
     pub fn encode_shared(&self, codec: &dyn MessageEncoding, sample: &EncodingSample<'_>, hash: u64, options: &EncodeOptions, compress: Compress) -> (Result<Arc<Encoded>, String>, bool) {
         let key = (codec.name().to_owned(), quality_bucket(options.quality), serde_json::Value::Object(options.options.clone()).to_string(), hash, compress);
-        self.encoded.get_or_compute(key, || {
+        self.encoded.get_or_compute(key, self.encode_timeout, || {
             let (frame, _) = self.decode_shared(codec, sample, hash, Channel::Data);
             let bytes = codec.encode(&*frame?, options).map_err(|error| format!("{error:#}"))?;
             let compressed = compress.apply(&bytes);
@@ -199,14 +245,44 @@ mod tests {
     #[test]
     fn cache_computes_once() {
         let cache: WorkCache<u32, u32> = WorkCache::new(2);
-        let (first, shared) = cache.get_or_compute(1, || Ok(10));
+        let timeout = DEFAULT_ENCODE_TIMEOUT;
+        let (first, shared) = cache.get_or_compute(1, timeout, || Ok(10));
         assert_eq!((*first.unwrap(), shared), (10, false));
-        let (again, shared) = cache.get_or_compute(1, || panic!("must not recompute"));
+        let (again, shared) = cache.get_or_compute(1, timeout, || panic!("must not recompute"));
         assert_eq!((*again.unwrap(), shared), (10, true));
-        let _ = cache.get_or_compute(2, || Ok(20));
-        let _ = cache.get_or_compute(3, || Ok(30));
-        let (evicted, shared) = cache.get_or_compute(1, || Ok(11));
+        let _ = cache.get_or_compute(2, timeout, || Ok(20));
+        let _ = cache.get_or_compute(3, timeout, || Ok(30));
+        let (evicted, shared) = cache.get_or_compute(1, timeout, || Ok(11));
         assert_eq!((*evicted.unwrap(), shared), (11, false), "oldest entry evicted at capacity");
+    }
+
+    #[test]
+    fn a_waiter_gives_up_on_a_hung_shared_compute_and_the_next_caller_recomputes() {
+        let cache: Arc<WorkCache<u32, u32>> = Arc::new(WorkCache::new(4));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hung = std::thread::spawn({
+            let cache = cache.clone();
+            move || {
+                cache.get_or_compute(1, DEFAULT_ENCODE_TIMEOUT, move || {
+                    let _ = release_rx.recv();
+                    Ok(10)
+                })
+            }
+        });
+        while cache.entries.lock().is_empty() {
+            std::thread::yield_now();
+        }
+        let started = std::time::Instant::now();
+        let (waited, shared) = cache.get_or_compute(1, Duration::from_millis(50), || panic!("the first caller computes"));
+        assert!(waited.is_err() && shared, "gave up");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let (fresh, shared) = cache.get_or_compute(1, Duration::from_millis(50), || Ok(11));
+        assert_eq!((*fresh.unwrap(), shared), (11, false), "the hung entry is gone: computed afresh");
+        release_tx.send(()).unwrap();
+        assert_eq!(*hung.join().unwrap().0.unwrap(), 10);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.get_or_compute(2, DEFAULT_ENCODE_TIMEOUT, || panic!("boom"))));
+        assert!(panicked.is_err());
+        assert!(cache.get_or_compute(2, DEFAULT_ENCODE_TIMEOUT, || Ok(0)).0.is_err(), "a panicked compute is settled as an error, not waited on");
     }
 
     #[test]

@@ -22,7 +22,8 @@ use rtc::rtp_transceiver::rtp_sender::RTCRtpHeaderExtensionCapability;
 use rtc::rtp_transceiver::rtp_sender::{RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::future::Future;
+use std::sync::Arc;
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use webrtc::data_channel::DataChannel;
@@ -225,6 +226,15 @@ pub struct MediaTrack {
     owner: AtomicU64,
     /// it has carried a playout delay outside low-latency rendering (see [`sent_playout_delay`])
     left_low_latency: AtomicBool,
+    /// told when the track is dropped: its RTCP reader ends then, even while `poll` never returns
+    dropped: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for MediaTrack {
+    fn drop(&mut self) {
+        // (notify_one keeps the wake-up if the reader isn't waiting right now)
+        self.dropped.notify_one();
+    }
 }
 
 /// libwebrtc renders "as soon as decoded" (render time 0) while the playout delay is low-latency: min 0 and max at most
@@ -299,24 +309,38 @@ impl Drop for TrackClaim {
 }
 
 /// Watches the track's RTCP for keyframe requests until the track is dropped.
-fn spawn_rtcp_reader(track: Arc<TrackLocalStaticSample>, owner: Weak<MediaTrack>, keyframe_requested: Arc<AtomicBool>, keyframe_requests: Arc<AtomicU64>) {
-    tokio::spawn(async move {
-        while owner.strong_count() > 0 {
-            match track.poll().await {
-                Some(TrackLocalEvent::OnRtcpPacket(packets)) => {
-                    for packet in packets {
-                        let any = packet.as_any();
-                        if any.is::<PictureLossIndication>() || any.is::<FullIntraRequest>() {
-                            keyframe_requested.store(true, Ordering::Release);
-                            keyframe_requests.fetch_add(1, Ordering::Relaxed);
-                        }
+fn spawn_rtcp_reader(track: Arc<TrackLocalStaticSample>, dropped: Arc<tokio::sync::Notify>, keyframe_requested: Arc<AtomicBool>, keyframe_requests: Arc<AtomicU64>) {
+    tokio::spawn(read_rtcp(move || {
+        let track = track.clone();
+        async move { track.poll().await }
+    }, dropped, keyframe_requested, keyframe_requests));
+}
+
+/// [`spawn_rtcp_reader`]'s loop over `poll`; it ends when `dropped` is notified, whatever `poll` is doing, so the track
+/// (held by `poll`) goes with its `MediaTrack`.
+async fn read_rtcp<F: Future<Output = Option<TrackLocalEvent>>>(mut poll: impl FnMut() -> F, dropped: Arc<tokio::sync::Notify>, keyframe_requested: Arc<AtomicBool>, keyframe_requests: Arc<AtomicU64>) {
+    loop {
+        let event = tokio::select! {
+            event = poll() => event,
+            () = dropped.notified() => return,
+        };
+        match event {
+            Some(TrackLocalEvent::OnRtcpPacket(packets)) => {
+                for packet in packets {
+                    let any = packet.as_any();
+                    if any.is::<PictureLossIndication>() || any.is::<FullIntraRequest>() {
+                        keyframe_requested.store(true, Ordering::Release);
+                        keyframe_requests.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                // not bound yet (or unbound): look again shortly
-                _ => tokio::time::sleep(Duration::from_millis(100)).await,
             }
+            // not bound yet (or unbound): look again shortly
+            _ => tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                () = dropped.notified() => return,
+            },
         }
-    });
+    }
 }
 
 /// The mids of `sdp`'s m-sections still in use (port not 0): a subscription the page closed stopped its transceiver, and
@@ -383,8 +407,9 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
     let mid = mid.context("the offer had no new m-line for the track (add a recvonly transceiver of its kind before renegotiating)")?;
     let payload_type = negotiated_payload_type(&sender, mime).await.with_context(|| format!("the browser did not accept {mime}"))?;
     let keyframe_requested = Arc::new(AtomicBool::new(true));
-    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), owner: AtomicU64::new(0), left_low_latency: AtomicBool::new(false) });
-    spawn_rtcp_reader(track, Arc::downgrade(&video), video.keyframe_requested.clone(), video.keyframe_requests.clone());
+    let dropped = Arc::new(tokio::sync::Notify::new());
+    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), owner: AtomicU64::new(0), left_low_latency: AtomicBool::new(false), dropped: dropped.clone() });
+    spawn_rtcp_reader(track, dropped, video.keyframe_requested.clone(), video.keyframe_requests.clone());
     Ok((local, Some(video)))
 }
 
@@ -424,6 +449,17 @@ pub struct Decoding {
     pub item: subscription::Pending,
     /// (what came of the sample, milliseconds it took, its identity across frontends: key + payload hash)
     pub task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>,
+}
+
+/// A decode's frame, whether it was another frontend's, the ms it took and the sample's identity; or why there is none.
+/// Given up after `timeout` (`ServerBuilder::encode_timeout`): a hung decoder keeps only its blocking thread.
+pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>, timeout: Duration) -> std::result::Result<(Arc<DecodedFrame>, bool, f64, u64), String> {
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok((Ok((decoded, reused)), ms, hash))) => Ok((decoded, reused, ms, hash)),
+        Ok(Ok((Err(error), _, _))) => Err(error),
+        Ok(Err(error)) => Err(format!("decoder task failed: {error}")),
+        Err(_) => Err(format!("decode took over {timeout:?}: skipped")),
+    }
 }
 
 /// Starts decoding a picked sample.
@@ -697,21 +733,25 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         if changed {
             state.size = Some((source, size, now));
         }
-        let mut encoder = match state.encoder.take().map_or_else(|| codecs.video_encoder(&*codec, session.format), Ok) {
-            Ok(encoder) => encoder,
-            Err(error) => {
-                out.error = Some(error);
-                return out;
-            }
-        };
+        // (made on the blocking pool too: a hardware encoder's setup can block)
+        let (existing, format, timeout) = (state.encoder.take(), session.format, codecs.encode_timeout);
         let decoded = input.decoded.clone();
         let encoding = tokio::task::spawn_blocking(move || {
+            let mut encoder = existing.map_or_else(|| codecs.video_encoder(&*codec, format), Ok)?;
             let started = Instant::now();
             let result = encoder.encode(&decoded, &target).map_err(|error| format!("{error:#}"));
-            (encoder, result, started.elapsed().as_secs_f64() * 1000.0)
+            Ok::<_, String>((encoder, result, started.elapsed().as_secs_f64() * 1000.0))
         });
-        match encoding.await {
-            Ok((encoder, result, encode_ms)) => {
+        // an encode that hangs gives up its encoder (rebuilt next frame, from a keyframe) and the session's lock, which
+        // every viewer of the session waits on
+        let Ok(encoded) = tokio::time::timeout(timeout, encoding).await else {
+            state.keyframe_wanted = true;
+            out.error = Some(format!("video encode took over {timeout:?}: the encoder is rebuilt"));
+            return out;
+        };
+        match encoded {
+            Ok(Err(error)) => out.error = Some(error),
+            Ok(Ok((encoder, result, encode_ms))) => {
                 state.encoder = Some(encoder);
                 state.governor.observe_encode(encode_ms);
                 out.encode_ms = state.governor.encode_ms;
@@ -780,19 +820,15 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             }
         };
         let Decoding { key, item, task } = decoding;
-        let (decoded, hash) = match task.await {
-            Ok((Ok((decoded, reused)), ms, hash)) => {
+        let (decoded, hash) = match finish_decode(task, shared.codecs.encode_timeout).await {
+            Ok((decoded, reused, ms, hash)) => {
                 if !reused {
                     decode_ms = Some(ewma(decode_ms, ms));
                 }
                 (decoded, hash)
             }
-            Ok((Err(error), _, _)) => {
-                shared.record_encoding_error(&error);
-                continue;
-            }
             Err(error) => {
-                shared.record_encoding_error(&format!("decoder task failed: {error}"));
+                shared.record_encoding_error(&error);
                 continue;
             }
         };
@@ -873,6 +909,35 @@ mod tests {
         assert!(live.contains("0") && live.contains("3"), "{live:?}");
         assert!(!live.contains("1"), "port 0: rejected");
         assert!(!live.contains("2"), "absent: recycled under a new mid");
+    }
+
+    #[tokio::test]
+    async fn the_rtcp_reader_ends_when_its_track_drops_though_poll_never_returns() {
+        use std::sync::Arc;
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        // stands in for the track `poll` holds
+        let held = Arc::new(());
+        let reader = tokio::spawn(super::read_rtcp(
+            {
+                let held = held.clone();
+                move || {
+                    let held = held.clone();
+                    async move {
+                        let _held = held;
+                        std::future::pending::<Option<webrtc::media_stream::track_local::TrackLocalEvent>>().await
+                    }
+                }
+            },
+            dropped.clone(),
+            Arc::default(),
+            Arc::default(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!reader.is_finished());
+        // what MediaTrack's Drop does
+        dropped.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), reader).await.expect("the reader ends").unwrap();
+        assert_eq!(Arc::strong_count(&held), 1, "and lets go of the track");
     }
 
     #[test]

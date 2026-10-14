@@ -82,6 +82,8 @@ struct Path {
     ack_history: std::collections::VecDeque<(Instant, u64)>,
     /// the next bulk frame waited on the window or the pacing rate
     held: bool,
+    /// a frame went unacked for `stale_after`: the page stopped reading (see `SendGate::expire_stale`)
+    stalled: bool,
     round: RoundSamples,
     /// the bandwidth the link model last gave, and the current ack epoch: since when, and what was acked in it
     bandwidth: f64,
@@ -129,6 +131,7 @@ impl SendGate {
                 ack_history: Default::default(),
                 quiet_rtts: Default::default(),
                 held: false,
+                stalled: false,
                 round: RoundSamples::default(),
                 bandwidth: crate::allocator::INITIAL_BANDWIDTH,
                 epoch_started: Instant::now(),
@@ -177,6 +180,7 @@ impl Path {
     fn expire_lost(&mut self, now: Instant, stale_after: Duration) {
         let high_rtt = self.rtts.iter().map(|(_, rtt)| *rtt).reduce(f64::max).unwrap_or(0.0);
         let timeout = crate::secs(2.0 * high_rtt / 1000.0).max(MIN_LOSS_TIMEOUT) + ACK_DELAY;
+        self.stalled |= self.frames.values().any(|frame| now.duration_since(frame.sent_at) > stale_after);
         let lost: Vec<u64> = self
             .frames
             .iter()
@@ -399,6 +403,14 @@ impl SendGate {
         }
     }
 
+    /// Expires lost and stale frames (every allocation round, so a lost tail goes long before `stale_after`); true once
+    /// a frame went `stale_after` with no ack of it or past it: the page stopped reading.
+    pub fn expire_stale(&self) -> bool {
+        let mut path = self.path.lock();
+        path.expire_lost(Instant::now(), self.stale_after);
+        path.stalled
+    }
+
     /// Lets go of every frame (the peer is gone).
     pub fn forget_all(&self) {
         let mut path = self.path.lock();
@@ -468,8 +480,10 @@ mod tests {
         assert_eq!(path.in_flight, 200, "younger than the loss timeout: maybe still queued");
         path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT + ACK_DELAY + Duration::from_millis(1), gate.stale_after);
         assert_eq!(path.in_flight, 100, "the lossy tail is lost; the reliable frame waits (SCTP resends it)");
+        assert!(!path.stalled);
         path.expire_lost(Instant::now() + gate.stale_after + Duration::from_millis(1), gate.stale_after);
         assert_eq!(path.in_flight, 0, "unacked past stale_after: forgotten, the page stopped answering");
+        assert!(path.stalled, "and the page is judged to have stopped reading");
     }
 
     #[tokio::test]

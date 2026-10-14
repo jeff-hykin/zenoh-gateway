@@ -56,7 +56,16 @@ pub struct AllocationConfig {
     pub latency_target: Duration,
     /// how long anything unanswered (an unacked frame, an unfinished query, a quiet key) is waited on
     pub stale_after: Duration,
+    /// the longest a put (a publisher's, a control-channel put or delete, a deadman) waits on zenoh
+    pub put_timeout: Duration,
+    /// the longest answering an offer or a renegotiation may take
+    pub signalling_timeout: Duration,
 }
+
+/// What `ServerBuilder::put_timeout` defaults to.
+pub const DEFAULT_PUT_TIMEOUT: Duration = Duration::from_secs(5);
+/// What `ServerBuilder::signalling_timeout` defaults to.
+pub const DEFAULT_SIGNALLING_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How the gateway's side of each connection reaches browsers (builder options / command-line flags).
 #[derive(Debug, Clone, Default)]
@@ -187,7 +196,7 @@ struct PeerState {
     /// queryables, liveliness, matching listeners it declared through the control channel
     api: api::ApiState,
     /// events from those (queries, liveliness, matching), forwarded to the control channel
-    api_events: tokio::sync::mpsc::UnboundedSender<Value>,
+    api_events: api::Events,
 }
 
 /// PeerStates alive: a browser connection's state must go when the connection does.
@@ -212,13 +221,13 @@ impl PeerState {
         video_rate: Arc<media::VideoRate>,
         token: Option<String>,
         grant: Grant,
-    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<(Instant, Value)>) {
         let config = gateway.allocation;
         let (api_events, api_events_receiver) = tokio::sync::mpsc::unbounded_channel();
         LIVE_PEER_STATES.fetch_add(1, Ordering::Relaxed);
         let state = PeerState {
             api: api::ApiState::new(config.stale_after),
-            api_events,
+            api_events: api::Events(api_events),
             gateway: Arc::downgrade(gateway),
             token,
             grant,
@@ -419,17 +428,17 @@ impl PeerState {
             // trip first, so a put racing in behind the deadman can't undo it
             deadman.shared.tripped.store(true, Ordering::Release);
             deadman.shared.stats.lock().deadman_armed = false;
-            let result = self
+            let put = self
                 .session
                 .put(deadman.key.as_str(), deadman.bytes)
                 .priority(Priority::RealTime)
                 .congestion_control(CongestionControl::Block)
                 .reliability(Reliability::Reliable)
-                .express(true)
-                .await;
-            match result {
-                Ok(()) => info!("peer {}: deadman fired on {:?} ({reason})", self.peer_id, deadman.key),
-                Err(error) => warn!("peer {}: deadman on {:?} failed: {error}", self.peer_id, deadman.key),
+                .express(true);
+            match tokio::time::timeout(self.config.put_timeout, put).await {
+                Ok(Ok(())) => info!("peer {}: deadman fired on {:?} ({reason})", self.peer_id, deadman.key),
+                Ok(Err(error)) => warn!("peer {}: deadman on {:?} failed: {error}", self.peer_id, deadman.key),
+                Err(_) => warn!("peer {}: deadman on {:?} failed: zenoh held it past {:?}", self.peer_id, deadman.key, self.config.put_timeout),
             }
             let control = self.control.lock().clone();
             if let Some(control) = control {
@@ -475,6 +484,11 @@ impl Gateway {
             connect_config,
             udp_ports_in_use: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The longest answering an offer or a renegotiation may take (`ServerBuilder::signalling_timeout`).
+    pub fn signalling_timeout(&self) -> Duration {
+        self.allocation.signalling_timeout
     }
 
     /// A port of `udp_ports` no other connection uses and nothing else has bound, reserved for `peer_id`.
@@ -541,8 +555,20 @@ impl Gateway {
         let state = Arc::new(state);
         let mut pending = PendingPeer { gateway: Arc::downgrade(self), peer_id, state: state.clone(), connection: None, armed: true };
         let forwarder = Arc::downgrade(&state);
+        let (stale_after, mut gone) = (self.allocation.stale_after, state.gone_signal.subscribe());
         tokio::spawn(async move {
-            while let Some(event) = api_events.recv().await {
+            loop {
+                let (at, event) = tokio::select! {
+                    next = api_events.recv() => match next {
+                        Some(next) => next,
+                        None => break,
+                    },
+                    _ = gone.wait_for(|gone| *gone) => break,
+                };
+                // an event that waited this long behind a control channel that stopped draining is dropped
+                if at.elapsed() > stale_after {
+                    continue;
+                }
                 let Some(state) = forwarder.upgrade() else {
                     break;
                 };
@@ -642,7 +668,7 @@ impl Gateway {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }
-                let _ = entry.connection.close().await;
+                let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()).await;
             });
         }
     }
@@ -650,13 +676,10 @@ impl Gateway {
     /// Fires every frontend's deadmen ("shutdown") and closes its connection.
     pub async fn shutdown(&self) {
         let peers: Vec<PeerEntry> = self.peers.lock().drain().map(|(_, entry)| entry).collect();
-        for entry in &peers {
-            entry.state.fire_deadmen("shutdown").await;
-        }
+        // every frontend's at once (each put waits at most put_timeout), so many browsers don't add up
+        futures::future::join_all(peers.iter().map(|entry| entry.state.fire_deadmen("shutdown"))).await;
         // a peer whose transport is already broken can take forever to close; never hold up exit
-        for entry in peers {
-            let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()).await;
-        }
+        futures::future::join_all(peers.iter().map(|entry| tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()))).await;
     }
 }
 
@@ -668,6 +691,15 @@ async fn run_allocator(state: Weak<PeerState>) {
         ticker.tick().await;
         let Some(state) = state.upgrade() else { break };
         if state.gone.load(Ordering::Relaxed) {
+            break;
+        }
+        // a page that acked nothing of a frame for stale_after stopped reading: what is queued for it in SCTP (strict
+        // and small frames, control) can't be taken back, so it goes with its connection
+        if state.gate.expire_stale() {
+            warn!("peer {}: the page acked nothing for {:?}: dropping it", state.peer_id, state.config.stale_after);
+            if let Some(gateway) = state.gateway.upgrade() {
+                gateway.drop_peer(state.peer_id, "stopped reading");
+            }
             break;
         }
         let now = Instant::now();
@@ -698,7 +730,7 @@ impl Drop for PendingPeer {
         self.state.gone_signal.send_replace(true);
         if let (Some(connection), Ok(runtime)) = (self.connection.take(), tokio::runtime::Handle::try_current()) {
             runtime.spawn(async move {
-                let _ = connection.close().await;
+                let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, connection.close()).await;
             });
         }
     }
@@ -819,7 +851,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
                 state.send_accepted(label.id).await;
                 let (leases, key) = (state.leases.clone(), label.key.clone());
                 let blocker = move || leases.blocker(peer_id, &key);
-                publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker).await;
+                publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker, state.config.put_timeout).await;
                 None
             }
             Err(error) => Some(error),
@@ -1071,9 +1103,16 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
         {
             let (dc, state) = (dc.clone(), state.clone());
             let slow = api::SLOW_OPS.contains(&request.op.as_str());
+            // a get waits its own timeout (at most MAX_GET_TIMEOUT_MS); anything else as long as a put may
+            let limit = state.config.put_timeout + if slow { Duration::from_millis(api::MAX_GET_TIMEOUT_MS) } else { Duration::ZERO };
             let task = async move {
-                let context = api::Context { session: &state.session, access: state.access(), api: &state.api, events: state.api_events.clone() };
-                let response = api::handle(context, request).await;
+                let id = request.id.clone();
+                let context = api::Context { session: &state.session, access: state.access(), api: &state.api, events: state.api_events.clone(), put_timeout: state.config.put_timeout };
+                let response = tokio::select! {
+                    response = tokio::time::timeout(limit, api::handle(context, request)) => response.unwrap_or_else(|_| fail(&id, format!("timed out after {limit:?}"))),
+                    // a peer that left takes its pending ops with it (each held its state)
+                    () = state.wait_gone() => return,
+                };
                 let _ = dc.send_text(&response.to_string()).await;
             };
             // ops that wait on the network don't hold up pings and stats
@@ -1096,10 +1135,17 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             "listTopics" | "renegotiate" | "expireLease" => {
                 let (dc, state) = (dc.clone(), state.clone());
                 tokio::spawn(async move {
-                    let response = match request.op.as_str() {
-                        "listTopics" => handle_list_topics(&state.session, &request, &state.grant).await,
-                        "expireLease" => expire_lease(&state, &request).await,
-                        _ => handle_renegotiate(&state, &request).await,
+                    let handling = async {
+                        match request.op.as_str() {
+                            "listTopics" => handle_list_topics(&state.session, &request, &state.grant).await,
+                            "expireLease" => expire_lease(&state, &request).await,
+                            _ => handle_renegotiate(&state, &request).await,
+                        }
+                    };
+                    // a peer that left takes its pending ops with it (each held its state)
+                    let response = tokio::select! {
+                        response = handling => response,
+                        () = state.wait_gone() => return,
                     };
                     let _ = dc.send_text(&response.to_string()).await;
                 });
@@ -1156,31 +1202,42 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
     let Some(connection) = state.connection.lock().clone() else {
         return fail(&request.id, "peer is gone");
     };
-    let _negotiating = state.negotiation.lock().await;
-    let live = media::live_mids(&offer.sdp);
-    match media::renegotiate(&connection, offer, mime).await {
-        Ok((answer, track)) => {
-            // tracks whose m-line the offer dropped (their subscription closed and the page stopped the transceiver)
-            let dropped: Vec<Arc<media::MediaTrack>> = {
-                let mut tracks = state.tracks.lock();
-                let gone: Vec<String> = tracks.keys().filter(|mid| !live.contains(*mid)).cloned().collect();
-                gone.iter().filter_map(|mid| tracks.remove(mid)).collect()
-            };
-            if !dropped.is_empty() {
-                info!("peer {}: stopping {} dropped track(s), {} left", state.peer_id, dropped.len(), state.tracks.lock().len());
+    let timeout = state.config.signalling_timeout;
+    let negotiating = async {
+        let _negotiating = state.negotiation.lock().await;
+        let live = media::live_mids(&offer.sdp);
+        match media::renegotiate(&connection, offer, mime).await {
+            Ok((answer, track)) => {
+                // tracks whose m-line the offer dropped (their subscription closed and the page stopped the transceiver)
+                let dropped: Vec<Arc<media::MediaTrack>> = {
+                    let mut tracks = state.tracks.lock();
+                    let gone: Vec<String> = tracks.keys().filter(|mid| !live.contains(*mid)).cloned().collect();
+                    gone.iter().filter_map(|mid| tracks.remove(mid)).collect()
+                };
+                if !dropped.is_empty() {
+                    info!("peer {}: stopping {} dropped track(s), {} left", state.peer_id, dropped.len(), state.tracks.lock().len());
+                }
+                media::stop_tracks(&connection, &dropped).await;
+                let mid = track.map(|track| {
+                    let mid = track.mid.clone();
+                    state.tracks.lock().insert(mid.clone(), track);
+                    mid
+                });
+                ok(&request.id, json!({"sdp": answer, "mid": mid}))
             }
-            media::stop_tracks(&connection, &dropped).await;
-            let mid = track.map(|track| {
-                let mid = track.mid.clone();
-                state.tracks.lock().insert(mid.clone(), track);
-                mid
-            });
-            ok(&request.id, json!({"sdp": answer, "mid": mid}))
+            Err(error) => {
+                warn!("peer {}: renegotiation failed: {error:#}", state.peer_id);
+                fail(&request.id, format!("{error:#}"))
+            }
         }
-        Err(error) => {
-            warn!("peer {}: renegotiation failed: {error:#}", state.peer_id);
-            fail(&request.id, format!("{error:#}"))
-        }
+    };
+    // the WebRTC library answering (or a renegotiation queued behind a stuck one) never holds the page, or the lock, forever
+    tokio::select! {
+        response = tokio::time::timeout(timeout, negotiating) => response.unwrap_or_else(|_| {
+            warn!("peer {}: renegotiation took over {timeout:?}", state.peer_id);
+            fail(&request.id, format!("renegotiation timed out after {timeout:?}"))
+        }),
+        () = state.wait_gone() => fail(&request.id, "peer is gone"),
     }
 }
 

@@ -284,6 +284,26 @@ impl SubShared {
         self.closed.load(Ordering::Relaxed)
     }
 
+    /// Resolves once the subscription is closed: whatever its sender waits on (the window, the message turn) is
+    /// given up then, since that wait can depend on its own frames the page will never ack.
+    pub async fn wait_closed(&self) {
+        let _ = self.closed_signal.subscribe().wait_for(|closed| *closed).await;
+    }
+
+    /// [`SendGate::wait_bulk_turn`] until the subscription closes (None).
+    async fn bulk_turn(&self, bytes: usize) -> Option<Duration> {
+        tokio::select! {
+            on_window = self.gate.wait_bulk_turn(bytes) => Some(on_window),
+            () = self.wait_closed() => None,
+        }
+    }
+
+    /// Lets go of every frame of this channel the gate still counts in flight: the page will never ack them.
+    fn release_frames(&self) {
+        self.gate.frames_dropped(self.state.lock().unconsumed.drain(..).map(|(_, _, order, _)| order));
+        self.gate.forget(self.stream_id);
+    }
+
     /// How long this stream's data can tolerate waiting in the link's queue (seconds): its maxAge (older is useless to the
     /// page), never less than one of its messages takes to cross at `bandwidth` (a 400 KB map can't arrive sooner
     /// anyway). `None` without a maxAge: no opinion (its rate says how fast a sensor runs, not how urgent it is).
@@ -699,7 +719,7 @@ struct Unsubscribe(Arc<SubShared>);
 impl Drop for Unsubscribe {
     fn drop(&mut self) {
         self.0.close();
-        self.0.gate.forget(self.0.stream_id);
+        self.0.release_frames();
     }
 }
 
@@ -760,9 +780,11 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
         }
     }
     shared.close();
+    // its own unacked frames first: they could hold the window shut that its sender is waiting on
+    shared.release_frames();
     let _ = sender.await;
-    shared.gate.frames_dropped(shared.state.lock().unconsumed.drain(..).map(|(_, _, order, _)| order));
-    shared.gate.forget(shared.stream_id);
+    // and whatever it sent while finishing
+    shared.release_frames();
     drop(subscriber);
     debug!("unsubscribed {:?}", label.key);
 }
@@ -826,11 +848,16 @@ async fn encode(shared: &SubShared, codec: Arc<dyn MessageEncoding>, key: &str, 
     let options = shared.encode_options(quality);
     let payload = item.payload.to_bytes().into_owned();
     let (key, encoding, codecs, compress) = (key.to_owned(), item.encoding.clone(), shared.codecs.clone(), shared.compress);
-    let outcome = tokio::task::spawn_blocking(move || {
+    let timeout = codecs.encode_timeout;
+    let encoding_task = tokio::task::spawn_blocking(move || {
         let sample = EncodingSample::new(&key, &payload, &encoding);
         codecs.encode_shared(&*codec, &sample, registry::sample_hash(&sample), &options, compress)
-    })
-    .await;
+    });
+    // (a hung encoder keeps its blocking thread; the sender, and the message turn it may hold, go on without it)
+    let Ok(outcome) = tokio::time::timeout(timeout, encoding_task).await else {
+        shared.record_encoding_error(&format!("encode took over {timeout:?}: skipped"));
+        return None;
+    };
     let error = match outcome {
         Ok((Ok(encoded), reused)) => {
             // the price model learns the bytes actually sent, after compression
@@ -856,7 +883,10 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
         // picks its sample once it has the turn, so the one it sends is the newest
         let _turn = match shared.is_strict() || shared.typical_message_bytes() <= shared.gate.chunk_bytes() as f64 {
             true => None,
-            false => Some(shared.gate.message_turn().await),
+            false => tokio::select! {
+                turn = shared.gate.message_turn() => Some(turn),
+                () = shared.wait_closed() => return,
+            },
         };
         let (next, _) = shared.pick(Instant::now());
         let Some((key, item)) = next else {
@@ -926,7 +956,9 @@ impl MessageSender {
             let frame_len = frame.len();
             if strict_turn.is_none() {
                 let started = Instant::now();
-                let on_window = shared.gate.wait_bulk_turn(frame_len).await;
+                let Some(on_window) = shared.bulk_turn(frame_len).await else {
+                    return Sent::Closed;
+                };
                 let mut state = shared.state.lock();
                 state.stats.blocked_ms += on_window.as_secs_f64() * 1000.0;
                 state.stats.paced_ms += started.elapsed().saturating_sub(on_window).as_secs_f64() * 1000.0;
@@ -1072,6 +1104,29 @@ mod tests {
         assert_eq!(shared.gate.in_flight(), 100, "a seq far behind is not an ack");
         shared.ack(9);
         assert_eq!((shared.stats().unconsumed_bytes, shared.gate.in_flight()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_closed_subscriptions_sender_stops_waiting_on_its_own_unacked_frames() {
+        let shared = Arc::new(shared(r#"{"delivery": "reliable"}"#));
+        shared.gate.configure(1e6, 1e6, 10_000, false);
+        {
+            // its own reliable frames fill the window, and the page will never ack them
+            let mut state = shared.state.lock();
+            let order = shared.gate.frame_sent(shared.stream_id, 20_000, false);
+            state.unconsumed.push_back((0, 20_000, order, Instant::now()));
+        }
+        let waiting = tokio::spawn({
+            let shared = shared.clone();
+            async move { shared.bulk_turn(10_000).await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!waiting.is_finished(), "the window is full");
+        shared.close();
+        let turn = tokio::time::timeout(Duration::from_secs(1), waiting).await.expect("returns at once, not after stale_after").unwrap();
+        assert_eq!(turn, None, "closed: no turn");
+        shared.release_frames();
+        assert_eq!((shared.gate.in_flight(), shared.counts()["unacked"].as_u64()), (0, Some(0)), "the gate lets go of its frames");
     }
 
     #[test]

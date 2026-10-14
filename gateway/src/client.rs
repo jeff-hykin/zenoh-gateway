@@ -568,6 +568,18 @@ struct Inner {
     heartbeat_paused: Arc<AtomicBool>,
 }
 
+/// Removes a request's reply slot when dropped.
+struct PendingRequest<'a> {
+    requests: &'a Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+    id: u64,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.requests.lock().remove(&self.id);
+    }
+}
+
 impl Inner {
     async fn request(&self, body: Value, timeout: Duration) -> Result<Value> {
         self.request_as(self.next_id.fetch_add(1, Ordering::Relaxed), body, timeout).await
@@ -579,9 +591,10 @@ impl Inner {
         let op = body["op"].as_str().unwrap_or_default().to_owned();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.shared.requests.lock().insert(id, reply_tx);
+        // however this ends (a failed send, the timeout, the caller dropping it), the entry goes
+        let _pending = PendingRequest { requests: &self.shared.requests, id };
         self.control.send_text(&body.to_string()).await.map_err(|error| anyhow!("{op}: {error}"))?;
         let reply = tokio::time::timeout(timeout, reply_rx).await;
-        self.shared.requests.lock().remove(&id);
         let reply = reply.map_err(|_| anyhow!("{op} timed out"))?.map_err(|_| anyhow!("{op}: connection lost"))?;
         ensure!(reply["ok"] == true, "zenoh-gateway: {}", reply["error"].as_str().unwrap_or("error"));
         Ok(reply)
