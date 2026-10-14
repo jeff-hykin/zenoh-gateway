@@ -692,6 +692,12 @@ impl SubShared {
         }
     }
 
+    /// How long SCTP tries to deliver one of this channel's frames: the client opens lossy channels with
+    /// maxPacketLifeTime = maxAge, else 1 s (`defaultPacketLifetimeMs`), at most 65535 ms; `None` when reliable.
+    pub fn packet_lifetime(&self) -> Option<Duration> {
+        (!self.delivery.reliable).then(|| Duration::from_millis(self.delivery.max_age_ms.unwrap_or(1000.0).clamp(0.0, 65535.0) as u64))
+    }
+
     /// Sizes of what this subscription holds, for the stats' memory section.
     pub fn counts(&self) -> serde_json::Value {
         let state = self.state.lock();
@@ -977,7 +983,7 @@ impl MessageSender {
             message_bytes += frame_len;
             {
                 let mut state = shared.state.lock();
-                let order = shared.gate.frame_sent(shared.stream_id, frame_len + PACKET_OVERHEAD_BYTES as usize, !shared.delivery.reliable);
+                let order = shared.gate.frame_sent(shared.stream_id, frame_len + PACKET_OVERHEAD_BYTES as usize, shared.packet_lifetime());
                 state.unconsumed.push_back((frame_id, frame_len, order, Instant::now()));
                 state.stats.unconsumed_bytes += frame_len;
                 state.stats.frames_sent += 1;
@@ -1094,7 +1100,7 @@ mod tests {
         {
             let mut state = shared.state.lock();
             for seq in [5u32, 6, 9] {
-                state.unconsumed.push_back((seq, 100, shared.gate.frame_sent(0, 100, false), Instant::now()));
+                state.unconsumed.push_back((seq, 100, shared.gate.frame_sent(0, 100, None), Instant::now()));
                 state.stats.unconsumed_bytes += 100;
             }
         }
@@ -1113,7 +1119,7 @@ mod tests {
         {
             // its own reliable frames fill the window, and the page will never ack them
             let mut state = shared.state.lock();
-            let order = shared.gate.frame_sent(shared.stream_id, 20_000, false);
+            let order = shared.gate.frame_sent(shared.stream_id, 20_000, None);
             state.unconsumed.push_back((0, 20_000, order, Instant::now()));
         }
         let waiting = tokio::spawn({

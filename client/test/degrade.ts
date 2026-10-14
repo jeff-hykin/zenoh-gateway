@@ -180,6 +180,12 @@ async function runCell(cell: Cell) {
     const browser = await launch({ headless: true, args: ["--no-sandbox", "--autoplay-policy=no-user-gesture-required"] })
     try {
         const page = await browser.newPage(`http://127.0.0.1:${proxy.addr.port}/blank.html`)
+        // the page's warnings and errors (a subscription that failed to open says why only here)
+        page.addEventListener("console", (event: any) => {
+            if (["error", "warn", "warning"].includes(event.detail?.type)) {
+                console.log(`  [page ${event.detail.type}] ${String(event.detail.text).slice(0, 300)}`)
+            }
+        })
         // astral retries evaluate 5x on a 10 s deadline: long runs need more
         ;(page as any).timeout = (cell.seconds + 60) * 1000
         const windows = await page.evaluate(async (url: string, seconds: number, windowMs: number, diagnose: boolean) => {

@@ -41,6 +41,9 @@ struct Frame {
     stream: usize,
     bytes: usize,
     lossy: bool,
+    /// a lossy frame's SCTP lifetime: acked later than that (plus the ack delay), SCTP had abandoned it and the page's
+    /// cumulative ack only passed over it
+    lifetime: Option<Duration>,
     sent_at: Instant,
     /// the sender was held back by the link (not its own spacing) when it sent this
     link_limited: bool,
@@ -290,7 +293,10 @@ impl SendGate {
 
     /// A frame went to SCTP; returns its place in the frontend's send order. Every frame spends tokens, so bulk yields to
     /// what strict streams sent.
-    pub fn frame_sent(&self, stream: usize, bytes: usize, lossy: bool) -> u64 {
+    /// `lifetime`: for a lossy frame, how long SCTP tries to deliver it (its channel's maxPacketLifeTime); `None` for
+    /// a reliable one.
+    pub fn frame_sent(&self, stream: usize, bytes: usize, lifetime: Option<Duration>) -> u64 {
+        let lossy = lifetime.is_some();
         let mut path = self.path.lock();
         let now = Instant::now();
         path.refill(now);
@@ -299,7 +305,7 @@ impl SendGate {
         path.next += 1;
         let quiet = path.in_flight <= QUIET_BYTES;
         path.in_flight += bytes;
-        let frame = Frame { stream, bytes, lossy, sent_at: now, link_limited: std::mem::take(&mut path.held), latency_limited: std::mem::take(&mut path.held_by_target), quiet };
+        let frame = Frame { stream, bytes, lossy, lifetime, sent_at: now, link_limited: std::mem::take(&mut path.held), latency_limited: std::mem::take(&mut path.held_by_target), quiet };
         path.frames.insert(order, frame);
         order
     }
@@ -313,6 +319,12 @@ impl SendGate {
         let mut newest_acked: Option<Frame> = None;
         for order in orders {
             if let Some(frame) = path.remove(order) {
+                // (an abandoned lossy frame wasn't delivered: counted, a jittery link's abandoned backlog read as
+                // megabytes delivered, the estimate grew 11x the link, and more was sent to be abandoned)
+                if frame.lifetime.is_some_and(|lifetime| now.duration_since(frame.sent_at) > lifetime + ACK_DELAY) {
+                    newest = Some(order);
+                    continue;
+                }
                 path.acked_total += frame.bytes as u64;
                 let rtt = now.duration_since(frame.sent_at).as_secs_f64() * 1000.0;
                 path.rtts.push_back((now, rtt));
@@ -460,10 +472,10 @@ mod tests {
     #[test]
     fn in_flight_counts_until_the_page_acks_and_an_ack_passes_earlier_lossy_frames() {
         let gate = gate(1e6, 10_000);
-        let reliable = gate.frame_sent(1, 100, false);
-        let lost = gate.frame_sent(2, 1000, true);
-        let acked = gate.frame_sent(2, 1000, true);
-        let later = gate.frame_sent(2, 1000, true);
+        let reliable = gate.frame_sent(1, 100, None);
+        let lost = gate.frame_sent(2, 1000, Some(Duration::from_secs(1)));
+        let acked = gate.frame_sent(2, 1000, Some(Duration::from_secs(1)));
+        let later = gate.frame_sent(2, 1000, Some(Duration::from_secs(1)));
         assert_eq!(gate.in_flight(), 3100);
         gate.frames_acked([acked]);
         assert_eq!(gate.in_flight(), 1100, "the lossy frame before it was lost; the reliable one still waits for its own ack");
@@ -477,10 +489,21 @@ mod tests {
     }
 
     #[test]
+    fn a_lossy_frame_acked_past_its_lifetime_was_abandoned_not_delivered() {
+        let gate = gate(1e6, 10_000);
+        let abandoned = gate.frame_sent(1, 1000, Some(Duration::from_millis(1)));
+        std::thread::sleep(ACK_DELAY + Duration::from_millis(10));
+        let delivered = gate.frame_sent(1, 500, Some(Duration::from_secs(1)));
+        gate.frames_acked([abandoned, delivered]);
+        assert_eq!(gate.acked_total(), 500, "the page's cumulative ack passed over it; SCTP had given up on it");
+        assert_eq!(gate.in_flight(), 0);
+    }
+
+    #[test]
     fn another_channels_ack_passes_no_frame() {
         let gate = gate(1e6, 10_000);
-        gate.frame_sent(1, 1000, true);
-        let other = gate.frame_sent(2, 1000, true);
+        gate.frame_sent(1, 1000, Some(Duration::from_secs(1)));
+        let other = gate.frame_sent(2, 1000, Some(Duration::from_secs(1)));
         gate.frames_acked([other]);
         assert_eq!(gate.in_flight(), 1000, "channel 1 acks on its own timer: its frame isn't lost yet");
     }
@@ -488,8 +511,8 @@ mod tests {
     #[test]
     fn a_lost_tail_times_out() {
         let gate = gate(1e6, 10_000);
-        gate.frame_sent(1, 100, true);
-        gate.frame_sent(2, 100, false);
+        gate.frame_sent(1, 100, Some(Duration::from_secs(1)));
+        gate.frame_sent(2, 100, None);
         let mut path = gate.path.lock();
         path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT / 2, gate.stale_after);
         assert_eq!(path.in_flight, 200, "younger than the loss timeout: maybe still queued");
@@ -506,7 +529,7 @@ mod tests {
         // a window under two chunks counts as two chunks (8 KB at this rate)
         let gate = std::sync::Arc::new(gate(1e6, 2000));
         assert_eq!(gate.wait_bulk_turn(5000).await, Duration::ZERO, "an empty window always admits one frame");
-        let first = gate.frame_sent(1, 5000, false);
+        let first = gate.frame_sent(1, 5000, None);
         tokio::time::sleep(Duration::from_millis(10)).await;
         let waiting = tokio::spawn({
             let gate = gate.clone();
@@ -525,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn bulk_is_paced_at_the_rate() {
         let gate = gate(100_000.0, usize::MAX);
-        gate.frame_sent(1, 10_000, true);
+        gate.frame_sent(1, 10_000, Some(Duration::from_secs(1)));
         let started = Instant::now();
         gate.wait_bulk_turn(10_000).await;
         let waited = started.elapsed().as_secs_f64();
