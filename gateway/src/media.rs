@@ -96,6 +96,20 @@ pub struct VideoRate {
     /// how long video's packets of the latest feedback waited in a queue (ms, f64 bits): their median one-way delay
     /// above the least of the last `QUEUE_BASE_WINDOW`
     queue_delay_ms: AtomicU64,
+    /// what video delivered by the receiver's clock, see `VideoRate::delivery`
+    delivery: parking_lot::Mutex<Option<Delivery>>,
+}
+
+/// Video's delivery rate over the last `pacing::SAMPLE_SPAN` of arrivals (the receiver's clock, so feedback that comes
+/// late or in bursts doesn't move it: per allocation round, what feedback reported arrived read 0 for seconds on a
+/// 125 KB/s link while video got through), and the least queueing delay of its packets, 0 unless the bottleneck was
+/// never idle the whole span (a link with a backlog throughout delivered at its own rate).
+#[derive(Debug, Clone, Copy)]
+pub struct Delivery {
+    pub bytes_per_sec: f64,
+    pub least_queue_ms: f64,
+    /// when the feedback it came from got here
+    pub at: std::time::Instant,
 }
 
 impl VideoRate {
@@ -115,6 +129,12 @@ impl VideoRate {
         self.cap_bps.store((bytes_per_sec * 8.0).max(GCC_MIN_BPS).to_bits(), Ordering::Relaxed);
     }
 
+    /// What video delivered lately (`Delivery`), or `None` once no feedback came for a sample's span (no video, or
+    /// none got through).
+    pub fn delivery(&self) -> Option<Delivery> {
+        (*self.delivery.lock()).filter(|delivery| delivery.at.elapsed() <= crate::pacing::SAMPLE_SPAN)
+    }
+
     /// How long video waited in a queue, per the latest transport feedback (ms).
     pub fn queue_delay_ms(&self) -> f64 {
         f64::from_bits(self.queue_delay_ms.load(Ordering::Relaxed))
@@ -129,11 +149,6 @@ impl VideoRate {
     fn cap_bps(&self) -> f64 {
         f64::from_bits(self.cap_bps.load(Ordering::Relaxed))
     }
-
-    /// What the allocator granted video, bytes/s (at least GCC's floor).
-    pub fn cap_bytes_per_sec(&self) -> f64 {
-        self.cap_bps() / 8.0
-    }
 }
 
 struct ReportingEstimator {
@@ -142,6 +157,10 @@ struct ReportingEstimator {
     /// the first departure seen (one-way delays are measured from it) and (when, least one-way delay) per feedback
     epoch: Option<Instant>,
     one_way_floor: VecDeque<(Instant, f64)>,
+    /// (arrival ms on the receiver's clock, bytes, one-way delay ms) of packets that arrived, over a sample's span
+    arrivals: VecDeque<(f64, usize, f64)>,
+    /// the newest arrival (receiver's clock, ms) when feedback last reported a packet lost
+    lost_at: f64,
 }
 
 impl ReportingEstimator {
@@ -175,6 +194,33 @@ impl BandwidthEstimator for ReportingEstimator {
             sorted.sort_by(f64::total_cmp);
             let median = sorted[sorted.len() / 2];
             self.rate.queue_delay_ms.store((median - floor).max(0.0).to_bits(), Ordering::Relaxed);
+            for report in reports {
+                if let Some(arrival) = report.arrival.filter(|_| report.arrived) {
+                    let arrival_ms = arrival.as_secs_f64() * 1000.0;
+                    self.arrivals.push_back((arrival_ms, report.size, arrival_ms - report.departure.saturating_duration_since(epoch).as_secs_f64() * 1000.0));
+                }
+            }
+            let span_ms = crate::pacing::SAMPLE_SPAN.as_secs_f64() * 1000.0;
+            let newest = self.arrivals.iter().map(|(at, _, _)| *at).fold(f64::NEG_INFINITY, f64::max);
+            if reports.iter().any(|report| !report.arrived) {
+                self.lost_at = newest;
+            }
+            // (one packet from before the span is kept: it says the span is covered)
+            while self.arrivals.get(1).is_some_and(|(at, _, _)| *at <= newest - span_ms) {
+                self.arrivals.pop_front();
+            }
+            if self.arrivals.front().is_some_and(|(at, _, _)| *at <= newest - span_ms) {
+                let within = || self.arrivals.iter().filter(|(at, _, _)| *at > newest - span_ms);
+                let bytes: usize = within().map(|(_, bytes, _)| *bytes).sum();
+                // the link had no idle moment: each packet was already queued when the one before it arrived (a
+                // keyframe that queued after a quiet stretch had a high least delay, but a span half idle, and read the
+                // 125 KB/s link at 57)
+                // and lost nothing: a full drop-tail queue also carried resends and RTCP the arrivals don't count (a
+                // 1 s queue on a 125 KB/s link read 62-86 KB/s of video, and the estimate halved)
+                let busy = self.lost_at <= newest - span_ms && self.arrivals.iter().zip(self.arrivals.iter().skip(1)).all(|((previous, _, _), (at, _, one_way))| at - (one_way - floor) <= *previous);
+                let least_queue_ms = if busy { within().map(|(_, _, one_way)| one_way - floor).fold(f64::INFINITY, f64::min).max(0.0) } else { 0.0 };
+                *self.rate.delivery.lock() = Some(Delivery { bytes_per_sec: bytes as f64 / (span_ms / 1000.0), least_queue_ms, at: std::time::Instant::now() });
+            }
         }
         self.inner.on_reports(now, reports);
         self.publish();
@@ -257,8 +303,8 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
         media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: rtp_codec(mime), payload_type }, kind)?;
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0) });
-    let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new() };
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default() });
+    let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new(), arrivals: VecDeque::new(), lost_at: f64::NEG_INFINITY };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default());
     Ok((media_engine, registry, rate))
