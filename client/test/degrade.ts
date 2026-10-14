@@ -16,7 +16,9 @@ import { launch } from "jsr:@astral/astral@0.5.6"
 
 // slackMs: what the strict streams may take beyond the link's own round trip (300 ms; the floor cell's strict traffic is a
 // third of its link, and its packets queue behind each other)
-type Cell = { name: string; seconds: number; schedule: [number, number][]; delayMs: number; jitterMs: number; loss: number; slackMs?: number }
+// subscribe: which of the page's streams it subscribes (default all: cams clouds map pose tf cmd cmd_vel); serverEnv: the
+// degrade_server's load (CAMS, MAP_HZ, ...); shape cells check only the link model, tracing its stats every 250 ms
+type Cell = { name: string; seconds: number; schedule: [number, number][]; delayMs: number; jitterMs: number; loss: number; slackMs?: number; subscribe?: string[]; serverEnv?: Record<string, string>; shape?: boolean }
 const cells: Cell[] = [
     { name: "20mbit", seconds: 30, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
     { name: "8mbit", seconds: 30, schedule: [[0, 1_000_000]], delayMs: 30, jitterMs: 0, loss: 0 },
@@ -37,6 +39,15 @@ const cells: Cell[] = [
     // a 5 s Wi-Fi stall on a fast link: the estimate must not collapse with it (it once fell to 1 KB/s and took 4 min back)
     { name: "stall", seconds: 50, schedule: [[0, 2_500_000], [20, 1_000], [25, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
     { name: "step", seconds: 90, schedule: [[0, 2_500_000], [30, 125_000], [60, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
+    // page shapes the full page never produces, only when named: the link model must find and keep the link's rate
+    // when nothing is link-limited, or only video is, or data comes in rare bursts
+    ...([
+        { name: "video_only", seconds: 60, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["cams"], serverEnv: { CAMS: "1" }, shape: true },
+        { name: "video_tf", seconds: 60, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["cams", "tf"], serverEnv: { CAMS: "1" }, shape: true },
+        { name: "video_slow", seconds: 60, schedule: [[0, 125_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["cams"], serverEnv: { CAMS: "1" }, shape: true },
+        { name: "map_sparse", seconds: 80, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["map"], serverEnv: { MAP_HZ: "0.05" }, shape: true },
+        { name: "tf_only", seconds: 40, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["tf"], shape: true },
+    ] as Cell[]).filter((cell) => Deno.args.includes(cell.name)),
 ]
 const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell.name)) : cells
 const queueSeconds = 1
@@ -112,7 +123,7 @@ function shapedDirection(cell: Cell, linkStart: () => number, deliver: (data: Ui
 }
 
 async function runCell(cell: Cell) {
-    const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], stdout: "piped", stderr: "inherit" }).spawn()
+    const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], env: cell.serverEnv ?? {}, stdout: "piped", stderr: "inherit" }).spawn()
     const serverUrl = await (async () => {
         for await (const chunk of server.stdout.pipeThrough(new TextDecoderStream())) {
             const match = chunk.match(/listening on (\S+)/)
@@ -190,12 +201,13 @@ async function runCell(cell: Cell) {
         })
         // astral retries evaluate 5x on a 10 s deadline: long runs need more
         ;(page as any).timeout = (cell.seconds + 60) * 1000
-        const windows = await page.evaluate(async (url: string, seconds: number, windowMs: number, diagnose: boolean) => {
+        const windows = await page.evaluate(async (url: string, seconds: number, windowMs: number, diagnose: boolean, subscribe: string[], trace: boolean) => {
+            const wants = (group: string) => subscribe.includes(group)
             const { connect, Priority } = await import("/client/zenoh_gateway.js")
             // at 5% loss the first connect can time out opening its channels; a page retries as dim-app does
             const client = await connect(url, { heartbeatHz: 5, heartbeatMisses: 50 }).catch(() => connect(url, { heartbeatHz: 5, heartbeatMisses: 50 }))
             const started = performance.now()
-            type Window = { rtt: number[]; echo: number[]; echoSent: number; ages: Record<string, number[]>; bytes: Record<string, number>; count: Record<string, number>; alloc: Record<string, any>; bw: any; statsBytes?: number }
+            type Window = { rtt: number[]; echo: number[]; echoSent: number; ages: Record<string, number[]>; bytes: Record<string, number>; count: Record<string, number>; alloc: Record<string, any>; bw: any; statsBytes?: number; trace?: any[] }
             const windows: Window[] = []
             const current = () => (windows[Math.floor((performance.now() - started) / windowMs)] ??= { rtt: [], echo: [], echoSent: 0, ages: {}, bytes: {}, count: {}, alloc: {}, bw: null })
             const record = (key: string, message: any) => {
@@ -204,7 +216,7 @@ async function runCell(cell: Cell) {
                 window.count[key] = (window.count[key] ?? 0) + 1
                 window.bytes[key] = (window.bytes[key] ?? 0) + (message.video ? message.video.encodedBytes : message.bytes.length)
             }
-            for (const key of ["robot/cam0", "robot/cam1"]) {
+            for (const key of wants("cams") ? ["robot/cam0", "robot/cam1"] : []) {
                 let attached = false
                 client.subscribe(key, { delivery: "latest", encoding: "test-cam", bandwidthPriority: 0.1 }, (message: any) => {
                     record(key, message)
@@ -220,20 +232,23 @@ async function runCell(cell: Cell) {
                     }
                 })
             }
-            for (const key of ["robot/cloud0", "robot/cloud1"]) {
+            for (const key of wants("clouds") ? ["robot/cloud0", "robot/cloud1"] : []) {
                 client.subscribe(key, { delivery: "latest", encoding: "test-cloud", minQuality: 0.0625, bandwidthPriority: 10 }, (message: any) => record(key, message))
             }
-            client.subscribe("robot/map", { delivery: "latest", bandwidthPriority: 0 }, (message: any) => record("robot/map", message))
-            client.subscribe("robot/pose", { delivery: "latest" }, (message: any) => record("robot/pose", message))
-            client.subscribe("robot/tf", { delivery: "reliable" }, (message: any) => record("robot/tf", message))
-            client.subscribe("robot/cmd", { delivery: "latest", priority: 1 }, (message: any) => record("robot/cmd", message))
+            if (wants("map")) client.subscribe("robot/map", { delivery: "latest", bandwidthPriority: 0 }, (message: any) => record("robot/map", message))
+            if (wants("pose")) client.subscribe("robot/pose", { delivery: "latest" }, (message: any) => record("robot/pose", message))
+            if (wants("tf")) client.subscribe("robot/tf", { delivery: "reliable" }, (message: any) => record("robot/tf", message))
+            if (wants("cmd")) client.subscribe("robot/cmd", { delivery: "latest", priority: 1 }, (message: any) => record("robot/cmd", message))
             // the page's commands: sent time in the payload, echoed back by the server
-            client.subscribe("robot/cmd_vel_echo", { delivery: "latest", priority: 1 }, (message: any) => {
+            if (wants("cmd_vel")) client.subscribe("robot/cmd_vel_echo", { delivery: "latest", priority: 1 }, (message: any) => {
                 const sentAt = new DataView(message.bytes.buffer, message.bytes.byteOffset).getFloat64(0)
                 current().echo.push(performance.now() - sentAt)
             })
             const cmdVel = client.publisher("robot/cmd_vel", { delivery: "latest", priority: Priority.REAL_TIME })
             const commander = setInterval(() => {
+                if (!wants("cmd_vel")) {
+                    return
+                }
                 const payload = new Uint8Array(48)
                 new DataView(payload.buffer).setFloat64(0, performance.now())
                 cmdVel.put(payload)
@@ -265,13 +280,24 @@ async function runCell(cell: Cell) {
                     }
                 }
             }, windowMs)
+            // shape cells: the link model every 250 ms (stats replies leave on the control channel, outside the model)
+            const tracer = setInterval(async () => {
+                if (!trace) {
+                    return
+                }
+                const at = performance.now() - started
+                const bw = (await client._request({ op: "stats" }, 3000).catch(() => null))?.bandwidth
+                if (bw) {
+                    ;(current().trace ??= []).push({ at, est: bw.dataEstimateBytesPerSec, budget: bw.budgetBytesPerSec, startingUp: bw.startingUp, probingRtt: bw.probingRtt, video: bw.videoSentBytesPerSec, delivered: bw.deliveredBytesPerSec, gain: bw.gain })
+                }
+            }, 250)
             await new Promise((resolve) => setTimeout(resolve, seconds * 1000))
-            for (const timer of [commander, sampler, statsTimer]) {
+            for (const timer of [commander, sampler, statsTimer, tracer]) {
                 clearInterval(timer)
             }
             client.close()
             return windows.slice(0, Math.floor((seconds * 1000) / windowMs))
-        }, { args: [`http://127.0.0.1:${proxy.addr.port}`, cell.seconds, windowMs, diagnose] })
+        }, { args: [`http://127.0.0.1:${proxy.addr.port}`, cell.seconds, windowMs, diagnose, cell.subscribe ?? ["cams", "clouds", "map", "pose", "tf", "cmd", "cmd_vel"], cell.shape ?? false] })
         const seconds = (performance.now() - linkStartedAt) / 1000
         const rate = (offered: { bytes: number; packets: number }) => `${Math.round(offered.bytes / seconds / 100) / 10} KB/s in ${Math.round(offered.packets / seconds)} packets/s`
         console.log(`  offered: down ${rate(offeredDown)}, up ${rate(offeredUp)}`)
@@ -349,13 +375,42 @@ function check(cell: Cell, windows: any[], from: number, to: number, label: stri
     return failures
 }
 
+/** A shape cell: once settled (10 s), the estimate must not fall back toward the first guess, and startup must end. */
+function checkShape(cell: Cell, windows: any[]): string[] {
+    const trace = windows.flatMap((window) => window.trace ?? [])
+    const settled = trace.filter((point) => point.at >= 10_000)
+    const link = cell.schedule[0][1]
+    const peak = Math.max(...settled.map((point) => point.est))
+    const least = Math.min(...settled.map((point) => point.est))
+    const dips = settled.filter((point) => point.est < 0.5 * peak)
+    const startup = settled.filter((point) => point.startingUp).length
+    const probing = settled.filter((point) => point.probingRtt).length
+    const kb = (value: number) => `${Math.round(value / 1000)} KB/s`
+    console.log(`  shape      est ${kb(least)}..${kb(peak)} on ${kb(link)} | under half the peak ${dips.length}/${settled.length} samples at ${dips.map((point) => (point.at / 1000).toFixed(1)).join(" ")} s | startup ${startup}/${settled.length} | probeRTT ${probing}/${settled.length}`)
+    for (const [index, window] of windows.entries()) {
+        const points = window.trace ?? []
+        const ages = Object.entries(window.ages as Record<string, number[]>).map(([key, values]) => `${key.replace("robot/", "")} ${window.count[key]} msgs ${kb(window.bytes[key] / (windowMs / 1000))} p95 age ${round(percentile(values, 0.95))} ms`).join(", ")
+        console.log(`    ${String(index * windowMs / 1000).padStart(3)} s est ${points.map((point: any) => Math.round(point.est / 1000)).join(" ")} KB/s | startup ${points.filter((point: any) => point.startingUp).length}/${points.length} | ${ages}`)
+    }
+    const failures: string[] = []
+    if (dips.length) {
+        failures.push(`${cell.name}: estimate fell under half its peak (${kb(peak)}) ${dips.length} times after 10 s, least ${kb(least)}`)
+    }
+    if (startup === settled.length && settled.length) {
+        failures.push(`${cell.name}: still starting up after ${cell.seconds} s`)
+    }
+    return failures
+}
+
 const failures: string[] = []
 try {
     for (const cell of chosen) {
         console.log(`${cell.name}: ${JSON.stringify(cell.schedule)} B/s, ${cell.delayMs} ms each way, jitter ${cell.jitterMs} ms, loss ${cell.loss * 100}%`)
         const windows = await runCell(cell)
         await Deno.writeTextFile(`${scratch}/${cell.name}.json`, JSON.stringify({ cell, windows }))
-        if (cell.name === "step") {
+        if (cell.shape) {
+            failures.push(...checkShape(cell, windows))
+        } else if (cell.name === "step") {
             const [high, low] = [cell.schedule[0][1], cell.schedule[1][1]]
             failures.push(...check(cell, windows, 10, 30, "before", high))
             failures.push(...check(cell, windows, 40, 60, "dropped", low))

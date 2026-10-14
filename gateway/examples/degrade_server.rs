@@ -3,7 +3,7 @@
 //! - robot/cam0, robot/cam1 (CAMS of them): `test-cam`, a 640x480 moving picture at CAM_HZ (30), for video channels;
 //! - robot/cloud0, robot/cloud1: `test-cloud`, CLOUD_BYTES (200 KB) of 12-byte points at 10 Hz, quality q keeping 1 point
 //!   in round(1/q) (at most 16);
-//! - robot/map: raw MAP_BYTES (400 KB) at 1 Hz; robot/pose 200 B at 20 Hz; robot/tf 200 B at 100 Hz; robot/cmd 64 B at
+//! - robot/map: raw MAP_BYTES (400 KB) at MAP_HZ (1); robot/pose 200 B at 20 Hz; robot/tf 200 B at 100 Hz; robot/cmd 64 B at
 //!   20 Hz;
 //! - robot/cmd_vel_echo: every robot/cmd_vel put, republished as is (the page's commands, round trip).
 
@@ -96,11 +96,11 @@ async fn main() -> Result<()> {
     let running = Server::builder().session(session.clone()).serve_dir(serve_dir).encoding(Cam).encoding(Cloud).build().await?.bind("127.0.0.1:0").await?;
     let env = |name: &str, default: f64| std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default);
     let (cloud, map, cam_hz) = (env("CLOUD_BYTES", 200_000.0) as usize, env("MAP_BYTES", 400_000.0) as usize, env("CAM_HZ", 30.0));
-    let cams = env("CAMS", 2.0) as usize;
+    let (cams, map_hz) = (env("CAMS", 2.0) as usize, env("MAP_HZ", 1.0));
     for key in ["robot/cam0", "robot/cam1"].into_iter().take(cams) {
         publish(&session, key, 4, cam_hz);
     }
-    for (key, bytes, hz) in [("robot/cloud0", cloud, 10.0), ("robot/cloud1", cloud, 10.0), ("robot/map", map, 1.0), ("robot/pose", 200, 20.0), ("robot/tf", 200, 100.0), ("robot/cmd", 64, 20.0)] {
+    for (key, bytes, hz) in [("robot/cloud0", cloud, 10.0), ("robot/cloud1", cloud, 10.0), ("robot/map", map, map_hz), ("robot/pose", 200, 20.0), ("robot/tf", 200, 100.0), ("robot/cmd", 64, 20.0)] {
         publish(&session, key, bytes, hz);
     }
     let echo = session.clone();
