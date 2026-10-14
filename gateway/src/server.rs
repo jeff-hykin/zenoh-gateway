@@ -68,6 +68,7 @@ pub struct ServerBuilder {
     serve_dir: Option<PathBuf>,
     max_bandwidth_bytes_per_sec: Option<f64>,
     latency_target: Duration,
+    stale_after: Duration,
     encodings: Vec<Arc<dyn MessageEncoding>>,
     authorize: Option<Arc<Authorize>>,
     lease_groups: HashMap<String, Vec<String>>,
@@ -86,6 +87,7 @@ impl Default for ServerBuilder {
             serve_dir: None,
             max_bandwidth_bytes_per_sec: None,
             latency_target: crate::allocator::DEFAULT_LATENCY_TARGET,
+            stale_after: crate::allocator::DEFAULT_STALE_AFTER,
             encodings: Vec::new(),
             authorize: None,
             lease_groups: HashMap::new(),
@@ -143,6 +145,14 @@ impl ServerBuilder {
     /// never less than the path's own round trip. A subscription's `maxAge` tightens it.
     pub fn latency_target(mut self, latency: Duration) -> Self {
         self.latency_target = latency;
+        self
+    }
+
+    /// How long the gateway waits on anything a browser or zenoh leaves unanswered before forgetting it (default 60 s):
+    /// a frame the page never acks, a query it never finalizes, a wildcard subscription's key whose publisher went
+    /// quiet. Nothing waits forever.
+    pub fn stale_after(mut self, after: Duration) -> Self {
+        self.stale_after = after;
         self
     }
 
@@ -259,6 +269,7 @@ impl ServerBuilder {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
         ensure!(!self.latency_target.is_zero(), "latency target must be more than 0");
+        ensure!(!self.stale_after.is_zero(), "stale_after must be more than 0");
         self.video_policy.validate()?;
         let codecs = EncodingRegistry::new(self.encodings)?.with_video(self.video_encoders, self.video_policy);
         let mut config = self.zenoh_config.unwrap_or_default();
@@ -276,7 +287,7 @@ impl ServerBuilder {
         };
         ensure!(self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0), "the UDP port range must be non-empty and above 0");
         let leases = Leases::new(self.lease_groups);
-        let gateway = Gateway::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, latency_target: self.latency_target }, leases, self.connect_config);
+        let gateway = Gateway::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, latency_target: self.latency_target, stale_after: self.stale_after }, leases, self.connect_config);
         let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {
             ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");

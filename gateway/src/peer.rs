@@ -54,6 +54,8 @@ pub struct AllocationConfig {
     pub max_bandwidth: Option<f64>,
     /// what data may take to reach the page while the path is faster than that (`allocator::LinkModel::window`)
     pub latency_target: Duration,
+    /// how long anything unanswered (an unacked frame, an unfinished query, a quiet key) is waited on
+    pub stale_after: Duration,
 }
 
 /// How the gateway's side of each connection reaches browsers (builder options / command-line flags).
@@ -215,7 +217,7 @@ impl PeerState {
         let (api_events, api_events_receiver) = tokio::sync::mpsc::unbounded_channel();
         LIVE_PEER_STATES.fetch_add(1, Ordering::Relaxed);
         let state = PeerState {
-            api: api::ApiState::default(),
+            api: api::ApiState::new(config.stale_after),
             api_events,
             gateway: Arc::downgrade(gateway),
             token,
@@ -238,7 +240,7 @@ impl PeerState {
             tracks: Mutex::new(HashMap::new()),
             video_rate,
             config,
-            gate: Arc::default(),
+            gate: Arc::new(SendGate::new(config.stale_after)),
             link: Mutex::new(LinkModel::default()),
             acked_total: AtomicU64::new(0),
             video_received: AtomicU64::new(0),

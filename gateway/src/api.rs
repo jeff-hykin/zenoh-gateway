@@ -52,12 +52,11 @@ pub(crate) const SLOW_OPS: &[&str] = &["get", "livelinessGet", "matchingStatus"]
 const DEFAULT_GET_TIMEOUT_MS: u64 = 5000;
 /// A page's timeoutMs is capped: the query kept the peer alive until it ended.
 const MAX_GET_TIMEOUT_MS: u64 = 60_000;
-/// A query the frontend never finalizes is answered as final after this (the asker has long given up).
-const QUERY_LIFETIME: Duration = Duration::from_secs(120);
 
 /// One frontend's declared entities.
-#[derive(Default)]
 pub(crate) struct ApiState {
+    /// a query the frontend never finalizes is answered as final after this (`ServerBuilder::stale_after`)
+    stale_after: Duration,
     /// shared with queryable callbacks, which number the queries they receive
     next_id: Arc<AtomicU64>,
     queryables: Mutex<HashMap<u64, Queryable<()>>>,
@@ -76,6 +75,18 @@ enum MatchingEntity {
 }
 
 impl ApiState {
+    pub(crate) fn new(stale_after: Duration) -> Self {
+        ApiState {
+            stale_after,
+            next_id: Default::default(),
+            queryables: Default::default(),
+            queries: Default::default(),
+            tokens: Default::default(),
+            liveliness_subscribers: Default::default(),
+            matching: Default::default(),
+        }
+    }
+
     fn next(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -104,7 +115,8 @@ impl ApiState {
     /// Called on every API request and every allocation round (a frontend that stopped making requests kept its
     /// unfinished queries forever).
     pub(crate) fn reap_queries(&self) {
-        self.queries.lock().retain(|_, (_, since)| since.elapsed() < QUERY_LIFETIME);
+        let stale_after = self.stale_after;
+        self.queries.lock().retain(|_, (_, since)| since.elapsed() < stale_after);
     }
 }
 

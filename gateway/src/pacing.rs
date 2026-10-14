@@ -97,6 +97,8 @@ struct Path {
 }
 
 pub struct SendGate {
+    /// a frame the page hasn't acked this long is forgotten (see `Path::expire_lost`)
+    stale_after: Duration,
     /// strict streams currently sending a message
     strict_busy: AtomicUsize,
     path: Mutex<Path>,
@@ -108,8 +110,15 @@ pub struct SendGate {
 
 impl Default for SendGate {
     fn default() -> Self {
+        SendGate::new(crate::allocator::DEFAULT_STALE_AFTER)
+    }
+}
+
+impl SendGate {
+    pub fn new(stale_after: Duration) -> Self {
         let (rate, window) = crate::allocator::LinkModel::default().pacing(None);
         SendGate {
+            stale_after,
             strict_busy: AtomicUsize::new(0),
             path: Mutex::new(Path {
                 frames: BTreeMap::new(),
@@ -163,10 +172,17 @@ impl Path {
     /// (queueing included, so a frame waiting in a queue isn't counted lost) plus the page's ack delay, never will be.
     /// Not only while the page is silent: other channels' acks keep coming, and a channel that went quiet after losing
     /// its last frame held the window full and stalled every stream.
-    fn expire_lost(&mut self, now: Instant) {
+    /// Also forgets any frame, reliable ones too, the page hasn't acked in `stale_after`: a page that stopped acking
+    /// without disconnecting must not hold the window (and every bulk sender) shut forever.
+    fn expire_lost(&mut self, now: Instant, stale_after: Duration) {
         let high_rtt = self.rtts.iter().map(|(_, rtt)| *rtt).reduce(f64::max).unwrap_or(0.0);
         let timeout = crate::secs(2.0 * high_rtt / 1000.0).max(MIN_LOSS_TIMEOUT) + ACK_DELAY;
-        let lost: Vec<u64> = self.frames.iter().filter(|(_, frame)| frame.lossy && now.duration_since(frame.sent_at) > timeout).map(|(order, _)| *order).collect();
+        let lost: Vec<u64> = self
+            .frames
+            .iter()
+            .filter(|(_, frame)| (frame.lossy && now.duration_since(frame.sent_at) > timeout) || now.duration_since(frame.sent_at) > stale_after)
+            .map(|(order, _)| *order)
+            .collect();
         for order in lost {
             self.remove(order);
         }
@@ -197,6 +213,11 @@ impl SendGate {
 
     pub fn chunk_bytes(&self) -> usize {
         self.chunk_bytes.load(Ordering::Relaxed)
+    }
+
+    /// How long an unanswered frame (or anything else of this frontend's) is waited on: `ServerBuilder::stale_after`.
+    pub fn stale_after(&self) -> Duration {
+        self.stale_after
     }
 
     /// Sizes of what the gate holds, for the stats' memory section.
@@ -350,7 +371,7 @@ impl SendGate {
             let wait = {
                 let mut path = self.path.lock();
                 let now = Instant::now();
-                path.expire_lost(now);
+                path.expire_lost(now, self.stale_after);
                 path.refill(now);
                 // (at least two chunks: one on the wire, one queued behind it)
                 let window = path.window.max(2 * self.chunk_bytes());
@@ -443,10 +464,12 @@ mod tests {
         gate.frame_sent(1, 100, true);
         gate.frame_sent(2, 100, false);
         let mut path = gate.path.lock();
-        path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT / 2);
+        path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT / 2, gate.stale_after);
         assert_eq!(path.in_flight, 200, "younger than the loss timeout: maybe still queued");
-        path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT + ACK_DELAY + Duration::from_millis(1));
-        assert_eq!(path.in_flight, 100, "the lossy tail is lost; the reliable frame never is (SCTP resends it)");
+        path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT + ACK_DELAY + Duration::from_millis(1), gate.stale_after);
+        assert_eq!(path.in_flight, 100, "the lossy tail is lost; the reliable frame waits (SCTP resends it)");
+        path.expire_lost(Instant::now() + gate.stale_after + Duration::from_millis(1), gate.stale_after);
+        assert_eq!(path.in_flight, 0, "unacked past stale_after: forgotten, the page stopped answering");
     }
 
     #[tokio::test]

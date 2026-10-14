@@ -204,6 +204,8 @@ pub const INITIAL_BANDWIDTH: f64 = 64_000.0;
 /// A 500 kbit/s link: on a path slower than the latency target, faster links may keep more in flight by the square root
 /// of their speed over this.
 pub const SLOW_LINK: f64 = 62_500.0;
+/// What `ServerBuilder::stale_after` defaults to.
+pub const DEFAULT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 /// What `ServerBuilder::latency_target` defaults to.
 pub const DEFAULT_LATENCY_TARGET: std::time::Duration = std::time::Duration::from_millis(300);
 

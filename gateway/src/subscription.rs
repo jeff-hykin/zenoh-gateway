@@ -35,9 +35,6 @@ const VIDEO_PRICE_HEADROOM: f64 = 1.5;
 const RELIABLE_MAX_BACKLOG: Duration = Duration::from_secs(2);
 /// Streams at this zenoh priority or more urgent (2 INTERACTIVE_HIGH, 1 REAL_TIME) bypass allocation and pacing.
 const STRICT_PRIORITY: u8 = 2;
-/// A key (of a wildcard subscription) whose publisher went quiet this long, with nothing queued, is forgotten: kept,
-/// every key a wildcard ever matched stayed for the subscription's life.
-const KEY_IDLE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,7 +99,8 @@ struct KeyQueue {
     /// arrivals since the allocator last looked, and the resulting source rate
     arrivals: u32,
     rate_hz: f64,
-    /// the latest sample's arrival: a key quiet for `KEY_IDLE` with nothing queued is forgotten
+    /// the latest sample's arrival: a key quiet for `stale_after` with nothing queued is forgotten (kept, every key a
+    /// wildcard subscription ever matched stayed for its life)
     last_arrival: Option<Instant>,
 }
 
@@ -120,8 +118,9 @@ struct SubState {
     keys: HashMap<String, KeyQueue>,
     next_seq: u32,
     stats: SubStats,
-    /// (frameId, frame bytes, place in the frontend's send order) in send order, until the page acks a frameId at or past it
-    unconsumed: VecDeque<(u32, usize, u64)>,
+    /// (frameId, frame bytes, place in the frontend's send order, when sent) in send order, until the page acks a frameId at
+    /// or past it (or `stale_after` passes)
+    unconsumed: VecDeque<(u32, usize, u64, Instant)>,
     allocation: Allocation,
     /// the link model is probing for bandwidth this round (see `apply`)
     probing: bool,
@@ -386,8 +385,13 @@ impl SubShared {
     /// Measures rates since the previous call and describes what this stream wants.
     pub fn usage(&self, interval_secs: f64) -> Usage {
         let mut state = self.state.lock();
-        let now = Instant::now();
-        state.keys.retain(|_, queue| !queue.items.is_empty() || queue.last_arrival.is_some_and(|at| now.duration_since(at) < KEY_IDLE));
+        let (now, stale_after) = (Instant::now(), self.gate.stale_after());
+        state.keys.retain(|_, queue| !queue.items.is_empty() || queue.last_arrival.is_some_and(|at| now.duration_since(at) < stale_after));
+        // frames the page never acked within stale_after (the gate forgot them too)
+        while state.unconsumed.front().is_some_and(|(_, _, _, sent)| now.duration_since(*sent) > stale_after) {
+            let (_, len, _, _) = state.unconsumed.pop_front().unwrap();
+            state.stats.unconsumed_bytes -= len;
+        }
         let mut max_hz = 0.0;
         for queue in state.keys.values_mut() {
             queue.rate_hz = ewma(queue.rate_hz, queue.arrivals as f64 / interval_secs.max(1e-3));
@@ -638,7 +642,7 @@ impl SubShared {
     fn ack(&self, frame_id: u32) {
         let mut state = self.state.lock();
         let mut acked = Vec::new();
-        while let Some(&(sent_frame_id, len, order)) = state.unconsumed.front() {
+        while let Some(&(sent_frame_id, len, order, _)) = state.unconsumed.front() {
             if !seq_at_or_before(sent_frame_id, frame_id) {
                 break;
             }
@@ -757,7 +761,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session
     }
     shared.close();
     let _ = sender.await;
-    shared.gate.frames_dropped(shared.state.lock().unconsumed.drain(..).map(|(_, _, order)| order));
+    shared.gate.frames_dropped(shared.state.lock().unconsumed.drain(..).map(|(_, _, order, _)| order));
     shared.gate.forget(shared.stream_id);
     drop(subscriber);
     debug!("unsubscribed {:?}", label.key);
@@ -942,7 +946,7 @@ impl MessageSender {
             {
                 let mut state = shared.state.lock();
                 let order = shared.gate.frame_sent(shared.stream_id, frame_len + PACKET_OVERHEAD_BYTES as usize, !shared.delivery.reliable);
-                state.unconsumed.push_back((frame_id, frame_len, order));
+                state.unconsumed.push_back((frame_id, frame_len, order, Instant::now()));
                 state.stats.unconsumed_bytes += frame_len;
                 state.stats.frames_sent += 1;
                 state.stats.bytes_sent += frame_len as u64;
@@ -1058,7 +1062,7 @@ mod tests {
         {
             let mut state = shared.state.lock();
             for seq in [5u32, 6, 9] {
-                state.unconsumed.push_back((seq, 100, shared.gate.frame_sent(0, 100, false)));
+                state.unconsumed.push_back((seq, 100, shared.gate.frame_sent(0, 100, false), Instant::now()));
                 state.stats.unconsumed_bytes += 100;
             }
         }
