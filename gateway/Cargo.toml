@@ -18,8 +18,8 @@ include = ["/src/**/*.rs", "/Cargo.toml"]
 zenoh = "=1.6.2"
 zenoh-ext = { version = "=1.6.2", features = ["unstable"] }
 # webrtc-rs with small fixes, renamed so they reach crates that depend on zenoh-gateway (github.com/jeff-hykin/webrtc-rs-zenoh-web)
-webrtc = { package = "zenoh-web-webrtc", version = "=0.21.0-zw.4" }
-rtc = { package = "zenoh-web-rtc", version = "=0.21.0-zw.4" }
+webrtc = { package = "zenoh-web-webrtc", version = "=0.21.0-zw.5" }
+rtc = { package = "zenoh-web-rtc", version = "=0.21.0-zw.5" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
