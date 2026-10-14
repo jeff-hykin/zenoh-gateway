@@ -6,7 +6,7 @@ use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 
 /// Encoded results kept for sharing (they are small).
@@ -41,9 +41,11 @@ impl<T> Drop for SettleOnPanic<'_, T> {
 }
 
 /// A tiny FIFO of in-flight or finished results; callers for the same key wait on one cell, so it computes once.
+/// Finished results are dropped once older than the sharing window (`sweep`): kept until evicted, the last frames of a
+/// camera nobody watches any more held 20 MB for good.
 struct WorkCache<K, T> {
     capacity: usize,
-    entries: Mutex<VecDeque<(K, Arc<Cell<T>>)>>,
+    entries: Mutex<VecDeque<(K, Arc<Cell<T>>, Instant)>>,
 }
 
 impl<K: PartialEq, T> WorkCache<K, T> {
@@ -57,11 +59,11 @@ impl<K: PartialEq, T> WorkCache<K, T> {
     fn get_or_compute(&self, key: K, timeout: Duration, compute: impl FnOnce() -> Result<T, String>) -> (Result<Arc<T>, String>, bool) {
         let (cell, shared) = {
             let mut entries = self.entries.lock();
-            match entries.iter().find(|(existing, _)| *existing == key) {
-                Some((_, cell)) => (cell.clone(), true),
+            match entries.iter().find(|(existing, _, _)| *existing == key) {
+                Some((_, cell, _)) => (cell.clone(), true),
                 None => {
                     let cell = Arc::new(Cell { result: Mutex::new(None), ready: Condvar::new() });
-                    entries.push_back((key, cell.clone()));
+                    entries.push_back((key, cell.clone(), Instant::now()));
                     while entries.len() > self.capacity {
                         entries.pop_front();
                     }
@@ -82,10 +84,21 @@ impl<K: PartialEq, T> WorkCache<K, T> {
             Some(result) => (result, true),
             None => {
                 drop(result);
-                self.entries.lock().retain(|(_, other)| !Arc::ptr_eq(other, &cell));
+                self.entries.lock().retain(|(_, other, _)| !Arc::ptr_eq(other, &cell));
                 (Err(format!("gave up on another frontend's encode after {timeout:?}")), true)
             }
         }
+    }
+}
+
+impl<K, T> WorkCache<K, T> {
+    /// Drops finished results older than `window` (one still being computed stays: its waiters hold it anyway).
+    fn sweep(&self, window: Duration) {
+        self.entries.lock().retain(|(_, cell, at)| at.elapsed() < window || cell.result.lock().is_none());
+    }
+
+    fn len(&self) -> usize {
+        self.entries.lock().len()
     }
 }
 
@@ -192,6 +205,18 @@ impl EncodingRegistry {
     }
 
     /// Blocking: decodes `sample` for `channel` (or reuses another frontend's decode of it). `true` = reused.
+    /// Drops shared decodes and encodes older than `encode_timeout`: frontends sharing a sample's work ask for it within
+    /// that (a result is only worth sharing while the sample is current). Called every second by the gateway.
+    pub fn sweep(&self) {
+        self.decoded.sweep(self.encode_timeout);
+        self.encoded.sweep(self.encode_timeout);
+    }
+
+    /// (decoded, encoded) results held for sharing, for the stats' memory section.
+    pub fn cached(&self) -> (usize, usize) {
+        (self.decoded.len(), self.encoded.len())
+    }
+
     pub fn decode_shared(&self, codec: &dyn MessageEncoding, sample: &EncodingSample<'_>, hash: u64, channel: Channel) -> (Result<Arc<DecodedFrame>, String>, bool) {
         self.decoded.get_or_compute((codec.name().to_owned(), channel.kind(), hash), self.encode_timeout, || codec.decode(sample, channel).map_err(|error| format!("{error:#}")))
     }
@@ -240,6 +265,17 @@ mod tests {
         let duplicate = EncodingRegistry::new([Arc::new(Named("custom")) as Arc<dyn MessageEncoding>, Arc::new(Named("custom"))]).err().unwrap();
         assert!(duplicate.to_string().contains("registered twice"), "{duplicate}");
         assert!(EncodingRegistry::new([Arc::new(Named("")) as Arc<dyn MessageEncoding>]).is_err());
+    }
+
+    #[test]
+    fn finished_results_expire() {
+        let cache: WorkCache<u32, u32> = WorkCache::new(8);
+        let _ = cache.get_or_compute(1, DEFAULT_ENCODE_TIMEOUT, || Ok(10));
+        cache.sweep(Duration::from_secs(60));
+        assert_eq!(cache.len(), 1, "young: kept for sharing");
+        std::thread::sleep(Duration::from_millis(20));
+        cache.sweep(Duration::from_millis(10));
+        assert_eq!(cache.len(), 0, "older than the window: dropped");
     }
 
     #[test]

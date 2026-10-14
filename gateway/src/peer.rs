@@ -287,6 +287,7 @@ impl PeerState {
             "gate": self.gate.counts(),
             "api": self.api.counts(),
             "livePeerStates": live_peer_states(),
+            "sharedResults": { "decoded": self.codecs.cached().0, "encoded": self.codecs.cached().1 },
         })
     }
 
@@ -474,9 +475,20 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(session: zenoh::Session, codecs: EncodingRegistry, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
+        let codecs = Arc::new(codecs);
+        // the shared decode/encode results expire whether or not any frontend is left to ask
+        let weak = Arc::downgrade(&codecs);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let Some(codecs) = weak.upgrade() else { break };
+                codecs.sweep();
+            }
+        });
         Arc::new(Gateway {
             session,
-            codecs: Arc::new(codecs),
+            codecs,
             allocation,
             peers: Mutex::new(HashMap::new()),
             next_peer: AtomicU64::new(1),
