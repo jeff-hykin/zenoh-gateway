@@ -191,6 +191,9 @@ pub struct LinkModel {
     startup_level: f64,
     #[serde(skip)]
     stalled_rounds: u32,
+    /// when startup's estimate last grew by `STARTUP_GROWTH`
+    #[serde(skip)]
+    grew_at: Option<std::time::Instant>,
     #[serde(skip)]
     cycle: usize,
     /// the bandwidth when the current round began (what a probe must beat)
@@ -199,9 +202,6 @@ pub struct LinkModel {
     /// the last probe found more: probe again at startup's gain
     #[serde(skip)]
     probing_up: bool,
-    /// (when, bytes/s) video delivered over the last `pacing::SAMPLE_SPAN`
-    #[serde(skip)]
-    video_samples: std::collections::VecDeque<(std::time::Instant, f64)>,
     #[serde(skip)]
     round_started: Option<std::time::Instant>,
     /// something in this round waited on the window or pacing
@@ -261,21 +261,29 @@ impl Default for LinkModel {
             probe_rtt_until: None,
             startup_level: 0.0,
             stalled_rounds: 0,
+            grew_at: None,
             cycle: 0,
             probe_level: 0.0,
             probing_up: false,
-            video_samples: Default::default(),
             round_started: None,
             round_link_limited: false,
         }
     }
 }
 
+/// Video's delivery was held back by the link: every packet of its sample waited in the bottleneck's queue
+/// (`queue_delay_ms`, the least one-way queueing delay of `media::Delivery`) over a quarter of the latency target, where
+/// video's queue brake stops calling it empty. A link with a backlog throughout delivers at its own rate. Not GCC braking: after its
+/// cut GCC holds video far under the link for seconds, and counted as the link's rate those rounds took a 125 KB/s
+/// link's estimate to 2 KB/s (video_slow).
+pub fn video_held_by_link(queue_delay_ms: f64, latency_target: std::time::Duration) -> bool {
+    queue_delay_ms > latency_target.as_secs_f64() * 1000.0 / 4.0
+}
+
 impl LinkModel {
-    /// One round of `secs`: the gate's samples, what video got through (bytes/s, added to each data sample; on its own
-    /// when no data was acked: a page with only video otherwise never measured the link, and its video stayed at the
-    /// first guess's 1.5 Mbit/s), whether video was held back by the link (its own congestion control below its grant),
-    /// and what was delivered in all (bytes/s, reported).
+    /// One round of `secs`: the gate's samples, what video got through (bytes/s over a sample's span, `media::Delivery`;
+    /// added to each data sample, on its own when no data was acked: a page with only video otherwise never measured the link, and its video stayed at the
+    /// first guess's 1.5 Mbit/s), whether video was held back by the link (queued there, `video_held_by_link`), and what was delivered in all (bytes/s, reported).
     pub fn update(&mut self, now: std::time::Instant, secs: f64, round: crate::pacing::RoundSamples, video_bytes_per_sec: f64, video_link_limited: bool, delivered_bytes_per_sec: f64) {
         if secs <= 0.0 {
             return;
@@ -285,6 +293,7 @@ impl LinkModel {
             self.typical_rtt_ms = round.typical_rtt_ms;
         }
         self.delivered_bytes_per_sec = delivered_bytes_per_sec;
+        let samples_before = self.samples.len() + self.target_limited_samples.len();
         // (rounds spent re-measuring the round trip hold the window down on purpose: they say nothing about the link)
         let link_limited = round.link_limited_rate.is_some() && !self.probing_rtt;
         if let Some(rate) = round.link_limited_rate.filter(|_| link_limited) {
@@ -293,16 +302,12 @@ impl LinkModel {
         if let Some(rate) = round.latency_limited_rate.filter(|_| !self.probing_rtt) {
             self.target_limited_samples.push_back((now, rate + video_bytes_per_sec));
         }
-        if let Some(rate) = round.app_limited_rate.map(|rate| rate + video_bytes_per_sec).filter(|rate| *rate > self.bandwidth_bytes_per_sec) {
+        // (data under its share while video queues at the link: the link was busy all the same, and what got through is its rate)
+        if let Some(rate) = round.app_limited_rate.map(|rate| rate + video_bytes_per_sec).filter(|rate| video_link_limited || *rate > self.bandwidth_bytes_per_sec) {
             self.samples.push_back((now, rate));
         }
-        // video alone: its delivery averaged over a sample's span (transport feedback comes in batches)
-        self.video_samples.push_back((now, video_bytes_per_sec));
-        while self.video_samples.front().is_some_and(|(at, _)| now.duration_since(*at) > crate::pacing::SAMPLE_SPAN) {
-            self.video_samples.pop_front();
-        }
         let no_data_sample = round.link_limited_rate.is_none() && round.app_limited_rate.is_none() && round.latency_limited_rate.is_none();
-        let video_rate = self.video_samples.iter().map(|(_, rate)| *rate).sum::<f64>() / self.video_samples.len().max(1) as f64;
+        let video_rate = video_bytes_per_sec;
         let video_only = no_data_sample && video_rate > 0.0;
         if video_only && (video_link_limited || video_rate > self.bandwidth_bytes_per_sec) {
             self.samples.push_back((now, video_rate));
@@ -322,9 +327,13 @@ impl LinkModel {
         // round it holds back isn't a link-limited sample, and a 250 kbit/s link never left startup's first guess)
         // (and, starting up, rounds of video alone: offered startup's 2.89x, a camera that stops growing is the link's
         // (or its own) limit either way; held to GCC braking alone, video on a slow link never left startup)
-        self.round_link_limited |= link_limited || (self.starting_up && (round.window_waited || video_only)) || (video_only && video_link_limited);
+        self.round_link_limited |= link_limited || video_link_limited || (self.starting_up && (round.window_waited || video_only));
         self.extra_acked_samples.push_back((now, round.extra_acked));
-        for samples in [&mut self.samples, &mut self.extra_acked_samples, &mut self.target_limited_samples] {
+        // old rates age out only when a new one comes in, as BBR's max filter: aging by time alone, the falling samples
+        // of a queue draining (129 down to 24 KB/s) took the estimate down one by one to the last, and it stood there
+        // while GCC held video at its floor and nothing more was sampled (video_slow)
+        let sampled = self.samples.len() + self.target_limited_samples.len() > samples_before;
+        for samples in [&mut self.samples, &mut self.target_limited_samples].into_iter().filter(|_| sampled).chain([&mut self.extra_acked_samples]) {
             while samples.front().is_some_and(|(at, _)| now.duration_since(*at) > window) {
                 samples.pop_front();
             }
@@ -340,11 +349,15 @@ impl LinkModel {
                 self.bandwidth_bytes_per_sec = measured.max(INITIAL_BANDWIDTH);
             }
             if measured >= STARTUP_GROWTH * self.startup_level {
-                (self.startup_level, self.stalled_rounds) = (measured, 0);
+                (self.startup_level, self.stalled_rounds, self.grew_at) = (measured, 0, Some(now));
             } else if new_round && self.round_link_limited && measured > 0.0 {
                 self.stalled_rounds += 1;
             }
-            if self.stalled_rounds >= STARTUP_ROUNDS {
+            // (or once it hasn't grown for as long as the bandwidth is remembered, held back or not: BBR counts only
+            // link-limited rounds, and a page under the link (a camera plus tf, a 400 KB map every 20 s) never left
+            // startup, offered 2.89x the estimate with ProbeRTT held off; a probe that finds more probes at startup's gain)
+            let grown_lately = self.grew_at.is_none_or(|at| now.duration_since(at) < window);
+            if self.stalled_rounds >= STARTUP_ROUNDS || (measured > 0.0 && !grown_lately) {
                 // done: the drain round comes first
                 (self.starting_up, self.cycle) = (false, 1);
                 if measured > 0.0 {
@@ -356,9 +369,13 @@ impl LinkModel {
                 self.bandwidth_bytes_per_sec = measured;
             }
             if new_round {
-                // a probe that found 25% more probes again, at startup's gain (BBR v2's probe-up, exponential): after a
-                // drop and recovery the estimate climbs in seconds, not at 25% per eight rounds
-                let found_more = self.cycle == 0 && measured >= STARTUP_GROWTH * self.probe_level;
+                // a probe that found more probes again, at startup's gain (BBR v2's probe-up, exponential): after a
+                // drop and recovery the estimate climbs in seconds, not at 25% per eight rounds. More is half what the
+                // probe asked beyond the estimate (at most startup's 25%): a 1.25x probe measures a few % under 1.25x (a
+                // sample is padded by the ack delay), and asked to find all 25% it never probed up (est 929 of 2500 KB/s
+                // 20 s after the step back); a full link measures it at 1x
+                let found = (1.0 + (self.gain - 1.0) / 2.0).min(STARTUP_GROWTH);
+                let found_more = self.cycle == 0 && measured >= found * self.probe_level;
                 self.probing_up = found_more;
                 if !found_more {
                     self.cycle = (self.cycle + 1) % PROBE_GAINS.len();
@@ -589,6 +606,26 @@ mod tests {
     }
 
     #[test]
+    fn a_link_that_comes_back_is_found_in_seconds() {
+        // step: 2.5 MB/s, 125 KB/s for 30 s, 2.5 MB/s again. A rate sample reads a few % under what got through (padded
+        // by the ack delay), so a 1.25x probe measured 1.23x, never the 25% that probes up: 25% per eight rounds, est
+        // 929 of 2500 KB/s 20 s after
+        let mut model = LinkModel::default();
+        let start = Instant::now();
+        let mut estimates = vec![];
+        for round in 0..140u64 {
+            let now = start + Duration::from_millis(ROUND_MS * round);
+            let capacity = if (40..90).contains(&round) { 125_000.0 } else { 2_500_000.0 };
+            let (rate, _) = model.pacing(None);
+            let delivered = rate.min(capacity) * 0.97;
+            model.update(now, ROUND_MS as f64 / 1000.0, sample(delivered, true, 20.0), 0.0, false, delivered);
+            estimates.push(model.bandwidth_bytes_per_sec);
+        }
+        let back = 90 + (10_000 / ROUND_MS) as usize;
+        assert!(estimates[back] >= 2_000_000.0, "10 s after the link came back: {:?}", &estimates[90..back + 1]);
+    }
+
+    #[test]
     fn latency_first_under_the_target_throughput_first_over_it() {
         let mut model = LinkModel::default();
         run(&mut model, Instant::now(), 0..40, 62_500.0, true);
@@ -634,7 +671,8 @@ mod tests {
             let data_room = (budget - video_sent).min(capacity - video_sent).max(0.0);
             let data_sent = data.min(data_room);
             let rate = (data > 0.0).then_some(data_sent);
-            let link_limited = data > data_room;
+            // (held back by a budget under the estimate, a drain round's, is ours, not the link's: see `SendGate::wait_bulk_turn`)
+            let link_limited = data > data_room && (model.gain >= 1.0 || capacity < budget);
             let round_samples = crate::pacing::RoundSamples {
                 link_limited_rate: rate.filter(|_| link_limited),
                 app_limited_rate: rate.filter(|_| !link_limited),
@@ -673,6 +711,35 @@ mod tests {
     }
 
     #[test]
+    fn the_last_samples_dont_take_it_down_as_they_age() {
+        // video_slow: startup's queue drained in a few falling samples (129, 111, 89, 63, 34, 24 KB/s), then GCC held
+        // video at its floor and nothing more was sampled. Aging out one by one, the estimate followed them down to the
+        // last, 24 KB/s, and stood there; BBR's max filter only ages when a sample comes in
+        let mut model = LinkModel::default();
+        let start = Instant::now();
+        let now = run(&mut model, start, 0..40, 125_000.0, true);
+        let before = model.bandwidth_bytes_per_sec;
+        for (round, rate) in [111_000.0, 89_000.0, 63_000.0, 34_000.0, 24_000.0].into_iter().enumerate() {
+            model.update(now + Duration::from_millis(250 * (round as u64 + 1)), 0.25, crate::pacing::RoundSamples::default(), rate, true, rate);
+        }
+        for round in 6..120u64 {
+            model.update(now + Duration::from_millis(250 * round), 0.25, crate::pacing::RoundSamples::default(), 6_000.0, false, 6_000.0);
+        }
+        assert!(model.bandwidth_bytes_per_sec >= 0.5 * before, "{} of {before}", model.bandwidth_bytes_per_sec);
+    }
+
+    #[test]
+    fn a_page_under_the_link_leaves_startup() {
+        // video_tf: a camera plus tf on a 2.5 MB/s link, neither ever held back, so no round is link-limited and BBR's
+        // startup (which only counts link-limited rounds) never ended: no ProbeRTT, and 2.89x the estimate offered forever
+        let mut model = LinkModel::default();
+        let estimates = page(&mut model, Instant::now(), 0..240, 2_500_000.0, 20_000.0, 430_000.0);
+        assert!(!model.starting_up, "estimates {:?}", &estimates[200..]);
+        let least = estimates[40..].iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(least >= 450_000.0, "and the estimate stands: {least}");
+    }
+
+    #[test]
     fn data_below_the_link_keeps_its_estimate() {
         // 200 KB/s of data on a 2.5 MB/s link (clouds, no camera)
         let mut model = LinkModel::default();
@@ -690,30 +757,65 @@ mod tests {
         assert!(!model.starting_up, "estimates {:?}", &estimates[200..]);
     }
 
+    /// A page with only a camera wanting `camera` bytes/s on a `capacity` link with a drop-tail-free queue: video sends
+    /// min(camera, budget, GCC's limit), the link drains the queue at `capacity`, and `video_held_by_link` judges each
+    /// round from the queue left. Returns the bandwidth after each round.
+    fn video_page(model: &mut LinkModel, start: Instant, rounds: std::ops::Range<u64>, capacity: f64, camera: f64, gcc: impl Fn(u64) -> Option<f64>) -> Vec<f64> {
+        let mut queued = 0.0;
+        let mut estimates = vec![];
+        for round in rounds {
+            let now = start + Duration::from_millis(250 * round);
+            let (budget, _) = model.pacing(None);
+            queued += camera.min(budget).min(gcc(round).unwrap_or(f64::INFINITY)) * 0.25;
+            let delivered = queued.min(capacity * 0.25);
+            queued -= delivered;
+            let held = video_held_by_link(queued / capacity * 1000.0, DEFAULT_LATENCY_TARGET);
+            model.update(now, 0.25, crate::pacing::RoundSamples::default(), delivered / 0.25, delivered > 0.0 && held, delivered / 0.25);
+            estimates.push(model.bandwidth_bytes_per_sec);
+        }
+        estimates
+    }
+
+    #[test]
+    fn video_held_by_gcc_under_a_slow_link_keeps_its_estimate() {
+        // video_slow: a camera on a 125 KB/s link; startup's overshoot queued, GCC cut to 25 KB/s and held it there for
+        // 20 s while the link sat idle. Counted as the link's rate, its rounds took the estimate to 2 KB/s.
+        let mut model = LinkModel::default();
+        let estimates = video_page(&mut model, Instant::now(), 0..240, 125_000.0, 1_000_000.0, |round| (16..96).contains(&round).then_some(25_000.0));
+        let peak = estimates.iter().copied().fold(0.0, f64::max);
+        let least = estimates[40..].iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(peak <= 1.25 * 125_000.0 && least >= 0.5 * peak, "peak {peak}, then {least}: {:?}", &estimates[40..]);
+    }
+
     #[test]
     fn a_big_infrequent_message_is_sent_at_the_learned_rate() {
         // a 400 KB map every 20 s on a 2.5 MB/s link: each send is held by pacing (link-limited) and grows the
-        // estimate, but the burst is too short for three stalled rounds, so startup never ends; 10 s later the
-        // samples age out and the next map starts again from 64 KB/s
+        // estimate, the burst too short for three stalled rounds; once its samples aged out the next map started again
+        // from 64 KB/s
         let mut model = LinkModel::default();
         let start = Instant::now();
         let capacity = 2_500_000.0;
         let mut durations = vec![];
+        let mut learned = vec![];
         for map in 0..4u64 {
+            learned.push(model.bandwidth_bytes_per_sec);
             let mut remaining = 400_000.0;
             let mut round = map * 80;
             while remaining > 0.0 {
                 let now = start + Duration::from_millis(250 * round);
                 let (rate, _) = model.pacing(None);
                 let sent = (rate.min(capacity) * 0.25).min(remaining);
+                // (the last round ran out of map before pacing held it back)
+                let held = sent < remaining;
                 remaining -= sent;
                 let samples = crate::pacing::RoundSamples {
-                    link_limited_rate: Some(sent / 0.25),
+                    link_limited_rate: Some(sent / 0.25).filter(|_| held),
+                    app_limited_rate: Some(sent / 0.25).filter(|_| !held),
                     min_rtt_ms: Some(20.0),
                     typical_rtt_ms: Some(20.0),
                     path_rtt_ms: Some(20.0),
                     drained: true,
-                    window_waited: true,
+                    window_waited: held,
                     ..Default::default()
                 };
                 model.update(now, 0.25, samples, 0.0, false, sent / 0.25);
@@ -725,7 +827,9 @@ mod tests {
                 model.update(start + Duration::from_millis(250 * idle), 0.25, crate::pacing::RoundSamples { drained: true, ..Default::default() }, 0.0, false, 0.0);
             }
         }
-        assert!(durations[3] <= 0.5, "400 KB on 2.5 MB/s, seconds per map: {durations:?} (starting_up {})", model.starting_up);
+        // (out of startup it is paced at the learned rate, not startup's 2.89x: a burst shorter than a round can't show more)
+        let at_learned = (400_000.0 / learned[3] / 0.25).ceil() * 0.25;
+        assert!(learned[3] >= learned[1] && durations[3] <= at_learned, "400 KB on 2.5 MB/s, seconds per map: {durations:?}, learned {learned:?} (starting_up {})", model.starting_up);
     }
 
     #[test]

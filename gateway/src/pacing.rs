@@ -413,7 +413,10 @@ impl SendGate {
                     // woken by an ack or a strict turn ending; looked at again after the loss timeout for a lost tail
                     (true, MIN_LOSS_TIMEOUT)
                 } else if path.tokens < 0.0 {
-                    path.held = true;
+                    // (paced under the estimate, a drain round's 0.75 or the budget's cap, it is held back by us, not the
+                    // link: counted as the link's rate, a page under the link left with only its drain rounds' samples,
+                    // and its estimate fell 25% with each)
+                    path.held |= path.rate >= path.bandwidth;
                     (false, crate::secs(-path.tokens / path.rate.max(1.0)))
                 } else {
                     return on_window;
