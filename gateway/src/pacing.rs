@@ -199,6 +199,18 @@ impl SendGate {
         self.chunk_bytes.load(Ordering::Relaxed)
     }
 
+    /// Sizes of what the gate holds, for the stats' memory section.
+    pub fn counts(&self) -> serde_json::Value {
+        let path = self.path.lock();
+        serde_json::json!({
+            "frames": path.frames.len(),
+            "inFlightBytes": path.in_flight,
+            "rtts": path.rtts.len(),
+            "quietRtts": path.quiet_rtts.len(),
+            "ackHistory": path.ack_history.len(),
+        })
+    }
+
     /// Bytes the page has acked, ever.
     pub fn acked_total(&self) -> u64 {
         self.path.lock().acked_total

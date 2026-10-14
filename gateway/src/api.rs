@@ -90,7 +90,20 @@ impl ApiState {
         self.matching.lock().clear();
     }
 
-    fn reap_queries(&self) {
+    /// Entity counts, for the stats' memory section.
+    pub(crate) fn counts(&self) -> Value {
+        json!({
+            "queryables": self.queryables.lock().len(),
+            "openQueries": self.queries.lock().len(),
+            "livelinessTokens": self.tokens.lock().len(),
+            "livelinessSubscribers": self.liveliness_subscribers.lock().len(),
+            "matchingListeners": self.matching.lock().len(),
+        })
+    }
+
+    /// Called on every API request and every allocation round (a frontend that stopped making requests kept its
+    /// unfinished queries forever).
+    pub(crate) fn reap_queries(&self) {
         self.queries.lock().retain(|_, (_, since)| since.elapsed() < QUERY_LIFETIME);
     }
 }

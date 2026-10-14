@@ -319,6 +319,33 @@ fn spawn_rtcp_reader(track: Arc<TrackLocalStaticSample>, owner: Weak<MediaTrack>
     });
 }
 
+/// The mids of `sdp`'s m-sections still in use (port not 0): a subscription the page closed stopped its transceiver, and
+/// the next offer rejects that m-line (port 0) or recycles it under a new mid.
+pub fn live_mids(sdp: &str) -> std::collections::HashSet<String> {
+    sdp.split("\nm=")
+        .skip(1)
+        .filter(|section| section.split_whitespace().nth(1).is_some_and(|port| port != "0"))
+        .filter_map(|section| section.lines().find_map(|line| line.trim().strip_prefix("a=mid:")).map(str::to_owned))
+        .collect()
+}
+
+/// Stops the transceivers of tracks the browser dropped: their sender's interceptor streams unbind (a 1024-packet NACK
+/// buffer, ~1.2 MB a video track, and the congestion-control history) and the RTCP reader ends with the track. Never
+/// stopped, each video resubscribe kept one until the page closed.
+pub async fn stop_tracks(connection: &Arc<dyn PeerConnection>, dropped: &[Arc<MediaTrack>]) {
+    if dropped.is_empty() {
+        return;
+    }
+    for transceiver in connection.get_transceivers().await {
+        let Ok(Some(mid)) = transceiver.mid().await else { continue };
+        if dropped.iter().any(|track| track.mid == mid)
+            && let Err(error) = transceiver.stop().await
+        {
+            log::warn!("stopping the transceiver of dropped track {mid}: {error}");
+        }
+    }
+}
+
 /// Applies a browser offer (renegotiation over `control`). With `add` (a track format), first adds
 /// a track, which pairs with the offer's new recvonly m-line of its kind, and returns it with its mid.
 pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSessionDescription, add: Option<&'static str>) -> Result<(RTCSessionDescription, Option<Arc<MediaTrack>>)> {
@@ -839,6 +866,15 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rejected_or_recycled_m_line_is_not_live() {
+        let sdp = "v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\ns=-\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:0\r\nm=video 0 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:3\r\n";
+        let live = super::live_mids(sdp);
+        assert!(live.contains("0") && live.contains("3"), "{live:?}");
+        assert!(!live.contains("1"), "port 0: rejected");
+        assert!(!live.contains("2"), "absent: recycled under a new mid");
+    }
+
     #[test]
     fn the_picture_keeps_its_size_through_small_and_quick_changes() {
         use super::{SIZE_DOWN_SETTLE, SIZE_UP_SETTLE, steady_size};

@@ -35,6 +35,9 @@ const VIDEO_PRICE_HEADROOM: f64 = 1.5;
 const RELIABLE_MAX_BACKLOG: Duration = Duration::from_secs(2);
 /// Streams at this zenoh priority or more urgent (2 INTERACTIVE_HIGH, 1 REAL_TIME) bypass allocation and pacing.
 const STRICT_PRIORITY: u8 = 2;
+/// A key (of a wildcard subscription) whose publisher went quiet this long, with nothing queued, is forgotten: kept,
+/// every key a wildcard ever matched stayed for the subscription's life.
+const KEY_IDLE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +102,8 @@ struct KeyQueue {
     /// arrivals since the allocator last looked, and the resulting source rate
     arrivals: u32,
     rate_hz: f64,
+    /// the latest sample's arrival: a key quiet for `KEY_IDLE` with nothing queued is forgotten
+    last_arrival: Option<Instant>,
 }
 
 /// How often a key may send.
@@ -381,6 +386,8 @@ impl SubShared {
     /// Measures rates since the previous call and describes what this stream wants.
     pub fn usage(&self, interval_secs: f64) -> Usage {
         let mut state = self.state.lock();
+        let now = Instant::now();
+        state.keys.retain(|_, queue| !queue.items.is_empty() || queue.last_arrival.is_some_and(|at| now.duration_since(at) < KEY_IDLE));
         let mut max_hz = 0.0;
         for queue in state.keys.values_mut() {
             queue.rate_hz = ewma(queue.rate_hz, queue.arrivals as f64 / interval_secs.max(1e-3));
@@ -540,6 +547,7 @@ impl SubShared {
             };
             queue.items.push_back(pending);
             queue.arrivals += 1;
+            queue.last_arrival = Some(Instant::now());
             // trimmed here too: a sender blocked on a stalled page never reaches `next`, and the queue grew without bound
             let max_age = self.delivery.max_age_ms.map(|max_age_ms| crate::secs(max_age_ms / 1000.0));
             if let Some(limit) = max_age.or(self.delivery.reliable.then_some(RELIABLE_MAX_BACKLOG)) {
@@ -658,6 +666,18 @@ impl SubShared {
             _ = self.data_ready.notified() => {}
             _ = tokio::time::sleep_until(wake_at.unwrap_or_else(Instant::now).into()), if wake_at.is_some() => {}
         }
+    }
+
+    /// Sizes of what this subscription holds, for the stats' memory section.
+    pub fn counts(&self) -> serde_json::Value {
+        let state = self.state.lock();
+        serde_json::json!({
+            "keys": state.keys.len(),
+            "queued": state.keys.values().map(|queue| queue.items.len()).sum::<usize>(),
+            "queuedBytes": state.keys.values().flat_map(|queue| queue.items.iter()).map(|item| item.payload.len()).sum::<usize>(),
+            "unacked": state.unconsumed.len(),
+            "encodedSizes": state.encoded_bytes.len(),
+        })
     }
 
     /// Ends the subscription: its sender stops and `run` returns, dropping the zenoh subscriber.

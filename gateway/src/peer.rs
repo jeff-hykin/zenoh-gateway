@@ -260,9 +260,29 @@ impl PeerState {
         channels.values().filter_map(|entry| if let ChannelStats::Sub(shared) = &entry.stats { Some(shared.clone()) } else { None }).collect()
     }
 
+    /// Sizes of everything this frontend holds (each must stay flat while the page runs; growth is a resource not freed).
+    fn memory_counts(&self) -> serde_json::Value {
+        let subscriptions: Vec<serde_json::Value> = self.subscriptions().iter().map(|shared| shared.counts()).collect();
+        let sum = |field: &str| subscriptions.iter().map(|counts| counts[field].as_u64().unwrap_or(0)).sum::<u64>();
+        json!({
+            "tracks": self.tracks.lock().len(),
+            "channels": self.channels.lock().len(),
+            "deadmen": self.deadmen.lock().len(),
+            "subscriptions": subscriptions.len(),
+            "subscriptionKeys": sum("keys"),
+            "queued": sum("queued"),
+            "queuedBytes": sum("queuedBytes"),
+            "unacked": sum("unacked"),
+            "gate": self.gate.counts(),
+            "api": self.api.counts(),
+            "livePeerStates": live_peer_states(),
+        })
+    }
+
     /// One allocation round: measure what reached the page, update the link model, pace and divide its budget.
     fn allocate(&self, interval_secs: f64) {
         let now = Instant::now();
+        self.api.reap_queries();
         let subscriptions = self.subscriptions();
         let usages: Vec<subscription::Usage> = subscriptions.iter().map(|shared| shared.usage(interval_secs)).collect();
         let data_usages = || usages.iter().filter(|usage| !usage.on_track);
@@ -1091,7 +1111,7 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock(), "rttMs": *state.rtt_ms.lock()});
                 let heartbeat = serde_json::to_value(state.heartbeat.lock().clone()).unwrap_or_default();
                 let bandwidth = serde_json::to_value(state.bandwidth.lock().clone()).unwrap_or_default();
-                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth}))
+                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth, "memory": state.memory_counts()}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
             "encodings" => {
@@ -1135,8 +1155,19 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
         return fail(&request.id, "peer is gone");
     };
     let _negotiating = state.negotiation.lock().await;
+    let live = media::live_mids(&offer.sdp);
     match media::renegotiate(&connection, offer, mime).await {
         Ok((answer, track)) => {
+            // tracks whose m-line the offer dropped (their subscription closed and the page stopped the transceiver)
+            let dropped: Vec<Arc<media::MediaTrack>> = {
+                let mut tracks = state.tracks.lock();
+                let gone: Vec<String> = tracks.keys().filter(|mid| !live.contains(*mid)).cloned().collect();
+                gone.iter().filter_map(|mid| tracks.remove(mid)).collect()
+            };
+            if !dropped.is_empty() {
+                info!("peer {}: stopping {} dropped track(s), {} left", state.peer_id, dropped.len(), state.tracks.lock().len());
+            }
+            media::stop_tracks(&connection, &dropped).await;
             let mid = track.map(|track| {
                 let mid = track.mid.clone();
                 state.tracks.lock().insert(mid.clone(), track);
