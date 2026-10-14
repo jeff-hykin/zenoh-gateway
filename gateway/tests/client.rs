@@ -6,6 +6,8 @@ mod relay_sketch;
 use anyhow::Result;
 use openh264::formats::YUVSource;
 use serde_json::json;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 use tokio::time::timeout;
 use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions, VideoFrame};
@@ -252,6 +254,71 @@ async fn video_keeps_flowing_at_the_source_rate() {
         frames += 1;
     }
     assert!(frames >= 35, "{frames} frames in 5 s at maxHz 10 from a 20 Hz source");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+/// [`SolidColor`] that takes 100 ms or more to decode (a big jpeg on a slow core); the payload's 8th byte on is ignored, so
+/// each sample can differ (identical samples share one decode).
+struct SlowSolid;
+
+static SLOW_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static SLOW_MOST_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static SLOW_DECODES: AtomicUsize = AtomicUsize::new(0);
+static SLOW_DECODE_MICROS: AtomicUsize = AtomicUsize::new(0);
+
+impl MessageEncoding for SlowSolid {
+    fn name(&self) -> &str {
+        "test-slow-solid"
+    }
+
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Video
+    }
+
+    fn decode(&self, sample: &EncodingSample<'_>, channel: Channel) -> Result<DecodedFrame> {
+        let started = std::time::Instant::now();
+        SLOW_MOST_IN_FLIGHT.fetch_max(SLOW_IN_FLIGHT.fetch_add(1, SeqCst) + 1, SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        SLOW_IN_FLIGHT.fetch_sub(1, SeqCst);
+        SLOW_DECODES.fetch_add(1, SeqCst);
+        // (a loaded Mac's timer slack stretches the sleep, so the test measures what a decode took)
+        SLOW_DECODE_MICROS.fetch_add(started.elapsed().as_micros() as usize, SeqCst);
+        SolidColor.decode(&EncodingSample::new(sample.key, &sample.payload[..7], &zenoh::bytes::Encoding::default()), channel)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decode_slower_than_the_frame_interval_does_not_set_the_rate() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let running = Server::builder().session(session.clone()).encoding(SlowSolid).build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { encoding: Some("test-slow-solid".into()), max_hz: Some(30.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await.unwrap();
+    // 25 Hz, each sample its own
+    let _putter = tokio::spawn({
+        let session = session.clone();
+        async move {
+            for count in 0u32.. {
+                session.put("camera/front", [solid([200, 40, 90], 160, 120), count.to_le_bytes().to_vec()].concat()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
+    });
+    let first = next_video(&mut camera).await;
+    assert_color(decode_all(&[first]).1, [200, 40, 90]);
+    let (decodes_before, micros_before) = (SLOW_DECODES.load(SeqCst), SLOW_DECODE_MICROS.load(SeqCst));
+    let start = std::time::Instant::now();
+    let mut frames = 0;
+    while start.elapsed() < Duration::from_secs(3) {
+        next_video(&mut camera).await;
+        frames += 1;
+    }
+    let decode_secs = (SLOW_DECODE_MICROS.load(SeqCst) - micros_before) as f64 / 1e6 / (SLOW_DECODES.load(SeqCst) - decodes_before).max(1) as f64;
+    // one decode at a time could not pass 1 / decode_secs fps
+    let serial = 3.0 / decode_secs;
+    let most = SLOW_MOST_IN_FLIGHT.load(SeqCst);
+    assert!(most >= 2 && frames as f64 > 1.8 * serial, "{frames} frames in 3 s from a 25 Hz source, {decode_secs:.3} s a decode, at most {most} at once (one at a time: {serial:.0})");
     client.close().await;
     running.shutdown().await.unwrap();
 }
