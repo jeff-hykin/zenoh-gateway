@@ -607,6 +607,154 @@ mod tests {
         assert!(!model.starting_up, "and leaves startup once video is held back by the link");
     }
 
+    // ---- blind spots: page shapes and lifecycles degrade.ts's full page never produces ----
+
+    /// Rounds at the allocator's real interval (250 ms) for a page wanting `data` bytes/s of bulk data and `video`
+    /// bytes/s of camera on a link of `capacity`: video gets min(demand, budget) and the link carries what fits;
+    /// `video_link_limited` is false, as `peer::allocate` computes it while GCC isn't braking (nor, before 84d38fe, while
+    /// GCC's target was steady: the grant was min(GCC, budget), never above GCC).
+    /// Data is link-limited only when the budget left after video, or the link, holds it below its demand. Returns the
+    /// bandwidth after each round.
+    fn page(model: &mut LinkModel, start: Instant, rounds: std::ops::Range<u64>, capacity: f64, data: f64, video: f64) -> Vec<f64> {
+        let mut estimates = vec![];
+        for round in rounds {
+            let now = start + Duration::from_millis(250 * round);
+            let (budget, _) = model.pacing(None);
+            let video_sent = video.min(budget).min(capacity);
+            let data_room = (budget - video_sent).min(capacity - video_sent).max(0.0);
+            let data_sent = data.min(data_room);
+            let rate = (data > 0.0).then_some(data_sent);
+            let link_limited = data > data_room;
+            let round_samples = crate::pacing::RoundSamples {
+                link_limited_rate: rate.filter(|_| link_limited),
+                app_limited_rate: rate.filter(|_| !link_limited),
+                min_rtt_ms: rate.map(|_| 20.0),
+                typical_rtt_ms: rate.map(|_| 20.0),
+                path_rtt_ms: rate.map(|_| 20.0),
+                drained: true,
+                window_waited: link_limited,
+                ..Default::default()
+            };
+            model.update(now, 0.25, round_samples, video_sent, false, video_sent + data_sent);
+            estimates.push(model.bandwidth_bytes_per_sec);
+        }
+        estimates
+    }
+
+    #[test]
+    #[ignore = "blind spot: an app-limited page stays in startup and its estimate falls back to the first guess"]
+    fn video_alone_below_the_link_keeps_its_estimate() {
+        // one 1 MB/s camera on a 2.5 MB/s link: never link-limited, so never leaves startup; video's samples count only
+        // when higher than the estimate, and 10 s after the last record the window is empty and startup's
+        // `measured.max(INITIAL_BANDWIDTH)` puts the estimate (and video's grant) back at 64 KB/s x gain
+        let mut model = LinkModel::default();
+        let estimates = page(&mut model, Instant::now(), 0..240, 2_500_000.0, 0.0, 1_000_000.0);
+        let least = estimates[20..].iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(least >= 1_000_000.0, "settled at the camera's rate, then fell to {least} (starting_up {})", model.starting_up);
+    }
+
+    #[test]
+    #[ignore = "blind spot: an app-limited page stays in startup and its estimate falls back to the first guess"]
+    fn video_with_a_small_topic_keeps_its_estimate() {
+        // a camera plus tf (2 KB/s): the data acks disable the video-only path, data is never held, so nothing is
+        // link-limited and the estimate empties every 10 s
+        let mut model = LinkModel::default();
+        let estimates = page(&mut model, Instant::now(), 0..240, 2_500_000.0, 2_000.0, 1_000_000.0);
+        let least = estimates[20..].iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(least >= 1_000_000.0, "fell to {least} (starting_up {})", model.starting_up);
+    }
+
+    #[test]
+    #[ignore = "blind spot: an app-limited page stays in startup and its estimate falls back to the first guess"]
+    fn data_below_the_link_keeps_its_estimate() {
+        // 200 KB/s of data on a 2.5 MB/s link (clouds, no camera)
+        let mut model = LinkModel::default();
+        let estimates = page(&mut model, Instant::now(), 0..240, 2_500_000.0, 200_000.0, 0.0);
+        let least = estimates[20..].iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(least >= 200_000.0, "fell to {least} (starting_up {})", model.starting_up);
+    }
+
+    #[test]
+    #[ignore = "blind spot: video held back by a slow link reads as link-limited only while GCC brakes, so startup never ends"]
+    fn video_held_by_gcc_leaves_startup() {
+        // a 1 MB/s camera on a 250 KB/s link that delivers what fits without GCC braking: video_link_limited is false
+        // every round, so startup (gain 2.89, video paced at 2.89x the link) never ends and ProbeRTT never runs
+        let mut model = LinkModel::default();
+        let estimates = page(&mut model, Instant::now(), 0..240, 250_000.0, 0.0, 1_000_000.0);
+        assert!(!model.starting_up, "estimates {:?}", &estimates[200..]);
+    }
+
+    #[test]
+    #[ignore = "blind spot: between big infrequent messages the startup estimate falls back to the first guess"]
+    fn a_big_infrequent_message_is_sent_at_the_learned_rate() {
+        // a 400 KB map every 20 s on a 2.5 MB/s link: each send is held by pacing (link-limited) and grows the
+        // estimate, but the burst is too short for three stalled rounds, so startup never ends; 10 s later the
+        // samples age out and the next map starts again from 64 KB/s
+        let mut model = LinkModel::default();
+        let start = Instant::now();
+        let capacity = 2_500_000.0;
+        let mut durations = vec![];
+        for map in 0..4u64 {
+            let mut remaining = 400_000.0;
+            let mut round = map * 80;
+            while remaining > 0.0 {
+                let now = start + Duration::from_millis(250 * round);
+                let (rate, _) = model.pacing(None);
+                let sent = (rate.min(capacity) * 0.25).min(remaining);
+                remaining -= sent;
+                let samples = crate::pacing::RoundSamples {
+                    link_limited_rate: Some(sent / 0.25),
+                    min_rtt_ms: Some(20.0),
+                    typical_rtt_ms: Some(20.0),
+                    path_rtt_ms: Some(20.0),
+                    drained: true,
+                    window_waited: true,
+                    ..Default::default()
+                };
+                model.update(now, 0.25, samples, 0.0, false, sent / 0.25);
+                round += 1;
+            }
+            durations.push((round - map * 80) as f64 * 0.25);
+            // idle until the next map
+            for idle in round..(map + 1) * 80 {
+                model.update(start + Duration::from_millis(250 * idle), 0.25, crate::pacing::RoundSamples { drained: true, ..Default::default() }, 0.0, false, 0.0);
+            }
+        }
+        assert!(durations[3] <= 0.5, "400 KB on 2.5 MB/s, seconds per map: {durations:?} (starting_up {})", model.starting_up);
+    }
+
+    #[test]
+    #[ignore = "blind spot: idle after startup, a stale min round trip re-enters ProbeRTT every other round"]
+    fn idle_doesnt_loop_probe_rtt() {
+        let mut model = LinkModel::default();
+        let start = Instant::now();
+        let now = run(&mut model, start, 0..40, 1_000_000.0, true);
+        let mut probing = 0;
+        for round in 1..=120u64 {
+            model.update(now + Duration::from_millis(250 * round), 0.25, crate::pacing::RoundSamples { drained: true, ..Default::default() }, 0.0, false, 0.0);
+            probing += model.probing_rtt() as u32;
+        }
+        assert!(probing <= 12, "30 s idle: ProbeRTT (window {MIN_WINDOW} B) in {probing} of 120 rounds");
+    }
+
+    #[test]
+    #[ignore = "blind spot: ProbeRTT's one-round escape never fires (round_started is never `now`)"]
+    fn probe_rtt_ends_while_strict_streams_keep_the_window_full() {
+        // strict streams bypass the window and keep more than the minimum in flight: never `drained`; the comment in
+        // update_round_trip says the probe ends after one round regardless, but probe_rtt_rounds only counts when
+        // round_started == now, which the previous update never sets
+        let mut model = LinkModel::default();
+        let start = Instant::now();
+        let now = run(&mut model, start, 0..40, 1_000_000.0, true);
+        let mut probing_rounds = 0;
+        for round in 1..=120u64 {
+            let samples = crate::pacing::RoundSamples { drained: false, ..sample(1_000_000.0, true, 20.0) };
+            model.update(now + Duration::from_millis(250 * round), 0.25, samples, 0.0, false, 1_000_000.0);
+            probing_rounds += model.probing_rtt() as u32;
+        }
+        assert!(probing_rounds <= 12, "ProbeRTT (bulk window {MIN_WINDOW} B) for {probing_rounds} of 120 rounds");
+    }
+
     #[test]
     fn a_few_seconds_stall_doesnt_empty_it() {
         let mut model = LinkModel::default();
