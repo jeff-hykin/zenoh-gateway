@@ -328,11 +328,10 @@ impl PeerState {
         let delivered = acked + video_through;
         let link = {
             let mut link = self.link.lock();
-            // video is held back by the link while it queues there (not by a cut, GCC's or its own brake's: those hold it
-            // under the link, and counting their rounds as the link's speed lowered the bandwidth with every cut, a spiral)
-            let delivery = self.video_rate.delivery();
-            let video_link_limited = delivery.is_some_and(|delivery| allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
-            link.update(now, interval_secs, self.gate.take_round(), delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
+            // video is held back by the link when GCC allows less than its grant (not by its own queue brake: that is
+            // ours, and counting its rounds as the link's speed lowered the bandwidth with every cut, a spiral)
+            let video_link_limited = video_through > 0.0 && self.video_rate.gcc_limit_bytes_per_sec().is_some_and(|limit| limit < self.video_rate.cap_bytes_per_sec());
+            link.update(now, interval_secs, self.gate.take_round(), per_sec(video_through), video_link_limited, per_sec(delivered));
             link.clone()
         };
         let budget = self.budget(&link);
