@@ -34,6 +34,8 @@ const cells: Cell[] = [
     { name: "r1_wifi", seconds: 45, schedule: [[0, 300_000]], delayMs: 2, jitterMs: 400, loss: 0.005, slackMs: 500 },
     // memory soak, only when named: SOAK_SECONDS on a clean 20 Mbit/s link (DEGRADE_FEATURES=dhat-heap profiles the heap)
     ...(Deno.args.includes("soak") ? [{ name: "soak", seconds: Number(Deno.env.get("SOAK_SECONDS") ?? 1200), schedule: [[0, 2_500_000]] as [number, number][], delayMs: 30, jitterMs: 0, loss: 0 }] : []),
+    // a 5 s Wi-Fi stall on a fast link: the estimate must not collapse with it (it once fell to 1 KB/s and took 4 min back)
+    { name: "stall", seconds: 50, schedule: [[0, 2_500_000], [20, 1_000], [25, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
     { name: "step", seconds: 90, schedule: [[0, 2_500_000], [30, 125_000], [60, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
 ]
 const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell.name)) : cells

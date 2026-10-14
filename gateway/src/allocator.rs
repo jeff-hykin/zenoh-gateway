@@ -195,6 +195,9 @@ pub struct LinkModel {
     /// the bandwidth when the current round began (what a probe must beat)
     #[serde(skip)]
     probe_level: f64,
+    /// the last probe found more: probe again at startup's gain
+    #[serde(skip)]
+    probing_up: bool,
     #[serde(skip)]
     round_started: Option<std::time::Instant>,
     /// something in this round waited on the window or pacing
@@ -219,6 +222,10 @@ const STARTUP_GROWTH: f64 = 1.25;
 const STARTUP_ROUNDS: u32 = 3;
 const PROBE_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 const BANDWIDTH_ROUNDS: f64 = 10.0;
+/// ... and over at least this long: a Wi-Fi stall of a few seconds filled ten 0.55 s rounds with next to nothing, the
+/// bandwidth fell from 2.5 MB/s to 1 KB/s, and sending next to nothing it took four minutes to climb back (links change
+/// over minutes, so a longer memory costs little).
+const BANDWIDTH_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 const MIN_RTT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 const PROBE_RTT_TIME: std::time::Duration = std::time::Duration::from_millis(200);
 /// ProbeRTT runs at least this often (not only when the least round trip went stale): its drain sends frames with little
@@ -252,6 +259,7 @@ impl Default for LinkModel {
             stalled_rounds: 0,
             cycle: 0,
             probe_level: 0.0,
+            probing_up: false,
             round_started: None,
             round_link_limited: false,
         }
@@ -284,7 +292,7 @@ impl LinkModel {
         // (and at least one rate sample long: probing for 250 ms with 550 ms samples, the extra 25% was averaged with the
         // drain round after it, never measured, and after a drop the estimate stayed at a tenth of the recovered link)
         let round_secs = secs.max(self.min_rtt_ms.unwrap_or(0.0) / 1000.0).max(crate::pacing::SAMPLE_SPAN.as_secs_f64());
-        let window = crate::secs(BANDWIDTH_ROUNDS * round_secs);
+        let window = crate::secs(BANDWIDTH_ROUNDS * round_secs).max(BANDWIDTH_WINDOW);
         // a round is at least a round trip: what is delivered now was sent a round trip ago, so judging growth or moving
         // the gain cycle every 250 ms on a 400 ms path ended startup before its doubling showed
         let new_round = self.round_started.is_none_or(|started| now.duration_since(started).as_secs_f64() >= round_secs);
@@ -321,16 +329,17 @@ impl LinkModel {
                 self.bandwidth_bytes_per_sec = measured;
             }
             if new_round {
-                // a probe that found 25% more probes again (BBR v2's probe-up): after a drop and recovery the estimate
-                // climbs in seconds, not at 25% per eight rounds
+                // a probe that found 25% more probes again, at startup's gain (BBR v2's probe-up, exponential): after a
+                // drop and recovery the estimate climbs in seconds, not at 25% per eight rounds
                 let found_more = self.cycle == 0 && measured >= STARTUP_GROWTH * self.probe_level;
+                self.probing_up = found_more;
                 if !found_more {
                     self.cycle = (self.cycle + 1) % PROBE_GAINS.len();
                 }
                 self.probe_level = self.bandwidth_bytes_per_sec;
             }
         }
-        self.gain = if self.starting_up { STARTUP_GAIN } else { PROBE_GAINS[self.cycle] };
+        self.gain = if self.starting_up || self.probing_up { STARTUP_GAIN } else { PROBE_GAINS[self.cycle] };
     }
 
     fn update_round_trip(&mut self, now: std::time::Instant, round: &crate::pacing::RoundSamples) {
@@ -564,6 +573,17 @@ mod tests {
         let (window, _) = model.window(target);
         let at_least = model.bandwidth_bytes_per_sec * 0.4;
         assert!(window as f64 >= at_least - 1.0, "a path slower than the target alone: never capped under it ({window} < {at_least})");
+    }
+
+    #[test]
+    fn a_few_seconds_stall_doesnt_empty_it() {
+        let mut model = LinkModel::default();
+        let start = Instant::now();
+        run(&mut model, start, 0..40, 2_500_000.0, true);
+        let before = model.bandwidth_bytes_per_sec;
+        // 5 s of a stalled link: the sender held back, next to nothing acked
+        run(&mut model, start, 40..48, 1_000.0, true);
+        assert!(model.bandwidth_bytes_per_sec >= 0.5 * before, "a stall shorter than the window: {model:?}");
     }
 
     #[test]
