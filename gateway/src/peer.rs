@@ -315,12 +315,13 @@ impl PeerState {
         let link = {
             let mut link = self.link.lock();
             // video is held back by the link when its own congestion control (GCC) allows less than its grant
-            let video_link_limited = video_through > 0.0 && self.video_rate.gcc_bytes_per_sec() < self.video_rate.cap_bytes_per_sec();
+            let video_link_limited = video_through > 0.0 && self.video_rate.gcc_limit_bytes_per_sec().is_some_and(|limit| limit < self.video_rate.cap_bytes_per_sec());
             link.update(now, interval_secs, self.gate.take_round(), per_sec(video_through), video_link_limited, per_sec(delivered));
             link.clone()
         };
         let budget = self.budget(&link);
-        let video_estimate = if has_video { self.video_rate.gcc_bytes_per_sec() } else { 0.0 };
+        // video gets the budget, but no more than GCC's target while GCC brakes (it found the path congested)
+        let video_estimate = if has_video { self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget) } else { 0.0 };
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();

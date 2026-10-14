@@ -43,6 +43,8 @@ const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
 const PACING_FACTOR: f64 = 2.5;
+/// GCC limits video for this long after it last cut its target (see `VideoRate::gcc_limit_bytes_per_sec`).
+const GCC_BRAKE: Duration = Duration::from_secs(5);
 /// Asks the browser to show each frame as soon as it is decoded (min = max = 0): no jitter-buffer
 /// smoothing, which on a jittery path held frames ~50-100 ms for even pacing.
 const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
@@ -87,11 +89,20 @@ pub struct VideoRate {
     cap_bps: AtomicU64,
     /// bytes of video the browser's transport feedback reported arrived, ever
     received_bytes: AtomicU64,
+    /// when GCC last cut its target (it found the path congested)
+    braked_at: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 impl VideoRate {
     pub fn gcc_bytes_per_sec(&self) -> f64 {
         f64::from_bits(self.gcc_bps.load(Ordering::Relaxed)) / 8.0
+    }
+
+    /// GCC's target while it brakes (it cut its target within `GCC_BRAKE`), else `None`. GCC is a brake, not a ceiling:
+    /// it climbs ~8% a second from its first guess, so held under it video took 30 s to reach a link with room from the
+    /// first second; the link model (which measures video's delivery too) sets the pace otherwise.
+    pub fn gcc_limit_bytes_per_sec(&self) -> Option<f64> {
+        self.braked_at.lock().filter(|at| at.elapsed() < GCC_BRAKE).map(|_| self.gcc_bytes_per_sec())
     }
 
     /// What the allocator granted video; the pacer never goes below GCC's own floor (RTCP and a keyframe still get out).
@@ -122,7 +133,11 @@ struct ReportingEstimator {
 
 impl ReportingEstimator {
     fn publish(&self) {
-        self.rate.gcc_bps.store(self.inner.target_bitrate().to_bits(), Ordering::Relaxed);
+        let target = self.inner.target_bitrate();
+        let previous = f64::from_bits(self.rate.gcc_bps.swap(target.to_bits(), Ordering::Relaxed));
+        if target < previous * 0.95 {
+            *self.rate.braked_at.lock() = Some(std::time::Instant::now());
+        }
     }
 }
 
@@ -139,7 +154,8 @@ impl BandwidthEstimator for ReportingEstimator {
     /// Never above a multiple of the allocator's video cap: paced off GCC alone, a keyframe burst into a 100 kbit/s link
     /// at 1.3 Mbit/s and held the strict streams behind it for seconds.
     fn target_bitrate(&self) -> f64 {
-        self.inner.target_bitrate().min(self.rate.cap_bps()) * PACING_FACTOR
+        let gcc = self.rate.gcc_limit_bytes_per_sec().map_or(f64::INFINITY, |limit| limit * 8.0);
+        gcc.min(self.rate.cap_bps()) * PACING_FACTOR
     }
 
     fn handle_timeout(&mut self, now: Instant) {
@@ -210,7 +226,7 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
         media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: rtp_codec(mime), payload_type }, kind)?;
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), received_bytes: AtomicU64::new(0) });
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), received_bytes: AtomicU64::new(0), braked_at: Default::default() });
     let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone() };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default());
