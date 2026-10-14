@@ -293,7 +293,6 @@ impl LinkModel {
             self.typical_rtt_ms = round.typical_rtt_ms;
         }
         self.delivered_bytes_per_sec = delivered_bytes_per_sec;
-        let samples_before = self.samples.len() + self.target_limited_samples.len();
         // (rounds spent re-measuring the round trip hold the window down on purpose: they say nothing about the link)
         let link_limited = round.link_limited_rate.is_some() && !self.probing_rtt;
         if let Some(rate) = round.link_limited_rate.filter(|_| link_limited) {
@@ -329,11 +328,7 @@ impl LinkModel {
         // (or its own) limit either way; held to GCC braking alone, video on a slow link never left startup)
         self.round_link_limited |= link_limited || video_link_limited || (self.starting_up && (round.window_waited || video_only));
         self.extra_acked_samples.push_back((now, round.extra_acked));
-        // old rates age out only when a new one comes in, as BBR's max filter: aging by time alone, the falling samples
-        // of a queue draining (129 down to 24 KB/s) took the estimate down one by one to the last, and it stood there
-        // while GCC held video at its floor and nothing more was sampled (video_slow)
-        let sampled = self.samples.len() + self.target_limited_samples.len() > samples_before;
-        for samples in [&mut self.samples, &mut self.target_limited_samples].into_iter().filter(|_| sampled).chain([&mut self.extra_acked_samples]) {
+        for samples in [&mut self.samples, &mut self.extra_acked_samples, &mut self.target_limited_samples] {
             while samples.front().is_some_and(|(at, _)| now.duration_since(*at) > window) {
                 samples.pop_front();
             }
@@ -708,24 +703,6 @@ mod tests {
         let estimates = page(&mut model, Instant::now(), 0..240, 2_500_000.0, 2_000.0, 1_000_000.0);
         let least = estimates[20..].iter().copied().fold(f64::INFINITY, f64::min);
         assert!(least >= 1_000_000.0, "fell to {least} (starting_up {})", model.starting_up);
-    }
-
-    #[test]
-    fn the_last_samples_dont_take_it_down_as_they_age() {
-        // video_slow: startup's queue drained in a few falling samples (129, 111, 89, 63, 34, 24 KB/s), then GCC held
-        // video at its floor and nothing more was sampled. Aging out one by one, the estimate followed them down to the
-        // last, 24 KB/s, and stood there; BBR's max filter only ages when a sample comes in
-        let mut model = LinkModel::default();
-        let start = Instant::now();
-        let now = run(&mut model, start, 0..40, 125_000.0, true);
-        let before = model.bandwidth_bytes_per_sec;
-        for (round, rate) in [111_000.0, 89_000.0, 63_000.0, 34_000.0, 24_000.0].into_iter().enumerate() {
-            model.update(now + Duration::from_millis(250 * (round as u64 + 1)), 0.25, crate::pacing::RoundSamples::default(), rate, true, rate);
-        }
-        for round in 6..120u64 {
-            model.update(now + Duration::from_millis(250 * round), 0.25, crate::pacing::RoundSamples::default(), 6_000.0, false, 6_000.0);
-        }
-        assert!(model.bandwidth_bytes_per_sec >= 0.5 * before, "{} of {before}", model.bandwidth_bytes_per_sec);
     }
 
     #[test]
