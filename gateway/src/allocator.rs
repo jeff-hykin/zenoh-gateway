@@ -181,8 +181,9 @@ pub struct LinkModel {
     min_rtt_at: Option<std::time::Instant>,
     #[serde(skip)]
     probing_rtt: bool,
+    /// when the ProbeRTT under way began
     #[serde(skip)]
-    probe_rtt_rounds: u32,
+    probe_rtt_started: Option<std::time::Instant>,
     #[serde(skip)]
     probe_rtt_until: Option<std::time::Instant>,
     /// startup: the bandwidth last seen growing, and the rounds since; then the place in `PROBE_GAINS`
@@ -256,7 +257,7 @@ impl Default for LinkModel {
             target_limited_samples: Default::default(),
             min_rtt_at: None,
             probing_rtt: false,
-            probe_rtt_rounds: 0,
+            probe_rtt_started: None,
             probe_rtt_until: None,
             startup_level: 0.0,
             stalled_rounds: 0,
@@ -319,7 +320,9 @@ impl LinkModel {
         }
         // (startup ends when growth stalls while the window holds the sender back, the latency target's window too: a
         // round it holds back isn't a link-limited sample, and a 250 kbit/s link never left startup's first guess)
-        self.round_link_limited |= link_limited || (self.starting_up && round.window_waited) || (video_only && video_link_limited);
+        // (and, starting up, rounds of video alone: offered startup's 2.89x, a camera that stops growing is the link's
+        // (or its own) limit either way; held to GCC braking alone, video on a slow link never left startup)
+        self.round_link_limited |= link_limited || (self.starting_up && (round.window_waited || video_only)) || (video_only && video_link_limited);
         self.extra_acked_samples.push_back((now, round.extra_acked));
         for samples in [&mut self.samples, &mut self.extra_acked_samples, &mut self.target_limited_samples] {
             while samples.front().is_some_and(|(at, _)| now.duration_since(*at) > window) {
@@ -331,7 +334,11 @@ impl LinkModel {
         if self.starting_up {
             // the first guess stands until a round measures more (the first rounds, while the channels open, deliver next
             // to nothing); growth is judged on what was measured, once anything got through
-            self.bandwidth_bytes_per_sec = measured.max(INITIAL_BANDWIDTH);
+            // (with no sample in the window the estimate stands: aged out by time alone, a page whose demand stayed under
+            // the link fell back to the first guess every 10 s, as BBR's max filter doesn't)
+            if measured > 0.0 {
+                self.bandwidth_bytes_per_sec = measured.max(INITIAL_BANDWIDTH);
+            }
             if measured >= STARTUP_GROWTH * self.startup_level {
                 (self.startup_level, self.stalled_rounds) = (measured, 0);
             } else if new_round && self.round_link_limited && measured > 0.0 {
@@ -339,7 +346,10 @@ impl LinkModel {
             }
             if self.stalled_rounds >= STARTUP_ROUNDS {
                 // done: the drain round comes first
-                (self.starting_up, self.cycle, self.bandwidth_bytes_per_sec) = (false, 1, measured);
+                (self.starting_up, self.cycle) = (false, 1);
+                if measured > 0.0 {
+                    self.bandwidth_bytes_per_sec = measured;
+                }
             }
         } else {
             if measured > 0.0 {
@@ -369,22 +379,22 @@ impl LinkModel {
             // the clock starts once what is in flight is down to the minimum window, or after one round regardless: strict
             // streams bypass the window and can keep more than it in flight, and a probe waiting on them never ended (the
             // R1 sat in one with a 5 KB window until its estimate fell to 46 KB/s)
-            if self.probe_rtt_until.is_none() && (drained || self.probe_rtt_rounds >= 1) {
+            let started = *self.probe_rtt_started.get_or_insert(now);
+            let a_round = crate::secs(self.min_rtt_ms.unwrap_or(0.0) / 1000.0).max(crate::pacing::SAMPLE_SPAN);
+            if self.probe_rtt_until.is_none() && (drained || now.duration_since(started) >= a_round) {
                 self.probe_rtt_until = Some(now + PROBE_RTT_TIME);
-            }
-            if self.round_started.is_none_or(|started| started == now) {
-                self.probe_rtt_rounds += 1;
             }
             if let Some(rtt) = round_rtt_ms.filter(|_| self.probe_rtt_until.is_some()) {
                 self.probe_min_rtt = Some(self.probe_min_rtt.map_or(rtt, |least| least.min(rtt)));
             }
 
             if self.probe_rtt_until.is_some_and(|until| now >= until) {
-                (self.probing_rtt, self.probe_rtt_rounds) = (false, 0);
-                self.probe_rtt_until = None;
-                if let Some(least) = self.probe_min_rtt.take() {
-                    (self.min_rtt_ms, self.min_rtt_at) = (Some(least), Some(now));
-                }
+                self.probing_rtt = false;
+                (self.probe_rtt_until, self.probe_rtt_started) = (None, None);
+                // (the least round trip is fresh again whether or not the probe saw one: left stale, an idle page went
+                // straight back into ProbeRTT every other round)
+                let least = self.probe_min_rtt.take().or(self.min_rtt_ms);
+                (self.min_rtt_ms, self.min_rtt_at) = (least, Some(now));
                 self.probed_rtt_at = Some(now);
             }
             return;
@@ -642,7 +652,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blind spot: an app-limited page stays in startup and its estimate falls back to the first guess"]
     fn video_alone_below_the_link_keeps_its_estimate() {
         // one 1 MB/s camera on a 2.5 MB/s link: never link-limited, so never leaves startup; video's samples count only
         // when higher than the estimate, and 10 s after the last record the window is empty and startup's
@@ -654,7 +663,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blind spot: an app-limited page stays in startup and its estimate falls back to the first guess"]
     fn video_with_a_small_topic_keeps_its_estimate() {
         // a camera plus tf (2 KB/s): the data acks disable the video-only path, data is never held, so nothing is
         // link-limited and the estimate empties every 10 s
@@ -665,7 +673,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blind spot: an app-limited page stays in startup and its estimate falls back to the first guess"]
     fn data_below_the_link_keeps_its_estimate() {
         // 200 KB/s of data on a 2.5 MB/s link (clouds, no camera)
         let mut model = LinkModel::default();
@@ -675,7 +682,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blind spot: video held back by a slow link reads as link-limited only while GCC brakes, so startup never ends"]
     fn video_held_by_gcc_leaves_startup() {
         // a 1 MB/s camera on a 250 KB/s link that delivers what fits without GCC braking: video_link_limited is false
         // every round, so startup (gain 2.89, video paced at 2.89x the link) never ends and ProbeRTT never runs
@@ -685,7 +691,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blind spot: between big infrequent messages the startup estimate falls back to the first guess"]
     fn a_big_infrequent_message_is_sent_at_the_learned_rate() {
         // a 400 KB map every 20 s on a 2.5 MB/s link: each send is held by pacing (link-limited) and grows the
         // estimate, but the burst is too short for three stalled rounds, so startup never ends; 10 s later the
@@ -724,7 +729,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blind spot: idle after startup, a stale min round trip re-enters ProbeRTT every other round"]
     fn idle_doesnt_loop_probe_rtt() {
         let mut model = LinkModel::default();
         let start = Instant::now();
@@ -738,7 +742,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blind spot: ProbeRTT's one-round escape never fires (round_started is never `now`)"]
     fn probe_rtt_ends_while_strict_streams_keep_the_window_full() {
         // strict streams bypass the window and keep more than the minimum in flight: never `drained`; the comment in
         // update_round_trip says the probe ends after one round regardless, but probe_rtt_rounds only counts when
