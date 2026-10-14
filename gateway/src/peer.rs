@@ -46,6 +46,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often each frontend's bandwidth is re-estimated and re-allocated.
 const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
+/// Video's queue brake cuts at most this often (see `PeerState::video_cap`).
+const VIDEO_BRAKE_SPACING: Duration = Duration::from_millis(500);
 
 /// Gateway-wide allocation settings (builder options / command-line flags).
 #[derive(Debug, Clone, Copy)]
@@ -92,6 +94,9 @@ struct BandwidthStats {
     video_estimate_bytes_per_sec: f64,
     /// what the video tracks sent
     video_sent_bytes_per_sec: f64,
+    /// how long video waited in a queue per the latest transport feedback, and the cap its queue brake holds it to
+    video_queue_delay_ms: f64,
+    video_brake_bytes_per_sec: Option<f64>,
     /// `--max-bandwidth-bytes-per-sec`
     cap_bytes_per_sec: Option<f64>,
     /// min(cap, bandwidth x gain): what the allocator divides and the pacing rate
@@ -180,6 +185,8 @@ struct PeerState {
     acked_total: AtomicU64,
     /// `media::VideoRate::received_bytes` as of the previous allocation round
     video_received: AtomicU64,
+    /// video's own brake: (its cap in bytes/s, when it was last cut), see `video_cap`
+    video_brake: Mutex<Option<(f64, Instant)>>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
     /// flips to true when the peer is dropped: its channel tasks end on it, since a closed connection's data channels
@@ -253,6 +260,7 @@ impl PeerState {
             link: Mutex::new(LinkModel::default()),
             acked_total: AtomicU64::new(0),
             video_received: AtomicU64::new(0),
+            video_brake: Mutex::new(None),
             bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, ..Default::default() }),
             gone: AtomicBool::new(false),
             gone_signal: tokio::sync::watch::Sender::new(false),
@@ -314,14 +322,20 @@ impl PeerState {
         let delivered = acked + video_through;
         let link = {
             let mut link = self.link.lock();
-            // video is held back by the link when its own congestion control (GCC) allows less than its grant
-            let video_link_limited = video_through > 0.0 && self.video_rate.gcc_limit_bytes_per_sec().is_some_and(|limit| limit < self.video_rate.cap_bytes_per_sec());
+            // video is held back by the link when its queue brake or GCC allows less than its grant
+            let braked = self.video_brake.lock().is_some();
+            let video_link_limited = video_through > 0.0 && (braked || self.video_rate.gcc_limit_bytes_per_sec().is_some_and(|limit| limit < self.video_rate.cap_bytes_per_sec()));
             link.update(now, interval_secs, self.gate.take_round(), per_sec(video_through), video_link_limited, per_sec(delivered));
             link.clone()
         };
         let budget = self.budget(&link);
-        // video gets the budget, but no more than GCC's target while GCC brakes (it found the path congested)
-        let video_estimate = if has_video { self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget) } else { 0.0 };
+        // video gets the budget, but no more than its queue brake allows, nor GCC's target while GCC brakes
+        let video_estimate = if has_video {
+            let brake = self.video_cap(now, budget, per_sec(video_through));
+            self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget).min(brake.unwrap_or(budget))
+        } else {
+            0.0
+        };
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
@@ -339,6 +353,8 @@ impl PeerState {
             delivered_bytes_per_sec: link.delivered_bytes_per_sec,
             video_estimate_bytes_per_sec: video_estimate,
             video_sent_bytes_per_sec: per_sec(video_sent),
+            video_queue_delay_ms: self.video_rate.queue_delay_ms(),
+            video_brake_bytes_per_sec: self.video_brake.lock().map(|(cap, _)| cap),
             cap_bytes_per_sec: self.config.max_bandwidth,
             budget_bytes_per_sec: budget,
             gain: link.gain,
@@ -359,6 +375,29 @@ impl PeerState {
             network_blocked_fraction: (blocked_ms / 1000.0 / (interval_secs * active.max(1) as f64)).min(1.0),
             constrained: total_demand > budget,
         };
+    }
+
+    /// Video's own brake, from how long its packets wait in a queue (transport feedback's arrival times): video bypasses
+    /// the send window, so without it the latency target held data only, and at full quality a camera kept a Wi-Fi
+    /// queue of 150-650 ms. Over half the latency target of queueing (one way, so about the target in a round trip), it
+    /// is cut to 85% of what it delivers, at most once per `VIDEO_BRAKE_SPACING` (the queue takes time to drain); under
+    /// a quarter of the target it grows 8% a round, and lets go once at the budget.
+    fn video_cap(&self, now: Instant, budget: f64, video_delivered: f64) -> Option<f64> {
+        let queue_ms = self.video_rate.queue_delay_ms();
+        let target_ms = self.config.latency_target.as_secs_f64() * 1000.0;
+        let mut brake = self.video_brake.lock();
+        if queue_ms > target_ms / 2.0 && video_delivered > 0.0 {
+            let cut_due = brake.is_none_or(|(_, at)| now.duration_since(at) >= VIDEO_BRAKE_SPACING);
+            if cut_due {
+                let cap = brake.map_or(video_delivered, |(cap, _)| cap.min(video_delivered)) * 0.85;
+                *brake = Some((cap, now));
+            }
+        } else if queue_ms < target_ms / 4.0
+            && let Some((cap, at)) = *brake
+        {
+            *brake = (cap * 1.08 < budget).then_some((cap * 1.08, at));
+        }
+        brake.map(|(cap, _)| cap)
     }
 
     /// What data may take to reach the page: the gateway's target, tightened by the latency tolerances the page's streams

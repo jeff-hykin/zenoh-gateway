@@ -43,6 +43,8 @@ const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
 const PACING_FACTOR: f64 = 2.5;
+/// Video's queueing delay is measured against the least one-way delay over this long.
+const QUEUE_BASE_WINDOW: Duration = Duration::from_secs(10);
 /// GCC limits video for this long after it last cut its target (see `VideoRate::gcc_limit_bytes_per_sec`).
 const GCC_BRAKE: Duration = Duration::from_secs(5);
 /// Asks the browser to show each frame as soon as it is decoded (min = max = 0): no jitter-buffer
@@ -91,6 +93,9 @@ pub struct VideoRate {
     received_bytes: AtomicU64,
     /// when GCC last cut its target (it found the path congested)
     braked_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// how long video's packets of the latest feedback waited in a queue, at most (ms, f64 bits): their one-way delay
+    /// above the least of the last `QUEUE_BASE_WINDOW`
+    queue_delay_ms: AtomicU64,
 }
 
 impl VideoRate {
@@ -108,6 +113,11 @@ impl VideoRate {
     /// What the allocator granted video; the pacer never goes below GCC's own floor (RTCP and a keyframe still get out).
     pub fn set_cap_bytes_per_sec(&self, bytes_per_sec: f64) {
         self.cap_bps.store((bytes_per_sec * 8.0).max(GCC_MIN_BPS).to_bits(), Ordering::Relaxed);
+    }
+
+    /// How long video waited in a queue, per the latest transport feedback (ms).
+    pub fn queue_delay_ms(&self) -> f64 {
+        f64::from_bits(self.queue_delay_ms.load(Ordering::Relaxed))
     }
 
     /// Bytes of video the browser reported arrived, ever: what video really got through (GCC's target is a guess that
@@ -129,6 +139,9 @@ impl VideoRate {
 struct ReportingEstimator {
     inner: Gcc,
     rate: Arc<VideoRate>,
+    /// the first departure seen (one-way delays are measured from it) and (when, least one-way delay) per feedback
+    epoch: Option<Instant>,
+    one_way_floor: VecDeque<(Instant, f64)>,
 }
 
 impl ReportingEstimator {
@@ -145,6 +158,21 @@ impl BandwidthEstimator for ReportingEstimator {
     fn on_reports(&mut self, now: Instant, reports: &[PacketReport]) {
         let arrived: usize = reports.iter().filter(|report| report.arrived).map(|report| report.size).sum();
         self.rate.received_bytes.fetch_add(arrived as u64, Ordering::Relaxed);
+        // video's queueing delay: one-way delay (receiver clock minus send time, offset unknown) above its recent least
+        let epoch = *self.epoch.get_or_insert_with(|| reports.first().map_or(now, |report| report.departure));
+        let one_way: Vec<f64> = reports
+            .iter()
+            .filter_map(|report| report.arrival.map(|arrival| arrival.as_secs_f64() * 1000.0 - report.departure.saturating_duration_since(epoch).as_secs_f64() * 1000.0))
+            .collect();
+        if let Some(least) = one_way.iter().copied().reduce(f64::min) {
+            self.one_way_floor.push_back((now, least));
+            while self.one_way_floor.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) > QUEUE_BASE_WINDOW) {
+                self.one_way_floor.pop_front();
+            }
+            let floor = self.one_way_floor.iter().map(|(_, delay)| *delay).fold(f64::INFINITY, f64::min);
+            let most = one_way.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            self.rate.queue_delay_ms.store((most - floor).max(0.0).to_bits(), Ordering::Relaxed);
+        }
         self.inner.on_reports(now, reports);
         self.publish();
     }
@@ -226,8 +254,8 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
         media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: rtp_codec(mime), payload_type }, kind)?;
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), received_bytes: AtomicU64::new(0), braked_at: Default::default() });
-    let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone() };
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0) });
+    let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new() };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default());
     Ok((media_engine, registry, rate))
@@ -815,10 +843,42 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
     out
 }
 
+/// Most samples a video stream decodes ahead of the one it encodes, each on its own blocking thread.
+const MAX_DECODE_AHEAD: usize = 4;
+
+/// Decodes to keep in flight ahead of the frame being encoded: one (overlapping the encode) while the encode is the
+/// slower stage, more while a decode takes longer than an encode, so that the stream's rate is not one core's decode
+/// rate (a 1080p q95 jpeg took ~38 ms on a Jetson Orin core against ~1 ms of hardware encode: at most ~26 fps).
+fn decode_ahead(decode_ms: Option<f64>, encode_ms: Option<f64>) -> usize {
+    match (decode_ms, encode_ms) {
+        (Some(decode_ms), Some(encode_ms)) => ((decode_ms / encode_ms.max(1.0)).ceil() as usize).clamp(1, MAX_DECODE_AHEAD),
+        _ => 1,
+    }
+}
+
+/// Awaits `work` while starting decodes of samples as they may go (paced by `pick`), up to `limit` waiting in `ahead`.
+async fn picking_while<T>(work: impl Future<Output = T>, ahead: &mut VecDeque<Decoding>, limit: usize, shared: &SubShared, codec: &Arc<dyn MessageEncoding>) -> T {
+    tokio::pin!(work);
+    loop {
+        if ahead.len() >= limit {
+            return work.await;
+        }
+        let (picked, wake_at) = shared.pick(Instant::now());
+        if let Some((key, item)) = picked {
+            ahead.push_back(start_decode(shared, codec, key, item));
+            continue;
+        }
+        tokio::select! {
+            output = &mut work => return output,
+            _ = shared.wait_for_data(wake_at) => {}
+        }
+    }
+}
+
 /// Sends a video subscription's frames: pick (paced), decode (shared across frontends), encode in the encode session
-/// of its grant (shared by viewers at that grant, off the runtime), write to the track. The next decode overlaps this
-/// encode, so the slower of the two sets the rate (in series a 1920x1536 jpeg on a Jetson Orin core, ~16 ms + ~20 ms,
-/// could not keep up with 30 Hz).
+/// of its grant (shared by viewers at that grant, off the runtime), write to the track. Later samples decode while this
+/// one decodes and encodes ([`decode_ahead`]), in order, so the slower stage's throughput sets the rate, not the two
+/// in series (a 1920x1536 jpeg on a Jetson Orin core, ~16 ms + ~20 ms, could not keep up with 30 Hz) nor one decode.
 pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: TrackClaim) {
     let Some(codec) = shared.codec.clone() else { return };
     let sessions = &shared.codecs.video_sessions;
@@ -826,10 +886,10 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
     let mut next_frame_id: u32 = 0;
     let mut last_write: Option<Instant> = None;
     let mut warned_write = false;
-    let mut next: Option<Decoding> = None;
-    let mut decode_ms: Option<f64> = None;
+    let mut ahead: VecDeque<Decoding> = VecDeque::new();
+    let (mut decode_ms, mut encode_ms): (Option<f64>, Option<f64>) = (None, None);
     while !shared.is_closed() && track.is_current() {
-        let decoding = match next.take() {
+        let decoding = match ahead.pop_front() {
             Some(decoding) => decoding,
             None => {
                 let (picked, wake_at) = shared.pick(Instant::now());
@@ -841,7 +901,9 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             }
         };
         let Decoding { key, item, task } = decoding;
-        let (decoded, hash) = match finish_decode(task, shared.codecs.encode_timeout).await {
+        let depth = decode_ahead(decode_ms, encode_ms);
+        let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth - 1, &shared, &codec).await;
+        let (decoded, hash) = match finished {
             Ok((decoded, reused, ms, hash)) => {
                 if !reused {
                     decode_ms = Some(ewma(decode_ms, ms));
@@ -867,25 +929,9 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         }
         member.session = Some(session.clone());
         let input = Input { decoded, timestamp_ms: item.timestamp_ms, hash, quality, keyframe_requested: track.keyframe_requested.swap(false, Ordering::AcqRel) };
-        let outcome = {
-            let stepping = step(session, &mut member, input, shared.codecs.clone(), codec.clone());
-            tokio::pin!(stepping);
-            // while it encodes, pick the next frame and start decoding it as soon as one may go
-            loop {
-                if next.is_some() {
-                    break (&mut stepping).await;
-                }
-                let (picked, wake_at) = shared.pick(Instant::now());
-                if let Some((key, item)) = picked {
-                    next = Some(start_decode(&shared, &codec, key, item));
-                    continue;
-                }
-                tokio::select! {
-                    outcome = &mut stepping => break outcome,
-                    _ = shared.wait_for_data(wake_at) => {}
-                }
-            }
-        };
+        let stepping = step(session, &mut member, input, shared.codecs.clone(), codec.clone());
+        let outcome = picking_while(stepping, &mut ahead, depth, &shared, &codec).await;
+        encode_ms = outcome.encode_ms.or(encode_ms);
         if let Some(error) = &outcome.error {
             shared.record_encoding_error(error);
         }
