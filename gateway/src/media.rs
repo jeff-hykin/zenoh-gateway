@@ -93,7 +93,7 @@ pub struct VideoRate {
     received_bytes: AtomicU64,
     /// when GCC last cut its target (it found the path congested)
     braked_at: parking_lot::Mutex<Option<std::time::Instant>>,
-    /// how long video's packets of the latest feedback waited in a queue, at most (ms, f64 bits): their one-way delay
+    /// how long video's packets of the latest feedback waited in a queue (ms, f64 bits): their median one-way delay
     /// above the least of the last `QUEUE_BASE_WINDOW`
     queue_delay_ms: AtomicU64,
 }
@@ -170,8 +170,11 @@ impl BandwidthEstimator for ReportingEstimator {
                 self.one_way_floor.pop_front();
             }
             let floor = self.one_way_floor.iter().map(|(_, delay)| *delay).fold(f64::INFINITY, f64::min);
-            let most = one_way.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            self.rate.queue_delay_ms.store((most - floor).max(0.0).to_bits(), Ordering::Relaxed);
+            // the batch's median (a Wi-Fi aggregation burst delays a few packets without a standing queue)
+            let mut sorted = one_way.clone();
+            sorted.sort_by(f64::total_cmp);
+            let median = sorted[sorted.len() / 2];
+            self.rate.queue_delay_ms.store((median - floor).max(0.0).to_bits(), Ordering::Relaxed);
         }
         self.inner.on_reports(now, reports);
         self.publish();

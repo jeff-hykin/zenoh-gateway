@@ -46,8 +46,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often each frontend's bandwidth is re-estimated and re-allocated.
 const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
-/// Video's queue brake cuts at most this often (see `PeerState::video_cap`).
+/// Video's queue brake (see `PeerState::video_cap`): cuts at most this often, after the queue was high this many rounds
+/// in a row, from the most video delivered over this long.
 const VIDEO_BRAKE_SPACING: Duration = Duration::from_millis(500);
+const VIDEO_QUEUE_ROUNDS: u32 = 2;
+const VIDEO_DELIVERY_WINDOW: Duration = Duration::from_secs(2);
 
 /// Gateway-wide allocation settings (builder options / command-line flags).
 #[derive(Debug, Clone, Copy)]
@@ -187,6 +190,8 @@ struct PeerState {
     video_received: AtomicU64,
     /// video's own brake: (its cap in bytes/s, when it was last cut), see `video_cap`
     video_brake: Mutex<Option<(f64, Instant)>>,
+    /// (when, bytes/s) video delivered over the last `VIDEO_DELIVERY_WINDOW`, and the rounds in a row its queue was high
+    video_delivery: Mutex<(std::collections::VecDeque<(Instant, f64)>, u32)>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
     /// flips to true when the peer is dropped: its channel tasks end on it, since a closed connection's data channels
@@ -261,6 +266,7 @@ impl PeerState {
             acked_total: AtomicU64::new(0),
             video_received: AtomicU64::new(0),
             video_brake: Mutex::new(None),
+            video_delivery: Mutex::new(Default::default()),
             bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, ..Default::default() }),
             gone: AtomicBool::new(false),
             gone_signal: tokio::sync::watch::Sender::new(false),
@@ -322,9 +328,9 @@ impl PeerState {
         let delivered = acked + video_through;
         let link = {
             let mut link = self.link.lock();
-            // video is held back by the link when its queue brake or GCC allows less than its grant
-            let braked = self.video_brake.lock().is_some();
-            let video_link_limited = video_through > 0.0 && (braked || self.video_rate.gcc_limit_bytes_per_sec().is_some_and(|limit| limit < self.video_rate.cap_bytes_per_sec()));
+            // video is held back by the link when GCC allows less than its grant (not by its own queue brake: that is
+            // ours, and counting its rounds as the link's speed lowered the bandwidth with every cut, a spiral)
+            let video_link_limited = video_through > 0.0 && self.video_rate.gcc_limit_bytes_per_sec().is_some_and(|limit| limit < self.video_rate.cap_bytes_per_sec());
             link.update(now, interval_secs, self.gate.take_round(), per_sec(video_through), video_link_limited, per_sec(delivered));
             link.clone()
         };
@@ -379,23 +385,33 @@ impl PeerState {
 
     /// Video's own brake, from how long its packets wait in a queue (transport feedback's arrival times): video bypasses
     /// the send window, so without it the latency target held data only, and at full quality a camera kept a Wi-Fi
-    /// queue of 150-650 ms. Over half the latency target of queueing (one way, so about the target in a round trip), it
-    /// is cut to 85% of what it delivers, at most once per `VIDEO_BRAKE_SPACING` (the queue takes time to drain); under
-    /// a quarter of the target it grows 8% a round, and lets go once at the budget.
+    /// queue of 150-650 ms. When the queue stays over half the latency target (one way, so about the target in a round
+    /// trip) for `VIDEO_QUEUE_ROUNDS` rounds, video is cut to 85% of the most it delivered over `VIDEO_DELIVERY_WINDOW`
+    /// (cut from the last round's, a cut lowered what it delivered and the next cut went lower: a spiral), at most once
+    /// per `VIDEO_BRAKE_SPACING`; under a quarter of the target it grows 25% a round (back in about a second), and lets
+    /// go once at the budget.
     fn video_cap(&self, now: Instant, budget: f64, video_delivered: f64) -> Option<f64> {
         let queue_ms = self.video_rate.queue_delay_ms();
         let target_ms = self.config.latency_target.as_secs_f64() * 1000.0;
+        let (recent_most, high_rounds) = {
+            let mut delivery = self.video_delivery.lock();
+            delivery.0.push_back((now, video_delivered));
+            while delivery.0.front().is_some_and(|(at, _)| now.duration_since(*at) > VIDEO_DELIVERY_WINDOW) {
+                delivery.0.pop_front();
+            }
+            delivery.1 = if queue_ms > target_ms / 2.0 { delivery.1 + 1 } else { 0 };
+            (delivery.0.iter().map(|(_, rate)| *rate).fold(0.0, f64::max), delivery.1)
+        };
         let mut brake = self.video_brake.lock();
-        if queue_ms > target_ms / 2.0 && video_delivered > 0.0 {
-            let cut_due = brake.is_none_or(|(_, at)| now.duration_since(at) >= VIDEO_BRAKE_SPACING);
-            if cut_due {
-                let cap = brake.map_or(video_delivered, |(cap, _)| cap.min(video_delivered)) * 0.85;
+        if high_rounds >= VIDEO_QUEUE_ROUNDS && recent_most > 0.0 {
+            if brake.is_none_or(|(_, at)| now.duration_since(at) >= VIDEO_BRAKE_SPACING) {
+                let cap = brake.map_or(recent_most, |(cap, _)| cap.min(recent_most)) * 0.85;
                 *brake = Some((cap, now));
             }
         } else if queue_ms < target_ms / 4.0
             && let Some((cap, at)) = *brake
         {
-            *brake = (cap * 1.08 < budget).then_some((cap * 1.08, at));
+            *brake = (cap * 1.25 < budget).then_some((cap * 1.25, at));
         }
         brake.map(|(cap, _)| cap)
     }
