@@ -25,6 +25,9 @@ const MIN_LOSS_TIMEOUT: Duration = Duration::from_millis(200);
 /// at least `MIN_SAMPLE_TIME`, and the ack delay is added to each sample's time: never above the link, at most ~9% under.
 const ACK_DELAY: Duration = Duration::from_millis(50);
 const MIN_SAMPLE_TIME: Duration = Duration::from_millis(10 * ACK_DELAY.as_millis() as u64);
+/// The time one rate sample covers at least: a round of the link model must last this long, or a probe round's extra
+/// is averaged with the rounds around it and never shows.
+pub const SAMPLE_SPAN: Duration = Duration::from_millis(MIN_SAMPLE_TIME.as_millis() as u64 + ACK_DELAY.as_millis() as u64);
 /// A frame sent with at most this much in flight queued behind (almost) nothing of ours: its round trip is the path's.
 const QUIET_BYTES: usize = 8 * 1024;
 /// Acks are remembered this long to sample a rate over (longer than any round trip worth sampling over).
@@ -41,6 +44,8 @@ struct Frame {
     sent_at: Instant,
     /// the sender was held back by the link (not its own spacing) when it sent this
     link_limited: bool,
+    /// ... or by the latency target's window
+    latency_limited: bool,
     /// at most `QUIET_BYTES` were in flight when it was sent
     quiet: bool,
 }
@@ -51,6 +56,8 @@ struct Frame {
 pub struct RoundSamples {
     pub link_limited_rate: Option<f64>,
     pub app_limited_rate: Option<f64>,
+    /// the highest from frames the latency target's window held back (the sender wanted more; the link may carry more)
+    pub latency_limited_rate: Option<f64>,
     pub min_rtt_ms: Option<f64>,
     /// the median send-to-ack time over the last `TYPICAL_RTT_WINDOW`: what the window must cover on a path whose delay
     /// swings (Wi-Fi: 20-400 ms), where a window of bandwidth x the least delivered a tenth of the bandwidth
@@ -82,6 +89,8 @@ struct Path {
     ack_history: std::collections::VecDeque<(Instant, u64)>,
     /// the next bulk frame waited on the window or the pacing rate
     held: bool,
+    /// the next bulk frame waited on the latency target's window
+    held_by_target: bool,
     /// a frame went unacked for `stale_after`: the page stopped reading (see `SendGate::expire_stale`)
     stalled: bool,
     round: RoundSamples,
@@ -131,6 +140,7 @@ impl SendGate {
                 ack_history: Default::default(),
                 quiet_rtts: Default::default(),
                 held: false,
+                held_by_target: false,
                 stalled: false,
                 round: RoundSamples::default(),
                 bandwidth: crate::allocator::INITIAL_BANDWIDTH,
@@ -289,7 +299,7 @@ impl SendGate {
         path.next += 1;
         let quiet = path.in_flight <= QUIET_BYTES;
         path.in_flight += bytes;
-        let frame = Frame { stream, bytes, lossy, sent_at: now, link_limited: std::mem::take(&mut path.held), quiet };
+        let frame = Frame { stream, bytes, lossy, sent_at: now, link_limited: std::mem::take(&mut path.held), latency_limited: std::mem::take(&mut path.held_by_target), quiet };
         path.frames.insert(order, frame);
         order
     }
@@ -330,7 +340,11 @@ impl SendGate {
                 // (over the time plus the ack delay: what this ack covers may have arrived that much earlier, and the highest
                 // sample wins, so the unpadded time read the link 1.3x fast on a 500 kbit/s link)
                 let rate = (acked_total - acked_then) as f64 / (now.duration_since(at) + ACK_DELAY).as_secs_f64();
-                let slot = if frame.link_limited { &mut path.round.link_limited_rate } else { &mut path.round.app_limited_rate };
+                let slot = match (frame.link_limited, frame.latency_limited) {
+                    (true, _) => &mut path.round.link_limited_rate,
+                    (false, true) => &mut path.round.latency_limited_rate,
+                    (false, false) => &mut path.round.app_limited_rate,
+                };
                 *slot = Some(slot.map_or(rate, |most| most.max(rate)));
             }
         }
@@ -382,6 +396,7 @@ impl SendGate {
                 let window_open = path.in_flight == 0 || path.in_flight + bytes <= window;
                 if self.strict_busy.load(Ordering::Acquire) > 0 || !window_open {
                     path.held |= !window_open && !path.latency_capped;
+                    path.held_by_target |= !window_open && path.latency_capped;
                     path.round.window_waited |= !window_open;
                     // woken by an ack or a strict turn ending; looked at again after the loss timeout for a lost tail
                     (true, MIN_LOSS_TIMEOUT)
