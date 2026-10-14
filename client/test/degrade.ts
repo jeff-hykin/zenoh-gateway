@@ -17,7 +17,7 @@ import { launch } from "jsr:@astral/astral@0.5.6"
 // slackMs: what the strict streams may take beyond the link's own round trip (300 ms; the floor cell's strict traffic is a
 // third of its link, and its packets queue behind each other)
 // subscribe: which of the page's streams it subscribes (default all: cams clouds map pose tf cmd cmd_vel); serverEnv: the
-// degrade_server's load (CAMS, MAP_HZ, ...); shape cells check only the link model, tracing its stats every 250 ms
+// degrade_server's load (CAMS, MAP_HZ, ...); shape cells check only the link model, tracing its stats every second
 type Cell = { name: string; seconds: number; schedule: [number, number][]; delayMs: number; jitterMs: number; loss: number; slackMs?: number; subscribe?: string[]; serverEnv?: Record<string, string>; shape?: boolean }
 const cells: Cell[] = [
     { name: "20mbit", seconds: 30, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
@@ -280,17 +280,20 @@ async function runCell(cell: Cell) {
                     }
                 }
             }, windowMs)
-            // shape cells: the link model every 250 ms (stats replies leave on the control channel, outside the model)
+            // shape cells: the link model every second (stats replies leave on the control channel, outside the model: a
+            // reply is several KB, and every 250 ms they took a third of video_slow's 125 KB/s link unseen, so video
+            // queued at the link delivered 40-80 KB/s and the estimate followed)
             const tracer = setInterval(async () => {
                 if (!trace) {
                     return
                 }
                 const at = performance.now() - started
-                const bw = (await client._request({ op: "stats" }, 3000).catch(() => null))?.bandwidth
+                const reply = await client._request({ op: "stats" }, 3000).catch(() => null)
+                const bw = reply?.bandwidth
                 if (bw) {
-                    ;(current().trace ??= []).push({ at, est: bw.dataEstimateBytesPerSec, budget: bw.budgetBytesPerSec, startingUp: bw.startingUp, probingRtt: bw.probingRtt, video: bw.videoSentBytesPerSec, delivered: bw.deliveredBytesPerSec, gain: bw.gain })
+                    ;(current().trace ??= []).push({ at, replyBytes: JSON.stringify(reply).length, est: bw.dataEstimateBytesPerSec, budget: bw.budgetBytesPerSec, startingUp: bw.startingUp, probingRtt: bw.probingRtt, video: bw.videoSentBytesPerSec, delivered: bw.deliveredBytesPerSec, gain: bw.gain, queue: bw.videoQueueDelayMs, brake: bw.videoBrakeBytesPerSec })
                 }
-            }, 250)
+            }, 1000)
             await new Promise((resolve) => setTimeout(resolve, seconds * 1000))
             for (const timer of [commander, sampler, statsTimer, tracer]) {
                 clearInterval(timer)
@@ -375,18 +378,24 @@ function check(cell: Cell, windows: any[], from: number, to: number, label: stri
     return failures
 }
 
-/** A shape cell: once settled (10 s), the estimate must not fall back toward the first guess, and startup must end. */
+/** A shape cell: once settled (10 s), the estimate must not fall under half what it reached, and startup must end. */
 function checkShape(cell: Cell, windows: any[]): string[] {
     const trace = windows.flatMap((window) => window.trace ?? [])
     const settled = trace.filter((point) => point.at >= 10_000)
     const link = cell.schedule[0][1]
     const peak = Math.max(...settled.map((point) => point.est))
     const least = Math.min(...settled.map((point) => point.est))
-    const dips = settled.filter((point) => point.est < 0.5 * peak)
+    // under half the most it had reached by then: before a page's first message (a map every 20 s) there is nothing to
+    // measure, and the first guess standing isn't a fall
+    let reached = 0
+    const dips = trace.filter((point) => {
+        reached = Math.max(reached, point.est)
+        return point.at >= 10_000 && point.est < 0.5 * reached
+    })
     const startup = settled.filter((point) => point.startingUp).length
     const probing = settled.filter((point) => point.probingRtt).length
     const kb = (value: number) => `${Math.round(value / 1000)} KB/s`
-    console.log(`  shape      est ${kb(least)}..${kb(peak)} on ${kb(link)} | under half the peak ${dips.length}/${settled.length} samples at ${dips.map((point) => (point.at / 1000).toFixed(1)).join(" ")} s | startup ${startup}/${settled.length} | probeRTT ${probing}/${settled.length}`)
+    console.log(`  shape      est ${kb(least)}..${kb(peak)} on ${kb(link)} | under half the most yet ${dips.length}/${settled.length} samples at ${dips.map((point) => (point.at / 1000).toFixed(1)).join(" ")} s | startup ${startup}/${settled.length} | probeRTT ${probing}/${settled.length}`)
     for (const [index, window] of windows.entries()) {
         const points = window.trace ?? []
         const ages = Object.entries(window.ages as Record<string, number[]>).map(([key, values]) => `${key.replace("robot/", "")} ${window.count[key]} msgs ${kb(window.bytes[key] / (windowMs / 1000))} p95 age ${round(percentile(values, 0.95))} ms`).join(", ")
@@ -394,7 +403,7 @@ function checkShape(cell: Cell, windows: any[]): string[] {
     }
     const failures: string[] = []
     if (dips.length) {
-        failures.push(`${cell.name}: estimate fell under half its peak (${kb(peak)}) ${dips.length} times after 10 s, least ${kb(least)}`)
+        failures.push(`${cell.name}: estimate fell under half what it had reached (peak ${kb(peak)}) ${dips.length} times after 10 s, least ${kb(least)}`)
     }
     if (startup === settled.length && settled.length) {
         failures.push(`${cell.name}: still starting up after ${cell.seconds} s`)
