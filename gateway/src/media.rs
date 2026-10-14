@@ -108,6 +108,11 @@ impl VideoRate {
     fn cap_bps(&self) -> f64 {
         f64::from_bits(self.cap_bps.load(Ordering::Relaxed))
     }
+
+    /// What the allocator granted video, bytes/s (at least GCC's floor).
+    pub fn cap_bytes_per_sec(&self) -> f64 {
+        self.cap_bps() / 8.0
+    }
 }
 
 struct ReportingEstimator {

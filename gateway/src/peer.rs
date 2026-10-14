@@ -314,7 +314,9 @@ impl PeerState {
         let delivered = acked + video_through;
         let link = {
             let mut link = self.link.lock();
-            link.update(now, interval_secs, self.gate.take_round(), per_sec(video_through), per_sec(delivered));
+            // video is held back by the link when its own congestion control (GCC) allows less than its grant
+            let video_link_limited = video_through > 0.0 && self.video_rate.gcc_bytes_per_sec() < self.video_rate.cap_bytes_per_sec();
+            link.update(now, interval_secs, self.gate.take_round(), per_sec(video_through), video_link_limited, per_sec(delivered));
             link.clone()
         };
         let budget = self.budget(&link);
