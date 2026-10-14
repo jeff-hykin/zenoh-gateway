@@ -25,6 +25,8 @@ const MIN_LOSS_TIMEOUT: Duration = Duration::from_millis(200);
 /// at least `MIN_SAMPLE_TIME`, and the ack delay is added to each sample's time: never above the link, at most ~9% under.
 const ACK_DELAY: Duration = Duration::from_millis(50);
 const MIN_SAMPLE_TIME: Duration = Duration::from_millis(10 * ACK_DELAY.as_millis() as u64);
+/// A frame sent with at most this much in flight queued behind (almost) nothing of ours: its round trip is the path's.
+const QUIET_BYTES: usize = 8 * 1024;
 /// Acks are remembered this long to sample a rate over (longer than any round trip worth sampling over).
 const ACK_HISTORY: Duration = Duration::from_secs(2);
 /// The typical round trip is the median over this long.
@@ -39,6 +41,8 @@ struct Frame {
     sent_at: Instant,
     /// the sender was held back by the link (not its own spacing) when it sent this
     link_limited: bool,
+    /// at most `QUIET_BYTES` were in flight when it was sent
+    quiet: bool,
 }
 
 /// One round of delivery-rate samples (draft-cheng-iccrg-delivery-rate-estimation): the highest from frames sent while
@@ -51,8 +55,9 @@ pub struct RoundSamples {
     /// the median send-to-ack time over the last `TYPICAL_RTT_WINDOW`: what the window must cover on a path whose delay
     /// swings (Wi-Fi: 20-400 ms), where a window of bandwidth x the least delivered a tenth of the bandwidth
     pub typical_rtt_ms: Option<f64>,
-    /// the median send-to-ack time of this round's acks
-    pub median_rtt_ms: Option<f64>,
+    /// the path's own round trip: the median send-to-ack time, over `RTT_WINDOW`, of frames sent while at most
+    /// `QUIET_BYTES` were in flight (they queued behind nothing of ours)
+    pub path_rtt_ms: Option<f64>,
     /// the most acks ran ahead of bandwidth x time this round (bytes): they arrive in bursts (the page acks in batches,
     /// Wi-Fi aggregates frames), so the window needs this on top of bandwidth x round trip
     pub extra_acked: f64,
@@ -71,8 +76,8 @@ struct Path {
     acked_total: u64,
     /// (when, send-to-ack ms) of recent acks
     rtts: std::collections::VecDeque<(Instant, f64)>,
-    /// send-to-ack times (ms) of this round's acks
-    round_rtts: Vec<f64>,
+    /// (when, send-to-ack ms) of acked frames sent while at most `QUIET_BYTES` were in flight
+    quiet_rtts: std::collections::VecDeque<(Instant, f64)>,
     /// (when, acked_total) after each ack, for `ACK_HISTORY`
     ack_history: std::collections::VecDeque<(Instant, u64)>,
     /// the next bulk frame waited on the window or the pacing rate
@@ -113,7 +118,7 @@ impl Default for SendGate {
                 acked_total: 0,
                 rtts: Default::default(),
                 ack_history: Default::default(),
-                round_rtts: Vec::new(),
+                quiet_rtts: Default::default(),
                 held: false,
                 round: RoundSamples::default(),
                 bandwidth: crate::allocator::INITIAL_BANDWIDTH,
@@ -215,10 +220,13 @@ impl SendGate {
         let mut recent: Vec<f64> = path.rtts.iter().filter(|(at, _)| now.duration_since(*at) <= TYPICAL_RTT_WINDOW).map(|(_, rtt)| *rtt).collect();
         recent.sort_by(f64::total_cmp);
         let typical_rtt_ms = recent.get(recent.len() / 2).copied();
-        let mut round_rtts = std::mem::take(&mut path.round_rtts);
-        round_rtts.sort_by(f64::total_cmp);
-        let median_rtt_ms = round_rtts.get(round_rtts.len() / 2).copied();
-        RoundSamples { drained, typical_rtt_ms, median_rtt_ms, ..std::mem::take(&mut path.round) }
+        while path.quiet_rtts.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW) {
+            path.quiet_rtts.pop_front();
+        }
+        let mut quiet: Vec<f64> = path.quiet_rtts.iter().map(|(_, rtt)| *rtt).collect();
+        quiet.sort_by(f64::total_cmp);
+        let path_rtt_ms = quiet.get(quiet.len() / 2).copied();
+        RoundSamples { drained, typical_rtt_ms, path_rtt_ms, ..std::mem::take(&mut path.round) }
     }
 
     /// The right to send one message bigger than a bulk chunk, held until it is sent whole; waiters get it in arrival
@@ -242,8 +250,9 @@ impl SendGate {
         path.tokens -= bytes as f64;
         let order = path.next;
         path.next += 1;
+        let quiet = path.in_flight <= QUIET_BYTES;
         path.in_flight += bytes;
-        let frame = Frame { stream, bytes, lossy, sent_at: now, link_limited: std::mem::take(&mut path.held) };
+        let frame = Frame { stream, bytes, lossy, sent_at: now, link_limited: std::mem::take(&mut path.held), quiet };
         path.frames.insert(order, frame);
         order
     }
@@ -260,7 +269,9 @@ impl SendGate {
                 path.acked_total += frame.bytes as u64;
                 let rtt = now.duration_since(frame.sent_at).as_secs_f64() * 1000.0;
                 path.rtts.push_back((now, rtt));
-                path.round_rtts.push(rtt);
+                if frame.quiet {
+                    path.quiet_rtts.push_back((now, rtt));
+                }
                 path.round.min_rtt_ms = Some(path.round.min_rtt_ms.map_or(rtt, |least| least.min(rtt)));
                 newest_acked = Some(frame);
             }

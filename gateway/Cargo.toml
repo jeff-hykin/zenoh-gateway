@@ -49,6 +49,9 @@ rav1e = { version = "0.8", default-features = false, features = ["threading"], o
 # feature `client`: POST /offer
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
+# only for the dhat-heap feature
+dhat = { version = "0.3", optional = true }
+
 [features]
 default = ["av1"]
 # channel video-av1 out of the box: rav1e, pure Rust
@@ -57,6 +60,8 @@ av1 = ["dep:rav1e"]
 client = ["dep:reqwest"]
 # zenoh_gateway::CloudflareTurn: TURN credentials from Cloudflare's API
 cloudflare = ["dep:reqwest"]
+# examples/degrade_server: profile the heap with dhat (live bytes per allocation site, written on exit)
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 # decodes a real camera frame for the ignored bench_stages

@@ -157,17 +157,16 @@ pub struct LinkModel {
     pub min_rtt_ms: Option<f64>,
     /// the median round trip lately (`RoundSamples::typical_rtt_ms`)
     pub typical_rtt_ms: Option<f64>,
-    /// the path's own round trip: the median measured while ProbeRTT has the queue drained (averaged with the previous),
-    /// so a queue of ours can't pass for it
+    /// the path's own round trip (`RoundSamples::path_rtt_ms`: frames sent with almost nothing of ours in flight), so a
+    /// queue of ours can't pass for it (measured during ProbeRTT's drain instead, a 640 KB queue the drain didn't empty
+    /// read as a 645 ms path, left latency first, and the queue grew)
     pub path_rtt_ms: Option<f64>,
     pub extra_acked: f64,
     #[serde(skip)]
     extra_acked_samples: std::collections::VecDeque<(std::time::Instant, f64)>,
-    /// the least round trip seen during the ProbeRTT under way, and its rounds' medians
+    /// the least round trip seen during the ProbeRTT under way
     #[serde(skip)]
     probe_min_rtt: Option<f64>,
-    #[serde(skip)]
-    probe_median_rtts: Vec<f64>,
     /// when the last ProbeRTT ended (or the model started)
     #[serde(skip)]
     probed_rtt_at: Option<std::time::Instant>,
@@ -216,8 +215,8 @@ const PROBE_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 const BANDWIDTH_ROUNDS: f64 = 10.0;
 const MIN_RTT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 const PROBE_RTT_TIME: std::time::Duration = std::time::Duration::from_millis(200);
-/// ProbeRTT runs at least this often (not only when the least round trip went stale) to re-measure the path's own round
-/// trip, which picks between latency and throughput (`window`).
+/// ProbeRTT runs at least this often (not only when the least round trip went stale): its drain sends frames with little
+/// in flight, whose round trips are the path's own (`path_rtt_ms`, which picks latency or throughput first in `window`).
 const PROBE_RTT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Bytes in flight before any round trip is measured, and the least ever: RFC 6928's 10 packets, BBR's 4.
 const INITIAL_WINDOW: usize = 10 * 1200;
@@ -236,7 +235,6 @@ impl Default for LinkModel {
             extra_acked: 0.0,
             extra_acked_samples: Default::default(),
             probe_min_rtt: None,
-            probe_median_rtts: Vec::new(),
             probed_rtt_at: None,
             samples: Default::default(),
             min_rtt_at: None,
@@ -325,6 +323,9 @@ impl LinkModel {
 
     fn update_round_trip(&mut self, now: std::time::Instant, round: &crate::pacing::RoundSamples) {
         let (round_rtt_ms, drained) = (round.min_rtt_ms, round.drained);
+        if round.path_rtt_ms.is_some() {
+            self.path_rtt_ms = round.path_rtt_ms;
+        }
         self.probed_rtt_at.get_or_insert(now);
         if self.probing_rtt {
             // the clock starts once what is in flight is down to the minimum window, or after one round regardless: strict
@@ -339,19 +340,12 @@ impl LinkModel {
             if let Some(rtt) = round_rtt_ms.filter(|_| self.probe_rtt_until.is_some()) {
                 self.probe_min_rtt = Some(self.probe_min_rtt.map_or(rtt, |least| least.min(rtt)));
             }
-            if let Some(median) = round.median_rtt_ms.filter(|_| self.probe_rtt_until.is_some()) {
-                self.probe_median_rtts.push(median);
-            }
+
             if self.probe_rtt_until.is_some_and(|until| now >= until) {
                 (self.probing_rtt, self.probe_rtt_rounds) = (false, 0);
                 self.probe_rtt_until = None;
                 if let Some(least) = self.probe_min_rtt.take() {
                     (self.min_rtt_ms, self.min_rtt_at) = (Some(least), Some(now));
-                }
-                let mut medians = std::mem::take(&mut self.probe_median_rtts);
-                medians.sort_by(f64::total_cmp);
-                if let Some(&median) = medians.get(medians.len() / 2) {
-                    self.path_rtt_ms = Some(self.path_rtt_ms.map_or(median, |previous| (previous + median) / 2.0));
                 }
                 self.probed_rtt_at = Some(now);
             }
@@ -509,7 +503,7 @@ mod tests {
     fn sample(rate: f64, link_limited: bool, rtt_ms: f64) -> crate::pacing::RoundSamples {
         let rate = Some(rate);
         let (link_limited_rate, app_limited_rate) = if link_limited { (rate, None) } else { (None, rate) };
-        crate::pacing::RoundSamples { link_limited_rate, app_limited_rate, min_rtt_ms: Some(rtt_ms), typical_rtt_ms: Some(rtt_ms), median_rtt_ms: Some(rtt_ms), extra_acked: 0.0, drained: true, window_waited: link_limited }
+        crate::pacing::RoundSamples { link_limited_rate, app_limited_rate, min_rtt_ms: Some(rtt_ms), typical_rtt_ms: Some(rtt_ms), path_rtt_ms: Some(rtt_ms), extra_acked: 0.0, drained: true, window_waited: link_limited }
     }
 
     /// Rounds of 250 ms on a link that carries `capacity` bytes/s: delivered is what the budget allowed, up to it.

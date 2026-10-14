@@ -8,6 +8,12 @@
 //! - robot/cmd_vel_echo: every robot/cmd_vel put, republished as is (the page's commands, round trip).
 
 use anyhow::Result;
+
+// DHAT=1 builds (`--features dhat-heap`): the heap's live bytes every 30 s on stderr, and per allocation site in
+// dhat-heap.json (DHAT_FILE) on SIGINT/SIGTERM; view it at https://nnethercote.github.io/dh_view/dh_view.html
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 use std::time::Duration;
 use zenoh_gateway::{Channel, DecodedFrame, EncodeOptions, EncodingOutput, EncodingSample, MessageEncoding, Server, VideoImage, zenoh};
 
@@ -109,6 +115,24 @@ async fn main() -> Result<()> {
         .await
         .map_err(anyhow::Error::msg)?;
     println!("listening on http://{}", running.local_addr());
-    tokio::signal::ctrl_c().await?;
-    running.shutdown().await
+    #[cfg(feature = "dhat-heap")]
+    let profiler = dhat::Profiler::builder().file_name(std::env::var("DHAT_FILE").unwrap_or_else(|_| "dhat-heap.json".into())).build();
+    #[cfg(feature = "dhat-heap")]
+    tokio::spawn(async {
+        let started = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let stats = dhat::HeapStats::get();
+            eprintln!("heap t={:.0}s live {:.1} MB in {} blocks (peak {:.1} MB)", started.elapsed().as_secs_f64(), stats.curr_bytes as f64 / 1e6, stats.curr_blocks, stats.max_bytes as f64 / 1e6);
+        }
+    });
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => {}
+    }
+    let result = running.shutdown().await;
+    #[cfg(feature = "dhat-heap")]
+    drop(profiler);
+    result
 }

@@ -95,7 +95,7 @@ struct BandwidthStats {
     extra_acked_bytes: f64,
     probing_rtt: bool,
     /// what data may take to reach the page (the gateway's target, tightened by the streams' maxAge), the path's own round
-    /// trip (measured with the queue drained), and whether the path is under the target so latency comes first
+    /// trip (from frames sent with almost nothing of ours in flight), and whether the path is under the target so latency comes first
     latency_target_ms: f64,
     path_rtt_ms: Option<f64>,
     latency_first: bool,

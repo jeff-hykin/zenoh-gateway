@@ -32,6 +32,8 @@ const cells: Cell[] = [
     // the R1 on 2.4 GHz Wi-Fi (2026-10-13): ~300 KB/s, 3 ms at best, 60-400 ms typical, frames retried; the estimate
     // collapsed to 16 KB/s and blamed the page
     { name: "r1_wifi", seconds: 45, schedule: [[0, 300_000]], delayMs: 2, jitterMs: 400, loss: 0.005, slackMs: 500 },
+    // memory soak, only when named: SOAK_SECONDS on a clean 20 Mbit/s link (DEGRADE_FEATURES=dhat-heap profiles the heap)
+    ...(Deno.args.includes("soak") ? [{ name: "soak", seconds: Number(Deno.env.get("SOAK_SECONDS") ?? 1200), schedule: [[0, 2_500_000]] as [number, number][], delayMs: 30, jitterMs: 0, loss: 0 }] : []),
     { name: "step", seconds: 90, schedule: [[0, 2_500_000], [30, 125_000], [60, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
 ]
 const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell.name)) : cells
@@ -48,7 +50,7 @@ const bundled = await new Deno.Command(Deno.execPath(), { args: ["bundle", "--qu
 if (bundled.code !== 0) {
     throw new Error(`deno bundle failed: ${new TextDecoder().decode(bundled.stderr)}`)
 }
-const build = await new Deno.Command("cargo", { args: ["build", "--release", "--example", "degrade_server"], cwd: `${root}gateway`, stderr: "inherit" }).output()
+const build = await new Deno.Command("cargo", { args: ["build", "--release", "--example", "degrade_server", ...(Deno.env.get("DEGRADE_FEATURES") ? ["--features", Deno.env.get("DEGRADE_FEATURES")!] : [])], cwd: `${root}gateway`, stderr: "inherit" }).output()
 if (build.code !== 0) {
     throw new Error("cargo build failed")
 }
