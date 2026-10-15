@@ -75,6 +75,7 @@ pub struct ServerBuilder {
     encodings: Vec<Arc<dyn MessageEncoding>>,
     authorize: Option<Arc<Authorize>>,
     lease_groups: HashMap<String, Vec<String>>,
+    slowest_lease_heartbeat_allowed: Duration,
     connect_config: ConnectConfig,
     video_encoders: Vec<(VideoFormat, VideoEncoderFactory)>,
     video_policy: VideoPolicy,
@@ -97,6 +98,7 @@ impl Default for ServerBuilder {
             encodings: Vec::new(),
             authorize: None,
             lease_groups: HashMap::new(),
+            slowest_lease_heartbeat_allowed: Duration::from_secs(60),
             connect_config: ConnectConfig::default(),
             video_encoders: Vec::new(),
             video_policy: VideoPolicy::default(),
@@ -216,6 +218,13 @@ impl ServerBuilder {
         self
     }
 
+    /// The slowest heartbeat a client may hold a lease with (default 60 s): `heartbeatMisses / heartbeatHz` longer than
+    /// this is refused a lease, since a page that froze keeps its leases until that much silence.
+    pub fn slowest_lease_heartbeat_allowed(mut self, deadline: Duration) -> Self {
+        self.slowest_lease_heartbeat_allowed = deadline;
+        self
+    }
+
     /// STUN/TURN servers for the gateway's side of every connection, also handed to browsers at [`ICE_PATH`].
     pub fn ice_servers(mut self, servers: impl IntoIterator<Item = IceServer>) -> Self {
         self.connect_config.ice_servers = servers.into_iter().collect();
@@ -315,7 +324,7 @@ impl ServerBuilder {
             }
         };
         ensure!(self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0), "the UDP port range must be non-empty and above 0");
-        let leases = Leases::new(self.lease_groups);
+        let leases = Leases::new(self.lease_groups, self.slowest_lease_heartbeat_allowed);
         let gateway = Gateway::new(session.clone(), codecs, AllocationConfig {
             max_bandwidth: self.max_bandwidth_bytes_per_sec,
             latency_target: self.latency_target,

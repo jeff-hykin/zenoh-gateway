@@ -592,6 +592,26 @@ impl Gateway {
         channels.collect()
     }
 
+    /// Ends every other connection's subscription to keys overlapping `keys` (`holder` just leased them), telling each
+    /// one `rejected` with why.
+    async fn end_leased_subscriptions(&self, keys: &[String], holder: u64) {
+        let ended: Vec<(Arc<PeerState>, Option<u64>, String)> = {
+            let peers = self.peers.lock();
+            peers.iter().filter(|(peer_id, _)| **peer_id != holder).flat_map(|(peer_id, entry)| entry.state.channels.lock().values().filter_map(|channel| match &channel.stats {
+                ChannelStats::Sub(shared) if !shared.is_closed() && let Some(reason) = self.leases.subscribe_blocker(*peer_id, &channel.label.key) && crate::auth::overlaps(keys, std::slice::from_ref(&channel.label.key)) => {
+                    shared.leased_away.store(true, Ordering::Relaxed);
+                    shared.close();
+                    Some((entry.state.clone(), channel.label.id, reason))
+                }
+                _ => None,
+            }).collect::<Vec<_>>()).collect()
+        };
+        for (state, sub_id, reason) in ended {
+            info!("peer {}: subscription {sub_id:?} ended: {reason}", state.peer_id);
+            state.send_event(json!({"event": "rejected", "id": sub_id, "reason": reason})).await;
+        }
+    }
+
     /// Ends `group`'s lease, telling its holder `reason`; false when nobody holds it.
     pub async fn expire_lease(&self, group: &str, reason: &str) -> bool {
         match self.leases.end(group, |_, _| true) {
@@ -908,9 +928,17 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
             Ok((opts, resolved, track)) => {
                 let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone()));
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
+                // checked once registered, so a lease taken meanwhile either sees this subscription or is seen here
+                if let Some(reason) = state.leases.subscribe_blocker(peer_id, &label.key) {
+                    return Some(reason);
+                }
                 state.leases.changed();
                 state.send_accepted(label.id).await;
-                subscription::run(dc.clone(), label.clone(), session, shared, track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
+                subscription::run(dc.clone(), label.clone(), session, shared.clone(), track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
+                // like a rejected channel, the client closes it itself
+                if shared.leased_away.load(Ordering::Relaxed) {
+                    close_after_client(&dc).await;
+                }
                 None
             }
             Err(error) => Some(error),
@@ -944,18 +972,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     if let Some(error) = rejected {
         warn!("peer {peer_id}: rejected channel {raw_label}: {error}");
         state.send_event(json!({"event": "rejected", "id": label.id, "reason": error})).await;
-        // the client closes a rejected channel itself; closing it from both ends at once lets the second reset land on
-        // the next channel that reuses its stream id (it then closes before opening)
-        let client_closed = async {
-            while let Some(event) = dc.poll().await {
-                if matches!(event, DataChannelEvent::OnClose) {
-                    break;
-                }
-            }
-        };
-        if tokio::time::timeout(Duration::from_secs(5), client_closed).await.is_err() {
-            let _ = dc.close().await;
-        }
+        close_after_client(&dc).await;
     }
     if state.channels.lock().remove(&entry_id).is_some_and(|entry| matches!(entry.stats, ChannelStats::Sub(_))) {
         state.leases.changed();
@@ -965,6 +982,21 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         && let Some(id) = label.id
     {
         state.deadmen.lock().remove(&id);
+    }
+}
+
+/// Waits up to 5 s for the client to close `dc`, then closes it: closing it from both ends at once lets the second
+/// reset land on the next channel that reuses its stream id (it then closes before opening).
+async fn close_after_client(dc: &Arc<dyn DataChannel>) {
+    let client_closed = async {
+        while let Some(event) = dc.poll().await {
+            if matches!(event, DataChannelEvent::OnClose) {
+                break;
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(5), client_closed).await.is_err() {
+        let _ = dc.close().await;
     }
 }
 
@@ -1137,9 +1169,13 @@ struct ControlRequest {
     sdp: Option<RTCSessionDescription>,
     /// renegotiate: add a track for this channel (`video-h264`, `audio-opus`, ...)
     channel: Option<String>,
-    /// lease ops: the group, its keys (a group the server doesn't define) and maxSeconds
+    /// lease ops: the group, its keys (a group the server doesn't define: `publish`, or `keys` from older clients;
+    /// `subscribe`), allowTakeover and maxSeconds
     group: Option<String>,
     keys: Option<Vec<String>>,
+    publish: Option<Vec<String>>,
+    subscribe: Option<Vec<String>>,
+    allow_takeover: Option<bool>,
     max_seconds: Option<f64>,
     /// updateSubscription: the subscription's channel id, and the options to change
     sub_id: Option<u64>,
@@ -1237,7 +1273,12 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 let encodings: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
                 ok(&request.id, json!({"encodings": encodings}))
             }
-            "lease" => take_lease(&state, &request),
+            "lease" => {
+                let response = take_lease(&state, &request);
+                let _ = dc.send_text(&response.to_string()).await;
+                state.leases.changed();
+                continue;
+            }
             "updateSubscription" => update_subscription(&state, &request),
             "releaseLease" => {
                 state.leases.end(request.group.as_deref().unwrap_or_default(), |holder, _| holder == state.peer_id);
@@ -1314,12 +1355,32 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
 
 /// Takes (or renews) a lease; it ends at maxSeconds, when the heartbeat stops, or on disconnect.
 fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
-    if !state.heartbeat.lock().configured {
+    let heartbeat = state.heartbeat.lock().clone();
+    if !heartbeat.configured {
         return fail(&request.id, "a lease needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })");
     }
-    let group = request.group.clone().unwrap_or_default();
-    match state.leases.take(state.peer_id, &state.grant, &group, request.keys.clone(), request.max_seconds) {
-        Ok((keys, expires_in, serial)) => {
+    let deadline_secs = heartbeat.misses as f64 / heartbeat.hz;
+    let slowest = state.leases.slowest_heartbeat.as_secs_f64();
+    if deadline_secs > slowest {
+        return fail(&request.id, format!("a lease needs a heartbeat deadline (heartbeatMisses / heartbeatHz) of at most {slowest} s, got {deadline_secs} s"));
+    }
+    let asked = crate::auth::LeaseRequest {
+        publish: request.publish.clone().or_else(|| request.keys.clone()),
+        subscribe: request.subscribe.clone().unwrap_or_default(),
+        takeover: request.allow_takeover.unwrap_or(false),
+        max_secs: request.max_seconds,
+    };
+    match state.leases.take(state.peer_id, &state.grant, request.group.as_deref(), asked) {
+        Ok(crate::auth::Taken { group, publish, subscribe, expires_in, serial, taken_over }) => {
+            let gateway = state.gateway.clone();
+            let (holder, ending) = (state.peer_id, subscribe.clone());
+            tokio::spawn(async move {
+                let Some(gateway) = gateway.upgrade() else { return };
+                for (lost, loser) in taken_over {
+                    gateway.lease_lost(loser, &lost, "takenOver").await;
+                }
+                gateway.end_leased_subscriptions(&ending, holder).await;
+            });
             if let Some(after) = expires_in {
                 let (gateway, group) = (state.gateway.clone(), group.clone());
                 tokio::spawn(async move {
@@ -1331,8 +1392,9 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
                     }
                 });
             }
-            info!("peer {}: leased {group:?} {keys:?}", state.peer_id);
-            ok(&request.id, json!({"group": group, "keys": keys, "expiresInMs": expires_in.map(|after| after.as_millis() as u64)}))
+            info!("peer {}: leased {group:?} publish {publish:?} subscribe {subscribe:?}", state.peer_id);
+            let expires_in_ms = expires_in.map(|after| after.as_millis() as u64);
+            ok(&request.id, json!({"group": group, "keys": publish, "publish": publish, "subscribe": subscribe, "expiresInMs": expires_in_ms}))
         }
         Err(error) => fail(&request.id, error),
     }

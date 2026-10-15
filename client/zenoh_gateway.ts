@@ -678,11 +678,22 @@ export class Subscription extends Endpoint {
         this.watchChannel(channel, acceptance)
     }
 
+    /** Also after it opened: another client's lease took its key, so its channel and track go. */
+    override _rejected(reason: string): void {
+        super._rejected(reason)
+        this.channel?.close()
+        this.#releaseTransceiver()
+    }
+
     override close(): void {
         if (this.closed) {
             return
         }
         super.close()
+        this.#releaseTransceiver()
+    }
+
+    #releaseTransceiver(): void {
         const peer = this.owner._peer
         if (this.#transceiver && peer) {
             this.owner._releaseTransceiver(peer, this.#transceiver)
@@ -1022,12 +1033,26 @@ export class Publisher extends Endpoint {
 }
 
 /** An exclusive right to publish on a group of keys among this gateway's clients (SPEC "Leases"). */
+export interface LeaseOptions {
+    /** a group the server defines (its keys and grants), or a name for this one; unset = unnamed */
+    group?: string
+    /** keys only the holder may publish on: the gateway drops other clients' puts there */
+    publish?: string[]
+    /** keys only the holder may subscribe to: the gateway ends and refuses other clients' subscriptions there */
+    subscribe?: string[]
+    /** a newer lease on overlapping keys takes this one over ("takenOver"); false: it is refused while this is held */
+    allowTakeover?: boolean
+    maxSeconds?: number
+    onLost?: (reason: string) => void
+}
+
 export class Lease {
-    /** why it ended: "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" */
+    /** why it ended: "takenOver" | "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" | "renewed" */
     lost: string | null = null
     #listeners = new Set<(reason: string) => void>()
 
-    constructor(readonly owner: ZenohGateway, readonly group: string, readonly keys: string[], readonly expiresInMs: number | null) {}
+    /** `keys`: the ones only we publish on; `subscribe`: the ones only we subscribe to */
+    constructor(readonly owner: ZenohGateway, readonly group: string, readonly keys: string[], readonly subscribe: string[], readonly expiresInMs: number | null) {}
 
     onLost(listener: (reason: string) => void): () => void {
         this.#listeners.add(listener)
@@ -1571,18 +1596,27 @@ export class ZenohGateway {
     }
 
     /**
-     * Takes (or renews) the exclusive right to publish on `group`'s keys among this gateway's clients: the
-     * server's group, or `keys` for one it doesn't define. Needs a heartbeat; it ends when the heartbeat
-     * stops, at `maxSeconds`, on disconnect, by `release()` or by force-expiry (`onLost` says which).
+     * Takes (or renews) the exclusive right, among this gateway's clients, to publish on `publish` and subscribe to
+     * `subscribe` (or a server group's keys). Needs a heartbeat; it ends when the heartbeat stops, at `maxSeconds`, on
+     * disconnect, by `release()`, by force-expiry or, with `allowTakeover`, when a newer lease overlaps it (`onLost`
+     * says which). The older form `lease(group, { keys })` is `lease({ group, publish: keys })`.
      */
-    async lease(group: string, { keys, maxSeconds }: { keys?: string[], maxSeconds?: number } = {}): Promise<Lease> {
+    async lease(options: LeaseOptions): Promise<Lease>
+    async lease(group: string, options?: { keys?: string[], maxSeconds?: number }): Promise<Lease>
+    async lease(groupOrOptions: string | LeaseOptions, older: { keys?: string[], maxSeconds?: number } = {}): Promise<Lease> {
+        const options: LeaseOptions = typeof groupOrOptions === "string" ? { group: groupOrOptions, publish: older.keys, maxSeconds: older.maxSeconds } : groupOrOptions
         if (!this.options.heartbeatHz) {
             throw new Error("zenoh-gateway: a lease needs a heartbeat; connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })")
         }
-        const response = await this._request({ op: "lease", group, keys, maxSeconds }, pingTimeoutMs)
-        const lease = new Lease(this, group, response.keys as string[], (response.expiresInMs as number | null) ?? null)
-        this._leases.get(group)?._lose("renewed")
-        this._leases.set(group, lease)
+        const { group, publish, subscribe, allowTakeover, maxSeconds, onLost } = options
+        const response = await this._request({ op: "lease", group, publish, subscribe, allowTakeover, maxSeconds }, pingTimeoutMs)
+        const granted = String(response.group)
+        const lease = new Lease(this, granted, response.keys as string[], (response.subscribe as string[] | undefined) ?? [], (response.expiresInMs as number | null) ?? null)
+        if (onLost) {
+            lease.onLost(onLost)
+        }
+        this._leases.get(granted)?._lose("renewed")
+        this._leases.set(granted, lease)
         return lease
     }
 

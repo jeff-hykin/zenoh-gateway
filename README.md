@@ -88,7 +88,7 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 | `state`, `onState(fn)` | `"connecting"` / `"connected"` / `"degraded"` / `"lost"`; `onState` returns an unsubscribe function |
 | `now()` | the page clock used for timestamps |
 | `pollStats()` | refresh stats now |
-| `lease(group, { keys?, maxSeconds? })` → `Lease` | exclusive publish rights on a group's keys among this gateway's clients ([Leases](#leases)) |
+| `lease({ publish?, subscribe?, allowTakeover?, maxSeconds?, onLost?, group? })` → `Lease` | exclusive rights to publish on and subscribe to keys among this gateway's clients ([Leases](#leases)) |
 | `expireLease(group)` | end another client's lease (needs the grant's `forceExpire`) |
 | `iceServers` | the ICE servers in use |
 | `pauseHeartbeat()`, `resumeHeartbeat()` | stop/resume beats (to test deadman wiring) |
@@ -333,12 +333,23 @@ the host; zenoh-gateway-cli's `--auth-file` is a small file-based example. SPEC 
 
 ## Leases
 
-`const lease = await z.lease("drive", { maxSeconds: 60 })` gives this page the exclusive right to
-publish on the group's keys among the gateway's clients: everyone else's puts there are dropped
-(`publisher.blocked` says why) until the lease ends: the holder's heartbeat stops, `maxSeconds`
-passes, it disconnects, calls `lease.release()`, or a client with `forceExpire` calls
-`z.expireLease("drive")`. `lease.onLost(reason)` reports which. Groups come from the server
-(`lease_group`) or, for names it doesn't define, from the client (`{ keys: [...] }`), within the grant.
+```js
+const seat = await z.lease({
+    publish: ["robot/cmd_vel"],    // only we drive: everyone else's puts are dropped
+    subscribe: ["robot/cam/**"],   // only we watch: everyone else's subscriptions are ended and refused
+    allowTakeover: true,           // a newer lease on these keys wins; false: it is refused while we hold this
+    onLost: (reason) => banner(reason),
+})
+```
+
+gives this page those rights among the gateway's clients (`publisher.blocked` and a subscription's
+`rejectionReason` tell the others why) until the lease ends: another client takes it over (`"takenOver"`),
+the holder's heartbeat stops (it needs one, with `heartbeatMisses / heartbeatHz` at most the server's
+`slowest_lease_heartbeat_allowed`, default 60 s), `maxSeconds` passes, it
+disconnects, calls `seat.release()`, or a client with `forceExpire` calls `z.expireLease(seat.group)`.
+`onLost(reason)` reports which. `allowTakeover` is the held lease's: it says whether *it* may be taken
+over. `group: "drive"` names a group the server defines (`lease_group`, its keys and grants); an unnamed
+lease needs a grant that may lease any group (`*`). (`lease("drive", { keys })` still works: `publish`.)
 **Leases bind only this gateway's clients**, not native zenoh publishers; use zenoh's
 `access_control` for those. SPEC "Leases".
 

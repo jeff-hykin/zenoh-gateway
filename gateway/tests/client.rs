@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 use tokio::time::timeout;
-use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions, VideoFrame};
+use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, LeaseOptions, PublisherOptions, SubscribeOptions, VideoFrame};
 use zenoh_gateway::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, RunningServer, Server, VideoImage, zenoh};
 
 /// `[r, g, b, width u16, height u16]` → a solid picture.
@@ -742,5 +742,47 @@ async fn encode_options_reach_the_encoding_and_quality_caps_it() {
     let refused = client.subscribe("echo/a", options(serde_json::json!({"colour": "red"}))).await.err().unwrap().to_string();
     assert!(refused.contains("prefix and fields"), "the encoding refuses options it doesn't know: {refused}");
     client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_lease_moves_the_cameras_to_the_newest_viewer() {
+    let (running, session, url) = start().await;
+    let _camera = keep_putting(&session, "robot/cam/front", b"frame".to_vec());
+    let _tf = keep_putting(&session, "robot/tf", b"tf".to_vec());
+    let options = ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 20, ..Default::default() };
+    let seat = || LeaseOptions { publish: vec!["robot/cmd_vel".into()], subscribe: vec!["robot/cam/**".into()], allow_takeover: true, ..Default::default() };
+    let old_viewer = Client::connect(&url, options.clone()).await.unwrap();
+    let old_lease = old_viewer.lease_with(seat()).await.unwrap();
+    assert!(old_lease.group.starts_with('#'), "unnamed: {}", old_lease.group);
+    let mut old_camera = old_viewer.subscribe("robot/cam/front", SubscribeOptions::default()).await.unwrap();
+    let mut old_tf = old_viewer.subscribe("robot/tf", SubscribeOptions::default()).await.unwrap();
+    assert!(timeout(Duration::from_secs(5), old_camera.recv()).await.unwrap().is_some());
+    // without the lease, another client's subscription to a leased key is refused
+    let bystander = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let refused = bystander.subscribe("robot/cam/front", SubscribeOptions::default()).await.err().expect("refused").to_string();
+    assert!(refused.contains("leased by another client"), "{refused}");
+    let new_viewer = Client::connect(&url, options).await.unwrap();
+    let new_lease = new_viewer.lease_with(seat()).await.unwrap();
+    assert_eq!(timeout(Duration::from_secs(5), old_lease.wait_lost()).await.unwrap(), "takenOver");
+    let ended = timeout(Duration::from_secs(8), async { while old_camera.recv().await.is_some() {} }).await;
+    assert!(ended.is_ok(), "the old viewer's camera ended with its lease");
+    assert!(timeout(Duration::from_secs(5), old_tf.recv()).await.unwrap().is_some(), "keys outside the lease stay");
+    let mut new_camera = new_viewer.subscribe("robot/cam/front", SubscribeOptions::default()).await.unwrap();
+    assert!(timeout(Duration::from_secs(5), new_camera.recv()).await.unwrap().is_some());
+    // a hard lease (no allowTakeover) takes over a takeover one, and then refuses the next
+    let hard = old_viewer.lease_with(LeaseOptions { subscribe: vec!["robot/cam/**".into()], ..Default::default() }).await.unwrap();
+    assert_eq!(timeout(Duration::from_secs(5), new_lease.wait_lost()).await.unwrap(), "takenOver");
+    let refused = new_viewer.lease_with(seat()).await.err().expect("a hard lease refuses").to_string();
+    assert!(refused.contains("held by another client"), "{refused}");
+    drop(hard);
+    // a heartbeat slower than the server's slowest_lease_heartbeat_allowed (default 60 s) gets no lease
+    let sleepy = Client::connect(&url, ClientOptions { heartbeat_hz: 0.01, heartbeat_misses: 3, ..Default::default() }).await.unwrap();
+    let refused = sleepy.lease_with(LeaseOptions { publish: vec!["robot/arm".into()], ..Default::default() }).await.err().expect("too slow").to_string();
+    assert!(refused.contains("at most 60 s, got 300 s"), "{refused}");
+    sleepy.close().await;
+    for client in [old_viewer, new_viewer, bystander] {
+        client.close().await;
+    }
     running.shutdown().await.unwrap();
 }

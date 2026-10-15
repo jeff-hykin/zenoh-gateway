@@ -605,20 +605,29 @@ per-browser layer on top, with reasons.
 
 ## Leases
 
-- A lease is one client's exclusive right to publish on a group of key expressions, among the clients
-  of this gateway. Groups are defined on the server (`ServerBuilder::lease_group(name, keys)`, or the
-  cli's auth file), or by the client (`z.lease(group, { keys })`) when the server doesn't define that
-  name. The grant must allow the group name, and `publish` must include every key of the group.
-- `z.lease(group, { maxSeconds })` needs a heartbeat (`connect(url, { heartbeatHz })`) and returns a
-  `Lease` (`keys`, `expiresInMs`, `release()`, `onLost`). Leasing a group you hold renews it (the old
-  handle is lost with `"renewed"`). A group whose keys intersect another client's lease is refused
-  (`conflicts with "<group>", held by another client`). `maxSeconds` is capped by `maxLeaseSecs`.
+- A lease is one client's exclusive right to publish on some key expressions and to subscribe to others,
+  among the clients of this gateway: `z.lease({ publish, subscribe, allowTakeover, maxSeconds, onLost, group })`
+  (control op `lease {group?, publish?, subscribe?, allowTakeover?, maxSeconds?}`; older clients send `keys`
+  for `publish`). A group defined on the server (`ServerBuilder::lease_group(name, keys)`, or the cli's auth
+  file) brings its own publish keys. The grant must allow the group name (`*` for an unnamed lease, which the
+  gateway names `#<n>`), `publish` every publish key and `subscribe` every subscribe key.
+- It needs a heartbeat (`connect(url, { heartbeatHz })`) and returns a `Lease` (`group`, `keys` (publish),
+  `subscribe`, `expiresInMs`, `release()`, `onLost`). Leasing a group you hold renews it (the old handle is
+  lost with `"renewed"`). Another client's lease on the same group, or with publish keys intersecting these
+  publish keys or subscribe keys intersecting these subscribe keys, refuses it (`conflicts with "<group>",
+  held by another client`), unless that lease was taken with `allowTakeover`: then it ends (its holder
+  gets `leaseLost` with `"takenOver"`) and this one is granted. `maxSeconds` is capped by `maxLeaseSecs`.
 - While held, every other client's puts on keys intersecting the lease are dropped by the gateway
   (`rejectedLeased` in that publisher's stats). The publisher is told why on its own channel: the gateway
   sends `{"blocked": "<key> is leased by another client (group \"<group>\")"}` when its first put is
   dropped and `{"blocked": null}` when puts go through again; the client keeps it in `publisher.blocked`.
   Other clients' deadmen on those keys don't fire either.
-- It ends when the holder's heartbeat misses (`"heartbeat"`, the same deadline as deadmen), at
+- While held, other clients' subscriptions to keys intersecting its subscribe keys are refused, and the ones
+  open when it was taken end: the gateway sends `{event: "rejected", id, reason: "<key> is leased by another
+  client (group \"<group>\")"}` and the client closes the channel (else the gateway does after 5 s).
+- It ends when the holder's heartbeat misses (`"heartbeat"`, the same deadline as deadmen; a client whose
+  `misses / hz` is longer than `ServerBuilder::slowest_lease_heartbeat_allowed`, default 60 s, is refused a
+  lease), when another client takes it over (`"takenOver"`), at
   `maxSeconds`, when the holder disconnects or is revoked, on `release()`, or when a client whose grant
   has `forceExpire` calls `z.expireLease(group)`. The gateway tells the holder with
   `{event: "leaseLost", group, reason}` on `control`, and the client calls `onLost`. Leases are not

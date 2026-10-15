@@ -221,6 +221,8 @@ pub struct SubShared {
     closed: AtomicBool,
     /// flips to true on close, so `run` also stops when the channel never reports its own close
     closed_signal: tokio::sync::watch::Sender<bool>,
+    /// ended by another client's lease on its key
+    pub leased_away: AtomicBool,
 }
 
 pub fn now_unix_ms() -> f64 {
@@ -254,6 +256,7 @@ impl SubShared {
             data_ready: Notify::new(),
             closed: AtomicBool::new(false),
             closed_signal: tokio::sync::watch::Sender::new(false),
+            leased_away: AtomicBool::new(false),
         }
     }
 

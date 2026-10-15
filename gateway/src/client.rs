@@ -146,6 +146,21 @@ pub struct SubscribeOptions {
     pub playout_delay: Option<(f64, f64)>,
 }
 
+/// What [`Client::lease_with`] asks for.
+#[derive(Debug, Clone, Default)]
+pub struct LeaseOptions {
+    /// a group the server defines (its keys and grants), or a name for this one; None = unnamed
+    pub group: Option<String>,
+    /// keys only the holder may publish on
+    pub publish: Vec<String>,
+    /// keys only the holder may subscribe to
+    pub subscribe: Vec<String>,
+    /// a newer lease on overlapping keys takes this one over ("takenOver") instead of being refused
+    pub allow_takeover: bool,
+    /// it ends after this many seconds
+    pub max_seconds: Option<f64>,
+}
+
 /// Publisher options.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -436,8 +451,9 @@ impl Shared {
         };
         let id = message["id"].as_u64().unwrap_or_default();
         let Some(event) = message["event"].as_str() else {
+            // an unnamed lease learns its group from the reply
             if let Some((group, ending)) = self.pending_leases.lock().remove(&id).filter(|_| message["ok"] == true)
-                && let Some(previous) = self.leases.lock().insert(group, ending)
+                && let Some(previous) = self.leases.lock().insert(message["group"].as_str().map_or(group, str::to_owned), ending)
             {
                 previous.end("renewed".into());
             }
@@ -906,15 +922,28 @@ impl Client {
     /// server's group, or `keys` for one it doesn't define (SPEC "Leases"). Needs a heartbeat; it ends
     /// when the heartbeat stops, at `max_seconds`, on disconnect, on [`Lease::release`] or by force-expiry.
     pub async fn lease(&self, group: &str, keys: Option<Vec<String>>, max_seconds: Option<f64>) -> Result<Lease> {
+        self.lease_with(LeaseOptions { group: Some(group.to_owned()), publish: keys.unwrap_or_default(), max_seconds, ..Default::default() }).await
+    }
+
+    /// Takes a lease on keys to publish and keys to subscribe to (SPEC "Leases"): while held, the gateway drops other
+    /// clients' puts on `publish` and ends their subscriptions to `subscribe`.
+    pub async fn lease_with(&self, options: LeaseOptions) -> Result<Lease> {
         ensure!(self.inner.options.heartbeat_hz > 0.0, "a lease needs a heartbeat (ClientOptions::heartbeat_hz)");
         let (id, ending) = (self.inner.next_id.fetch_add(1, Ordering::Relaxed), Arc::new(Ending::new()));
         // registered by the control reader as it reads the reply (renewing a lease held before)
-        self.inner.shared.pending_leases.lock().insert(id, (group.to_owned(), ending.clone()));
-        let reply = self.inner.request_as(id, json!({"op": "lease", "group": group, "keys": keys, "maxSeconds": max_seconds}), PING_TIMEOUT).await;
+        self.inner.shared.pending_leases.lock().insert(id, (options.group.clone().unwrap_or_default(), ending.clone()));
+        let request = json!({"op": "lease", "group": options.group, "publish": options.publish, "subscribe": options.subscribe, "allowTakeover": options.allow_takeover, "maxSeconds": options.max_seconds});
+        let reply = self.inner.request_as(id, request, PING_TIMEOUT).await;
         self.inner.shared.pending_leases.lock().remove(&id);
         let reply = reply?;
-        let keys = serde_json::from_value(reply["keys"].clone())?;
-        Ok(Lease { group: group.to_owned(), keys, expires_in_ms: reply["expiresInMs"].as_u64(), ending, client: Arc::downgrade(&self.inner) })
+        Ok(Lease {
+            group: reply["group"].as_str().map(str::to_owned).or(options.group).unwrap_or_default(),
+            keys: serde_json::from_value(reply["keys"].clone())?,
+            subscribe: serde_json::from_value(reply["subscribe"].clone()).unwrap_or_default(),
+            expires_in_ms: reply["expiresInMs"].as_u64(),
+            ending,
+            client: Arc::downgrade(&self.inner),
+        })
     }
 
     /// Ends another client's lease on `group` (needs the grant's force-expire right).
@@ -1486,10 +1515,12 @@ impl Drop for Publisher {
 
 /// An exclusive right to publish on a group of keys among the gateway's clients ([`Client::lease`]).
 pub struct Lease {
-    /// the group
+    /// the group (`#<n>` for an unnamed lease)
     pub group: String,
-    /// the keys it covers
+    /// the keys only its holder publishes on
     pub keys: Vec<String>,
+    /// the keys only its holder subscribes to
+    pub subscribe: Vec<String>,
     /// when it expires (`max_seconds`), None without a limit
     pub expires_in_ms: Option<u64>,
     ending: Arc<Ending>,
@@ -1497,7 +1528,7 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// Why it ended (`"heartbeat"`, `"maxSeconds"`, `"disconnected"`, `"released"`, `"renewed"`, force-expiry), None while held.
+    /// Why it ended (`"takenOver"`, `"heartbeat"`, `"maxSeconds"`, `"disconnected"`, `"released"`, `"renewed"`, force-expiry), None while held.
     pub fn lost(&self) -> Option<String> {
         self.ending.reason()
     }
