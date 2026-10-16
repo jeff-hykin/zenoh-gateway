@@ -338,6 +338,7 @@ const seat = await z.lease({
     publish: ["robot/cmd_vel"],    // only we drive: everyone else's puts are dropped
     subscribe: ["robot/cam/**"],   // only we watch: everyone else's subscriptions are ended and refused
     allowTakeover: true,           // a newer lease on these keys wins; false: it is refused while we hold this
+    timeoutMs: 5000,               // heartbeat silence that ends it (default: the connection's heartbeat deadline)
     onLost: (reason) => banner(reason),
 })
 ```

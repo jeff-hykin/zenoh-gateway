@@ -625,9 +625,10 @@ per-browser layer on top, with reasons.
 - While held, other clients' subscriptions to keys intersecting its subscribe keys are refused, and the ones
   open when it was taken end: the gateway sends `{event: "rejected", id, reason: "<key> is leased by another
   client (group \"<group>\")"}` and the client closes the channel (else the gateway does after 5 s).
-- It ends when the holder's heartbeat misses (`"heartbeat"`, the same deadline as deadmen; a client whose
-  `misses / hz` is longer than `ServerBuilder::slowest_lease_heartbeat_allowed`, default 60 s, is refused a
-  lease), when another client takes it over (`"takenOver"`), at
+- It ends when the holder's heartbeat misses (`"heartbeat"`): after its `timeoutMs` of silence when it has one,
+  else at the connection's heartbeat deadline, the same as deadmen (so a page can keep a 0.4 s deadman and a lease
+  that rides out a 5 s stall). Either longer than `ServerBuilder::slowest_lease_heartbeat_allowed` (default 60 s)
+  is refused. It also ends another client takes it over (`"takenOver"`), at
   `maxSeconds`, when the holder disconnects or is revoked, on `release()`, or when a client whose grant
   has `forceExpire` calls `z.expireLease(group)`. The gateway tells the holder with
   `{event: "leaseLost", group, reason}` on `control`, and the client calls `onLost`. Leases are not

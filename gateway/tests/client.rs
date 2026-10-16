@@ -776,6 +776,22 @@ async fn a_takeover_lease_moves_the_cameras_to_the_newest_viewer() {
     let refused = new_viewer.lease_with(seat()).await.err().expect("a hard lease refuses").to_string();
     assert!(refused.contains("held by another client"), "{refused}");
     drop(hard);
+    // a lease's own timeoutMs outlasts the connection's 2 s heartbeat deadline, which still trips deadmen and leases without one
+    let stalling = Client::connect(&url, ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 20, ..Default::default() }).await.unwrap();
+    let patient = stalling.lease_with(LeaseOptions { publish: vec!["robot/patient".into()], timeout_ms: Some(5000.0), ..Default::default() }).await.unwrap();
+    assert_eq!(patient.timeout_ms, Some(5000.0), "the gateway says it applies the timeout");
+    let tight = stalling.lease_with(LeaseOptions { publish: vec!["robot/tight".into()], ..Default::default() }).await.unwrap();
+    stalling.pause_heartbeat(true);
+    assert_eq!(timeout(Duration::from_secs(4), tight.wait_lost()).await.unwrap(), "heartbeat");
+    assert!(patient.lost().is_none(), "3 s silent: the 5 s lease holds");
+    stalling.pause_heartbeat(false);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(patient.lost().is_none(), "beats resumed before 5 s: still held");
+    stalling.pause_heartbeat(true);
+    assert_eq!(timeout(Duration::from_secs(8), patient.wait_lost()).await.unwrap(), "heartbeat");
+    let refused = stalling.lease_with(LeaseOptions { publish: vec!["robot/x".into()], timeout_ms: Some(61_000.0), ..Default::default() }).await.err().expect("over 60 s").to_string();
+    assert!(refused.contains("timeoutMs must be at most 60000"), "{refused}");
+    stalling.close().await;
     // a heartbeat slower than the server's slowest_lease_heartbeat_allowed (default 60 s) gets no lease
     let sleepy = Client::connect(&url, ClientOptions { heartbeat_hz: 0.01, heartbeat_misses: 3, ..Default::default() }).await.unwrap();
     let refused = sleepy.lease_with(LeaseOptions { publish: vec!["robot/arm".into()], ..Default::default() }).await.err().expect("too slow").to_string();

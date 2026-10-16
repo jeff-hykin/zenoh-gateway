@@ -286,6 +286,8 @@ struct Held {
     subscribe: Vec<String>,
     /// a newer lease on overlapping keys ends this one instead of being refused
     takeover: bool,
+    /// heartbeat silence that ends it; None: the connection's heartbeat deadline
+    timeout: Option<Duration>,
     expires: Option<Instant>,
     serial: u64,
 }
@@ -299,6 +301,8 @@ pub(crate) struct LeaseRequest {
     pub subscribe: Vec<String>,
     pub takeover: bool,
     pub max_secs: Option<f64>,
+    /// heartbeat silence that ends it (`timeoutMs`); None: the connection's heartbeat deadline
+    pub timeout: Option<Duration>,
 }
 
 /// A lease taken.
@@ -377,7 +381,7 @@ impl Leases {
         }
         let taken_over = conflicts.into_iter().filter_map(|name| held.remove(&name).map(|lease| (name, lease.holder))).collect();
         let expires = expires_in.and_then(|after| now.checked_add(after));
-        held.insert(group.to_owned(), Held { holder: peer, publish: publish.clone(), subscribe: subscribe.clone(), takeover: request.takeover, expires, serial });
+        held.insert(group.to_owned(), Held { holder: peer, publish: publish.clone(), subscribe: subscribe.clone(), takeover: request.takeover, timeout: request.timeout, expires, serial });
         // no `changed()` here: the caller announces it once the holder has its reply, or something reacting to the
         // change could end it and send `leaseLost` ahead of the grant (which the client then never matched)
         Ok(Taken { group: group.to_owned(), publish, subscribe, expires_in, serial, taken_over })
@@ -392,11 +396,25 @@ impl Leases {
         Some(holder)
     }
 
+    /// Whether `group` is still the lease numbered `serial`.
+    pub fn is_held(&self, group: &str, serial: u64) -> bool {
+        self.held.lock().get(group).is_some_and(|lease| lease.serial == serial)
+    }
+
     /// Ends every lease `peer` holds, returning their groups.
     pub fn release_all(&self, peer: u64) -> Vec<String> {
+        self.release_where(peer, |_| true)
+    }
+
+    /// Ends the leases `peer` holds that follow the connection's heartbeat deadline (no `timeout` of their own).
+    pub fn release_on_heartbeat_deadline(&self, peer: u64) -> Vec<String> {
+        self.release_where(peer, |lease| lease.timeout.is_none())
+    }
+
+    fn release_where(&self, peer: u64, which: impl Fn(&Held) -> bool) -> Vec<String> {
         let mut held = self.held.lock();
-        let groups: Vec<String> = held.iter().filter(|(_, lease)| lease.holder == peer).map(|(group, _)| group.clone()).collect();
-        held.retain(|_, lease| lease.holder != peer);
+        let groups: Vec<String> = held.iter().filter(|(_, lease)| lease.holder == peer && which(lease)).map(|(group, _)| group.clone()).collect();
+        held.retain(|group, _| !groups.contains(group));
         if !groups.is_empty() {
             self.changed();
         }
@@ -501,7 +519,7 @@ mod tests {
     fn a_takeover_lease_goes_to_the_newest_and_a_hard_one_refuses() {
         let leases = Leases::default();
         let everything = grant(&["**"], &["*"], None);
-        let seat = |takeover| LeaseRequest { publish: Some(vec!["robot/cmd_vel".into()]), subscribe: vec!["robot/cam/**".into()], takeover, max_secs: None };
+        let seat = |takeover| LeaseRequest { publish: Some(vec!["robot/cmd_vel".into()]), subscribe: vec!["robot/cam/**".into()], takeover, max_secs: None, timeout: None };
         let first = leases.take(1, &everything, Some("robot_control"), seat(true)).unwrap();
         assert!(first.taken_over.is_empty());
         assert!(leases.subscribe_blocker(2, "robot/cam/front").is_some());

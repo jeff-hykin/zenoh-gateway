@@ -1043,12 +1043,18 @@ export interface LeaseOptions {
     /** a newer lease on overlapping keys takes this one over ("takenOver"); false: it is refused while this is held */
     allowTakeover?: boolean
     maxSeconds?: number
+    /** heartbeat silence (ms) that ends it, instead of the connection's heartbeat deadline, so deadmen can stay tight
+     * while the lease rides out a stall; at most the server's slowest lease heartbeat (default 60 s) */
+    timeoutMs?: number
     onLost?: (reason: string) => void
 }
 
 export class Lease {
     /** why it ended: "takenOver" | "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" | "renewed" */
     lost: string | null = null
+    /** the heartbeat silence that ends it, as the gateway applies it; null: the connection's heartbeat deadline (or a
+     * gateway older than 0.5.17, which ignores `timeoutMs`) */
+    timeoutMs: number | null = null
     #listeners = new Set<(reason: string) => void>()
 
     /** `keys`: the ones only we publish on; `subscribe`: the ones only we subscribe to */
@@ -1608,10 +1614,11 @@ export class ZenohGateway {
         if (!this.options.heartbeatHz) {
             throw new Error("zenoh-gateway: a lease needs a heartbeat; connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })")
         }
-        const { group, publish, subscribe, allowTakeover, maxSeconds, onLost } = options
-        const response = await this._request({ op: "lease", group, publish, subscribe, allowTakeover, maxSeconds }, pingTimeoutMs)
+        const { group, publish, subscribe, allowTakeover, maxSeconds, timeoutMs, onLost } = options
+        const response = await this._request({ op: "lease", group, publish, subscribe, allowTakeover, maxSeconds, timeoutMs }, pingTimeoutMs)
         const granted = String(response.group)
         const lease = new Lease(this, granted, response.keys as string[], (response.subscribe as string[] | undefined) ?? [], (response.expiresInMs as number | null) ?? null)
+        lease.timeoutMs = (response.timeoutMs as number | null | undefined) ?? null
         if (onLost) {
             lease.onLost(onLost)
         }

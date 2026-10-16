@@ -175,6 +175,8 @@ struct PeerState {
     deadmen: Mutex<HashMap<u64, Deadman>>,
     control: Mutex<Option<Arc<dyn DataChannel>>>,
     heartbeat: Mutex<HeartbeatStats>,
+    /// when the last heartbeat arrived (or the connection was made), for leases with a `timeoutMs` of their own
+    last_beat: Mutex<Instant>,
     /// set once built; cleared when the peer goes (it holds the handler, which holds us)
     connection: Mutex<Option<Arc<dyn PeerConnection>>>,
     /// one renegotiation at a time
@@ -256,6 +258,7 @@ impl PeerState {
             deadmen: Mutex::new(HashMap::new()),
             control: Mutex::new(None),
             heartbeat: Mutex::new(HeartbeatStats::default()),
+            last_beat: Mutex::new(Instant::now()),
             connection: Mutex::new(None),
             negotiation: tokio::sync::Mutex::new(()),
             tracks: Mutex::new(HashMap::new()),
@@ -1128,6 +1131,7 @@ async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc
                 Some(DataChannelEvent::OnMessage(message)) => {
                     let t1 = now_unix_ms();
                     last_beat = tokio::time::Instant::now();
+                    *state.last_beat.lock() = Instant::now();
                     fired_since_last_beat = false;
                     state.heartbeat.lock().beats += 1;
                     if let Ok(sample) = serde_json::from_slice::<ClockSample>(&message.data) {
@@ -1144,7 +1148,8 @@ async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc
                 state.heartbeat.lock().deadlines_missed += 1;
                 warn!("peer {}: heartbeat missed for {deadline:?}", state.peer_id);
                 state.fire_deadmen("heartbeat").await;
-                for group in state.leases.release_all(state.peer_id) {
+                // a lease with a timeoutMs of its own outlasts the connection's deadline (see watch_lease_timeout)
+                for group in state.leases.release_on_heartbeat_deadline(state.peer_id) {
                     state.lease_lost(&group, "heartbeat").await;
                 }
             }
@@ -1176,6 +1181,8 @@ struct ControlRequest {
     publish: Option<Vec<String>>,
     subscribe: Option<Vec<String>>,
     allow_takeover: Option<bool>,
+    /// lease: heartbeat silence (ms) that ends it, instead of the connection's heartbeat deadline
+    timeout_ms: Option<f64>,
     max_seconds: Option<f64>,
     /// updateSubscription: the subscription's channel id, and the options to change
     sub_id: Option<u64>,
@@ -1353,22 +1360,59 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
     }
 }
 
+/// Ends lease `serial` of `group` once its holder's heartbeat has been silent for `timeout` ("heartbeat"); returns when
+/// the lease ends any other way or its holder goes. Holds the holder only weakly, between checks.
+async fn watch_lease_timeout(holder: Weak<PeerState>, group: String, serial: u64, timeout: Duration) {
+    loop {
+        let silent = {
+            let Some(state) = holder.upgrade() else { return };
+            if !state.leases.is_held(&group, serial) {
+                return;
+            }
+            state.last_beat.lock().elapsed()
+        };
+        if silent < timeout {
+            tokio::time::sleep(timeout - silent).await;
+            continue;
+        }
+        let Some(state) = holder.upgrade() else { return };
+        if state.leases.end(&group, |_, lease_serial| lease_serial == serial).is_some() {
+            warn!("peer {}: heartbeat silent for {timeout:?}: lease {group:?} ends", state.peer_id);
+            state.lease_lost(&group, "heartbeat").await;
+        }
+        return;
+    }
+}
+
 /// Takes (or renews) a lease; it ends at maxSeconds, when the heartbeat stops, or on disconnect.
 fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
     let heartbeat = state.heartbeat.lock().clone();
     if !heartbeat.configured {
         return fail(&request.id, "a lease needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })");
     }
-    let deadline_secs = heartbeat.misses as f64 / heartbeat.hz;
+    let timeout = match request.timeout_ms {
+        Some(ms) if !(ms.is_finite() && ms > 0.0) => return fail(&request.id, format!("timeoutMs must be a positive number, got {ms}")),
+        ms => ms.map(|ms| crate::secs(ms / 1000.0)),
+    };
     let slowest = state.leases.slowest_heartbeat.as_secs_f64();
-    if deadline_secs > slowest {
-        return fail(&request.id, format!("a lease needs a heartbeat deadline (heartbeatMisses / heartbeatHz) of at most {slowest} s, got {deadline_secs} s"));
+    match timeout {
+        Some(timeout) if timeout.as_secs_f64() > slowest => {
+            return fail(&request.id, format!("timeoutMs must be at most {} (the server's slowest lease heartbeat), got {}", slowest * 1000.0, timeout.as_secs_f64() * 1000.0));
+        }
+        Some(_) => {}
+        None => {
+            let deadline_secs = heartbeat.misses as f64 / heartbeat.hz;
+            if deadline_secs > slowest {
+                return fail(&request.id, format!("a lease needs a heartbeat deadline (heartbeatMisses / heartbeatHz, or timeoutMs) of at most {slowest} s, got {deadline_secs} s"));
+            }
+        }
     }
     let asked = crate::auth::LeaseRequest {
         publish: request.publish.clone().or_else(|| request.keys.clone()),
         subscribe: request.subscribe.clone().unwrap_or_default(),
         takeover: request.allow_takeover.unwrap_or(false),
         max_secs: request.max_seconds,
+        timeout,
     };
     match state.leases.take(state.peer_id, &state.grant, request.group.as_deref(), asked) {
         Ok(crate::auth::Taken { group, publish, subscribe, expires_in, serial, taken_over }) => {
@@ -1381,6 +1425,9 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
                 }
                 gateway.end_leased_subscriptions(&ending, holder).await;
             });
+            if let Some(timeout) = timeout {
+                tokio::spawn(watch_lease_timeout(Arc::downgrade(state), group.clone(), serial, timeout));
+            }
             if let Some(after) = expires_in {
                 let (gateway, group) = (state.gateway.clone(), group.clone());
                 tokio::spawn(async move {
@@ -1394,7 +1441,8 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
             }
             info!("peer {}: leased {group:?} publish {publish:?} subscribe {subscribe:?}", state.peer_id);
             let expires_in_ms = expires_in.map(|after| after.as_millis() as u64);
-            ok(&request.id, json!({"group": group, "keys": publish, "publish": publish, "subscribe": subscribe, "expiresInMs": expires_in_ms}))
+            let timeout_ms = timeout.map(|timeout| timeout.as_secs_f64() * 1000.0);
+            ok(&request.id, json!({"group": group, "keys": publish, "publish": publish, "subscribe": subscribe, "expiresInMs": expires_in_ms, "timeoutMs": timeout_ms}))
         }
         Err(error) => fail(&request.id, error),
     }

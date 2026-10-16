@@ -159,6 +159,9 @@ pub struct LeaseOptions {
     pub allow_takeover: bool,
     /// it ends after this many seconds
     pub max_seconds: Option<f64>,
+    /// heartbeat silence (ms) that ends it, instead of the connection's heartbeat deadline (so deadmen can stay tight
+    /// while a lease rides out a stall); at most the server's `slowest_lease_heartbeat_allowed`
+    pub timeout_ms: Option<f64>,
 }
 
 /// Publisher options.
@@ -932,7 +935,7 @@ impl Client {
         let (id, ending) = (self.inner.next_id.fetch_add(1, Ordering::Relaxed), Arc::new(Ending::new()));
         // registered by the control reader as it reads the reply (renewing a lease held before)
         self.inner.shared.pending_leases.lock().insert(id, (options.group.clone().unwrap_or_default(), ending.clone()));
-        let request = json!({"op": "lease", "group": options.group, "publish": options.publish, "subscribe": options.subscribe, "allowTakeover": options.allow_takeover, "maxSeconds": options.max_seconds});
+        let request = json!({"op": "lease", "group": options.group, "publish": options.publish, "subscribe": options.subscribe, "allowTakeover": options.allow_takeover, "maxSeconds": options.max_seconds, "timeoutMs": options.timeout_ms});
         let reply = self.inner.request_as(id, request, PING_TIMEOUT).await;
         self.inner.shared.pending_leases.lock().remove(&id);
         let reply = reply?;
@@ -940,6 +943,7 @@ impl Client {
             group: reply["group"].as_str().map(str::to_owned).or(options.group).unwrap_or_default(),
             keys: serde_json::from_value(reply["keys"].clone())?,
             subscribe: serde_json::from_value(reply["subscribe"].clone()).unwrap_or_default(),
+            timeout_ms: reply["timeoutMs"].as_f64(),
             expires_in_ms: reply["expiresInMs"].as_u64(),
             ending,
             client: Arc::downgrade(&self.inner),
@@ -1521,6 +1525,8 @@ pub struct Lease {
     pub keys: Vec<String>,
     /// the keys only its holder subscribes to
     pub subscribe: Vec<String>,
+    /// the heartbeat silence (ms) that ends it, as the gateway applies it; None: the connection's heartbeat deadline
+    pub timeout_ms: Option<f64>,
     /// when it expires (`max_seconds`), None without a limit
     pub expires_in_ms: Option<u64>,
     ending: Arc<Ending>,
