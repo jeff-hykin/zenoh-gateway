@@ -224,7 +224,9 @@ pub const DEFAULT_LATENCY_TARGET: std::time::Duration = std::time::Duration::fro
 const STARTUP_GAIN: f64 = 2.0 / std::f64::consts::LN_2;
 const STARTUP_GROWTH: f64 = 1.25;
 const STARTUP_ROUNDS: u32 = 3;
-const PROBE_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+const PROBE_GAINS: [f64; 8] = [PROBE_UP_GAIN, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+/// The probe round's gain: asking 25% more than the estimate.
+pub const PROBE_UP_GAIN: f64 = 1.25;
 const BANDWIDTH_ROUNDS: f64 = 10.0;
 /// ... and over at least this long: a Wi-Fi stall of a few seconds filled ten 0.55 s rounds with next to nothing, the
 /// bandwidth fell from 2.5 MB/s to 1 KB/s, and sending next to nothing it took four minutes to climb back (links change

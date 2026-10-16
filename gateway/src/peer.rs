@@ -338,7 +338,7 @@ impl PeerState {
             link.update(now, interval_secs, self.gate.take_round(), delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
             link.clone()
         };
-        let budget = self.budget(&link);
+        let (budget, at_cap) = self.budget(&link);
         // video gets the budget, but no more than its queue brake allows, nor GCC's target while GCC brakes
         let video_estimate = if has_video {
             let brake = self.video_cap(now, budget, per_sec(video_through));
@@ -356,7 +356,9 @@ impl PeerState {
         let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
         self.video_rate.set_cap_bytes_per_sec(video_granted);
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
-            shared.apply(allocation, link.probing_bandwidth());
+            // at the cap there is nothing to probe for: a probe lifting every stream's spacing let low-priority streams
+            // take what the allocation gave a high-priority one (19.8 Hz granted, 16 delivered)
+            shared.apply(allocation, link.probing_bandwidth() && !at_cap);
         }
         *self.bandwidth.lock() = BandwidthStats {
             data_estimate_bytes_per_sec: link.bandwidth_bytes_per_sec,
@@ -434,9 +436,16 @@ impl PeerState {
     }
 
     /// What the streams may use: the link's bandwidth x its gain, within the cap.
-    fn budget(&self, link: &LinkModel) -> f64 {
+    /// The frontend's budget, and whether it is the cap (`max_bandwidth`) rather than the link.
+    fn budget(&self, link: &LinkModel) -> (f64, bool) {
         let (rate, _) = link.pacing(None);
-        self.config.max_bandwidth.map_or(rate, |cap| cap.min(rate))
+        match self.config.max_bandwidth {
+            // a probe could reach the cap: the link carries about the cap, so probing past it (and draining what that
+            // queued) only dipped the budget under the cap (a 480 KB/s cap budgeted 333 KB/s in the drain round)
+            Some(cap) if link.bandwidth_bytes_per_sec * allocator::PROBE_UP_GAIN >= cap => (cap, true),
+            Some(cap) => (cap.min(rate), false),
+            None => (rate, false),
+        }
     }
 
     /// Clock sample reported by the browser (it has all four NTP timestamps).
