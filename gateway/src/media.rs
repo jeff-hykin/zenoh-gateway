@@ -43,7 +43,8 @@ const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
 /// Video RTP's clock (H.264, VP8, VP9 and AV1 all run at 90 kHz).
 const VIDEO_CLOCK_RATE: f64 = 90_000.0;
-/// The most a frame may wait in the RTP pacer before the next one is encoded (`VideoRate::pacer_delay`).
+/// The most what was written may still wait in the RTP pacer when the next frame is encoded (`VideoRate::pacer_delay`;
+/// the pacer drops what waits `rtp_pacer::MAX_QUEUE_AGE`).
 const PACER_MAX_DELAY: Duration = Duration::from_millis(50);
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
 const PACING_FACTOR: f64 = 2.5;
@@ -107,9 +108,8 @@ pub struct VideoRate {
     queue_delay_ms: AtomicU64,
     /// what video delivered by the receiver's clock, see `VideoRate::delivery`
     delivery: parking_lot::Mutex<Option<Delivery>>,
-    /// the RTP pacer's backlog as this side models it: (bytes written to video tracks and not yet drained at the pacing
-    /// rate, as of when), see `VideoRate::pacer_delay`
-    paced: parking_lot::Mutex<(f64, Option<Instant>)>,
+    /// the RTP pacer's backlog and the tracks it asks for keyframes (`rtp_pacer`)
+    pub pacer: Arc<crate::rtp_pacer::PacerShared>,
 }
 
 /// Video's delivery rate over the last `pacing::SAMPLE_SPAN` of arrivals (the receiver's clock, so feedback that comes
@@ -178,31 +178,9 @@ impl VideoRate {
         gcc.min(self.cap_bps().max(link)) * PACING_FACTOR
     }
 
-    /// The modelled pacer backlog drained to `now`, in bytes.
-    fn drain(paced: &mut (f64, Option<Instant>), now: Instant, bytes_per_sec: f64) -> f64 {
-        if let Some(at) = paced.1 {
-            paced.0 = (paced.0 - bytes_per_sec * now.saturating_duration_since(at).as_secs_f64()).max(0.0);
-        }
-        paced.1 = Some(now);
-        paced.0
-    }
-
-    /// A video frame of `bytes` went to a track (and into the pacer, with its RTP headers).
-    pub fn note_written(&self, bytes: usize) {
-        let packets = bytes.div_ceil(1200).max(1);
-        let rate = self.pacing_bps() / 8.0;
-        let mut paced = self.paced.lock();
-        Self::drain(&mut paced, Instant::now(), rate);
-        paced.0 += (bytes + packets * crate::subscription::PACKET_OVERHEAD_BYTES as usize) as f64;
-    }
-
-    /// How long what video wrote lately still waits in the RTP pacer: webrtc-rs's pacer holds up to 4096 packets (5 MB:
-    /// 40 s at 1 Mbit/s) with no age limit, and frames encoded faster than it drains (a keyframe, a hardware encoder
-    /// over its bitrate, a grant that just fell) queued there as seconds of video latency.
+    /// How long a frame written now would wait in the RTP pacer (`rtp_pacer::PacerShared::delay`).
     pub fn pacer_delay(&self) -> Duration {
-        let rate = self.pacing_bps() / 8.0;
-        let backlog = Self::drain(&mut self.paced.lock(), Instant::now(), rate);
-        crate::secs(backlog / rate.max(1.0))
+        self.pacer.delay()
     }
 }
 
@@ -357,10 +335,13 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
         media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: rtp_codec(mime), payload_type }, kind)?;
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), link_bps: AtomicU64::new(0), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default(), paced: Default::default() });
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), link_bps: AtomicU64::new(0), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default(), pacer: Default::default() });
     let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new(), arrivals: VecDeque::new(), lost_at: f64::NEG_INFINITY };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
-    let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default());
+    let registry = register_default_interceptors(registry, &mut media_engine)?
+        .with(Slot::Custom(14_000), KeyframeRequests::default())
+        // (replaces configure_congestion_control's pacer, which logs that it did)
+        .with(Slot::Pacer, crate::rtp_pacer::AgedPacer::new(rate.pacer.clone()));
     Ok((media_engine, registry, rate))
 }
 
@@ -380,7 +361,7 @@ pub struct MediaTrack {
     left_low_latency: AtomicBool,
     /// told when the track is dropped: its RTCP reader ends then, even while `poll` never returns
     dropped: Arc<tokio::sync::Notify>,
-    /// the connection's video rates (its pacer backlog, which writes add to)
+    /// the connection's video rates (and its RTP pacer's backlog)
     pub rate: Arc<VideoRate>,
     /// the next sample's media time on the track: its RTP timestamp less the first's, in ticks of `VIDEO_CLOCK_RATE`
     media_ticks: parking_lot::Mutex<u32>,
@@ -388,6 +369,7 @@ pub struct MediaTrack {
 
 impl Drop for MediaTrack {
     fn drop(&mut self) {
+        self.rate.pacer.forget_track(self.ssrc);
         // (notify_one keeps the wake-up if the reader isn't waiting right now)
         self.dropped.notify_one();
     }
@@ -434,11 +416,7 @@ impl MediaTrack {
         }
         let (min_delay, max_delay) = sent_playout_delay(playout_delay, self.left_low_latency.load(Ordering::Relaxed));
         let writer = if self.mime == OPUS { writer } else { writer.with_extension(HeaderExtension::PlayoutDelay(PlayoutDelayExtension { min_delay, max_delay })) };
-        let bytes = sample.data.len();
         writer.write_sample(&sample).await?;
-        if self.mime != OPUS {
-            self.rate.note_written(bytes);
-        }
         // in RTP ticks as webrtc-rs counts them (each sample's duration truncated to whole ticks), so the sum doesn't drift
         let mut ticks = self.media_ticks.lock();
         let at = *ticks;
@@ -574,6 +552,9 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
     let keyframe_requested = Arc::new(AtomicBool::new(true));
     let dropped = Arc::new(tokio::sync::Notify::new());
     let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), owner: AtomicU64::new(0), left_low_latency: AtomicBool::new(false), dropped: dropped.clone(), rate: rate.clone(), media_ticks: Default::default() });
+    if mime != OPUS {
+        rate.pacer.register_track(ssrc, video.keyframe_requested.clone());
+    }
     spawn_rtcp_reader(track, dropped, video.keyframe_requested.clone(), video.keyframe_requests.clone());
     Ok((local, Some(video)))
 }

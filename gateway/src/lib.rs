@@ -54,6 +54,7 @@ mod options;
 mod pacing;
 mod peer;
 mod publisher;
+mod rtp_pacer;
 mod server;
 mod subscription;
 
