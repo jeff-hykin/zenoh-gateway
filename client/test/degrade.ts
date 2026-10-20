@@ -13,6 +13,7 @@
 // Usage: deno run --allow-all --unstable-net client/test/degrade.ts [cell name ...]   (default: every cell)
 
 import { launch } from "jsr:@astral/astral@0.5.6"
+import { shapedLink } from "./shaped_link.ts"
 
 // slackMs: what the strict streams may take beyond the link's own round trip (300 ms; the floor cell's strict traffic is a
 // third of its link, and its packets queue behind each other)
@@ -50,7 +51,6 @@ const cells: Cell[] = [
     ] as Cell[]).filter((cell) => Deno.args.includes(cell.name)),
 ]
 const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell.name)) : cells
-const queueSeconds = 1
 // DIAGNOSE=1: read the gateway's bandwidth stats every window (they otherwise come every few seconds on slow links)
 const diagnose = Deno.env.get("DIAGNOSE") === "1"
 const windowMs = 2000
@@ -69,59 +69,6 @@ if (build.code !== 0) {
 }
 const targetDir = Deno.env.get("CARGO_TARGET_DIR") ?? `${root}gateway/target`
 
-/** One direction of the link: rate-limited (by the cell's schedule) drop-tail queue, then delay + jitter, with loss. */
-function shapedDirection(cell: Cell, linkStart: () => number, deliver: (data: Uint8Array) => void, offered: { bytes: number; packets: number }) {
-    const rateNow = () => {
-        const t = (performance.now() - linkStart()) / 1000
-        return cell.schedule.filter(([at]) => t >= at).at(-1)![1]
-    }
-    const queue: { data: Uint8Array; arrived: number }[] = []
-    let queuedBytes = 0
-    let freeAt = 0
-    let draining = false
-    let jitter = 0
-    let jitterDrawnAt = -Infinity
-    let lastDeliverAt = 0
-    const delayNow = (now: number) => {
-        if (now - jitterDrawnAt >= 200) {
-            jitterDrawnAt = now
-            jitter = Math.random() * cell.jitterMs
-        }
-        return cell.delayMs + jitter
-    }
-    const drain = () => {
-        const now = performance.now()
-        while (queue.length > 0) {
-            const { data, arrived } = queue[0]
-            const leaves = Math.max(freeAt, arrived) + (data.length / rateNow()) * 1000
-            if (leaves > now) {
-                setTimeout(drain, leaves - now)
-                return
-            }
-            queue.shift()
-            queuedBytes -= data.length
-            freeAt = leaves
-            // packets stay in order: a jitter drop never lets one overtake the one before it
-            lastDeliverAt = Math.max(lastDeliverAt, leaves + delayNow(leaves))
-            setTimeout(() => deliver(data), Math.max(0, lastDeliverAt - performance.now()))
-        }
-        draining = false
-    }
-    return (data: Uint8Array) => {
-        offered.bytes += data.length
-        offered.packets++
-        if (Math.random() < cell.loss || queuedBytes + data.length > Math.max(20_000, rateNow() * queueSeconds)) {
-            return
-        }
-        queue.push({ data, arrived: performance.now() })
-        queuedBytes += data.length
-        if (!draining) {
-            draining = true
-            drain()
-        }
-    }
-}
-
 async function runCell(cell: Cell) {
     const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], env: cell.serverEnv ?? {}, stdout: "piped", stderr: "inherit" }).spawn()
     const serverUrl = await (async () => {
@@ -133,66 +80,10 @@ async function runCell(cell: Cell) {
         }
         throw new Error("degrade_server exited")
     })()
-    let linkStartedAt = 0
-    const sockets: Deno.DatagramConn[] = []
-    // what each side tried to send, for the summary: a saturated uplink delays the downlink too (its SCTP acks wait)
-    const offeredDown = { bytes: 0, packets: 0 }
-    const offeredUp = { bytes: 0, packets: 0 }
-    const startShaper = (targetPort: number) => {
-        const chromeSide = Deno.listenDatagram({ transport: "udp", hostname: "127.0.0.1", port: 0 })
-        const serverSide = Deno.listenDatagram({ transport: "udp", hostname: "127.0.0.1", port: 0 })
-        sockets.push(chromeSide, serverSide)
-        let chromeAddress: Deno.NetAddr | null = null
-        const down = shapedDirection(cell, () => linkStartedAt, (data) => {
-            if (chromeAddress) {
-                chromeSide.send(data, chromeAddress).catch(() => {})
-            }
-        }, offeredDown)
-        const up = shapedDirection(cell, () => linkStartedAt, (data) => {
-            serverSide.send(data, { transport: "udp", hostname: "127.0.0.1", port: targetPort }).catch(() => {})
-        }, offeredUp)
-        ;(async () => {
-            for await (const [data, address] of chromeSide) {
-                chromeAddress = address as Deno.NetAddr
-                up(data)
-            }
-        })().catch(() => {})
-        ;(async () => {
-            for await (const [data] of serverSide) {
-                down(data)
-            }
-        })().catch(() => {})
-        return (chromeSide.addr as Deno.NetAddr).port
-    }
-    // a signaling proxy rewrites the SDP so ICE can only use the shaper
-    const proxy = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (request) => {
-        const url = new URL(request.url)
-        if (url.pathname !== "/offer") {
-            return fetch(`${serverUrl}${url.pathname}${url.search}`)
-        }
-        const offer = await request.json()
-        offer.sdp = offer.sdp.split("\r\n").filter((line: string) => !line.startsWith("a=candidate")).join("\r\n")
-        const answer = await (await fetch(`${serverUrl}/offer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(offer) })).json()
-        const lines: string[] = answer.sdp.split("\r\n")
-        const loopback = lines.find((line) => line.startsWith("a=candidate") && line.includes(" 127.0.0.1 "))
-        const port = startShaper(Number(loopback?.split(" ")[5]))
-        linkStartedAt = performance.now()
-        let replaced = false
-        answer.sdp = lines.flatMap((line) => {
-            if (!line.startsWith("a=candidate")) {
-                return [line]
-            }
-            if (replaced) {
-                return []
-            }
-            replaced = true
-            return [`a=candidate:1 1 udp 2130706431 127.0.0.1 ${port} typ host`]
-        }).join("\r\n")
-        return Response.json(answer)
-    })
+    const link = shapedLink(serverUrl, cell)
     const browser = await launch({ headless: true, args: ["--no-sandbox", "--autoplay-policy=no-user-gesture-required"] })
     try {
-        const page = await browser.newPage(`http://127.0.0.1:${proxy.addr.port}/blank.html`)
+        const page = await browser.newPage(`${link.url}/blank.html`)
         // the page's warnings and errors (a subscription that failed to open says why only here)
         page.addEventListener("console", (event: any) => {
             if (["error", "warn", "warning"].includes(event.detail?.type)) {
@@ -300,19 +191,16 @@ async function runCell(cell: Cell) {
             }
             client.close()
             return windows.slice(0, Math.floor((seconds * 1000) / windowMs))
-        }, { args: [`http://127.0.0.1:${proxy.addr.port}`, cell.seconds, windowMs, diagnose, cell.subscribe ?? ["cams", "clouds", "map", "pose", "tf", "cmd", "cmd_vel"], cell.shape ?? false] })
-        const seconds = (performance.now() - linkStartedAt) / 1000
+        }, { args: [link.url, cell.seconds, windowMs, diagnose, cell.subscribe ?? ["cams", "clouds", "map", "pose", "tf", "cmd", "cmd_vel"], cell.shape ?? false] })
+        const seconds = (performance.now() - link.startedAt()) / 1000
         const rate = (offered: { bytes: number; packets: number }) => `${Math.round(offered.bytes / seconds / 100) / 10} KB/s in ${Math.round(offered.packets / seconds)} packets/s`
-        console.log(`  offered: down ${rate(offeredDown)}, up ${rate(offeredUp)}`)
+        console.log(`  offered: down ${rate(link.offeredDown)}, up ${rate(link.offeredUp)}`)
         return windows
     } finally {
         await browser.close()
         server.kill("SIGTERM")
         await server.status
-        await proxy.shutdown()
-        for (const socket of sockets) {
-            socket.close()
-        }
+        await link.close()
     }
 }
 

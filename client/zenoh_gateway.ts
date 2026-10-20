@@ -85,6 +85,43 @@ export interface VideoFrameInfo {
     mediaTimeMs?: number
     /** when the gateway wrote it to the track (unix ms, gateway clock); absent from gateways before 0.5.20 */
     writtenMs?: number
+    /** the frame's RTP timestamp: a video element's requestVideoFrameCallback `rtpTimestamp` names this frame exactly
+     * (absent from gateways before 0.5.20, and until the gateway saw the track's first packet) */
+    rtpTimestamp?: number
+    /** when the gateway got the frame's sample and finished encoding it (unix ms, gateway clock; the sample's own time is
+     * the message's `timestamp`); absent from gateways before 0.5.20 */
+    receivedMs?: number
+    encodedMs?: number
+}
+
+/** Percentiles of one latency, ms. */
+export interface LatencySpread {
+    p50: number
+    p95: number
+}
+
+/** End-to-end video latency over the frames a video element showed lately (`Subscription.watchVideoLatency`), ms. */
+export interface VideoLatency {
+    /** frames measured, and shown frames no metadata named (lost, or from a gateway before 0.5.20) */
+    frames: number
+    unmatched: number
+    /** the sample's timestamp to the frame on screen */
+    total: LatencySpread
+    /** where it went: to the gateway (zenoh), decoding + encoding there, waiting to be written to the track, then RTP
+     * pacer + network + jitter buffer + decode to the screen; `toReceived`/`receivedToShown` split that last stage
+     * where the browser reports a frame's receive time (Chrome) */
+    stages: {
+        toGateway: LatencySpread
+        encoding: LatencySpread
+        toTrack: LatencySpread
+        trackToShown: LatencySpread
+        toReceived?: LatencySpread
+        receivedToShown?: LatencySpread
+    }
+    /** source-to-shown from the stamp the frame's own RTP packets carry (abs-capture-time, which Chrome reports in
+     * `getSynchronizationSources()`), on frames shown while they were the newest received: a check that the stamp
+     * that came with the video agrees with the one the metadata named */
+    captureToShown?: LatencySpread
 }
 
 export interface Message {
@@ -124,8 +161,10 @@ export interface SubscribeOptions {
     compress?: "zstd" | "none"
     /** video channels: most bits/s the stream asks for (default: the server's) */
     maxBitrate?: number
-    /** video channels: smallest share of the source's width and height the picture may shrink to (default 0.25) */
+    /** video channels: smallest share of the source's width and height the picture may shrink to (default 0) */
     minResolutionScale?: number
+    /** video channels: [width, height] the picture never shrinks below, aspect kept (default [160, 64]) */
+    minResolution?: [number, number]
     /** video channels: [width, height] box the picture is fitted into */
     maxResolution?: [number, number]
     /** video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once) */
@@ -134,7 +173,7 @@ export interface SubscribeOptions {
 
 /** What `Subscription.update` may change on a running subscription; `null` puts an option back to its default. */
 export type SubscriptionUpdate = {
-    [option in "maxHz" | "minQuality" | "qualityToHzTradeoff" | "bandwidthPriority" | "maxBitrate" | "minResolutionScale" | "maxResolution" | "playoutDelay"]?:
+    [option in "maxHz" | "minQuality" | "qualityToHzTradeoff" | "bandwidthPriority" | "maxBitrate" | "minResolutionScale" | "minResolution" | "maxResolution" | "playoutDelay"]?:
         SubscribeOptions[option] | null
 } & { encodeOptions?: { quality?: number } }
 
@@ -430,7 +469,55 @@ export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
         quality: view.getFloat32(20, true),
         encodedBytes: view.getUint32(24, true),
         ...(bytes.byteLength >= 44 ? { mediaTimeMs: view.getFloat64(28, true), writtenMs: view.getFloat64(36, true) } : {}),
+        ...(bytes.byteLength >= 64 && (bytes[1] & 2) !== 0 ? { rtpTimestamp: view.getUint32(44, true) } : {}),
+        ...(bytes.byteLength >= 64 ? { receivedMs: view.getFloat64(48, true), encodedMs: view.getFloat64(56, true) } : {}),
     }
+}
+
+const absCaptureTimeUri = "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
+/** ms from the NTP epoch (1900) to the unix epoch */
+const ntpUnixOffsetMs = 2_208_988_800_000
+
+/** Asks for the abs-capture-time RTP extension, which Chrome supports but doesn't offer by default (its header extension
+ * API); it gives `VideoLatency.captureToShown`. Browsers without the API go without. */
+function offerCaptureTime(transceiver: RTCRtpTransceiver): void {
+    const control = transceiver as unknown as {
+        getHeaderExtensionsToNegotiate?: () => { uri: string, direction: string }[]
+        setHeaderExtensionsToNegotiate?: (extensions: { uri: string, direction: string }[]) => void
+    }
+    try {
+        const extensions = control.getHeaderExtensionsToNegotiate?.()
+        if (extensions?.some((extension) => extension.uri === absCaptureTimeUri && extension.direction === "stopped")) {
+            control.setHeaderExtensionsToNegotiate!(extensions.map((extension) => extension.uri === absCaptureTimeUri ? { ...extension, direction: "recvonly" } : extension))
+        }
+    } catch (error) {
+        console.debug("zenoh-gateway: abs-capture-time not offered", error)
+    }
+}
+
+/** Video frames' metadata kept for matching shown frames, per subscription. */
+const videoTimesKept = 512
+/** Shown frames' latencies kept for `videoLatency()`. */
+const videoLatencyKept = 300
+
+/** One shown frame's latencies, ms (see `VideoLatency`). */
+interface FrameLatency {
+    /** when it was shown (the connection's clock) */
+    shownAt: number
+    total: number
+    toGateway: number
+    encoding: number
+    toTrack: number
+    trackToShown: number
+    toReceived?: number
+    receivedToShown?: number
+    captureToShown?: number
+}
+
+function spread(values: number[]): LatencySpread {
+    const sorted = [...values].sort((a, b) => a - b)
+    const at = (q: number) => sorted[Math.round((sorted.length - 1) * q)]
+    return { p50: at(0.5), p95: at(0.95) }
 }
 
 /** Browser -> gateway put: f64 sentAtMs (browser clock) | payload (little endian). */
@@ -595,6 +682,10 @@ export class Subscription extends Endpoint {
     #bytesSinceAck = 0
     #ackTimer: ReturnType<typeof setTimeout> | null = null
     #partials = new Map<number, PartialMessage>()
+    /** video: recent frames' metadata by RTP timestamp, with their sample's timestamp */
+    #videoTimes = new Map<number, { info: VideoFrameInfo, sourceMs: number }>()
+    #frameLatencies: FrameLatency[] = []
+    #unmatchedFrames = 0
 
     constructor(owner: ZenohGateway, id: number, key: string, public options: SubscribeOptions, readonly callback: (message: Message) => void) {
         super(owner, id, key)
@@ -605,6 +696,89 @@ export class Subscription extends Endpoint {
      * Changes the running subscription's options in place: same channel and track, no resubscribe; the gateway's
      * next frame uses them. Reconnects keep them too.
      */
+    /**
+     * Measures end-to-end latency on each frame `element` shows of this video subscription (requestVideoFrameCallback:
+     * Chrome, Firefox, Safari): the frame's RTP timestamp names its metadata, whose gateway times the connection's
+     * clock sync brings to this clock. Read it with `videoLatency()`; returns a function that stops measuring.
+     */
+    watchVideoLatency(element: HTMLVideoElement): () => void {
+        let stopped = false
+        let handle = 0
+        const onFrame = (_now: number, frame: VideoFrameCallbackMetadata & { rtpTimestamp?: number, receiveTime?: number }) => {
+            if (stopped) {
+                return
+            }
+            handle = element.requestVideoFrameCallback(onFrame)
+            const offsetMs = this.owner.clockOffsetMs
+            if (frame.rtpTimestamp === undefined || offsetMs === null) {
+                return
+            }
+            const entry = this.#videoTimes.get(frame.rtpTimestamp)
+            const { info, sourceMs } = entry ?? {}
+            if (info?.receivedMs === undefined || info.encodedMs === undefined || info.writtenMs === undefined || sourceMs === undefined) {
+                this.#unmatchedFrames++
+                return
+            }
+            // performance.now() based times to the connection's clock, and the gateway's clock to it
+            const toLocal = (perfMs: number) => this.owner.now() - (performance.now() - perfMs)
+            const shown = toLocal(frame.expectedDisplayTime ?? frame.presentationTime)
+            const received = frame.receiveTime === undefined ? undefined : toLocal(frame.receiveTime)
+            const written = info.writtenMs - offsetMs
+            // the in-packet stamp, where the receiver reports it for this very frame (Chrome: NTP ms, gateway clock)
+            const source = (this.#transceiver?.receiver.getSynchronizationSources() as ({ rtpTimestamp: number, captureTimestamp?: number }[] | undefined))?.[0]
+            const captureMs = source?.rtpTimestamp === frame.rtpTimestamp && source.captureTimestamp !== undefined ? source.captureTimestamp - ntpUnixOffsetMs : undefined
+            this.#frameLatencies.push({
+                shownAt: shown,
+                total: shown - (sourceMs - offsetMs),
+                toGateway: info.receivedMs - sourceMs,
+                encoding: info.encodedMs - info.receivedMs,
+                toTrack: info.writtenMs - info.encodedMs,
+                trackToShown: shown - written,
+                ...(received === undefined ? {} : { toReceived: received - written, receivedToShown: shown - received }),
+                ...(captureMs === undefined ? {} : { captureToShown: shown - (captureMs - offsetMs) }),
+            })
+            if (this.#frameLatencies.length > videoLatencyKept) {
+                this.#frameLatencies.shift()
+            }
+        }
+        handle = element.requestVideoFrameCallback(onFrame)
+        return () => {
+            stopped = true
+            element.cancelVideoFrameCallback(handle)
+        }
+    }
+
+    /** End-to-end latency of the frames a watched video element showed lately (see `watchVideoLatency`): its latest 300,
+     * or those of the last `windowMs`; null before any. */
+    videoLatency(windowMs = Infinity): VideoLatency | null {
+        const since = this.owner.now() - windowMs
+        const frames = this.#frameLatencies.filter((frame) => frame.shownAt >= since)
+        if (frames.length === 0) {
+            return null
+        }
+        const optional = (pick: (frame: FrameLatency) => number | undefined) => {
+            const values = frames.map(pick).filter((value): value is number => value !== undefined)
+            return values.length === 0 ? undefined : spread(values)
+        }
+        const toReceived = optional((frame) => frame.toReceived)
+        const receivedToShown = optional((frame) => frame.receivedToShown)
+        const captureToShown = optional((frame) => frame.captureToShown)
+        return {
+            frames: frames.length,
+            unmatched: this.#unmatchedFrames,
+            total: spread(frames.map((frame) => frame.total)),
+            stages: {
+                toGateway: spread(frames.map((frame) => frame.toGateway)),
+                encoding: spread(frames.map((frame) => frame.encoding)),
+                toTrack: spread(frames.map((frame) => frame.toTrack)),
+                trackToShown: spread(frames.map((frame) => frame.trackToShown)),
+                ...(toReceived === undefined ? {} : { toReceived }),
+                ...(receivedToShown === undefined ? {} : { receivedToShown }),
+            },
+            ...(captureToShown === undefined ? {} : { captureToShown }),
+        }
+    }
+
     async update(changes: SubscriptionUpdate): Promise<void> {
         await this.ready()
         await this.owner._request({ op: "updateSubscription", subId: this.id, opts: changes }, pingTimeoutMs)
@@ -813,6 +987,12 @@ export class Subscription extends Endpoint {
             // nothing to decode
         } else if (this.options.encoding !== undefined && !this.#decode(message, flags)) {
             return
+        }
+        if (message.video?.rtpTimestamp !== undefined) {
+            this.#videoTimes.set(message.video.rtpTimestamp, { info: message.video, sourceMs: message.timestamp })
+            if (this.#videoTimes.size > videoTimesKept) {
+                this.#videoTimes.delete(this.#videoTimes.keys().next().value!)
+            }
         }
         this.received++
         this.#receivedOnChannel++
@@ -1219,6 +1399,9 @@ export class ZenohGateway {
                 receiver.jitterBufferTarget = 0
             } else if (kind === "video") {
                 receiver.playoutDelayHint = 0
+            }
+            if (kind === "video") {
+                offerCaptureTime(transceiver)
             }
             await peer.setLocalDescription(await peer.createOffer())
             const offer = peer.localDescription

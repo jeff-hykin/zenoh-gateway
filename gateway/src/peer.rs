@@ -1023,8 +1023,8 @@ async fn close_after_client(dc: &Arc<dyn DataChannel>) {
 }
 
 /// The options a running subscription may change (the rest decide what it is, so they need a new subscription).
-const UPDATABLE: [&str; 9] =
-    ["maxHz", "minQuality", "qualityToHzTradeoff", "bandwidthPriority", "maxBitrate", "minResolutionScale", "maxResolution", "playoutDelay", "encodeOptions"];
+const UPDATABLE: [&str; 10] =
+    ["maxHz", "minQuality", "qualityToHzTradeoff", "bandwidthPriority", "maxBitrate", "minResolutionScale", "minResolution", "maxResolution", "playoutDelay", "encodeOptions"];
 
 /// Changes a running subscription's options in place: same channel, same track, the next frame uses them.
 fn update_subscription(state: &PeerState, request: &ControlRequest) -> Value {

@@ -3,7 +3,7 @@
 //!
 //! The allocator grants each video stream bytes/s and a frame rate; the encoder runs at that bitrate. The picture keeps
 //! its full size unless the grant would leave fewer than `min_bits_per_pixel` there (an encoder at its coarsest
-//! quantizer overshoots below that), then it shrinks just enough, never below `min_resolution_scale`.
+//! quantizer overshoots below that), then it shrinks just enough, never below `MIN_RESOLUTION` (or `min_resolution_scale`).
 
 use crate::encoding::{DecodedFrame, PixelFormat, VideoImage};
 use anyhow::{Result, anyhow, ensure};
@@ -12,6 +12,8 @@ use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, I
 use openh264::formats::YUVBuffer;
 
 const MIN_DIMENSION: u32 = 16;
+/// The default smallest picture (`VideoPolicy::min_resolution`).
+pub const MIN_RESOLUTION: (u32, u32) = (160, 64);
 /// Keyframe at least this often (seconds), on top of PLI/FIR requests from the browser.
 const KEYFRAME_SECONDS: f64 = 3.0;
 /// Re-create the encoder when the frame rate drifts past this ratio (bitrate changes apply in place).
@@ -34,15 +36,17 @@ pub struct VideoPolicy {
     /// still overshoots below ~0.03 on a busy scene, and at 0.05 a short link kept 720p at a few hundred kbit/s, whose
     /// keyframes then queued in the pacer for hundreds of ms).
     pub min_bits_per_pixel: f64,
-    /// Smallest share of the source's width and height (default 0.25).
+    /// Smallest share of the source's width and height (default 0: down to `min_resolution`).
     pub min_resolution_scale: f64,
+    /// Smallest picture, aspect kept: it shrinks until one side reaches its side here (default `MIN_RESOLUTION`, 160x64).
+    pub min_resolution: (u32, u32),
     /// Box the picture is fitted into, aspect kept (default none: the source's size).
     pub max_resolution: Option<(u32, u32)>,
 }
 
 impl Default for VideoPolicy {
     fn default() -> Self {
-        VideoPolicy { max_bitrate: None, max_bits_per_pixel: 0.3, min_bits_per_pixel: 0.1, min_resolution_scale: 0.25, max_resolution: None }
+        VideoPolicy { max_bitrate: None, max_bits_per_pixel: 0.3, min_bits_per_pixel: 0.1, min_resolution_scale: 0.0, min_resolution: MIN_RESOLUTION, max_resolution: None }
     }
 }
 
@@ -51,7 +55,8 @@ impl VideoPolicy {
         let positive = |value: f64| value.is_finite() && value > 0.0;
         ensure!(self.max_bitrate.is_none_or(positive), "max bitrate must be a positive number of bits/s");
         ensure!(positive(self.max_bits_per_pixel) && positive(self.min_bits_per_pixel), "bits per pixel must be positive");
-        ensure!(self.min_resolution_scale > 0.0 && self.min_resolution_scale <= 1.0, "min resolution scale must be within (0, 1]");
+        ensure!((0.0..=1.0).contains(&self.min_resolution_scale), "min resolution scale must be within [0, 1]");
+        ensure!(self.min_resolution.0 >= MIN_DIMENSION && self.min_resolution.1 >= MIN_DIMENSION, "min resolution must be at least {MIN_DIMENSION}x{MIN_DIMENSION}");
         ensure!(self.max_resolution.is_none_or(|(width, height)| width >= MIN_DIMENSION && height >= MIN_DIMENSION), "max resolution must be at least {MIN_DIMENSION}x{MIN_DIMENSION}");
         Ok(())
     }
@@ -59,6 +64,13 @@ impl VideoPolicy {
     /// Share of the source's width and height that fits `max_resolution`.
     fn fit(&self, (width, height): (u32, u32)) -> f64 {
         self.max_resolution.map_or(1.0, |(max_width, max_height)| (max_width as f64 / width as f64).min(max_height as f64 / height as f64).min(1.0))
+    }
+
+    /// The smallest share of the source's width and height the picture shrinks to: `min_resolution` (aspect kept) or
+    /// `min_resolution_scale`, whichever is larger, never past the fitted size.
+    pub(crate) fn floor_scale(&self, (width, height): (u32, u32)) -> f64 {
+        let smallest = (self.min_resolution.0 as f64 / width.max(1) as f64).max(self.min_resolution.1 as f64 / height.max(1) as f64);
+        self.min_resolution_scale.max(smallest).min(self.fit((width, height)))
     }
 
     /// The least a frame at full size (fitted into `max_resolution`) takes: `min_bits_per_pixel`. A grant below it shrinks
@@ -75,16 +87,16 @@ impl VideoPolicy {
             Some(bps) => bps / frame_hz.max(0.1),
             None => self.max_bits_per_pixel * pixels * self.fit(source).powi(2),
         } / 8.0;
-        let least = (self.min_bits_per_pixel * pixels * self.min_resolution_scale.min(self.fit(source)).powi(2) / 8.0).min(most);
+        let least = (self.min_bits_per_pixel * pixels * self.floor_scale(source).powi(2) / 8.0).min(most);
         least + (most - least) * quality.clamp(0.0, 1.0)
     }
 
     /// Even output size (a scaled width a multiple of 16) for `bitrate_bps` at `fps`: the source's (fitted into `max_resolution`), shrunk only to keep
-    /// `min_bits_per_pixel` and to `scale_cap` (the CPU governor's), never below `min_resolution_scale`.
+    /// `min_bits_per_pixel` and to `scale_cap` (the CPU governor's), never below `floor_scale`.
     pub(crate) fn size(&self, source: (u32, u32), bitrate_bps: f64, fps: f64, scale_cap: f64) -> (u32, u32) {
         let fit = self.fit(source);
         let affordable = (bitrate_bps / (fps.max(0.1) * source.0 as f64 * source.1 as f64 * self.min_bits_per_pixel)).sqrt();
-        let scale = fit.min(affordable).min(scale_cap).max(self.min_resolution_scale.min(fit));
+        let scale = fit.min(affordable).min(scale_cap).max(self.floor_scale(source));
         let scaled = |value: u32, step: u32| (((value as f64 * scale).round() as u32) & !(step - 1)).max(MIN_DIMENSION);
         let (width, height) = (scaled(source.0, 2), scaled(source.1, 2));
         // a scaled width is a whole number of macroblocks: phone decoders sheared 1362-wide H.264 (seen on the R1)
@@ -374,17 +386,21 @@ mod tests {
         let (width, _) = policy.size(hd, 5.53e6 / 4.0, 60.0, 1.0);
         assert!((624..=640).contains(&width), "a quarter of the bits: half the width, {width}");
         assert_eq!(policy.size((1920, 1536), 1e9, 60.0, 0.71), (1360, 1090), "a scaled width is a multiple of 16");
-        assert_eq!(policy.size(hd, 1e3, 60.0, 1.0), (320, 180), "never below min_resolution_scale");
+        assert_eq!(policy.size(hd, 1e3, 60.0, 1.0), (160, 90), "never below 160x64, aspect kept");
+        assert_eq!(policy.size((640, 480), 1e3, 30.0, 1.0), (160, 120));
+        assert_eq!(policy.size((1280, 200), 1e3, 30.0, 1.0), (400, 64), "64 high: a wide picture keeps more width");
+        assert_eq!(VideoPolicy { min_resolution_scale: 0.25, ..policy }.size(hd, 1e3, 60.0, 1.0), (320, 180), "or min_resolution_scale");
+        assert_eq!(VideoPolicy { min_resolution: (64, 64), ..policy }.size(hd, 1e3, 60.0, 1.0), (112, 64), "a page's own floor (a width multiple of 16)");
         assert_eq!(policy.size(hd, 1e9, 60.0, 0.5), (640, 360), "the CPU governor's cap");
         let boxed = VideoPolicy { max_resolution: Some((640, 640)), ..policy };
         assert_eq!(boxed.size(hd, 1e9, 60.0, 1.0), (640, 360), "fitted into max_resolution");
         // the price: the smallest picture at the floor (quality 0) to the most bits per frame (1)
         assert!((policy.frame_bytes(hd, 60.0, 1.0) - 0.3 * 1280.0 * 720.0 / 8.0).abs() < 1.0);
-        assert!((policy.frame_bytes(hd, 60.0, 0.0) - 0.1 * 320.0 * 180.0 / 8.0).abs() < 1.0);
+        assert!((policy.frame_bytes(hd, 60.0, 0.0) - 0.1 * 160.0 * 90.0 / 8.0).abs() < 1.0);
         let capped = VideoPolicy { max_bitrate: Some(6e6), ..policy };
         assert!((capped.frame_bytes(hd, 60.0, 1.0) - 12_500.0).abs() < 1e-6, "6 Mbit/s at 60 Hz");
         assert!(capped.frame_bytes(hd, 60.0, 0.3) < capped.frame_bytes(hd, 60.0, 0.6));
-        assert!(VideoPolicy { min_resolution_scale: 0.0, ..policy }.validate().is_err());
+        assert!(VideoPolicy { min_resolution_scale: 1.5, ..policy }.validate().is_err());
     }
 
     #[test]
@@ -424,7 +440,7 @@ mod tests {
         assert!(!encode(&mut encoder, &frame, 2e6, false).keyframe, "a new bitrate applies in place");
         assert!(encode(&mut encoder, &frame, 2e6, true).keyframe, "asked for");
         let low = encode(&mut encoder, &frame, 1e3, false);
-        assert_eq!((low.width, low.height), (112, 86), "10 kbit/s (the floor) at 10 Hz keeps 0.1 bits per pixel at about a third of the width");
+        assert_eq!((low.width, low.height), (160, 120), "10 kbit/s (the bitrate floor) at 10 Hz: the smallest picture, 160 wide");
         assert!(encoder.encode(&DecodedFrame::data(1u8), &target(&VideoPolicy::default(), (8, 8), 1.0, 1e6, 10.0, 1.0, false)).is_err(), "takes pictures only");
     }
 

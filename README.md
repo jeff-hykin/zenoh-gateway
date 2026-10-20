@@ -110,7 +110,8 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 | `encodeOptions` | `{}` | passed to the encoding (each documents its own); `quality` (0–1, default 1) is the most the allocator picks, lowered when bandwidth is short |
 | `compress` | the encoding's (none without one) | `"zstd"` or `"none"`: zstd-compress each data-channel message (raw topics too); the client decompresses, so `msg.bytes` is always plain. Rejected on video and audio channels |
 | `maxBitrate` | the server's (~0.3 bit/pixel at the source's size and rate) | video channels: most bits/s the stream asks for; it encodes at what the allocator grants |
-| `minResolutionScale` | 0.25 | video channels: the picture keeps its full size unless the grant is under 0.05 bit/pixel there, and never shrinks below this share |
+| `minResolutionScale` | 0 | video channels: the picture keeps its full size unless the grant is under 0.1 bit/pixel there, and never shrinks below this share |
+| `minResolution` | [160, 64] | video channels: never shrinks below this (aspect kept: it stops when one side reaches its value) |
 | `maxResolution` | none | video channels: `[width, height]` box the picture is fitted into |
 | `playoutDelay` | `[0, 0]` | video channels: `[min, max]` ms the browser may hold a frame to smooth out jitter; `[0, 0]` shows each frame at once (after a non-zero min on the same track, `[10, 10]`: Firefox can't go back) |
 

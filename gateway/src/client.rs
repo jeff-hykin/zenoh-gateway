@@ -138,8 +138,10 @@ pub struct SubscribeOptions {
     pub compress: Option<Compress>,
     /// video channels: most bits/s the stream asks for (default: the server's)
     pub max_bitrate: Option<f64>,
-    /// video channels: smallest share of the source's width and height the picture may shrink to (default 0.25)
+    /// video channels: smallest share of the source's width and height the picture may shrink to (default 0)
     pub min_resolution_scale: Option<f64>,
+    /// video channels: (width, height) the picture never shrinks below, aspect kept (default (160, 64))
+    pub min_resolution: Option<(u32, u32)>,
     /// video channels: (width, height) box the picture is fitted into
     pub max_resolution: Option<(u32, u32)>,
     /// video channels: (min, max) ms the browser may hold a frame to smooth out jitter (default (0, 0): show at once)
@@ -256,6 +258,12 @@ pub struct VideoFrameInfo {
     pub media_time_ms: Option<f64>,
     /// when the gateway wrote it to the track (unix ms, gateway clock); `None` from gateways before 0.5.20
     pub written_ms: Option<f64>,
+    /// its RTP timestamp, when the gateway knew it (0.5.20+)
+    pub rtp_timestamp: Option<u32>,
+    /// when the gateway got its sample (unix ms, gateway clock; 0.5.20+)
+    pub received_ms: Option<f64>,
+    /// when the gateway finished encoding it (unix ms, gateway clock; 0.5.20+)
+    pub encoded_ms: Option<f64>,
 }
 
 /// One Opus packet.
@@ -1095,7 +1103,7 @@ impl Subscription {
     }
 
     /// Changes the running subscription's options in place (same channel and track): any of maxHz, minQuality,
-    /// qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale, maxResolution, playoutDelay and
+    /// qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale, minResolution, maxResolution, playoutDelay and
     /// encodeOptions.quality, as JSON (`null` puts one back to its default). Returns the options now in force.
     pub async fn update(&self, changes: Value) -> Result<Value> {
         let inner = self.client.upgrade().context("the client closed")?;
@@ -1278,6 +1286,7 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
         Some("video") => {
             ensure!(bytes.len() >= media::METADATA_LEN_V1 && bytes[0] == 1, "not a video metadata frame");
             let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let float = |at: usize| f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
             Some(Message::VideoInfo(VideoFrameInfo {
                 key,
                 timestamp_ms,
@@ -1289,8 +1298,11 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
                 source_height: word(16),
                 quality: f32::from_bits(word(20)),
                 encoded_bytes: word(24),
-                media_time_ms: (bytes.len() >= media::METADATA_LEN).then(|| f64::from_le_bytes(bytes[28..36].try_into().unwrap())),
-                written_ms: (bytes.len() >= media::METADATA_LEN).then(|| f64::from_le_bytes(bytes[36..44].try_into().unwrap())),
+                media_time_ms: (bytes.len() >= media::METADATA_LEN_V2).then(|| float(28)),
+                written_ms: (bytes.len() >= media::METADATA_LEN_V2).then(|| float(36)),
+                rtp_timestamp: (bytes.len() >= media::METADATA_LEN && bytes[1] & media::METADATA_FLAG_RTP != 0).then(|| word(44)),
+                received_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(48)),
+                encoded_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(56)),
             }))
         }
         // one empty frame per sample, for a browser callback

@@ -53,6 +53,7 @@ pub struct SubOpts {
     /// video channels: bits/s the stream asks for at most, and how far its picture may shrink (see `VideoPolicy`)
     pub max_bitrate: Option<f64>,
     pub min_resolution_scale: Option<f64>,
+    pub min_resolution: Option<(u32, u32)>,
     pub max_resolution: Option<(u32, u32)>,
     /// video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once)
     pub playout_delay: Option<(f64, f64)>,
@@ -107,7 +108,10 @@ impl SubOpts {
         check_positive("maxAge", parsed.max_age)?;
         check_positive("maxHz", parsed.max_hz)?;
         check_positive("maxBitrate", parsed.max_bitrate)?;
-        check("minResolutionScale", parsed.min_resolution_scale, |scale| scale > 0.0 && scale <= 1.0, "within (0, 1]")?;
+        check("minResolutionScale", parsed.min_resolution_scale, |scale| (0.0..=1.0).contains(&scale), "within [0, 1]")?;
+        if parsed.min_resolution.is_some_and(|(width, height)| width < 16 || height < 16) {
+            return Err("minResolution must be at least [16, 16]".into());
+        }
         if parsed.max_resolution.is_some_and(|(width, height)| width < 16 || height < 16) {
             return Err("maxResolution must be at least [16, 16]".into());
         }
@@ -155,8 +159,8 @@ impl SubOpts {
         let channel = channel.unwrap_or_else(|| Channel::default_for(encoding.output(), VideoFormat::H264));
         let output = encoding.output_on(channel, &self.encoding_options())?;
         let video = matches!(channel, Channel::Video(_));
-        if !video && (self.max_bitrate.is_some() || self.min_resolution_scale.is_some() || self.max_resolution.is_some() || self.playout_delay.is_some()) {
-            return Err(format!("maxBitrate, minResolutionScale, maxResolution and playoutDelay are for video channels, not {}", channel.as_str()));
+        if !video && (self.max_bitrate.is_some() || self.min_resolution_scale.is_some() || self.min_resolution.is_some() || self.max_resolution.is_some() || self.playout_delay.is_some()) {
+            return Err(format!("maxBitrate, minResolutionScale, minResolution, maxResolution and playoutDelay are for video channels, not {}", channel.as_str()));
         }
         if let Channel::Video(format) = channel {
             registry.video_encoder(&*encoding, format)?;
@@ -185,6 +189,7 @@ impl SubOpts {
         VideoPolicy {
             max_bitrate: self.max_bitrate.or(server.max_bitrate),
             min_resolution_scale: self.min_resolution_scale.unwrap_or(server.min_resolution_scale),
+            min_resolution: self.min_resolution.unwrap_or(server.min_resolution),
             max_resolution: self.max_resolution.or(server.max_resolution),
             ..server
         }
@@ -222,6 +227,7 @@ impl SubOpts {
             "compress": self.compress.unwrap_or_default(),
             "maxBitrate": self.max_bitrate,
             "minResolutionScale": self.min_resolution_scale,
+            "minResolution": self.min_resolution,
             "maxResolution": self.max_resolution,
             "playoutDelay": self.playout_delay.unwrap_or((0.0, 0.0)),
         })
@@ -378,7 +384,9 @@ mod tests {
         let video = sub(r#"{"encoding":"camera","maxBitrate":4e6,"maxResolution":[640,480]}"#).unwrap();
         assert!(video.clone().resolve_encoding(&registry).is_ok());
         let policy = video.video_policy(VideoPolicy::default());
-        assert_eq!((policy.max_bitrate, policy.max_resolution, policy.min_resolution_scale), (Some(4e6), Some((640, 480)), 0.25));
+        assert_eq!((policy.max_bitrate, policy.max_resolution, policy.min_resolution_scale), (Some(4e6), Some((640, 480)), 0.0));
+        assert_eq!(sub(r#"{"minResolution":[320,180]}"#).unwrap().video_policy(VideoPolicy::default()).min_resolution, (320, 180));
+        assert!(sub(r#"{"minResolution":[8,64]}"#).is_err());
         let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"minQuality":0.3,"encodeOptions":{"quality":0.9},"qualityToHzTradeoff":0.7}"#).unwrap();
         assert_eq!(full.quality_range(), (0.3, 0.9));
         assert_eq!((full.normalized()["bandwidthPriority"].as_f64(), full.normalized()["qualityToHzTradeoff"].as_f64()), (Some(2.0), Some(0.7)));

@@ -221,7 +221,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
     and RTP timestamp, depacketized from the track (reordered and retransmitted packets included);
     after a lost frame the client sends a PLI and skips frames until a keyframe, so what it yields
     always decodes. `request_keyframe()` sends a PLI;
-  - `VideoInfo`: the 44-byte metadata frame (key, size, quality), which travels on the data channel
+  - `VideoInfo`: the 64-byte metadata frame (key, size, quality), which travels on the data channel
     apart from its frame;
   - `Audio`: Opus packets.
   Messages are acked once queued (64 per subscription), so a slow consumer slows the gateway instead
@@ -332,7 +332,10 @@ good as BT.709 through openh264 and ~0.5 dB better through VideoToolbox. H.264 o
   the last step (each resolution change restarts the encoder with a keyframe, so the ceiling must not flap). It only
   lowers the size the bitrate policy picked, never the bitrate or the frame rate, so the two never fight; a hardware
   encoder rarely moves it. Decode time does not move it (a slow decode caps the rate at any resolution). Stats:
-  `decodeMs`, `encodeMs`, `cpuScaleCap`.
+  `decodeMs`, `encodeMs`, `cpuScaleCap`, and `videoLatency` (smoothed per frame, ms: `sourceToReceivedMs` the sample's
+  timestamp to the gateway getting it, `receivedToEncodedMs` queue + decode + scale + encode, `encodedToWrittenMs` to the
+  track; `pacerP50Ms`/`pacerP95Ms` over the latest 128 frames, first packet into the RTP pacer to last packet out, as
+  interceptors above and below the pacer see them).
 
 Work happens lazily and on send: only messages the pacing/queues let through are transcoded, on
 tokio's blocking pool. Work is shared across frontends through two small caches per gateway: decoded
@@ -431,9 +434,16 @@ with the new m-line, then the `sub` channel's label names that `mid` (the gatewa
 another format). Renegotiations run one at a time. A closed subscription's transceiver is stopped (the next renegotiation frees its m-line) rather than reused:
 Chrome stopped assembling a reused receiver's frames after a few quick close-and-reopen switches. The gateway gives a
 track to the newest subscription that names it.
-Each video frame also sends a 44-byte metadata frame on the `sub` channel (`msg.video`), after the frame is written to
+Each video frame also sends a 64-byte metadata frame on the `sub` channel (`msg.video`), after the frame is written to
 the track. Nothing new is encoded while frames written to the connection's tracks would still wait in the
 RTP pacer over 50 ms (paced at 2.5x the larger of video's grant and the link's estimate): the newest sample goes once it drains.
+Video latency: the metadata names its frame by RTP timestamp and carries the gateway's times for it; a page's
+`requestVideoFrameCallback` `rtpTimestamp` says which frame is on screen, and the connection's clock sync (heartbeat
+`offsetMs`) brings gateway times to the page's clock, so `Subscription.watchVideoLatency(element)` / `videoLatency()`
+give source-to-screen p50/p95 and its stages in any browser with requestVideoFrameCallback. Once a second a frame's
+packets also carry the abs-capture-time extension (the sample's timestamp, NTP, capture clock offset 0; the client
+asks Chrome to negotiate it, which it doesn't by default), which Chrome reports per received frame (interpolated between
+stamps) in `getSynchronizationSources()`: `captureToShown`, the same time from the stamp that came with the video.
 Video RTP carries the playout-delay extension with the subscription's `playoutDelay` (default `[0, 0]`: the browser
 shows each frame at once; a larger max lets its jitter buffer smooth an uneven network). A track never returns to
 low-latency rendering (min 0, max <= 500 ms) once it has carried a delay outside it (an update from `[100, 400]` back to
@@ -445,7 +455,7 @@ Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden pe
   actually grants. Before its first frame the source's size is guessed from the sample (a 16:9 picture of 3 bytes per
   pixel) and priced by this policy, not by the raw sample's size.
 - The picture keeps the source's size (fitted into `maxResolution`) unless the grant would leave fewer than
-  `min_bits_per_pixel` (0.1) there; then it shrinks just enough, never below `minResolutionScale` (0.25). Below
+  `min_bits_per_pixel` (0.1) there; then it shrinks just enough, never below `minResolution` ([160, 64], aspect kept: it stops when one side reaches its value) or `minResolutionScale` (0), whichever is larger. Below
   ~0.03 bit/pixel openh264 overshoots its target even at its coarsest quantizer, while above it a full-size picture
   beat every smaller one at the same bitrate on the bench scene (after upscaling).
 - Quality, for video, is the share of the most bits per frame: 0 is the smallest picture at the bit-per-pixel floor,
@@ -736,6 +746,8 @@ resolving so the gateway has an offset before the first put.
 - Heartbeat: browser sends `{"t0", "offsetMs", "rttMs"}` (JSON), gateway answers `{"t0", "t1", "t2"}`.
 - Video `sub` label: adds `"mid"`. Video metadata frame (little endian): `u8 version=1 | u8 flags
   (bit0 keyframe) | u16 0 | u32 width | u32 height | u32 sourceWidth | u32 sourceHeight | f32 quality |
-  u32 encodedBytes | f64 mediaTimeMs | f64 writtenMs` (44 bytes; gateways before 0.5.20 send the first 28):
-  `mediaTimeMs` is the frame's RTP timestamp less the track's first, in ms (a page's `requestVideoFrameCallback`
-  `rtpTimestamp` names the frame it shows), `writtenMs` when it went to the track (unix ms, gateway clock). A fields message is "Fields", any other data-channel encoding's its own format.
+  u32 encodedBytes | f64 mediaTimeMs | f64 writtenMs | u32 rtpTimestamp | f64 receivedMs | f64 encodedMs` (64 bytes;
+  gateways before 0.5.20 send the first 28): `mediaTimeMs` is the frame's RTP timestamp less the track's first, in ms,
+  `writtenMs` when it went to the track, `rtpTimestamp` the frame's (valid when flags bit1 is set: a page's
+  `requestVideoFrameCallback` `rtpTimestamp` names the frame it shows), `receivedMs`/`encodedMs` when the gateway got
+  its sample and finished encoding it (unix ms, gateway clock); the frame header's timestamp is the sample's own. A fields message is "Fields", any other data-channel encoding's its own format.

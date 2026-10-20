@@ -81,6 +81,24 @@ pub struct SubStats {
     pub decode_ms: Option<f64>,
     pub encode_ms: Option<f64>,
     pub cpu_scale_cap: Option<f64>,
+    /// video: where its latest frames' time went inside the gateway
+    pub video_latency: Option<VideoLatency>,
+}
+
+/// A video stream's gateway stages, ms: smoothed over its frames, and the RTP pacer's over its latest 128.
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoLatency {
+    /// the sample's own timestamp to the gateway getting it (zenoh, and the publisher's clock against this one's;
+    /// 0 for samples without a zenoh timestamp)
+    pub source_to_received_ms: f64,
+    /// queued, decoded, scaled and encoded
+    pub received_to_encoded_ms: f64,
+    /// handed to the track (waits on the pacer rule and a shared encode session)
+    pub encoded_to_written_ms: f64,
+    /// first packet into the RTP pacer to last packet out
+    pub pacer_p50_ms: Option<f64>,
+    pub pacer_p95_ms: Option<f64>,
 }
 
 pub struct Pending {
@@ -89,6 +107,8 @@ pub struct Pending {
     pub kind: SampleKind,
     pub attachment: Option<ZBytes>,
     pub timestamp_ms: f64,
+    /// when the gateway got it (unix ms, its clock)
+    pub received_ms: f64,
     pub seq: u32,
     arrived: Instant,
     priority: u8,
@@ -537,6 +557,16 @@ impl SubShared {
         state.stats.cpu_scale_cap = Some(cpu_scale_cap);
     }
 
+    /// A video frame's gateway stages (ms) and its track's pacer delay percentiles.
+    pub fn record_video_latency(&self, source_to_received: f64, received_to_encoded: f64, encoded_to_written: f64, pacer: Option<(f64, f64)>) {
+        let mut state = self.state.lock();
+        let latency = state.stats.video_latency.get_or_insert_with(|| VideoLatency { source_to_received_ms: source_to_received, received_to_encoded_ms: received_to_encoded, encoded_to_written_ms: encoded_to_written, ..Default::default() });
+        latency.source_to_received_ms = ewma(latency.source_to_received_ms, source_to_received);
+        latency.received_to_encoded_ms = ewma(latency.received_to_encoded_ms, received_to_encoded);
+        latency.encoded_to_written_ms = ewma(latency.encoded_to_written_ms, encoded_to_written);
+        (latency.pacer_p50_ms, latency.pacer_p95_ms) = (pacer.map(|(p50, _)| p50), pacer.map(|(_, p95)| p95));
+    }
+
     /// Audio packets went to the track.
     pub fn record_media_bytes(&self, bytes: usize) {
         let mut state = self.state.lock();
@@ -573,12 +603,14 @@ impl SubShared {
             state.stats.queued += 1;
             state.stats.queued_bytes += payload_len;
             let timestamp_ms = sample_timestamp_ms(&sample);
-            state.stats.max_receive_lag_ms = state.stats.max_receive_lag_ms.max(now_unix_ms() - timestamp_ms);
+            let received_ms = now_unix_ms();
+            state.stats.max_receive_lag_ms = state.stats.max_receive_lag_ms.max(received_ms - timestamp_ms);
             let pending = Pending {
                 encoding: sample.encoding().clone(),
                 kind: sample.kind(),
                 attachment: sample.attachment().cloned(),
                 timestamp_ms,
+                received_ms,
                 seq,
                 arrived: Instant::now(),
                 priority: self.priority_override.unwrap_or(sample.priority() as u8),
@@ -1094,6 +1126,7 @@ mod tests {
             kind: SampleKind::Put,
             attachment: None,
             timestamp_ms: 0.0,
+            received_ms: 0.0,
             seq,
             arrived,
             priority,
