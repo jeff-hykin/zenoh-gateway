@@ -9,7 +9,8 @@
 // - frames moving: >= 10 shown/s from 500 kbit/s up, >= 3 below, no freeze over 2 s;
 // - the link used: video >= 40% of a link the camera could fill (its most is ~8 Mbit/s here), on clean links;
 // - pictures shrinking with the link, never under minResolution ([160, 64]: 160x90 for 16:9).
-// Usage: deno run --allow-all --unstable-net client/test/video_battery.ts [cell name ...]   (default: every cell; BROWSER=firefox)
+// Usage: deno run --allow-all --unstable-net client/test/video_battery.ts [cell name ...]   (default: every cell; BROWSER=firefox;
+// REPEAT=3)
 
 /// <reference lib="dom" />
 import { openPage, waitForOtherBrowserTests } from "./browser.ts"
@@ -18,6 +19,8 @@ import { type LinkShape, shapedLink } from "./shaped_link.ts"
 // phases: [start s, end s, label] measured over their last `measure` seconds
 type Cell = LinkShape & { name: string; seconds: number; phases?: [number, number, string][]; clean?: boolean }
 const measure = 10
+// REPEAT=n: each cell n times, judged on the run with the median p95 (the same link gave 289 ms one run, 8 s the next)
+const repeat = Number(Deno.env.get("REPEAT") ?? 1)
 const cells: Cell[] = [
     ...([["20mbit", 2_500_000], ["8mbit", 1_000_000], ["4mbit", 500_000], ["2mbit", 250_000], ["1mbit", 125_000], ["500kbit", 62_500], ["250kbit", 31_250], ["100kbit", 12_500]] as [string, number][])
         .map(([name, rate]) => ({ name, seconds: 25, schedule: [[0, rate]] as [number, number][], delayMs: 20, jitterMs: 0, loss: 0, clean: true })),
@@ -134,9 +137,18 @@ const rows: string[] = []
 const round = (value: number | undefined) => value === undefined || !Number.isFinite(value) ? "-" : String(Math.round(value))
 let previousWidth = Infinity
 for (const cell of chosen) {
-    console.log(`${cell.name}: ${cell.seconds} s`)
-    const phases = await runCell(cell)
-    for (const phase of phases) {
+    console.log(`${cell.name}: ${cell.seconds} s${repeat > 1 ? ` x ${repeat}` : ""}`)
+    const runs: Phase[][] = []
+    for (let run = 0; run < repeat; run++) {
+        runs.push(await runCell(cell))
+    }
+    for (const [index, label] of runs[0].map((phase, index) => [index, phase.label] as const)) {
+        // the run with the median p95 stands for the phase (a frameless run counts as the worst)
+        const tries = runs.map((phases) => phases[index]).sort((a, b) => (a.latency?.total.p95 ?? Infinity) - (b.latency?.total.p95 ?? Infinity))
+        const phase = tries[Math.floor((tries.length - 1) / 2)]
+        if (repeat > 1) {
+            console.log(`  ${cell.name} ${label}: p95 per run ${tries.map((one) => round(one.latency?.total.p95)).join(" / ")} ms`)
+        }
         const span = cell.phases?.find(([, , label]) => label === phase.label)
         const rate = cell.schedule.filter(([at]) => at <= (span?.[0] ?? 0)).at(-1)![1]
         const name = cell.phases ? `${cell.name} ${phase.label}` : cell.name
