@@ -70,7 +70,8 @@ const sockets: Deno.DatagramConn[] = []
 const offeredDown = { bytes: 0, packets: 0 }
 const offeredUp = { bytes: 0, packets: 0 }
 const startShaper = (targetPort: number) => {
-    const chromeSide = Deno.listenDatagram({ transport: "udp", hostname: "127.0.0.1", port: 0 })
+    // (every interface: Firefox offers only its LAN address, and a socket there can't reach 127.0.0.1)
+    const chromeSide = Deno.listenDatagram({ transport: "udp", hostname: "0.0.0.0", port: 0 })
     const serverSide = Deno.listenDatagram({ transport: "udp", hostname: "127.0.0.1", port: 0 })
     sockets.push(chromeSide, serverSide)
     let chromeAddress: Deno.NetAddr | null = null
@@ -107,6 +108,8 @@ const proxy = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, asyn
         return new Response("link down", { status: 503 })
     }
     const offer = await request.json()
+    // the browser's own IPv4 host address (Firefox's only candidate), offered beside loopback
+    const browserAddress = (offer.sdp as string).split("\r\n").map((line) => line.match(/^a=candidate:\S+ 1 udp \d+ (\d+\.\d+\.\d+\.\d+) \d+ typ host/i)?.[1]).find((address) => address !== undefined && !address.startsWith("127."))
     offer.sdp = offer.sdp.split("\r\n").filter((line: string) => !line.startsWith("a=candidate")).join("\r\n")
     const answer = await (await fetch(`${serverUrl}/offer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(offer) })).json()
     const lines: string[] = answer.sdp.split("\r\n")
@@ -125,7 +128,7 @@ const proxy = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, asyn
             return []
         }
         replaced = true
-        return [`a=candidate:1 1 udp 2130706431 127.0.0.1 ${port} typ host`]
+        return [`a=candidate:1 1 udp 2130706431 127.0.0.1 ${port} typ host`, ...(browserAddress ? [`a=candidate:2 1 udp 2130706430 ${browserAddress} ${port} typ host`] : [])]
     }).join("\r\n")
     return Response.json(answer)
 })
