@@ -192,7 +192,8 @@ for (const cell of chosen) {
         const tries = runs.map((phases) => phases[index]).sort((a, b) => (a.latency?.total.p95 ?? Infinity) - (b.latency?.total.p95 ?? Infinity))
         const phase = tries[Math.floor((tries.length - 1) / 2)]
         if (repeat > 1) {
-            console.log(`  ${cell.name} ${label}: p95 per run ${tries.map((one) => round(one.latency?.total.p95)).join(" / ")} ms`)
+            const each = runs.map((phases) => phases[index])
+            console.log(`  ${cell.name} ${label}: p95 per run ${tries.map((one) => round(one.latency?.total.p95)).join(" / ")} ms; per run (p95 ms, frames/s, longest freeze ms): ${each.map((one) => `${round(one.latency?.total.p95)}, ${one.shownPerSec.toFixed(1)}, ${round(one.maxGapMs)}`).join(" | ")}`)
         }
         const span = cell.phases?.find(([, , label]) => label === phase.label)
         const rate = cell.schedule.filter(([at]) => at <= (span?.[0] ?? 0)).at(-1)![1]
