@@ -26,8 +26,8 @@ const cells = async (file: string) => {
 
 const groups: Record<string, Suite[]> = {
     rust: [cargo("rust:lib", ["--lib"]), ...["client", "leak", "zenoh_api", "backpressure"].map((test) => cargo(`rust:${test}`, ["--test", test], test))],
-    browser: [deno("browser:video_latency", "video_latency.ts"), deno("browser:resubscribe", "resubscribe.ts"), deno("browser:backpressure", "backpressure.ts"), deno("browser:lease_takeover", "lease_takeover.ts")],
-    battery: (await cells("video_battery.ts")).map((cell) => deno(`battery:${cell}`, "video_battery.ts", ["client/test/shaped_link.ts"], [cell])),
+    browser: [deno("browser:video_latency", "video_latency.ts", ["client/test/browser.ts"]), deno("browser:resubscribe", "resubscribe.ts"), deno("browser:backpressure", "backpressure.ts"), deno("browser:lease_takeover", "lease_takeover.ts")],
+    battery: (await cells("video_battery.ts")).map((cell) => deno(`battery:${cell}`, "video_battery.ts", ["client/test/shaped_link.ts", "client/test/browser.ts"], [cell])),
     degrade: (await cells("degrade.ts")).map((cell) => deno(`degrade:${cell}`, "degrade.ts", ["client/test/shaped_link.ts"], [cell])),
 }
 

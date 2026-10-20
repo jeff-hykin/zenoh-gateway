@@ -14,6 +14,7 @@
 
 import { launch } from "jsr:@astral/astral@0.5.6"
 import { shapedLink } from "./shaped_link.ts"
+import { waitForOtherBrowserTests } from "./browser.ts"
 
 // slackMs: what the strict streams may take beyond the link's own round trip (300 ms; the floor cell's strict traffic is a
 // third of its link, and its packets queue behind each other)
@@ -60,6 +61,7 @@ const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell
 const diagnose = Deno.env.get("DIAGNOSE") === "1"
 const windowMs = 2000
 
+await waitForOtherBrowserTests()
 const root = new URL("../..", import.meta.url).pathname
 const scratch = await Deno.makeTempDir({ prefix: "zenoh-gateway-degrade-" })
 await Deno.mkdir(`${scratch}/client`)

@@ -9,11 +9,10 @@
 // Usage: deno run --allow-all client/test/video_latency.ts   (SECONDS per phase, default 8)
 
 /// <reference lib="dom" />
-import { launch } from "jsr:@astral/astral@0.5.6"
-
-const firefox = Deno.env.get("BROWSER") === "firefox"
+import { firefox, openPage, waitForOtherBrowserTests } from "./browser.ts"
 
 const seconds = Number(Deno.env.get("SECONDS") ?? 8)
+await waitForOtherBrowserTests()
 const root = new URL("../..", import.meta.url).pathname
 const scratch = await Deno.makeTempDir({ prefix: "zenoh-gateway-video-latency-" })
 await Deno.mkdir(`${scratch}/client`)
@@ -39,21 +38,7 @@ const serverUrl = await (async () => {
 })()
 
 const failures: string[] = []
-// one page.evaluate for either driver: astral passes `args`, Playwright one argument
-type Driver = { evaluate: <T>(fn: (...args: any[]) => Promise<T>, args: unknown[]) => Promise<T>; close: () => Promise<void> }
-const driver: Driver = firefox ? await (async () => {
-    const { firefox } = await import("npm:playwright@1.63.0")
-    const browser = await firefox.launch({ headless: true, firefoxUserPrefs: { "media.peerconnection.ice.loopback": true, "media.peerconnection.ice.obfuscate_host_addresses": false, "media.autoplay.default": 0 } })
-    const page = await browser.newPage()
-    page.setDefaultTimeout(seconds * 4_000 + 60_000)
-    await page.goto(`${serverUrl}/blank.html`)
-    return { evaluate: (fn, args) => page.evaluate(({ source, args }) => (0, eval)(`(${source})`)(...args), { source: fn.toString(), args }), close: () => browser.close() }
-})() : await (async () => {
-    const browser = await launch({ headless: true, args: ["--no-sandbox", "--autoplay-policy=no-user-gesture-required"] })
-    const page = await browser.newPage(`${serverUrl}/blank.html`)
-    ;(page as any).timeout = seconds * 4_000 + 60_000
-    return { evaluate: (fn, args) => page.evaluate(fn, { args }), close: () => browser.close() }
-})()
+const driver = await openPage(`${serverUrl}/blank.html`, seconds * 4_000 + 60_000)
 try {
     const measure = async (playoutDelay: [number, number]) => await driver.evaluate(async (url: string, playoutDelay: [number, number], seconds: number) => {
         const { connect } = await import("/client/zenoh_gateway.js")

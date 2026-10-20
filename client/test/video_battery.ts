@@ -9,10 +9,10 @@
 // - frames moving: >= 10 shown/s from 500 kbit/s up, >= 3 below, no freeze over 2 s;
 // - the link used: video >= 40% of a link the camera could fill (its most is ~8 Mbit/s here), on clean links;
 // - pictures shrinking with the link, never under minResolution ([160, 64]: 160x90 for 16:9).
-// Usage: deno run --allow-all --unstable-net client/test/video_battery.ts [cell name ...]   (default: every cell)
+// Usage: deno run --allow-all --unstable-net client/test/video_battery.ts [cell name ...]   (default: every cell; BROWSER=firefox)
 
 /// <reference lib="dom" />
-import { launch } from "jsr:@astral/astral@0.5.6"
+import { openPage, waitForOtherBrowserTests } from "./browser.ts"
 import { type LinkShape, shapedLink } from "./shaped_link.ts"
 
 // phases: [start s, end s, label] measured over their last `measure` seconds
@@ -34,6 +34,7 @@ if (Deno.args[0] === "--list-cells") {
 }
 const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell.name)) : cells
 
+await waitForOtherBrowserTests()
 const root = new URL("../..", import.meta.url).pathname
 const scratch = await Deno.makeTempDir({ prefix: "zenoh-gateway-video-battery-" })
 await Deno.mkdir(`${scratch}/client`)
@@ -62,10 +63,8 @@ async function runCell(cell: Cell): Promise<Phase[]> {
         throw new Error("degrade_server exited")
     })()
     const link = shapedLink(serverUrl, cell)
-    const browser = await launch({ headless: true, args: ["--no-sandbox", "--autoplay-policy=no-user-gesture-required"] })
+    const page = await openPage(`${link.url}/blank.html`, (cell.seconds + 60) * 1000)
     try {
-        const page = await browser.newPage(`${link.url}/blank.html`)
-        ;(page as any).timeout = (cell.seconds + 60) * 1000
         const phases = cell.phases ?? [[0, cell.seconds, cell.name]]
         return await page.evaluate(async (url: string, phases: [number, number, string][], measure: number) => {
             const { connect } = await import("/client/zenoh_gateway.js")
@@ -121,9 +120,9 @@ async function runCell(cell: Cell): Promise<Phase[]> {
             }
             client.close()
             return results
-        }, { args: [link.url, phases, measure] })
+        }, [link.url, phases, measure])
     } finally {
-        await browser.close()
+        await page.close()
         server.kill("SIGTERM")
         await server.status
         await link.close()
