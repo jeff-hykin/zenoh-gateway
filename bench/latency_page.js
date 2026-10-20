@@ -24,6 +24,7 @@ const toEpoch = (perfMs) => performance.timeOrigin + perfMs
 
 let gw = null
 const streams = {}
+const subscriptions = []
 const video = {
     meta: [],
     window: { meta: 0, metaBytes: 0, rxToWrite: [], frames: [], pixel: [] },
@@ -170,7 +171,7 @@ async function main() {
     window.gw = gw
     for (const { key, options, kind } of config.subscriptions) {
         let attached = false
-        gw.subscribe(key, options, (message) => {
+        const subscription = gw.subscribe(key, options, (message) => {
             const offset = gw.clockOffsetMs ?? 0
             const rxPage = message.timestamp - offset
             if (kind === "video") {
@@ -201,13 +202,15 @@ async function main() {
                 entry.points += positions.length / 3
             }
         })
+        subscriptions.push({ key, subscription })
     }
     window.harnessReady = true
 }
 
 let previousInbound = null
 window.sample = async () => {
-    const out = { at: nowEpoch(), rttMs: gw?.rttMs ?? null, clockOffsetMs: gw?.clockOffsetMs ?? null, errors: errors.splice(0), streams: {}, video: null, bandwidth: gw?.gatewayStats?.bandwidth ?? null, congestion: gw?.congestion ?? null }
+    const states = subscriptions.map(({ key, subscription }) => ({ key, state: subscription.state, rejected: subscription.rejectionReason ?? null }))
+    const out = { subscriptions: states, at: nowEpoch(), rttMs: gw?.rttMs ?? null, clockOffsetMs: gw?.clockOffsetMs ?? null, errors: errors.splice(0), streams: {}, video: null, bandwidth: gw?.gatewayStats?.bandwidth ?? null, congestion: gw?.congestion ?? null }
     for (const [key, entry] of Object.entries(streams)) {
         out.streams[key] = { ...entry }
         Object.assign(entry, { n: 0, bytes: 0, ages: [], points: 0 })

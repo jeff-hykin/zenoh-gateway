@@ -220,6 +220,11 @@ for (let second = 1; second <= options.seconds; second++) {
     if (sample.errors.length) {
         console.error("page:", sample.errors.join("; "))
     }
+    for (const { key, state, rejected } of sample.subscriptions ?? []) {
+        if (rejected || (second > 5 && state !== "open")) {
+            console.error(`subscription ${key}: ${state}${rejected ? `, rejected: ${rejected}` : ""}`)
+        }
+    }
     if (options.quiet) {
         continue
     }
