@@ -432,8 +432,8 @@ another format). Renegotiations run one at a time. A closed subscription's trans
 Chrome stopped assembling a reused receiver's frames after a few quick close-and-reopen switches. The gateway gives a
 track to the newest subscription that names it.
 Each video frame also sends a 44-byte metadata frame on the `sub` channel (`msg.video`), after the frame is written to
-the track. Nothing new is encoded while frames written to the connection's tracks would still wait over 100 ms in the
-RTP pacer (paced at 2.5x the larger of video's grant and the link's estimate): the newest sample goes once it drains.
+the track. Nothing new is encoded while frames written to the connection's tracks would still wait in the
+RTP pacer over 50 ms (paced at 2.5x the larger of video's grant and the link's estimate): the newest sample goes once it drains.
 Video RTP carries the playout-delay extension with the subscription's `playoutDelay` (default `[0, 0]`: the browser
 shows each frame at once; a larger max lets its jitter buffer smooth an uneven network). A track never returns to
 low-latency rendering (min 0, max <= 500 ms) once it has carried a delay outside it (an update from `[100, 400]` back to

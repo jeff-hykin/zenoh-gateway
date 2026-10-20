@@ -41,8 +41,10 @@ const OPUS: &str = "audio/opus";
 const GCC_INITIAL_BPS: f64 = crate::allocator::INITIAL_BANDWIDTH * 8.0;
 const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
+/// Video RTP's clock (H.264, VP8, VP9 and AV1 all run at 90 kHz).
+const VIDEO_CLOCK_RATE: f64 = 90_000.0;
 /// The most a frame may wait in the RTP pacer before the next one is encoded (`VideoRate::pacer_delay`).
-const PACER_MAX_DELAY: Duration = Duration::from_millis(100);
+const PACER_MAX_DELAY: Duration = Duration::from_millis(50);
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
 const PACING_FACTOR: f64 = 2.5;
 /// Video's queueing delay is measured against the least one-way delay over this long.
@@ -380,8 +382,8 @@ pub struct MediaTrack {
     dropped: Arc<tokio::sync::Notify>,
     /// the connection's video rates (its pacer backlog, which writes add to)
     pub rate: Arc<VideoRate>,
-    /// the next sample's media time on the track (ms since its first): what its RTP timestamp says, less the first's
-    media_time_ms: parking_lot::Mutex<f64>,
+    /// the next sample's media time on the track: its RTP timestamp less the first's, in ticks of `VIDEO_CLOCK_RATE`
+    media_ticks: parking_lot::Mutex<u32>,
 }
 
 impl Drop for MediaTrack {
@@ -437,10 +439,11 @@ impl MediaTrack {
         if self.mime != OPUS {
             self.rate.note_written(bytes);
         }
-        let mut media_time = self.media_time_ms.lock();
-        let at = *media_time;
-        *media_time += duration.as_secs_f64() * 1000.0;
-        Ok(at)
+        // in RTP ticks as webrtc-rs counts them (each sample's duration truncated to whole ticks), so the sum doesn't drift
+        let mut ticks = self.media_ticks.lock();
+        let at = *ticks;
+        *ticks = ticks.wrapping_add((duration.as_secs_f64() * VIDEO_CLOCK_RATE) as u32);
+        Ok(at as f64 * 1000.0 / VIDEO_CLOCK_RATE)
     }
 }
 
@@ -570,7 +573,7 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
     let payload_type = negotiated_payload_type(&sender, mime).await.with_context(|| format!("the browser did not accept {mime}"))?;
     let keyframe_requested = Arc::new(AtomicBool::new(true));
     let dropped = Arc::new(tokio::sync::Notify::new());
-    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), owner: AtomicU64::new(0), left_low_latency: AtomicBool::new(false), dropped: dropped.clone(), rate: rate.clone(), media_time_ms: Default::default() });
+    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), owner: AtomicU64::new(0), left_low_latency: AtomicBool::new(false), dropped: dropped.clone(), rate: rate.clone(), media_ticks: Default::default() });
     spawn_rtcp_reader(track, dropped, video.keyframe_requested.clone(), video.keyframe_requests.clone());
     Ok((local, Some(video)))
 }

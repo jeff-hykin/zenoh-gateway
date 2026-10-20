@@ -26,7 +26,7 @@ let gw = null
 const streams = {}
 const video = {
     meta: [],
-    window: { meta: 0, metaBytes: 0, rxToWrite: [], frames: [] },
+    window: { meta: 0, metaBytes: 0, rxToWrite: [], frames: [], pixel: [] },
     anchor: null,
     presented: 0,
     lastRtp: null,
@@ -44,12 +44,41 @@ function attachVideo(mediaStream) {
     document.body.append(element)
     element.srcObject = mediaStream
     element.play().catch((error) => errors.push(`video.play: ${error}`))
+    // --pixel-stamp: the source burned its stamp into the picture (40 blocks across the top 32 rows, ms, bit 39 first):
+    // read back from what is shown, it times camera stamp -> displayed with nothing of the gateway's or WebRTC's help
+    const canvas = config.pixelStamp ? new OffscreenCanvas(1, 1) : null
+    const context = canvas?.getContext("2d", { willReadFrequently: true })
+    const readStamp = (width, height) => {
+        canvas.width = width
+        canvas.height = Math.max(1, Math.round((32 * height) / 720))
+        context.drawImage(element, 0, 0, width, height, 0, 0, width, height)
+        const row = context.getImageData(0, Math.floor(canvas.height / 2), width, 1).data
+        let ms = 0
+        for (let bit = 0; bit < 40; bit++) {
+            const x = Math.floor(((bit + 0.5) * width) / 40)
+            const luma = (row[x * 4] + row[x * 4 + 1] + row[x * 4 + 2]) / 3
+            ms = ms * 2 + (luma > 127 ? 1 : 0)
+        }
+        return ms
+    }
     const onFrame = (_now, frame) => {
         element.requestVideoFrameCallback(onFrame)
+        if (canvas && frame.width) {
+            const stamp = readStamp(frame.width, frame.height)
+            const shown = toEpoch(frame.presentationTime)
+            // the stamp is the low 40 bits of unix ms
+            const full = Math.floor(shown / 2 ** 40) * 2 ** 40 + stamp
+            const age = shown - full
+            if (age > -1000 && age < 60000) {
+                video.window.pixel.push(age)
+            } else {
+                video.window.pixelBad = (video.window.pixelBad ?? 0) + 1
+            }
+        }
         if (frame.rtpTimestamp === undefined) {
             return
         }
-        const present = toEpoch(frame.expectedDisplayTime ?? frame.presentationTime)
+        const present = toEpoch(frame.presentationTime)
         const receive = frame.receiveTime === undefined ? null : toEpoch(frame.receiveTime)
         // sequential matching: frames reach the track in metadata order, so a frame is the metadata after the last
         // matched one nearest (last match's arrival + RTP ticks since it / 90); RTP ticks alone drift (webrtc-rs stamps
@@ -71,10 +100,17 @@ function attachVideo(mediaStream) {
                     best = video.meta[i]
                 }
             }
-            if (!best || Math.abs(best.mediaTimeMs - mediaTimeMs) > 2) {
+            if (!best || Math.abs(best.mediaTimeMs - mediaTimeMs) > 1) {
                 video.unmatched = (video.unmatched ?? 0) + 1
+                // anchored on the wrong message (the first shown frame wasn't the newest written): anchor again
+                video.missesInARow = (video.missesInARow ?? 0) + 1
+                if (video.missesInARow >= 3) {
+                    video.rtpBase = null
+                    video.missesInARow = 0
+                }
                 return
             }
+            video.missesInARow = 0
             best.estimateError = best.mediaTimeMs - mediaTimeMs
             const writeAt = best.writtenPage
             video.presented++
@@ -222,7 +258,7 @@ window.sample = async () => {
             },
         }
         previousInbound = inbound
-        video.window = { meta: 0, metaBytes: 0, rxToWrite: [], frames: [] }
+        video.window = { meta: 0, metaBytes: 0, rxToWrite: [], frames: [], pixel: [] }
     }
     return out
 }

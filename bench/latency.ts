@@ -36,6 +36,7 @@ const { options } = await new Command()
     .option("--client <url:string>", "Load the browser client from this URL instead of bundling client/zenoh_gateway.ts")
     .option("--chrome <path:string>", "Chrome/Chromium binary (default: astral's)")
     .option("--out <path:string>", "Write every per-second sample as JSON lines")
+    .option("--pixel-stamp", "The video source burns its stamp into the picture (bench/camera.py): time camera stamp -> displayed from the pixels")
     .option("--quiet", "Only the summary")
     .parse(Deno.args)
 
@@ -113,7 +114,7 @@ const subscriptions = [
     ...options.cloud.map((key) => ({ key, kind: "cloud", options: { delivery: "latest", encoding: "dimos_lcm_pointcloud2", ...JSON.parse(options.cloudOptions) } })),
     ...options.small.map((key) => ({ key, kind: "small", options: { delivery: "reliable", bandwidthPriority: 4, ...JSON.parse(options.smallOptions) } })),
 ]
-pageUrl.searchParams.set("config", JSON.stringify({ gateway: gatewayUrl, client: new URL(clientUrl, pageUrl).href, token: options.token, subscriptions }))
+pageUrl.searchParams.set("config", JSON.stringify({ gateway: gatewayUrl, client: new URL(clientUrl, pageUrl).href, token: options.token, pixelStamp: options.pixelStamp ?? false, subscriptions }))
 
 // ── the bus probe ───────────────────────────────────────────────────────────────────────────────────
 // per second and key: messages, bytes, and now - the LCM header stamp (found by scanning for a sec/nsec pair near now)
@@ -218,7 +219,7 @@ for (let second = 1; second <= options.seconds; second++) {
     }
     const parts = Object.entries(sample.streams).map(([key, entry]: [string, any]) => `${short(key)} ${entry.n}/s ${fmt(mbps(entry.bytes), 1)}Mb age${fmt(percentile(entry.ages, 0.5))}`)
     const v = sample.video
-    const videoPart = v ? `video meta ${v.meta}/s ${fmt(mbps(v.metaBytes), 2)}Mb shown ${v.frames.length}/s e2e ${fmt(percentile(v.frames.map((f: any) => f.total), 0.5))}ms (rx>wr ${fmt(percentile(v.rxToWrite, 0.5))} wr>recv ${fmt(percentile(v.frames.map((f: any) => f.writeToReceive), 0.5))} recv>show ${fmt(percentile(v.frames.map((f: any) => f.receiveToPresent), 0.5))}) inflight ${v.inbound ? v.metaTotal - v.inbound.framesReceived : "-"}` : ""
+    const videoPart = v ? `${options.pixelStamp ? `px ${fmt(percentile(v.pixel ?? [], 0.5))}ms ` : ""}video meta ${v.meta}/s ${fmt(mbps(v.metaBytes), 2)}Mb shown ${v.frames.length}/s e2e ${fmt(percentile(v.frames.map((f: any) => f.total), 0.5))}ms (rx>wr ${fmt(percentile(v.rxToWrite, 0.5))} wr>recv ${fmt(percentile(v.frames.map((f: any) => f.writeToReceive), 0.5))} recv>show ${fmt(percentile(v.frames.map((f: any) => f.receiveToPresent), 0.5))}) inflight ${v.inbound ? v.metaTotal - v.inbound.framesReceived : "-"}` : ""
     console.log(`${String(second).padStart(3)}s  ${videoPart}  |  ${parts.join("  ")}  |  rtt ${fmt(sample.rttMs)}ms gw cpu ${fmt(sample.gatewayCpu)}%`)
 }
 
@@ -258,6 +259,15 @@ if (options.video) {
     stage("written -> received (pacer + net + assembly)", frames.map((frame: any) => frame.writeToReceive))
     stage("received -> presented (jitter buf + decode)", frames.map((frame: any) => frame.receiveToPresent))
     stage("gateway rx -> presented (total)", frames.map((frame: any) => frame.total))
+    if (options.pixelStamp) {
+        const pixel = samples.flatMap((sample) => sample.video?.pixel ?? [])
+        stage("CAMERA STAMP -> DISPLAYED (from the pixels)", pixel)
+        const third = Math.max(1, Math.floor(samples.length / 3))
+        const p50Of = (part: any[]) => percentile(part.flatMap((sample) => sample.video?.pixel ?? []), 0.5)
+        const firstTen = samples.slice(0, 10)
+        const lastTen = samples.slice(-10)
+        console.log(`    ${pixel.length} frames read, ${samples.reduce((sum, sample) => sum + (sample.video?.pixelBad ?? 0), 0)} unreadable; p50 first 10 s ${fmt(p50Of(firstTen))}, last 10 s ${fmt(p50Of(lastTen))}, first third ${fmt(p50Of(samples.slice(0, third)))}, last third ${fmt(p50Of(samples.slice(-third)))} ms`)
+    }
     const jitter = samples.map((sample) => sample.video?.inbound?.jitterBufferMs).filter((value) => value !== null && value !== undefined)
     const decode = samples.map((sample) => sample.video?.inbound?.decodeMs).filter((value) => value !== null && value !== undefined)
     console.log(`  getStats: jitter buffer p50 ${fmt(percentile(jitter, 0.5))} ms, decode p50 ${fmt(percentile(decode, 0.5), 1)} ms, framesDropped ${last.video?.inbound?.framesDropped ?? "-"}, nack ${last.video?.inbound?.nackCount ?? "-"}, pli ${last.video?.inbound?.pliCount ?? "-"}, lost ${last.video?.inbound?.packetsLost ?? "-"}, size ${last.video?.inbound?.width ?? "-"}x${last.video?.inbound?.height ?? "-"}`)

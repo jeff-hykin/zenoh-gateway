@@ -658,6 +658,16 @@ impl SubShared {
                     wake_at = Some(wake_at.map_or(ready_at, |w| w.min(ready_at)));
                     continue;
                 }
+                // a video key held to fewer frames than its source sends: once its spacing is up, the next frame to
+                // arrive goes rather than the one that waited out the spacing (up to a source interval old: at 2.7 of 5
+                // Hz that was 100 ms p50 of the picture's age), unless no frame comes within a source interval
+                (Spacing::Every(interval), Some(last_sent)) if matches!(self.channel, Channel::Video(_)) && queue.rate_hz > 0.0 && head.arrived < last_sent + interval => {
+                    let fresh_by = last_sent + interval + crate::secs(1.0 / queue.rate_hz);
+                    if now < fresh_by {
+                        wake_at = Some(wake_at.map_or(fresh_by, |w| w.min(fresh_by)));
+                        continue;
+                    }
+                }
                 _ => {}
             }
             let rank = (head.priority, head.arrived);
