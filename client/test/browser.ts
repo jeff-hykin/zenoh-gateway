@@ -9,6 +9,8 @@ export const firefox = Deno.env.get("BROWSER") === "firefox"
 export type Page = {
     // deno-lint-ignore no-explicit-any
     evaluate: <T>(fn: (...args: any[]) => Promise<T>, args: unknown[]) => Promise<T>
+    /** Chrome only */
+    freeze?: (frozen: boolean) => Promise<unknown>
     close: () => Promise<void>
 }
 
@@ -28,7 +30,13 @@ export async function openPage(url: string, timeoutMs: number): Promise<Page> {
     const page = await browser.newPage(url)
     // astral retries evaluate 5x on a 10 s deadline: long runs need more
     ;(page as unknown as { timeout: number }).timeout = timeoutMs
-    return { evaluate: (fn, args) => page.evaluate(fn, { args }) as never, close: () => browser.close() }
+    // freeze: Chrome's Page Lifecycle freeze (a backgrounded tab's), over CDP
+    const celestial = (page as unknown as { unsafelyGetCelestialBindings: () => any }).unsafelyGetCelestialBindings()
+    return {
+        evaluate: (fn, args) => page.evaluate(fn, { args }) as never,
+        close: () => browser.close(),
+        freeze: (frozen: boolean) => celestial.Page.setWebLifecycleState({ state: frozen ? "frozen" : "active" }),
+    }
 }
 
 /** The browser suites and benches: two at once on one machine skew each other's timing (a concurrent run turned a

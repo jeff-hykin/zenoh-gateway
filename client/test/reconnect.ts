@@ -1,9 +1,10 @@
 #!/usr/bin/env -S deno run --allow-all --unstable-net
-// A phone switching tabs: the page goes hidden and its link goes dark for BLACKOUT_S (40: past the 30 s ICE consent
+// A phone switching tabs: the page goes hidden and its link goes dark (or, in Chrome, the page is frozen) for BLACKOUT_S (40: past the 30 s ICE consent
 // timeout, so the connection is gone, as a backgrounded phone tab's is) seconds, then both come back.
 // Measures how long after that until the camera shows frames again, with the client's default `freshAfterMs` (2000)
 // and with it off (the browser declares the old connection failed first, as before). Fails if video isn't back within
-// `freshAfterMs` + 2 s (before 0.5.24 it never came back: a failed reconnect attempt held the renegotiation queue).
+// `freshAfterMs` + 2 s with it (before 0.5.24 it never came back after a dark link: a failed reconnect attempt held
+// the renegotiation queue; kept through a 40 s freeze, video took 12 s to climb back).
 // Usage: deno run --allow-all --unstable-net client/test/reconnect.ts   (BROWSER=firefox for Firefox)
 
 /// <reference lib="dom" />
@@ -30,16 +31,17 @@ const targetDir = Deno.env.get("CARGO_TARGET_DIR") ?? `${root}gateway/target`
 // SERVER_LOG=path: the gateway's log (RUST_LOG, default warn) appended there
 const serverLog = Deno.env.get("SERVER_LOG")
 
-/** Seconds from the link coming back to the first frame shown after it, or null if none came in 30 s. */
-async function resumeSeconds(freshAfterMs: number, heartbeat: boolean): Promise<number | null> {
-    const { seconds, log } = await resume(freshAfterMs, heartbeat)
+/** Seconds from the page coming back to the first frame decoded after it, or null if none came in 30 s. */
+async function resumeSeconds(freshAfterMs: number, heartbeat: boolean, freeze: boolean): Promise<number | null> {
+    const { seconds, log } = await resume(freshAfterMs, heartbeat, freeze)
     if (seconds === null || Deno.env.get("VERBOSE") === "1") {
         console.log(`  freshAfterMs ${freshAfterMs} heartbeat ${heartbeat}:\n    ${log.join("\n    ")}`)
     }
     return seconds
 }
 
-async function resume(freshAfterMs: number, heartbeat: boolean): Promise<{ seconds: number | null; log: string[] }> {
+/** `freeze`: the page is hidden and frozen (Chrome's Page Lifecycle freeze) on a healthy link, instead of the link going dark */
+async function resume(freshAfterMs: number, heartbeat: boolean, freeze: boolean): Promise<{ seconds: number | null; log: string[] }> {
     const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], env: { CAMS: "1", CAM_SIZE: "1280x720", CAM_NOISE: "4", CLOUD_BYTES: "0", MAP_BYTES: "0", RUST_LOG: Deno.env.get("RUST_LOG") ?? "warn" }, stdout: "piped", stderr: serverLog ? "piped" : "null" }).spawn()
     if (serverLog) {
         const file = await Deno.open(serverLog, { write: true, create: true, append: true })
@@ -54,7 +56,8 @@ async function resume(freshAfterMs: number, heartbeat: boolean): Promise<{ secon
         }
         throw new Error("degrade_server exited")
     })()
-    const link = shapedLink(serverUrl, { schedule: [[0, 1_000_000], [darkAt, 0], [darkAt + blackoutSeconds, 1_000_000]], delayMs: 20, jitterMs: 0, loss: 0 })
+    const schedule: [number, number][] = freeze ? [[0, 1_000_000]] : [[0, 1_000_000], [darkAt, 0], [darkAt + blackoutSeconds, 1_000_000]]
+    const link = shapedLink(serverUrl, { schedule, delayMs: 20, jitterMs: 0, loss: 0 })
     const page = await openPage(`${link.url}/blank.html`, (darkAt + blackoutSeconds + 60) * 1000)
     try {
         // the page, and in it the client and the camera; `window.back` is set when it becomes visible again
@@ -105,12 +108,35 @@ async function resume(freshAfterMs: number, heartbeat: boolean): Promise<{ secon
             while (page.back === undefined) {
                 await new Promise((resolve) => setTimeout(resolve, 100))
             }
-            await new Promise((resolve) => setTimeout(resolve, 5000))
+            // frames decoded on the connection in use, from WebRTC's stats (headless Chrome renders no frames after a
+            // Page Lifecycle freeze, so shown frames can't tell)
+            const decoded = async () => {
+                let frames = 0
+                for (const report of (await (client._peer as RTCPeerConnection | null)?.getStats().catch(() => null))?.values() ?? []) {
+                    if (report.type === "inbound-rtp" && report.kind === "video") {
+                        frames += Number(report.framesDecoded ?? 0)
+                    }
+                }
+                return frames
+            }
+            let decodedAt: number | null = null
+            let peerAtBack = client._peer
+            let before = await decoded()
+            while (decodedAt === null && performance.now() - page.back < waitSeconds * 1000) {
+                await new Promise((resolve) => setTimeout(resolve, 50))
+                if (client._peer !== peerAtBack) {
+                    peerAtBack = client._peer
+                    before = 0
+                }
+                if ((await decoded()) > before) {
+                    decodedAt = performance.now()
+                }
+            }
+            page.decodedAt = decodedAt
             const peer = client._peer as RTCPeerConnection | null
             log.push(`back+5s: client ${client.state}, subscription ${page.subscription.state}, channel ${page.subscription.channel?.readyState} ${page.subscription.channel?.label?.slice(0, 60)}, peer ${peer?.connectionState}, transceivers ${peer?.getTransceivers().map((t) => `${t.mid}:${t.direction}:${t.currentDirection}:${t.receiver.track.readyState}`).join(" ")}`)
-            await new Promise((resolve) => setTimeout(resolve, (waitSeconds - 5) * 1000))
             client.close()
-            const first = shown.find((time) => time > page.back)
+            const first = page.decodedAt ?? undefined
             log.push(`back at ${((page.back - t0) / 1000).toFixed(1)}s`)
             return { seconds: first === undefined ? null : (first - page.back) / 1000, log }
         }, [link.url, freshAfterMs, heartbeat, 30])
@@ -123,7 +149,13 @@ async function resume(freshAfterMs: number, heartbeat: boolean): Promise<{ secon
         }
         await at(darkAt)
         await page.evaluate(async () => (window as any).setVisibility("hidden"), [])
+        if (freeze) {
+            await page.freeze!(true)
+        }
         await at(darkAt + blackoutSeconds)
+        if (freeze) {
+            await page.freeze!(false)
+        }
         await page.evaluate(async () => (window as any).setVisibility("visible"), [])
         return await watching
     } finally {
@@ -136,13 +168,19 @@ async function resume(freshAfterMs: number, heartbeat: boolean): Promise<{ secon
 
 const show = (seconds: number | null) => seconds === null ? "no frames in 30 s" : `${seconds.toFixed(1)} s`
 let failed = false
-for (const heartbeat of [false, true]) {
-    const fresh = await resumeSeconds(2000, heartbeat)
-    // (as before freshAfterMs: wait for the browser to call the old connection failed)
-    const off = await resumeSeconds(1e9, heartbeat)
-    console.log(`${heartbeat ? "heartbeat 5 Hz" : "no heartbeat"}: after a ${blackoutSeconds} s blackout while hidden, frames again: freshAfterMs 2000 ${show(fresh)}, off ${show(off)}`)
-    // back within freshAfterMs + 2 s (either way; which is faster when the reconnect loop retries anyway is luck)
-    failed ||= fresh === null || fresh > 4 || off === null || off > 4
+const scenarios = [
+    { name: "link dark, no heartbeat", heartbeat: false, freeze: false },
+    { name: "link dark, heartbeat 5 Hz", heartbeat: true, freeze: false },
+    // (Chrome only: a backgrounded tab's freeze)
+    ...(Deno.env.get("BROWSER") === "firefox" ? [] : [{ name: "page frozen, heartbeat 5 Hz", heartbeat: true, freeze: true }]),
+]
+for (const { name, heartbeat, freeze } of scenarios) {
+    const fresh = await resumeSeconds(2000, heartbeat, freeze)
+    // (as before freshAfterMs: wait for the browser to call the old connection failed, or catch up on it)
+    const off = await resumeSeconds(1e9, heartbeat, freeze)
+    console.log(`${name}: after ${blackoutSeconds} s away, frames again: freshAfterMs 2000 ${show(fresh)}, off ${show(off)}`)
+    // back within freshAfterMs + 2 s
+    failed ||= fresh === null || fresh > 4
 }
 if (failed) {
     console.log("FAIL")

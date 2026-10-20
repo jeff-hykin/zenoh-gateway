@@ -200,10 +200,9 @@ export interface ConnectOptions {
     /** sent as `Authorization: Bearer <token>`; the gateway's authorize hook turns it into a grant */
     token?: string
     reconnect?: boolean
-    /** ms the connection may stay "disconnected", or (when the page comes back from hidden) go without receiving a
-     *  byte, before the client starts a fresh connection at once instead of waiting for the browser to declare the old
-     *  one failed (default 2000; a phone drops a backgrounded tab's connection, which then took ~5 s to come back). A
-     *  connection that is still receiving is kept. */
+    /** ms the page may be hidden or frozen, or the connection "disconnected", before the client starts a fresh
+     *  connection at once instead of catching up or waiting for the browser to declare the old one failed (default 2000;
+     *  a phone drops a backgrounded tab's connection, which then took ~5 s to come back) */
     freshAfterMs?: number
     statsIntervalMs?: number
     heartbeatHz?: number
@@ -1348,39 +1347,48 @@ export class ZenohGateway {
         this.now = this.options.clock ?? (() => performance.timeOrigin + performance.now())
         if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
             document.addEventListener("visibilitychange", this.#onVisibility)
+            // the Page Lifecycle API's: a frozen page may never see a visibility change
+            document.addEventListener("freeze", this.#onAway)
+            document.addEventListener("resume", this.#onBack)
         }
     }
 
     /** the timer that starts a fresh connection once one stays "disconnected" `freshAfterMs` */
     #freshTimer: ReturnType<typeof setTimeout> | undefined
 
-    /** Back from hidden: a connection that isn't up, or receives nothing within `freshAfterMs`, starts over. A
-     *  connection the gateway already dropped (it stopped hearing the page's heartbeat) receives nothing; one that is
-     *  only resuming does (a ping alone waited on SCTP's retransmission backoff and threw away a live connection). */
-    #onVisibility = async (): Promise<void> => {
-        if (document.visibilityState !== "visible" || !this.options.reconnect || this.#closed) {
+    /** when the page was hidden or frozen (performance.now()), while it is */
+    #awayAt: number | null = null
+
+    #onAway = (): void => {
+        this.#awayAt ??= performance.now()
+    }
+
+    /** Back from hidden or frozen: away longer than `freshAfterMs` (or not connected), it starts a fresh connection
+     *  rather than catch up. A connection kept through 40 s frozen (Chrome keeps it up below a frozen page) had heard
+     *  no acks, so the gateway had written its link off, and video took 12 s to climb back. */
+    #onBack = (): void => {
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") {
             return
         }
-        const generation = this.#generation
-        const peer = this.#peer
+        const awayFor = this.#awayAt === null ? 0 : performance.now() - this.#awayAt
+        this.#awayAt = null
+        if (!this.options.reconnect || this.#closed) {
+            return
+        }
         // (a connection on its way up is already fresh)
-        if (this.state === "connecting" || this.#reconnecting) {
-            if (this.state === "lost" && this.#reconnecting) {
-                this.#startFresh()
-            }
+        if (this.state === "connecting" || (this.#reconnecting && this.state !== "lost")) {
             return
         }
-        if (this.state === "lost" || peer === null || peer.connectionState === "failed" || peer.connectionState === "closed") {
+        if (awayFor > this.options.freshAfterMs || this.state === "lost") {
             this.#startFresh()
-            return
         }
-        // a ping makes a live gateway send something even when nothing is subscribed
-        const t0 = this.now()
-        this._request({ op: "ping", t0, offsetMs: this.clockOffsetMs, rttMs: this.rttMs }, this.options.freshAfterMs).catch(() => {})
-        const before = await bytesReceived(peer)
-        await sleep(this.options.freshAfterMs)
-        if (generation === this.#generation && !this.#closed && (await bytesReceived(peer)) <= before) {
-            this.#startFresh()
+    }
+
+    #onVisibility = (): void => {
+        if (document.visibilityState === "hidden") {
+            this.#onAway()
+        } else {
+            this.#onBack()
         }
     }
 
@@ -2019,6 +2027,8 @@ export class ZenohGateway {
         clearTimeout(this.#freshTimer)
         if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
             document.removeEventListener("visibilitychange", this.#onVisibility)
+            document.removeEventListener("freeze", this.#onAway)
+            document.removeEventListener("resume", this.#onBack)
         }
         if (this.#statsTimer) {
             clearInterval(this.#statsTimer)
@@ -2033,17 +2043,6 @@ export class ZenohGateway {
         this.#peer?.close()
         this.#setState("lost")
     }
-}
-
-/** Bytes the connection's transports received, ever. */
-async function bytesReceived(peer: RTCPeerConnection): Promise<number> {
-    let bytes = 0
-    for (const report of (await peer.getStats().catch(() => new Map())).values()) {
-        if (report.type === "transport") {
-            bytes += Number(report.bytesReceived ?? 0)
-        }
-    }
-    return bytes
 }
 
 /** Connects to a zenoh-gateway server, e.g. `await connect("http://robot.local:7448")`. */
