@@ -14,8 +14,10 @@ use openh264::formats::YUVBuffer;
 const MIN_DIMENSION: u32 = 16;
 /// The default smallest picture (`VideoPolicy::min_resolution`).
 pub const MIN_RESOLUTION: (u32, u32) = (160, 64);
-/// Keyframe at least this often (seconds), on top of PLI/FIR requests from the browser.
-const KEYFRAME_SECONDS: f64 = 3.0;
+/// Keyframe at least this often (seconds), on top of PLI/FIR requests from the browser (what recovers a lost frame, as
+/// libwebrtc relies on). Every 3 s, each keyframe (5-10x a frame) took 0.3-0.5 s to cross a 1 Mbit/s link and held the
+/// frames behind it: a 1 Mbit/s link's p95 was its keyframes.
+const KEYFRAME_SECONDS: f64 = 60.0;
 /// Re-create the encoder when the frame rate drifts past this ratio (bitrate changes apply in place).
 const RECONFIGURE_RATIO: f64 = 1.3;
 /// What the encoders signal: the BT.601 matrix (what the pictures are), BT.709 primaries and transfer (what browsers
