@@ -461,7 +461,7 @@ Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden pe
 - Quality, for video, is the share of the most bits per frame: 0 is the smallest picture at the bit-per-pixel floor,
   1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other encodings.
 - openh264 applies bitrate changes in place (no keyframe); a size change restarts it with one.
-Keyframes: the first frame each viewer gets, on PLI/FIR from the browser (`keyframeRequests`), and every 3 s.
+Keyframes: the first frame each viewer gets, on PLI/FIR from the browser (`keyframeRequests`), and every 60 s (a periodic keyframe is 5-10x a frame: every 3 s, they were a 1 Mbit/s link's latency p95).
 Send-side congestion control: TWCC feedback into GCC (webrtc-rs interceptors), whose target feeds the
 allocator.
 Inbound PLI/FIR reach the encoder through an interceptor that marks them for the application (the
