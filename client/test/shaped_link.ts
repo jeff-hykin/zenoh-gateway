@@ -10,7 +10,7 @@ export type LinkShape = { schedule: [number, number][]; delayMs: number; jitterM
 const queueSeconds = 1
 
 /** One direction of the link: rate-limited (by the cell's schedule) drop-tail queue, then delay + jitter, with loss. */
-function shapedDirection(cell: LinkShape, linkStart: () => number, deliver: (data: Uint8Array) => void, offered: { bytes: number; packets: number }) {
+export function shapedDirection(cell: LinkShape, linkStart: () => number, deliver: (data: Uint8Array) => void, offered: { bytes: number; packets: number }) {
     const rateNow = () => {
         const t = (performance.now() - linkStart()) / 1000
         return cell.schedule.filter(([at]) => t >= at).at(-1)![1]
