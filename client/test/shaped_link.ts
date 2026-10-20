@@ -3,7 +3,8 @@
 // A signaling proxy in front of the gateway rewrites the SDP so ICE can only use the shaper. Used by degrade.ts and
 // video_battery.ts.
 
-/** schedule: [seconds from the link's start, bytes/s] steps; jitterMs: extra delay up to this, redrawn every 200 ms */
+/** schedule: [seconds from the link's start, bytes/s] steps (0: a blackout, everything dropped); jitterMs: extra delay
+ *  up to this, redrawn every 200 ms */
 export type LinkShape = { schedule: [number, number][]; delayMs: number; jitterMs: number; loss: number }
 
 const queueSeconds = 1
@@ -49,7 +50,7 @@ function shapedDirection(cell: LinkShape, linkStart: () => number, deliver: (dat
     return (data: Uint8Array) => {
         offered.bytes += data.length
         offered.packets++
-        if (Math.random() < cell.loss || queuedBytes + data.length > Math.max(20_000, rateNow() * queueSeconds)) {
+        if (rateNow() === 0 || Math.random() < cell.loss || queuedBytes + data.length > Math.max(20_000, rateNow() * queueSeconds)) {
             return
         }
         queue.push({ data, arrived: performance.now() })
@@ -100,13 +101,21 @@ const proxy = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, asyn
     if (url.pathname !== "/offer") {
         return fetch(`${serverUrl}${url.pathname}${url.search}`)
     }
+    // no network, no signaling either
+    const t = linkStartedAt === 0 ? 0 : (performance.now() - linkStartedAt) / 1000
+    if (cell.schedule.filter(([at]) => t >= at).at(-1)![1] === 0) {
+        return new Response("link down", { status: 503 })
+    }
     const offer = await request.json()
     offer.sdp = offer.sdp.split("\r\n").filter((line: string) => !line.startsWith("a=candidate")).join("\r\n")
     const answer = await (await fetch(`${serverUrl}/offer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(offer) })).json()
     const lines: string[] = answer.sdp.split("\r\n")
     const loopback = lines.find((line) => line.startsWith("a=candidate") && line.includes(" 127.0.0.1 "))
     const port = startShaper(Number(loopback?.split(" ")[5]))
-    linkStartedAt = performance.now()
+    // the schedule runs from the first connection: a reconnect doesn't restart it
+    if (linkStartedAt === 0) {
+        linkStartedAt = performance.now()
+    }
     let replaced = false
     answer.sdp = lines.flatMap((line) => {
         if (!line.startsWith("a=candidate")) {

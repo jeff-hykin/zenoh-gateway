@@ -63,6 +63,7 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 | `iceServers` | the gateway's | `RTCIceServer[]`; by default fetched from the gateway (`GET /zenoh-gateway/ice`, TURN credentials minted per client), `[]` on a gateway without any |
 | `iceTransportPolicy` | the `/zenoh-gateway/ice` reply's, else `"all"` | `"relay"` sends everything through TURN |
 | `reconnect` | `true` | re-open the connection and every live channel after a loss |
+| `freshAfterMs` | 2000 | a connection "disconnected" this long, or that receives nothing this long after the page comes back from hidden (a phone's background tab), is replaced at once instead of waiting for the browser to call it failed; one still receiving is kept |
 | `statsIntervalMs` | 1000 | how often `z.stats` / `z.gatewayStats` refresh |
 | `clock` | `performance.timeOrigin + performance.now()` | the page's clock in ms (put timestamps, clock sync) |
 

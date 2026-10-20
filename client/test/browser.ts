@@ -33,7 +33,7 @@ export async function openPage(url: string, timeoutMs: number): Promise<Page> {
 
 /** The browser suites and benches: two at once on one machine skew each other's timing (a concurrent run turned a
  * 289 ms cell into 11 s). */
-const timingSensitive = /(client\/test\/(video_battery|video_latency|degrade|resubscribe|backpressure|lease_takeover)\.ts|bench\/latency\.ts)/
+const timingSensitive = /(client\/test\/(video_battery|video_latency|degrade|resubscribe|backpressure|lease_takeover|reconnect)\.ts|bench\/latency\.ts)/
 
 /** Waits while another timing-sensitive browser run (from any checkout) is going on this machine. */
 export async function waitForOtherBrowserTests(): Promise<void> {

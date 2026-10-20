@@ -879,22 +879,24 @@ const CPU_EWMA_GAIN: f64 = 0.2;
 /// nvv4l2h264enc 16,000 times in 12 h.
 const SIZE_BAND: f64 = 1.1;
 /// The picture shrinks at most this often, and grows only this long after its last change, except back to full size,
-/// which it does at once (a subscription that started on a low grant stayed small for seconds).
+/// which it does at once (a subscription that started on a low grant stayed small for seconds) unless the quantizer
+/// shrank it (taken at once, it flapped with the quantizer between 640 and 560 wide each second, a keyframe each).
 const SIZE_DOWN_SETTLE: Duration = Duration::from_secs(1);
 const SIZE_UP_SETTLE: Duration = Duration::from_secs(5);
 
 /// The size to encode at: `wanted` (the bitrate policy's) once it is far enough from the size in use and that size has
-/// settled, else the size in use. A new source size, and full size, are taken at once.
+/// settled, else the size in use. A new source size, and full size (unless `qp_shrunk`), are taken at once.
 /// `starting_up`: the link model is still looking for the link's bandwidth, so the picture grows at once (held back
 /// `SIZE_UP_SETTLE`, video sent a third of its budget, the link model saw no growth and ended its startup at 93 KB/s on
 /// a 1 MB/s link).
-fn steady_size(current: Option<((u32, u32), (u32, u32), Instant)>, source: (u32, u32), wanted: (u32, u32), now: Instant, starting_up: bool) -> ((u32, u32), bool) {
+fn steady_size(current: Option<((u32, u32), (u32, u32), Instant)>, source: (u32, u32), wanted: (u32, u32), now: Instant, starting_up: bool, qp_shrunk: bool) -> ((u32, u32), bool) {
     let Some((_, size, changed_at)) = current.filter(|(current_source, _, _)| *current_source == source) else {
         return (wanted, true);
     };
     let ratio = wanted.0 as f64 / size.0.max(1) as f64;
     let since = now.duration_since(changed_at);
-    let change = (ratio < 1.0 / SIZE_BAND && since >= SIZE_DOWN_SETTLE) || (ratio > SIZE_BAND && (starting_up || since >= SIZE_UP_SETTLE)) || (wanted.0 >= source.0 & !1 && size.0 < source.0 & !1);
+    let change = (ratio < 1.0 / SIZE_BAND && since >= SIZE_DOWN_SETTLE) || (ratio > SIZE_BAND && (starting_up || since >= SIZE_UP_SETTLE))
+        || (!qp_shrunk && wanted.0 >= source.0 & !1 && size.0 < source.0 & !1);
     if change { (wanted, true) } else { (size, false) }
 }
 
@@ -988,6 +990,8 @@ struct SessionState {
     /// (source, size in use, when it was picked): see `steady_size`
     size: Option<((u32, u32), (u32, u32), Instant)>,
     qp: QpScaler,
+    /// the size in use is the quantizer's, under the bitrate's (see `steady_size`)
+    qp_shrunk: bool,
 }
 
 /// Sizes the picture by the encoder's quantizer, as libwebrtc's quality scaler does, but by an equation instead of its
@@ -1073,7 +1077,7 @@ impl VideoSessions {
                     Self::leave_locked(&mut sessions, &current, member);
                 }
                 oldest.filter(|oldest| sessions.iter().any(|session| Arc::ptr_eq(session, oldest))).unwrap_or_else(|| {
-                    let state = SessionState { encoder: None, governor: CpuGovernor::new(), log: VecDeque::new(), next_seq: 0, last_input: None, keyframe_wanted: true, source: (640, 480), scale: 1.0, size: None, qp: QpScaler::default() };
+                    let state = SessionState { encoder: None, governor: CpuGovernor::new(), log: VecDeque::new(), next_seq: 0, last_input: None, keyframe_wanted: true, source: (640, 480), scale: 1.0, size: None, qp: QpScaler::default(), qp_shrunk: false };
                     let id = self.next_session.fetch_add(1, Ordering::Relaxed);
                     let session = Arc::new(EncodeSession { id, codec: codec.to_owned(), format, key: key.to_owned(), policy, grants: Mutex::default(), state: tokio::sync::Mutex::new(state) });
                     sessions.push(session.clone());
@@ -1165,18 +1169,24 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         let starting_up = grants.iter().any(|grant| grant.3);
         let bitrate = grants.iter().map(|grant| grant.0).fold(f64::INFINITY, f64::min);
         let size_bitrate = grants.iter().map(|grant| grant.2).fold(f64::INFINITY, f64::min);
-        let qp_scale = state.qp.scale(state.source, size_bitrate, session.policy.target_qp);
         let hz = grants.iter().map(|grant| grant.1).fold(0.0, f64::max);
+        // (only while bandwidth is short: granted its whole demand, the policy's bits per pixel already set the quality at
+        // full size, and a coarse quantizer shrank a 20 Mbit/s link's picture to 1184x666)
+        let most = session.policy.frame_bytes(state.source, hz.max(0.1), 1.0) * 8.0 * hz.max(0.1);
+        let qp_scale = (bitrate < most).then(|| state.qp.scale(state.source, size_bitrate, session.policy.target_qp)).flatten();
         let (scale, source) = (state.scale, state.source);
         let floor = session.policy.floor_scale(source);
         out.scale_cap = state.governor.scale_cap(scale, floor, hz, Instant::now());
         let mut target = target(&session.policy, source, input.quality, bitrate, size_bitrate, qp_scale, hz, out.scale_cap, state.keyframe_wanted);
         let now = Instant::now();
-        let (size, changed) = steady_size(state.size, source, (target.width, target.height), now, starting_up);
-        (target.width, target.height) = size;
+        let (size, changed) = steady_size(state.size, source, (target.width, target.height), now, starting_up, state.qp_shrunk);
         if changed {
+            // the quantizer set it when its size is under the bitrate's
+            let by_bitrate = session.policy.size(source, size_bitrate.max(1.0), hz.max(0.1), out.scale_cap);
+            state.qp_shrunk = size.0 < by_bitrate.0;
             state.size = Some((source, size, now));
         }
+        (target.width, target.height) = size;
         // (made on the blocking pool too: a hardware encoder's setup can block)
         let (existing, format, timeout) = (state.encoder.take(), session.format, codecs.encode_timeout);
         let decoded = input.decoded.clone();
@@ -1465,18 +1475,19 @@ mod tests {
         use super::{SIZE_DOWN_SETTLE, SIZE_UP_SETTLE, steady_size};
         let (source, t0) = ((1920, 1536), std::time::Instant::now());
         let at = |size: (u32, u32), after: std::time::Duration| Some((source, size, t0 - after));
-        assert_eq!(steady_size(None, source, (1360, 1088), t0, false), ((1360, 1088), true), "the first frame takes its size");
+        assert_eq!(steady_size(None, source, (1360, 1088), t0, false, false), ((1360, 1088), true), "the first frame takes its size");
         let settled = SIZE_UP_SETTLE * 2;
-        assert_eq!(steady_size(at((1360, 1088), settled), source, (1312, 1050), t0, false).0, (1360, 1088), "a few percent smaller: kept");
-        assert_eq!(steady_size(at((1360, 1088), settled), source, (1440, 1152), t0, false).0, (1360, 1088), "a few percent bigger: kept");
-        assert_eq!(steady_size(at((1360, 1088), settled), source, (960, 768), t0, false), ((960, 768), true), "much smaller: shrinks");
-        assert_eq!(steady_size(at((1360, 1088), SIZE_DOWN_SETTLE / 2), source, (960, 768), t0, false).0, (1360, 1088), "not twice a second");
-        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, false).0, (960, 768), "grows only after it settled");
-        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, true).0, (1360, 1088), "or at once while the link model starts up");
-        assert_eq!(steady_size(at((960, 768), settled), source, (1360, 1088), t0, false).0, (1360, 1088));
-        assert_eq!(steady_size(at((1792, 1434), settled), source, (1920, 1536), t0, false).0, (1920, 1536), "back to full size");
-        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0, false).0, (1920, 1536), "full size at once");
-        assert_eq!(steady_size(Some(((640, 480), (320, 240), t0)), source, (1920, 1536), t0, false), ((1920, 1536), true), "a new source: at once");
+        assert_eq!(steady_size(at((1360, 1088), settled), source, (1312, 1050), t0, false, false).0, (1360, 1088), "a few percent smaller: kept");
+        assert_eq!(steady_size(at((1360, 1088), settled), source, (1440, 1152), t0, false, false).0, (1360, 1088), "a few percent bigger: kept");
+        assert_eq!(steady_size(at((1360, 1088), settled), source, (960, 768), t0, false, false), ((960, 768), true), "much smaller: shrinks");
+        assert_eq!(steady_size(at((1360, 1088), SIZE_DOWN_SETTLE / 2), source, (960, 768), t0, false, false).0, (1360, 1088), "not twice a second");
+        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, false, false).0, (960, 768), "grows only after it settled");
+        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, true, false).0, (1360, 1088), "or at once while the link model starts up");
+        assert_eq!(steady_size(at((960, 768), settled), source, (1360, 1088), t0, false, false).0, (1360, 1088));
+        assert_eq!(steady_size(at((1792, 1434), settled), source, (1920, 1536), t0, false, false).0, (1920, 1536), "back to full size");
+        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0, false, false).0, (1920, 1536), "full size at once");
+        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0, false, true).0, (960, 768), "not after the quantizer shrank it");
+        assert_eq!(steady_size(Some(((640, 480), (320, 240), t0)), source, (1920, 1536), t0, false, false), ((1920, 1536), true), "a new source: at once");
     }
 
     #[test]
