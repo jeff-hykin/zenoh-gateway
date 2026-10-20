@@ -3,7 +3,7 @@
 // a lease) the way the dimos Controller does, and this prints, per stream, what the bus carries vs what the gateway
 // received, sent and the page got, plus video end-to-end latency by stage (bench/latency_page.js has the method).
 //
-//   deno run -A --no-lock bench/latency.ts --url http://127.0.0.1:5555/zenoh-gateway         # an existing gateway (e.g. Desktop's)
+//   deno run -A --no-lock bench/latency.ts --url http://127.0.0.1:5555/zenoh-gateway --referer http://127.0.0.1:5555/   # Desktop's
 //   deno run -A --no-lock bench/latency.ts --gateway ./zenoh-gateway --zenoh-config z.json5    # starts its own on a free port
 //   ... --python ~/repos/dimos/.venv/bin/python   # also probe the bus itself (rate, bytes, header-stamp lag)
 //
@@ -23,6 +23,7 @@ const { options } = await new Command()
     .option("--gateway-log <path:string>", "--gateway's stderr goes here (RUST_LOG from the environment, default warn)")
     .option("--gateway-pid <pid:number>", "Sample this process's CPU (e.g. Desktop's, for --url)")
     .option("--token <token:string>", "Bearer token for the gateway")
+    .option("--referer <url:string>", "Send this Referer on every request the page makes, e.g. http://127.0.0.1:5555/ for Desktop's embedded gateway (it grants Desktop's own page everything; the harness only subscribes, never leases)")
     .option("--seconds <seconds:number>", "How long to measure", { default: 30 })
     .option("--video <key:string>", "Video key (sensor_msgs.Image); empty for none", { default: "dimos/color_image/**" })
     .option("--video-encoding <name:string>", "Video encoding", { default: "dimos_lcm_image" })
@@ -175,6 +176,11 @@ if (options.python) {
 // ── measure ─────────────────────────────────────────────────────────────────────────────────────────
 const browser = await launch({ headless: true, ...(options.chrome ? { path: options.chrome } : {}), args: ["--autoplay-policy=no-user-gesture-required"] })
 const page = await browser.newPage()
+if (options.referer) {
+    const cdp = page.unsafelyGetCelestialBindings()
+    await cdp.Network.enable({})
+    await cdp.Network.setExtraHTTPHeaders({ headers: { Referer: options.referer } })
+}
 await page.goto(pageUrl.href, { waitUntil: "none" })
 for (let i = 0; ; i++) {
     const state = await page.evaluate(() => ({ ready: (window as any).harnessReady === true, errors: (window as any).harnessErrors ?? [] })).catch(() => ({ ready: false, errors: [] }))
