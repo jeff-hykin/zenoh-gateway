@@ -359,6 +359,13 @@ impl PeerState {
                 // rate fell)
                 (true, Some(delivery)) => estimate.min((delivery.bytes_per_sec * link.gain).max(allocator::INITIAL_BANDWIDTH)),
                 (true, None) => estimate.min(allocator::INITIAL_BANDWIDTH),
+                // after it, while nothing brakes and video isn't queued, video may climb to what GCC's delay-based estimate
+                // allows, at most 1.5x what it measurably delivered (libwebrtc's AIMD rate control bounds its increase by
+                // 1.5x the acknowledged bitrate): video that holds its bitrate never fills the link, so BBR's 25% probes
+                // alone took a minute to find a link that came back from 500 kbit/s to 8 Mbit/s
+                (false, Some(delivery)) if brake.is_none() && self.video_rate.gcc_limit_bytes_per_sec().is_none() && !allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target) => {
+                    estimate.max(self.video_rate.gcc_bytes_per_sec().min(delivery.bytes_per_sec * 1.5))
+                }
                 (false, _) => estimate,
             }
         } else {
@@ -379,7 +386,8 @@ impl PeerState {
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
-        let allocations = allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video);
+        // (video climbing past the link model's budget, see `video_estimate`, brings the total with it)
+        let allocations = allocate_within_video_cap(budget.max(video_estimate), video_estimate, demands, &is_video);
         let latency_target = self.latency_target(&subscriptions, &allocations, link.bandwidth_bytes_per_sec);
         let (window, latency_capped) = link.window(Some(latency_target));
         self.video_rate.pacer.set_queue_limit(latency_target);

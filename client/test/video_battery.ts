@@ -211,7 +211,9 @@ for (const cell of chosen) {
         if (Deno.env.get("DIAGNOSE") === "1") {
             console.log(`  ${name} gateway bandwidth: ${JSON.stringify(phase.bandwidth)}`)
             console.log(`  ${name} gateway subscription: ${JSON.stringify(phase.subscription)}`)
-            for (const line of phase.timeline ?? []) {
+            // the worst run's timeline (only a run's first phase carries one)
+            const worst = runs.map((phases) => phases[0]).sort((a, b) => (b.latency?.total.p95 ?? Infinity) - (a.latency?.total.p95 ?? Infinity))[0]
+            for (const line of (index === 0 ? worst.timeline : []) ?? []) {
                 console.log(`    ${line}`)
             }
         }
