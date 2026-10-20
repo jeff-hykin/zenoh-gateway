@@ -221,7 +221,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
     and RTP timestamp, depacketized from the track (reordered and retransmitted packets included);
     after a lost frame the client sends a PLI and skips frames until a keyframe, so what it yields
     always decodes. `request_keyframe()` sends a PLI;
-  - `VideoInfo`: the 28-byte metadata frame (key, size, quality), which travels on the data channel
+  - `VideoInfo`: the 44-byte metadata frame (key, size, quality), which travels on the data channel
     apart from its frame;
   - `Audio`: Opus packets.
   Messages are acked once queued (64 per subscription), so a slow consumer slows the gateway instead
@@ -431,7 +431,9 @@ with the new m-line, then the `sub` channel's label names that `mid` (the gatewa
 another format). Renegotiations run one at a time. A closed subscription's transceiver is stopped (the next renegotiation frees its m-line) rather than reused:
 Chrome stopped assembling a reused receiver's frames after a few quick close-and-reopen switches. The gateway gives a
 track to the newest subscription that names it.
-Each video frame also sends a 28-byte metadata frame on the `sub` channel (`msg.video`).
+Each video frame also sends a 44-byte metadata frame on the `sub` channel (`msg.video`), after the frame is written to
+the track. Nothing new is encoded while frames written to the connection's tracks would still wait over 100 ms in the
+RTP pacer (paced at 2.5x the larger of video's grant and the link's estimate): the newest sample goes once it drains.
 Video RTP carries the playout-delay extension with the subscription's `playoutDelay` (default `[0, 0]`: the browser
 shows each frame at once; a larger max lets its jitter buffer smooth an uneven network). A track never returns to
 low-latency rendering (min 0, max <= 500 ms) once it has carried a delay outside it (an update from `[100, 400]` back to
@@ -440,9 +442,10 @@ drops from a real time to 0.
 Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden per subscription):
 - A stream asks the allocator for at most `maxBitrate` bits/s (default: `max_bits_per_pixel` × the source's pixels ×
   its rate, 0.3: ~17 Mbit/s for 720p60, ~1.4 Mbit/s for 320x240 at 60 Hz). The encoder runs at what the allocator
-  actually grants.
+  actually grants. Before its first frame the source's size is guessed from the sample (a 16:9 picture of 3 bytes per
+  pixel) and priced by this policy, not by the raw sample's size.
 - The picture keeps the source's size (fitted into `maxResolution`) unless the grant would leave fewer than
-  `min_bits_per_pixel` (0.05) there; then it shrinks just enough, never below `minResolutionScale` (0.25). Below
+  `min_bits_per_pixel` (0.1) there; then it shrinks just enough, never below `minResolutionScale` (0.25). Below
   ~0.03 bit/pixel openh264 overshoots its target even at its coarsest quantizer, while above it a full-size picture
   beat every smaller one at the same bitrate on the bench scene (after upscaling).
 - Quality, for video, is the share of the most bits per frame: 0 is the smallest picture at the bit-per-pixel floor,
@@ -733,4 +736,6 @@ resolving so the gateway has an offset before the first put.
 - Heartbeat: browser sends `{"t0", "offsetMs", "rttMs"}` (JSON), gateway answers `{"t0", "t1", "t2"}`.
 - Video `sub` label: adds `"mid"`. Video metadata frame (little endian): `u8 version=1 | u8 flags
   (bit0 keyframe) | u16 0 | u32 width | u32 height | u32 sourceWidth | u32 sourceHeight | f32 quality |
-  u32 encodedBytes`. A fields message is "Fields", any other data-channel encoding's its own format.
+  u32 encodedBytes | f64 mediaTimeMs | f64 writtenMs` (44 bytes; gateways before 0.5.20 send the first 28):
+  `mediaTimeMs` is the frame's RTP timestamp less the track's first, in ms (a page's `requestVideoFrameCallback`
+  `rtpTimestamp` names the frame it shows), `writtenMs` when it went to the track (unix ms, gateway clock). A fields message is "Fields", any other data-channel encoding's its own format.

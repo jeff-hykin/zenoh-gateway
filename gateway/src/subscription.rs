@@ -44,6 +44,8 @@ pub struct SubStats {
     pub dropped_queue: u64,
     pub dropped_age: u64,
     pub dropped_send_error: u64,
+    /// video: times the send loop held off encoding because written frames still waited in the RTP pacer
+    pub pacer_waits: u64,
     pub queued: usize,
     pub queued_bytes: usize,
     /// bytes sent the page hasn't acked
@@ -227,6 +229,18 @@ pub struct SubShared {
 
 pub fn now_unix_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
+}
+
+/// A video source's size before its first frame is decoded: a 16:9 picture of 3 bytes per pixel (a raw rgb8/bgr8 sample;
+/// a compressed one guesses small and is priced cheap until its first frame says otherwise). Priced as the raw sample
+/// instead, a 720p camera (2.7 MB) wanted 40 MB/s, was granted 0.016 Hz, and its first frame went out a minute later:
+/// nothing was sent meanwhile, so nothing measured the link either.
+fn guessed_video_source(payload_bytes: f64) -> Option<(u32, u32)> {
+    let pixels = payload_bytes / 3.0;
+    (pixels >= 64.0 * 64.0).then(|| {
+        let height = (pixels * 9.0 / 16.0).sqrt();
+        ((height * 16.0 / 9.0).round() as u32, height.round() as u32)
+    })
 }
 
 fn sample_timestamp_ms(sample: &Sample) -> f64 {
@@ -434,8 +448,8 @@ impl SubShared {
                 let message_bytes = if state.message_bytes > 0.0 { state.message_bytes + PACKET_OVERHEAD_BYTES as f64 } else { payload_bytes + FRAME_OVERHEAD_BYTES };
                 Box::new(move |_| message_bytes)
             }
-            Some(_) if matches!(self.channel, Channel::Video(_)) => match state.video_source {
-              // before its first frame, a picture costs what its source sample does
+            Some(_) if matches!(self.channel, Channel::Video(_)) => match state.video_source.or_else(|| guessed_video_source(payload_bytes)) {
+              // before its first frame and with no samples yet, the source's size is unknown: priced as the source sample
               None => {
                 let sample_bytes = payload_bytes + FRAME_OVERHEAD_BYTES;
                 Box::new(move |_| sample_bytes)
@@ -512,6 +526,10 @@ impl SubShared {
     }
 
     /// The video pipeline's per-frame costs and the CPU governor's ceiling on the picture's scale.
+    pub fn record_pacer_wait(&self) {
+        self.state.lock().stats.pacer_waits += 1;
+    }
+
     pub fn record_video_timing(&self, decode_ms: Option<f64>, encode_ms: Option<f64>, cpu_scale_cap: f64) {
         let mut state = self.state.lock();
         state.stats.decode_ms = decode_ms;

@@ -335,7 +335,10 @@ impl PeerState {
             // under the link, and counting their rounds as the link's speed lowered the bandwidth with every cut, a spiral)
             let delivery = self.video_rate.delivery();
             let video_link_limited = delivery.is_some_and(|delivery| allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
-            link.update(now, interval_secs, self.gate.take_round(), delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
+            let round = self.gate.take_round();
+            log::debug!(target: "zenoh_gateway::link", "peer {}: round {round:?} video {:?} link-limited {video_link_limited} delivered {:.0}", self.peer_id, delivery.map(|delivery| delivery.bytes_per_sec), per_sec(delivered));
+            link.update(now, interval_secs, round, delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
+            log::debug!(target: "zenoh_gateway::link", "peer {}: bandwidth {:.0} gain {:.2} starting up {} probing rtt {} window {:?}", self.peer_id, link.bandwidth_bytes_per_sec, link.gain, link.starting_up, link.probing_rtt(), link.window(Some(self.config.latency_target)));
             link.clone()
         };
         let (budget, at_cap) = self.budget(&link);
@@ -355,6 +358,7 @@ impl PeerState {
         self.gate.configure(link.bandwidth_bytes_per_sec, budget, window, latency_capped);
         let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
         self.video_rate.set_cap_bytes_per_sec(video_granted);
+        self.video_rate.set_link_bytes_per_sec(budget);
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
             // at the cap there is nothing to probe for: a probe lifting every stream's spacing let low-priority streams
             // take what the allocation gave a high-priority one (19.8 Hz granted, 16 delivered)
@@ -1334,7 +1338,7 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
     let negotiating = async {
         let _negotiating = state.negotiation.lock().await;
         let live = media::live_mids(&offer.sdp);
-        match media::renegotiate(&connection, offer, mime).await {
+        match media::renegotiate(&connection, offer, mime, &state.video_rate).await {
             Ok((answer, track)) => {
                 // tracks whose m-line the offer dropped (their subscription closed and the page stopped the transceiver)
                 let dropped: Vec<Arc<media::MediaTrack>> = {

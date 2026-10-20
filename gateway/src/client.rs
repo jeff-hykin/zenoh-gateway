@@ -252,6 +252,10 @@ pub struct VideoFrameInfo {
     pub quality: f32,
     /// the encoded frame's bytes
     pub encoded_bytes: u32,
+    /// the frame's media time on its track (its RTP timestamp less the track's first, ms); `None` from gateways before 0.5.20
+    pub media_time_ms: Option<f64>,
+    /// when the gateway wrote it to the track (unix ms, gateway clock); `None` from gateways before 0.5.20
+    pub written_ms: Option<f64>,
 }
 
 /// One Opus packet.
@@ -1272,7 +1276,7 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
     let bytes = if flags & frame::ZSTD != 0 { zstd::decode_all(&bytes[..])? } else { bytes };
     Ok(match kind {
         Some("video") => {
-            ensure!(bytes.len() >= media::METADATA_LEN && bytes[0] == 1, "not a video metadata frame");
+            ensure!(bytes.len() >= media::METADATA_LEN_V1 && bytes[0] == 1, "not a video metadata frame");
             let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
             Some(Message::VideoInfo(VideoFrameInfo {
                 key,
@@ -1285,6 +1289,8 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
                 source_height: word(16),
                 quality: f32::from_bits(word(20)),
                 encoded_bytes: word(24),
+                media_time_ms: (bytes.len() >= media::METADATA_LEN).then(|| f64::from_le_bytes(bytes[28..36].try_into().unwrap())),
+                written_ms: (bytes.len() >= media::METADATA_LEN).then(|| f64::from_le_bytes(bytes[36..44].try_into().unwrap())),
             }))
         }
         // one empty frame per sample, for a browser callback

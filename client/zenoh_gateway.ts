@@ -80,6 +80,11 @@ export interface VideoFrameInfo {
     quality: number
     keyframe: boolean
     encodedBytes: number
+    /** the frame's media time on its track (its RTP timestamp less the track's first, ms; a video element's
+     * requestVideoFrameCallback `rtpTimestamp` says which frame is showing); absent from gateways before 0.5.20 */
+    mediaTimeMs?: number
+    /** when the gateway wrote it to the track (unix ms, gateway clock); absent from gateways before 0.5.20 */
+    writtenMs?: number
 }
 
 export interface Message {
@@ -424,6 +429,7 @@ export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
         sourceHeight: view.getUint32(16, true),
         quality: view.getFloat32(20, true),
         encodedBytes: view.getUint32(24, true),
+        ...(bytes.byteLength >= 44 ? { mediaTimeMs: view.getFloat64(28, true), writtenMs: view.getFloat64(36, true) } : {}),
     }
 }
 

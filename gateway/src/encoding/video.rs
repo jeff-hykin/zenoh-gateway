@@ -30,8 +30,9 @@ pub struct VideoPolicy {
     pub max_bitrate: Option<f64>,
     /// See `max_bitrate` (default 0.3: ~17 Mbit/s for 720p60).
     pub max_bits_per_pixel: f64,
-    /// Below this many bits per pixel per frame the picture shrinks (default 0.05: openh264's coarsest quantizer
-    /// still overshoots below ~0.03 on a busy scene).
+    /// Below this many bits per pixel per frame the picture shrinks (default 0.1: openh264's coarsest quantizer
+    /// still overshoots below ~0.03 on a busy scene, and at 0.05 a short link kept 720p at a few hundred kbit/s, whose
+    /// keyframes then queued in the pacer for hundreds of ms).
     pub min_bits_per_pixel: f64,
     /// Smallest share of the source's width and height (default 0.25).
     pub min_resolution_scale: f64,
@@ -41,7 +42,7 @@ pub struct VideoPolicy {
 
 impl Default for VideoPolicy {
     fn default() -> Self {
-        VideoPolicy { max_bitrate: None, max_bits_per_pixel: 0.3, min_bits_per_pixel: 0.05, min_resolution_scale: 0.25, max_resolution: None }
+        VideoPolicy { max_bitrate: None, max_bits_per_pixel: 0.3, min_bits_per_pixel: 0.1, min_resolution_scale: 0.25, max_resolution: None }
     }
 }
 
@@ -367,10 +368,10 @@ mod tests {
     fn full_size_until_the_bits_per_pixel_floor() {
         let policy = VideoPolicy::default();
         let hd = (1280, 720);
-        // 0.05 bits per pixel at 720p60 is 2.76 Mbit/s: above it the picture keeps its size
-        assert_eq!(policy.size(hd, 3e6, 60.0, 1.0), (1280, 720));
+        // 0.1 bits per pixel at 720p60 is 5.53 Mbit/s: above it the picture keeps its size
+        assert_eq!(policy.size(hd, 6e6, 60.0, 1.0), (1280, 720));
         assert_eq!(policy.size((321, 241), 1e9, 60.0, 1.0), (320, 240), "even sizes");
-        let (width, _) = policy.size(hd, 2.76e6 / 4.0, 60.0, 1.0);
+        let (width, _) = policy.size(hd, 5.53e6 / 4.0, 60.0, 1.0);
         assert!((624..=640).contains(&width), "a quarter of the bits: half the width, {width}");
         assert_eq!(policy.size((1920, 1536), 1e9, 60.0, 0.71), (1360, 1090), "a scaled width is a multiple of 16");
         assert_eq!(policy.size(hd, 1e3, 60.0, 1.0), (320, 180), "never below min_resolution_scale");
@@ -379,7 +380,7 @@ mod tests {
         assert_eq!(boxed.size(hd, 1e9, 60.0, 1.0), (640, 360), "fitted into max_resolution");
         // the price: the smallest picture at the floor (quality 0) to the most bits per frame (1)
         assert!((policy.frame_bytes(hd, 60.0, 1.0) - 0.3 * 1280.0 * 720.0 / 8.0).abs() < 1.0);
-        assert!((policy.frame_bytes(hd, 60.0, 0.0) - 0.05 * 320.0 * 180.0 / 8.0).abs() < 1.0);
+        assert!((policy.frame_bytes(hd, 60.0, 0.0) - 0.1 * 320.0 * 180.0 / 8.0).abs() < 1.0);
         let capped = VideoPolicy { max_bitrate: Some(6e6), ..policy };
         assert!((capped.frame_bytes(hd, 60.0, 1.0) - 12_500.0).abs() < 1e-6, "6 Mbit/s at 60 Hz");
         assert!(capped.frame_bytes(hd, 60.0, 0.3) < capped.frame_bytes(hd, 60.0, 0.6));
