@@ -50,6 +50,11 @@ const cells: Cell[] = [
         { name: "tf_only", seconds: 40, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["tf"], shape: true },
     ] as Cell[]).filter((cell) => Deno.args.includes(cell.name)),
 ]
+// (bin/test runs and caches each default cell on its own)
+if (Deno.args[0] === "--list-cells") {
+    console.log(cells.map((cell) => cell.name).join("\n"))
+    Deno.exit(0)
+}
 const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell.name)) : cells
 // DIAGNOSE=1: read the gateway's bandwidth stats every window (they otherwise come every few seconds on slow links)
 const diagnose = Deno.env.get("DIAGNOSE") === "1"

@@ -27,6 +27,11 @@ const cells: Cell[] = [
     // a sudden 16x drop and back: each phase measured once it had 10 s to settle
     { name: "step", seconds: 60, schedule: [[0, 1_000_000], [20, 62_500], [40, 1_000_000]], delayMs: 20, jitterMs: 0, loss: 0, phases: [[0, 20, "8mbit"], [20, 40, "500kbit"], [40, 60, "8mbit again"]] },
 ]
+// (bin/test runs and caches each default cell on its own)
+if (Deno.args[0] === "--list-cells") {
+    console.log(cells.map((cell) => cell.name).join("\n"))
+    Deno.exit(0)
+}
 const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell.name)) : cells
 
 const root = new URL("../..", import.meta.url).pathname

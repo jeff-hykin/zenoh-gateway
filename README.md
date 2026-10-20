@@ -455,7 +455,13 @@ follow another nixpkgs. Native macOS binaries link `/usr/lib/libiconv` (not nix'
 ```sh
 cd gateway && cargo test --all-features && cargo clippy --all-features --all-targets && cargo doc --no-deps   # unit, client and doc tests, lints, API docs
 deno task check                            # type-check the client
+bin/test                                   # every suite whose inputs changed since it last passed (--all, --list, or name some)
 ```
+
+`bin/test` also runs the browser suites in `client/test` one at a time (headless Chrome against
+`examples/degrade_server`): `video_latency.ts` (source-to-screen timing; `BROWSER=firefox` too), `video_battery.ts` and
+`degrade.ts` (bad links through a userspace shaper, each cell cached on its own), `resubscribe.ts`, `backpressure.ts`,
+`lease_takeover.ts`.
 
 The end-to-end suites (a real zenoh peer, the server and headless Chrome; delivery, clock sync,
 deadmen, allocation, latency under load, throughput on a shaped link, video latency, encodings, auth and leases, and the rest of the
