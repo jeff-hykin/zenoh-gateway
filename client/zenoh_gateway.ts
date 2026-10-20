@@ -733,7 +733,9 @@ export class Subscription extends Endpoint {
             }
             // performance.now() based times to the connection's clock, and the gateway's clock to it
             const toLocal = (perfMs: number) => this.owner.now() - (performance.now() - perfMs)
-            const shown = toLocal(frame.expectedDisplayTime ?? frame.presentationTime)
+            // never before it was handed to the compositor: a headless Chrome (no display) reports an expectedDisplayTime
+            // whole vsyncs before even the callback, which read as a negative latency
+            const shown = toLocal(Math.max(frame.expectedDisplayTime ?? frame.presentationTime, frame.presentationTime))
             const received = frame.receiveTime === undefined ? undefined : toLocal(frame.receiveTime)
             const written = info.writtenMs - offsetMs
             // the in-packet stamp, where the receiver reports it for this very frame (Chrome: NTP ms, gateway clock)
