@@ -99,6 +99,10 @@ struct BandwidthStats {
     video_sent_bytes_per_sec: f64,
     /// how long video waited in a queue per the latest transport feedback, and the cap its queue brake holds it to
     video_queue_delay_ms: f64,
+    /// how long a packet written to a video track now would wait in the RTP pacer, and the packets it dropped for waiting
+    /// over `rtp_pacer::MAX_QUEUE_AGE` (ever)
+    pacer_delay_ms: f64,
+    pacer_dropped_packets: u64,
     video_brake_bytes_per_sec: Option<f64>,
     /// `--max-bandwidth-bytes-per-sec`
     cap_bytes_per_sec: Option<f64>,
@@ -370,6 +374,8 @@ impl PeerState {
             video_estimate_bytes_per_sec: video_estimate,
             video_sent_bytes_per_sec: per_sec(video_sent),
             video_queue_delay_ms: self.video_rate.queue_delay_ms(),
+            pacer_delay_ms: self.video_rate.pacer_delay().as_secs_f64() * 1000.0,
+            pacer_dropped_packets: self.video_rate.pacer.dropped_packets(),
             video_brake_bytes_per_sec: self.video_brake.lock().map(|(cap, _)| cap),
             cap_bytes_per_sec: self.config.max_bandwidth,
             budget_bytes_per_sec: budget,

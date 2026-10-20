@@ -424,7 +424,7 @@ mod tests {
         assert!(!encode(&mut encoder, &frame, 2e6, false).keyframe, "a new bitrate applies in place");
         assert!(encode(&mut encoder, &frame, 2e6, true).keyframe, "asked for");
         let low = encode(&mut encoder, &frame, 1e3, false);
-        assert_eq!((low.width, low.height), (160, 122), "10 kbit/s (the floor) at 10 Hz keeps 0.05 bits per pixel at about half the width");
+        assert_eq!((low.width, low.height), (112, 86), "10 kbit/s (the floor) at 10 Hz keeps 0.1 bits per pixel at about a third of the width");
         assert!(encoder.encode(&DecodedFrame::data(1u8), &target(&VideoPolicy::default(), (8, 8), 1.0, 1e6, 10.0, 1.0, false)).is_err(), "takes pictures only");
     }
 
