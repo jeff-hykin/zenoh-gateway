@@ -51,11 +51,17 @@ if (build.code !== 0) {
     throw new Error("cargo build failed")
 }
 const targetDir = Deno.env.get("CARGO_TARGET_DIR") ?? `${root}gateway/target`
+// SERVER_LOG=path: the gateway's log (RUST_LOG, default warn) appended there
+const serverLog = Deno.env.get("SERVER_LOG")
 
-type Phase = { bandwidth?: Record<string, unknown>; pacerP95Ms?: number; label: string; latency: any; shownPerSec: number; maxGapMs: number; size: string; quality: number; videoBytesPerSec: number }
+type Phase = { timeline?: string[]; subscription?: unknown; counts: Record<string, number>; bandwidth?: Record<string, unknown>; pacerP95Ms?: number; label: string; latency: any; shownPerSec: number; maxGapMs: number; size: string; quality: number; videoBytesPerSec: number }
 
 async function runCell(cell: Cell): Promise<Phase[]> {
-    const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], env: { CAMS: "1", CAM_SIZE: "1280x720", CAM_NOISE: "4", CLOUD_BYTES: "0", MAP_BYTES: "0" }, stdout: "piped", stderr: "null" }).spawn()
+    const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], env: { CAMS: "1", CAM_SIZE: "1280x720", CAM_NOISE: "4", CLOUD_BYTES: "0", MAP_BYTES: "0", RUST_LOG: Deno.env.get("RUST_LOG") ?? "warn" }, stdout: "piped", stderr: serverLog ? "piped" : "null" }).spawn()
+    if (serverLog) {
+        const file = await Deno.open(serverLog, { write: true, create: true, append: true })
+        server.stderr.pipeTo(file.writable)
+    }
     const serverUrl = await (async () => {
         for await (const chunk of server.stdout.pipeThrough(new TextDecoderStream())) {
             const match = chunk.match(/listening on (\S+)/)
@@ -69,7 +75,7 @@ async function runCell(cell: Cell): Promise<Phase[]> {
     const page = await openPage(`${link.url}/blank.html`, (cell.seconds + 60) * 1000)
     try {
         const phases = cell.phases ?? [[0, cell.seconds, cell.name]]
-        return await page.evaluate(async (url: string, phases: [number, number, string][], measure: number) => {
+        return await page.evaluate(async (url: string, phases: [number, number, string][], measure: number, diagnose: boolean) => {
             const { connect } = await import("/client/zenoh_gateway.js")
             const client = await connect(url, { heartbeatHz: 5, heartbeatMisses: 50 }).catch(() => connect(url, { heartbeatHz: 5, heartbeatMisses: 50 }))
             const started = performance.now()
@@ -97,6 +103,32 @@ async function runCell(cell: Cell): Promise<Phase[]> {
                 }
             })
             const results: any[] = []
+            // counters from the gateway's stats, summed wherever they appear: keyframes sent, the browser's PLI/FIRs, RTP packets the pacer dropped
+            const counters = (stats: unknown) => {
+                const sums: Record<string, number> = { keyframes: 0, keyframeRequests: 0, pacerDroppedPackets: 0 }
+                const walk = (value: any) => {
+                    for (const [key, inner] of Object.entries(value ?? {})) {
+                        if (key in sums && typeof inner === "number") {
+                            sums[key] += inner
+                        } else if (inner && typeof inner === "object") {
+                            walk(inner)
+                        }
+                    }
+                }
+                walk(stats)
+                return sums
+            }
+            const history: { at: number; sums: Record<string, number> }[] = []
+            const timeline: string[] = []
+            const sampler = setInterval(async () => {
+                const stats = await client._request({ op: "stats" }, 5000).catch(() => null)
+                history.push({ at: performance.now(), sums: counters(stats) })
+                if (diagnose) {
+                    const bandwidth = (stats as any)?.bandwidth ?? {}
+                    const video = JSON.stringify(stats).match(/"videoWidth":(\d+),"videoHeight":(\d+)/)
+                    timeline.push(`${((performance.now() - started) / 1000).toFixed(0)}s budget ${Math.round(bandwidth.budgetBytesPerSec / 1000)} videoEst ${Math.round(bandwidth.videoEstimateBytesPerSec / 1000)} brake ${Math.round((bandwidth.videoBrakeBytesPerSec ?? NaN) / 1000)} sent ${Math.round(bandwidth.videoSentBytesPerSec / 1000)} KB/s pacer ${Math.round(bandwidth.pacerDelayMs)} ms queue ${Math.round(bandwidth.videoQueueDelayMs)} ms ${video ? `${video[1]}x${video[2]}` : "-"} kf ${counters(stats).keyframes}`)
+                }
+            }, 1000)
             for (const [, end, label] of phases) {
                 await new Promise((resolve) => setTimeout(resolve, started + end * 1000 - performance.now()))
                 const from = performance.now() - measure * 1000
@@ -109,7 +141,26 @@ async function runCell(cell: Cell): Promise<Phase[]> {
                 const stats = JSON.stringify(await client._request({ op: "stats" }, 5000).catch(() => null))
                 const gatewayLatency = JSON.parse(stats?.match(/"videoLatency":(\{[^}]*\})/)?.[1] ?? "null")
                 const bw = JSON.parse(stats ?? "null")?.bandwidth
+                const now = counters(JSON.parse(stats ?? "null"))
+                const before = history.find((sample) => sample.at >= from)?.sums ?? now
                 results.push({
+                    subscription: (() => {
+                        const found: any[] = []
+                        const walk = (value: any) => {
+                            for (const inner of Object.values(value ?? {})) {
+                                if (inner && typeof inner === "object") {
+                                    if ("keyframeRequests" in (inner as any)) {
+                                        found.push(inner)
+                                    } else {
+                                        walk(inner)
+                                    }
+                                }
+                            }
+                        }
+                        walk(JSON.parse(stats ?? "null"))
+                        return found.map((one) => Object.fromEntries(Object.entries(one).filter(([, value]) => typeof value !== "object")))
+                    })(),
+                    counts: Object.fromEntries(Object.entries(now).map(([key, value]) => [key, value - before[key]])),
                     bandwidth: bw && Object.fromEntries(Object.entries(bw).filter(([, value]) => typeof value !== "object")),
                     pacerP95Ms: gatewayLatency?.pacerP95Ms,
                     label,
@@ -121,9 +172,13 @@ async function runCell(cell: Cell): Promise<Phase[]> {
                     videoBytesPerSec: messages.reduce((sum, message) => sum + message.bytes, 0) / measure,
                 })
             }
+            clearInterval(sampler)
+            if (diagnose) {
+                results[0].timeline = timeline
+            }
             client.close()
             return results
-        }, [link.url, phases, measure])
+        }, [link.url, phases, measure, Deno.env.get("DIAGNOSE") === "1"])
     } finally {
         await page.close()
         server.kill("SIGTERM")
@@ -155,7 +210,12 @@ for (const cell of chosen) {
         const latency = phase.latency
         if (Deno.env.get("DIAGNOSE") === "1") {
             console.log(`  ${name} gateway bandwidth: ${JSON.stringify(phase.bandwidth)}`)
+            console.log(`  ${name} gateway subscription: ${JSON.stringify(phase.subscription)}`)
+            for (const line of phase.timeline ?? []) {
+                console.log(`    ${line}`)
+            }
         }
+        console.log(`  ${name}: ${phase.counts.keyframes} keyframes, ${phase.counts.keyframeRequests} PLI/FIR, ${phase.counts.pacerDroppedPackets} RTP packets dropped by the pacer (last ${measure} s)`)
         const stages = latency?.stages
         const use = phase.videoBytesPerSec / rate
         rows.push([name.padEnd(20), round(latency?.total.p50).padStart(6), round(latency?.total.p95).padStart(6), round(stages?.encoding.p50).padStart(5), round(stages?.trackToShown.p50).padStart(6), round(phase.pacerP95Ms).padStart(6), round(stages?.toReceived?.p95).padStart(6), round(stages?.receivedToShown?.p95).padStart(6), phase.shownPerSec.toFixed(1).padStart(5), round(phase.maxGapMs).padStart(6), phase.size.padStart(9), phase.quality.toFixed(2).padStart(5), `${Math.round(use * 100)}%`.padStart(5)].join(" "))
@@ -174,9 +234,10 @@ for (const cell of chosen) {
         if (phase.maxGapMs > 2000) {
             failures.push(`${name}: froze ${round(phase.maxGapMs)} ms`)
         }
-        // (the camera's most at 0.3 bit/pixel: 1280 x 720 x 30 x 0.3 / 8 = 1 MB/s)
-        if (cell.clean && rate <= 1_000_000 && use < 0.4) {
-            failures.push(`${name}: video used ${Math.round(use * 100)}% of the link (< 40%)`)
+        // (the camera's most at 0.3 bit/pixel: 1280 x 720 x 30 x 0.3 / 8 = 1 MB/s): on a clean link, video either fills
+        // 40% of it or shows the whole picture (a picture stuck at 160x90 used 3% of 8 Mbit/s)
+        if (cell.clean && use < 0.4 && phase.size !== "1280x720") {
+            failures.push(`${name}: video used ${Math.round(use * 100)}% of the link (< 40%) at ${phase.size}`)
         }
         const [width, height] = phase.size.split("x").map(Number)
         if (width < 160 && height < 64) {

@@ -43,9 +43,6 @@ const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
 /// Video RTP's clock (H.264, VP8, VP9 and AV1 all run at 90 kHz).
 const VIDEO_CLOCK_RATE: f64 = 90_000.0;
-/// The most what was written may still wait in the RTP pacer when the next frame is encoded (`VideoRate::pacer_delay`;
-/// the pacer drops what waits `rtp_pacer::MAX_QUEUE_AGE`).
-const PACER_MAX_DELAY: Duration = Duration::from_millis(50);
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
 const PACING_FACTOR: f64 = 2.5;
 /// Video's queueing delay is measured against the least one-way delay over this long.
@@ -115,6 +112,12 @@ pub struct VideoRate {
     cap_bps: AtomicU64,
     /// the link model's bandwidth (video and data together), bits/s: what the pacer may burst a frame out at
     link_bps: AtomicU64,
+    /// the link's measured bandwidth (times its gain while it probes) over what video is allowed now (f64 bits): the picture is sized for the grant times
+    /// this, so a brake or GCC cut lowers the bitrate, not the size (each new size is a new encoder and a keyframe, and
+    /// a size that followed the brake's 6-63 KB/s swings cost a keyframe a second on a 500 kbit/s link)
+    size_ratio: AtomicU64,
+    /// the link model is in its startup and video isn't queued at the link (see `steady_size`)
+    starting_up: AtomicBool,
     /// bytes of video the browser's transport feedback reported arrived, ever
     received_bytes: AtomicU64,
     /// when GCC last cut its target (it found the path congested)
@@ -305,6 +308,23 @@ impl VideoRate {
         self.cap_bps.store((bytes_per_sec * 8.0).max(GCC_MIN_BPS).to_bits(), Ordering::Relaxed);
     }
 
+    /// See `size_ratio`.
+    pub fn set_size_ratio(&self, ratio: f64) {
+        self.size_ratio.store(ratio.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn size_ratio(&self) -> f64 {
+        f64::from_bits(self.size_ratio.load(Ordering::Relaxed))
+    }
+
+    pub fn set_starting_up(&self, starting_up: bool) {
+        self.starting_up.store(starting_up, Ordering::Relaxed);
+    }
+
+    pub fn starting_up(&self) -> bool {
+        self.starting_up.load(Ordering::Relaxed)
+    }
+
     /// The link model's bandwidth estimate (see `link_bps`).
     pub fn set_link_bytes_per_sec(&self, bytes_per_sec: f64) {
         self.link_bps.store((bytes_per_sec * 8.0).to_bits(), Ordering::Relaxed);
@@ -336,7 +356,7 @@ impl VideoRate {
     /// frame took 40% of a frame interval to leave and a keyframe several (75 ms p50, 270 ms p95 from track to browser
     /// on localhost, the link mostly idle); never above a multiple of the link's estimate, so a keyframe can't burst
     /// into a 100 kbit/s link at 1.3 Mbit/s (paced off GCC alone, it held the strict streams behind it for seconds).
-    fn pacing_bps(&self) -> f64 {
+    pub fn pacing_bps(&self) -> f64 {
         let gcc = self.gcc_limit_bytes_per_sec().map_or(f64::INFINITY, |limit| limit * 8.0);
         let link = f64::from_bits(self.link_bps.load(Ordering::Relaxed));
         gcc.min(self.cap_bps().max(link)) * PACING_FACTOR
@@ -500,7 +520,7 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: ABS_CAPTURE_TIME_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), link_bps: AtomicU64::new(0), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default(), pacer: Default::default(), rtp: Default::default() });
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), link_bps: AtomicU64::new(0), size_ratio: AtomicU64::new(1f64.to_bits()), starting_up: AtomicBool::new(true), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default(), pacer: Default::default(), rtp: Default::default() });
     let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new(), arrivals: VecDeque::new(), lost_at: f64::NEG_INFINITY };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default())
@@ -583,7 +603,12 @@ impl MediaTrack {
 
     /// `playout_delay`: (min, max) in 10 ms units, video only (audio has its own jitter buffer and no playout-delay extension).
     /// `capture_unix_ms`: the source sample's time, sent in the abs-capture-time extension (video only).
-    pub async fn write(&self, data: Vec<u8>, duration: Duration, playout_delay: (u16, u16), capture_unix_ms: Option<f64>) -> Result<Written> {
+    /// `keyframe`: the RTP pacer lets its packets wait longer (`rtp_pacer::MAX_KEYFRAME_AGE`).
+    pub async fn write(&self, data: Vec<u8>, duration: Duration, playout_delay: (u16, u16), capture_unix_ms: Option<f64>, keyframe: bool) -> Result<Written> {
+        if keyframe {
+            let first = self.rate.rtp.lock().get(&self.ssrc).and_then(|stream| stream.first_timestamp);
+            self.rate.pacer.mark_keyframe(self.ssrc, first.map(|first| first.wrapping_add(*self.media_ticks.lock())));
+        }
         let sample = Sample { data: Bytes::from(data), duration, ..Sample::new(Instant::now()) };
         let writer = self.track.sample_writer(self.ssrc, self.payload_type);
         let low_latency = playout_delay.0 == 0 && playout_delay.1 <= LOW_LATENCY_MAX_UNITS;
@@ -860,13 +885,16 @@ const SIZE_UP_SETTLE: Duration = Duration::from_secs(5);
 
 /// The size to encode at: `wanted` (the bitrate policy's) once it is far enough from the size in use and that size has
 /// settled, else the size in use. A new source size, and full size, are taken at once.
-fn steady_size(current: Option<((u32, u32), (u32, u32), Instant)>, source: (u32, u32), wanted: (u32, u32), now: Instant) -> ((u32, u32), bool) {
+/// `starting_up`: the link model is still looking for the link's bandwidth, so the picture grows at once (held back
+/// `SIZE_UP_SETTLE`, video sent a third of its budget, the link model saw no growth and ended its startup at 93 KB/s on
+/// a 1 MB/s link).
+fn steady_size(current: Option<((u32, u32), (u32, u32), Instant)>, source: (u32, u32), wanted: (u32, u32), now: Instant, starting_up: bool) -> ((u32, u32), bool) {
     let Some((_, size, changed_at)) = current.filter(|(current_source, _, _)| *current_source == source) else {
         return (wanted, true);
     };
     let ratio = wanted.0 as f64 / size.0.max(1) as f64;
     let since = now.duration_since(changed_at);
-    let change = (ratio < 1.0 / SIZE_BAND && since >= SIZE_DOWN_SETTLE) || (ratio > SIZE_BAND && since >= SIZE_UP_SETTLE) || (wanted.0 >= source.0 & !1 && size.0 < source.0 & !1);
+    let change = (ratio < 1.0 / SIZE_BAND && since >= SIZE_DOWN_SETTLE) || (ratio > SIZE_BAND && (starting_up || since >= SIZE_UP_SETTLE)) || (wanted.0 >= source.0 & !1 && size.0 < source.0 & !1);
     if change { (wanted, true) } else { (size, false) }
 }
 
@@ -942,7 +970,8 @@ struct EncodeSession {
     key: String,
     policy: VideoPolicy,
     /// member → (bits/s, frames/s) it is granted
-    grants: Mutex<HashMap<u64, (f64, f64)>>,
+    /// each member's (bits/s, frames/s, bits/s its picture is sized for, whether its link model is starting up)
+    grants: Mutex<HashMap<u64, (f64, f64, f64, bool)>>,
     state: tokio::sync::Mutex<SessionState>,
 }
 
@@ -958,6 +987,54 @@ struct SessionState {
     scale: f64,
     /// (source, size in use, when it was picked): see `steady_size`
     size: Option<((u32, u32), (u32, u32), Instant)>,
+    qp: QpScaler,
+}
+
+/// Sizes the picture by the encoder's quantizer, as libwebrtc's quality scaler does, but by an equation instead of its
+/// thresholds and steps: H.264's bits per frame halve each +6 QP, so at the bitrate now the picture that reaches
+/// `VideoPolicy::target_qp` has `pixels x (bitrate now / bitrate then) x 2^((target - QP) / 6)`, from the average QP of
+/// the last `SIZE_DOWN_SETTLE` of delta frames at the size in use. A picture too big for its bitrate (openh264 then
+/// skips frames, as at 0.1 bit/pixel on a 500 kbit/s link: 2 of 3) shrinks; one that compresses well grows back up to
+/// the size its bitrate affords (`video::target`). A coarse quantizer shrinks the picture only while the encoder spends
+/// its bitrate: one with bits to spare (a still picture, nothing to code) isn't short of them.
+#[derive(Default)]
+struct QpScaler {
+    /// (when, QP, bits, bits/s the picture was sized for, bits/s the encoder was given) of each delta frame at `size`
+    frames: VecDeque<(Instant, f64, f64, f64, f64)>,
+    size: (u32, u32),
+    /// when its first frame at `size` came
+    since: Option<Instant>,
+}
+
+impl QpScaler {
+    fn observe(&mut self, now: Instant, size: (u32, u32), qp: f64, bits: f64, size_bitrate: f64, bitrate: f64) {
+        if size != self.size {
+            self.frames.clear();
+            self.size = size;
+            self.since = Some(now);
+        }
+        self.frames.push_back((now, qp, bits, size_bitrate, bitrate));
+        while self.frames.front().is_some_and(|(at, ..)| now.duration_since(*at) > SIZE_DOWN_SETTLE) {
+            self.frames.pop_front();
+        }
+    }
+
+    /// The share of `source`'s width and height the picture should take at `bitrate`, once a frame was measured.
+    fn scale(&self, source: (u32, u32), bitrate: f64, target_qp: f64) -> Option<f64> {
+        if self.frames.is_empty() || source.0 == 0 {
+            return None;
+        }
+        let count = self.frames.len() as f64;
+        let qp = self.frames.iter().map(|(_, qp, ..)| qp).sum::<f64>() / count;
+        let then = self.frames.iter().map(|(_, _, _, size_bitrate, _)| size_bitrate).sum::<f64>() / count;
+        let given = self.frames.iter().map(|(.., bitrate)| bitrate).sum::<f64>() / count;
+        let window = self.since.map_or(SIZE_DOWN_SETTLE, |since| self.frames.back().map_or(SIZE_DOWN_SETTLE, |(last, ..)| last.duration_since(since)).min(SIZE_DOWN_SETTLE));
+        let spent = self.frames.iter().map(|(_, _, bits, ..)| bits).sum::<f64>() / window.as_secs_f64().max(f64::EPSILON);
+        let qp_factor = 2f64.powf((target_qp - qp) / 6.0);
+        let qp_factor = if spent < given { qp_factor.max(1.0) } else { qp_factor };
+        let pixels = self.size.0 as f64 * self.size.1 as f64 * (bitrate / then.max(1.0)) * qp_factor;
+        Some((pixels / (source.0 as f64 * source.1 as f64)).sqrt())
+    }
 }
 
 struct SessionFrame {
@@ -975,7 +1052,7 @@ impl EncodeSession {
     /// Whether a member granted `bitrate` can share this session: the others' grants and its own are close.
     fn fits(&self, member: u64, bitrate: f64) -> bool {
         let grants = self.grants.lock();
-        let others = grants.iter().filter(|(id, _)| **id != member).map(|(_, (bps, _))| *bps);
+        let others = grants.iter().filter(|(id, _)| **id != member).map(|(_, (bps, _, _, _))| *bps);
         let (low, high) = others.fold((bitrate, bitrate), |(low, high), bps| (low.min(bps), high.max(bps)));
         high <= low.max(1.0) * SHARE_RATIO
     }
@@ -984,7 +1061,7 @@ impl EncodeSession {
 impl VideoSessions {
     /// The session `member` encodes in at `grant`: `current` while it still fits (unless it is alone there and an older
     /// session of the same stream and policy fits too), else the oldest such session that fits, else a new one.
-    fn place(&self, current: Option<Arc<EncodeSession>>, member: u64, (codec, format, key): (&str, VideoFormat, &str), policy: VideoPolicy, grant: (f64, f64)) -> Arc<EncodeSession> {
+    fn place(&self, current: Option<Arc<EncodeSession>>, member: u64, (codec, format, key): (&str, VideoFormat, &str), policy: VideoPolicy, grant: (f64, f64, f64, bool)) -> Arc<EncodeSession> {
         let mut sessions = self.sessions.lock();
         let same_stream = |session: &&Arc<EncodeSession>| session.codec == codec && session.format == format && session.key == key && session.policy == policy;
         let oldest_fit = sessions.iter().filter(same_stream).filter(|session| session.fits(member, grant.0)).min_by_key(|session| session.id).cloned();
@@ -996,7 +1073,7 @@ impl VideoSessions {
                     Self::leave_locked(&mut sessions, &current, member);
                 }
                 oldest.filter(|oldest| sessions.iter().any(|session| Arc::ptr_eq(session, oldest))).unwrap_or_else(|| {
-                    let state = SessionState { encoder: None, governor: CpuGovernor::new(), log: VecDeque::new(), next_seq: 0, last_input: None, keyframe_wanted: true, source: (640, 480), scale: 1.0, size: None };
+                    let state = SessionState { encoder: None, governor: CpuGovernor::new(), log: VecDeque::new(), next_seq: 0, last_input: None, keyframe_wanted: true, source: (640, 480), scale: 1.0, size: None, qp: QpScaler::default() };
                     let id = self.next_session.fetch_add(1, Ordering::Relaxed);
                     let session = Arc::new(EncodeSession { id, codec: codec.to_owned(), format, key: key.to_owned(), policy, grants: Mutex::default(), state: tokio::sync::Mutex::new(state) });
                     sessions.push(session.clone());
@@ -1084,15 +1161,18 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         } else {
             false
         };
-        let grants: Vec<(f64, f64)> = session.grants.lock().values().copied().collect();
+        let grants: Vec<(f64, f64, f64, bool)> = session.grants.lock().values().copied().collect();
+        let starting_up = grants.iter().any(|grant| grant.3);
         let bitrate = grants.iter().map(|grant| grant.0).fold(f64::INFINITY, f64::min);
+        let size_bitrate = grants.iter().map(|grant| grant.2).fold(f64::INFINITY, f64::min);
+        let qp_scale = state.qp.scale(state.source, size_bitrate, session.policy.target_qp);
         let hz = grants.iter().map(|grant| grant.1).fold(0.0, f64::max);
         let (scale, source) = (state.scale, state.source);
         let floor = session.policy.floor_scale(source);
         out.scale_cap = state.governor.scale_cap(scale, floor, hz, Instant::now());
-        let mut target = target(&session.policy, source, input.quality, bitrate, hz, out.scale_cap, state.keyframe_wanted);
+        let mut target = target(&session.policy, source, input.quality, bitrate, size_bitrate, qp_scale, hz, out.scale_cap, state.keyframe_wanted);
         let now = Instant::now();
-        let (size, changed) = steady_size(state.size, source, (target.width, target.height), now);
+        let (size, changed) = steady_size(state.size, source, (target.width, target.height), now, starting_up);
         (target.width, target.height) = size;
         if changed {
             state.size = Some((source, size, now));
@@ -1104,7 +1184,8 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
             let mut encoder = existing.map_or_else(|| codecs.video_encoder(&*codec, format), Ok)?;
             let started = Instant::now();
             let result = encoder.encode(&decoded, &target).map_err(|error| format!("{error:#}"));
-            Ok::<_, String>((encoder, result, started.elapsed().as_secs_f64() * 1000.0))
+            let qp = encoder.last_qp();
+            Ok::<_, String>((encoder, result, started.elapsed().as_secs_f64() * 1000.0, qp))
         });
         // an encode that hangs gives up its encoder (rebuilt next frame, from a keyframe) and the session's lock, which
         // every viewer of the session waits on
@@ -1115,12 +1196,18 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         };
         match encoded {
             Ok(Err(error)) => out.error = Some(error),
-            Ok(Ok((encoder, result, encode_ms))) => {
+            Ok(Ok((encoder, result, encode_ms, qp))) => {
                 state.encoder = Some(encoder);
                 state.governor.observe_encode(encode_ms);
                 out.encode_ms = state.governor.encode_ms;
                 match result {
                     Ok(Some(frame)) => {
+                        // (a keyframe's quantizer says nothing about what a frame of this picture needs)
+                        if !frame.keyframe
+                            && let Some(qp) = qp
+                        {
+                            state.qp.observe(Instant::now(), (frame.width, frame.height), qp, frame.data.len() as f64 * 8.0, size_bitrate, bitrate);
+                        }
                         if !is_picture {
                             state.source = (frame.width, frame.height);
                         }
@@ -1203,13 +1290,16 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
     let mut warned_write = false;
     let mut ahead: VecDeque<Decoding> = VecDeque::new();
     let (mut decode_ms, mut encode_ms): (Option<f64>, Option<f64>) = (None, None);
+    // one frame at the granted rate: what may still wait in the RTP pacer when the next frame is encoded
+    let mut frame_interval = Duration::ZERO;
     while !shared.is_closed() && track.is_current() {
-        // nothing new is decoded or encoded while what was written still waits in the pacer past `PACER_MAX_DELAY`: the
-        // newest sample goes once it has drained (dropping encoded frames instead would break the picture until a keyframe)
+        // nothing new is decoded or encoded while what was written would still be in the pacer when the next frame is
+        // due: the newest sample goes once it has drained (dropping encoded frames instead would break the picture until a keyframe)
         let behind = track.rate.pacer_delay();
-        if ahead.is_empty() && behind > PACER_MAX_DELAY {
+        if ahead.is_empty() && behind > frame_interval {
             shared.record_pacer_wait();
-            tokio::time::sleep((behind - PACER_MAX_DELAY).min(Duration::from_millis(50))).await;
+            // (looked at again each frame: the pacer's rate can change meanwhile)
+            tokio::time::sleep((behind - frame_interval).min(frame_interval.max(Duration::from_millis(1)))).await;
             continue;
         }
         let decoding = match ahead.pop_front() {
@@ -1244,9 +1334,10 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             _ => shared.video_source().unwrap_or_default(),
         };
         let (quality, bitrate, hz) = shared.video_grant(&key, source);
+        frame_interval = crate::secs(1.0 / hz.max(0.1));
         let previous = member.session.take();
         let Channel::Video(format) = shared.channel else { return };
-        let session = sessions.place(previous.clone(), member.id, (codec.name(), format, &key), shared.tuning().video_policy, (bitrate, hz));
+        let session = sessions.place(previous.clone(), member.id, (codec.name(), format, &key), shared.tuning().video_policy, (bitrate, hz, bitrate * track.rate.size_ratio(), track.rate.starting_up()));
         if previous.is_none_or(|previous| !Arc::ptr_eq(&previous, &session)) {
             (member.next_seq, member.synced) = (None, false);
         }
@@ -1268,7 +1359,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             if !track.is_current() {
                 break;
             }
-            let written = match track.write(frame.data.clone(), duration, shared.tuning().playout_delay, Some(logged.timestamp_ms)).await {
+            let written = match track.write(frame.data.clone(), duration, shared.tuning().playout_delay, Some(logged.timestamp_ms), frame.keyframe).await {
                 Ok(written) => written,
                 Err(error) => {
                     if !warned_write {
@@ -1374,17 +1465,18 @@ mod tests {
         use super::{SIZE_DOWN_SETTLE, SIZE_UP_SETTLE, steady_size};
         let (source, t0) = ((1920, 1536), std::time::Instant::now());
         let at = |size: (u32, u32), after: std::time::Duration| Some((source, size, t0 - after));
-        assert_eq!(steady_size(None, source, (1360, 1088), t0), ((1360, 1088), true), "the first frame takes its size");
+        assert_eq!(steady_size(None, source, (1360, 1088), t0, false), ((1360, 1088), true), "the first frame takes its size");
         let settled = SIZE_UP_SETTLE * 2;
-        assert_eq!(steady_size(at((1360, 1088), settled), source, (1312, 1050), t0).0, (1360, 1088), "a few percent smaller: kept");
-        assert_eq!(steady_size(at((1360, 1088), settled), source, (1440, 1152), t0).0, (1360, 1088), "a few percent bigger: kept");
-        assert_eq!(steady_size(at((1360, 1088), settled), source, (960, 768), t0), ((960, 768), true), "much smaller: shrinks");
-        assert_eq!(steady_size(at((1360, 1088), SIZE_DOWN_SETTLE / 2), source, (960, 768), t0).0, (1360, 1088), "not twice a second");
-        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0).0, (960, 768), "grows only after it settled");
-        assert_eq!(steady_size(at((960, 768), settled), source, (1360, 1088), t0).0, (1360, 1088));
-        assert_eq!(steady_size(at((1792, 1434), settled), source, (1920, 1536), t0).0, (1920, 1536), "back to full size");
-        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0).0, (1920, 1536), "full size at once");
-        assert_eq!(steady_size(Some(((640, 480), (320, 240), t0)), source, (1920, 1536), t0), ((1920, 1536), true), "a new source: at once");
+        assert_eq!(steady_size(at((1360, 1088), settled), source, (1312, 1050), t0, false).0, (1360, 1088), "a few percent smaller: kept");
+        assert_eq!(steady_size(at((1360, 1088), settled), source, (1440, 1152), t0, false).0, (1360, 1088), "a few percent bigger: kept");
+        assert_eq!(steady_size(at((1360, 1088), settled), source, (960, 768), t0, false), ((960, 768), true), "much smaller: shrinks");
+        assert_eq!(steady_size(at((1360, 1088), SIZE_DOWN_SETTLE / 2), source, (960, 768), t0, false).0, (1360, 1088), "not twice a second");
+        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, false).0, (960, 768), "grows only after it settled");
+        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, true).0, (1360, 1088), "or at once while the link model starts up");
+        assert_eq!(steady_size(at((960, 768), settled), source, (1360, 1088), t0, false).0, (1360, 1088));
+        assert_eq!(steady_size(at((1792, 1434), settled), source, (1920, 1536), t0, false).0, (1920, 1536), "back to full size");
+        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0, false).0, (1920, 1536), "full size at once");
+        assert_eq!(steady_size(Some(((640, 480), (320, 240), t0)), source, (1920, 1536), t0, false), ((1920, 1536), true), "a new source: at once");
     }
 
     #[test]
@@ -1478,7 +1570,7 @@ mod tests {
         let sessions = &codecs.video_sessions;
         let picture = Arc::new(DecodedFrame::Video(VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap()));
         let mut viewers: Vec<Member> = (0..3).map(|id| Member { id, session: None, next_seq: None, synced: false, registry: None }).collect();
-        let grants = [(4e6, 30.0), (4.4e6, 30.0), (1e6, 30.0)];
+        let grants = [(4e6, 30.0, 4e6, false), (4.4e6, 30.0, 4.4e6, false), (1e6, 30.0, 1e6, false)];
         let mut sent = vec![Vec::new(); 3];
         for sample in 0..10u64 {
             for (index, viewer) in viewers.iter_mut().enumerate() {
@@ -1491,9 +1583,9 @@ mod tests {
         }
         assert_eq!(sessions.count(), 2, "4 and 4.4 Mbit/s share one session, 1 Mbit/s has its own");
         // a viewer that started alone (its first grant was a guess) joins the older session once its grant fits there
-        let late = sessions.place(None, 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (16e6, 30.0));
+        let late = sessions.place(None, 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (16e6, 30.0, 16e6, false));
         assert_eq!(sessions.count(), 3);
-        let merged = sessions.place(Some(late), 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4.2e6, 30.0));
+        let merged = sessions.place(Some(late), 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4.2e6, 30.0, 4.2e6, false));
         assert!(Arc::ptr_eq(&merged, viewers[0].session.as_ref().unwrap()) && sessions.count() == 2);
         sessions.leave(&merged, 9);
         assert_eq!(encodes.load(Ordering::Relaxed), 20, "10 samples, encoded once per session");
@@ -1501,7 +1593,7 @@ mod tests {
         assert!(sent[0][0].1 && sent[2][0].1, "each viewer starts at a keyframe");
         assert_eq!(sent[1].iter().filter(|frame| frame.2 == 0).count(), 10, "viewer 1 sent the frames viewer 0 encoded");
         // a viewer whose grant moves away leaves for a session of its own, from a keyframe
-        let session = sessions.place(viewers[1].session.take(), 1, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (12e6, 30.0));
+        let session = sessions.place(viewers[1].session.take(), 1, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (12e6, 30.0, 12e6, false));
         assert!(!Arc::ptr_eq(&session, viewers[0].session.as_ref().unwrap()));
         assert_eq!(sessions.count(), 3);
         for viewer in viewers.iter().filter(|viewer| viewer.session.is_some()) {

@@ -41,13 +41,14 @@ export async function waitForOtherBrowserTests(): Promise<void> {
     while (true) {
         const listed = await new Deno.Command("ps", { args: ["-axo", "pid=,ppid=,command="] }).output()
         const processes = new TextDecoder().decode(listed.stdout).split("\n").map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)).filter((match) => match !== null)
-        // this run and what started it (bin/test, caffeinate) don't count
+        // this run and what started it (bin/test, caffeinate) don't count, nor a shell whose command line names a test
+        // (only a deno process runs one: a shell piping a run into grep waited on itself)
         const parents = new Map(processes.map(([, pid, ppid]) => [Number(pid), Number(ppid)]))
         const ours = new Set<number>()
         for (let pid = Deno.pid; pid > 1 && !ours.has(pid); pid = parents.get(pid) ?? 1) {
             ours.add(pid)
         }
-        const others = processes.filter(([, pid, , command]) => !ours.has(Number(pid)) && command.includes("deno") && timingSensitive.test(command))
+        const others = processes.filter(([, pid, , command]) => !ours.has(Number(pid)) && /^\S*deno\s+run\b/.test(command) && timingSensitive.test(command))
         if (others.length === 0) {
             return
         }

@@ -100,7 +100,7 @@ struct BandwidthStats {
     /// how long video waited in a queue per the latest transport feedback, and the cap its queue brake holds it to
     video_queue_delay_ms: f64,
     /// how long a packet written to a video track now would wait in the RTP pacer, and the packets it dropped for waiting
-    /// over `rtp_pacer::MAX_QUEUE_AGE` (ever)
+    /// past the latency target and their frame's time to leave (ever)
     pacer_delay_ms: f64,
     pacer_dropped_packets: u64,
     video_brake_bytes_per_sec: Option<f64>,
@@ -349,20 +349,45 @@ impl PeerState {
         // video gets the budget, but no more than its queue brake allows, nor GCC's target while GCC brakes
         let video_estimate = if has_video {
             let brake = self.video_cap(now, budget, per_sec(video_through));
-            self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget).min(brake.unwrap_or(budget))
+            let estimate = self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget).min(brake.unwrap_or(budget));
+            // in startup, at most the startup gain times what video measurably delivered, as BBR's startup paces at its
+            // gain times the delivery it measured (the budget is that times a first guess, 64 KB/s: video sent 15x a
+            // 100 kbit/s link and its queue held even the page's requests for 13 s; nor, before any delivery is measured, the
+            // gain times a guess: the guess alone)
+            match (link.starting_up, self.video_rate.delivery()) {
+                // (never under the guess: a picture that compresses to little delivers little, and held to that its frame
+                // rate fell)
+                (true, Some(delivery)) => estimate.min((delivery.bytes_per_sec * link.gain).max(allocator::INITIAL_BANDWIDTH)),
+                (true, None) => estimate.min(allocator::INITIAL_BANDWIDTH),
+                (false, _) => estimate,
+            }
         } else {
             0.0
         };
+        if video_estimate > 0.0 {
+            // while the link model probes (startup, a probe-up round) the picture is sized for its gain too, so video probes
+            // the link as data does (sized only for the bandwidth, video held its bitrate and never filled the link: stuck at
+            // 93 KB/s on a 1 MB/s link)
+            // (in startup: what video may send, which follows its own measured delivery)
+            let sized_for = if link.starting_up { video_estimate } else { link.bandwidth_bytes_per_sec * link.gain.max(1.0) };
+            self.video_rate.set_size_ratio(sized_for / video_estimate);
+            // (only while fresh feedback shows video isn't queued at the link: on a 100 kbit/s link the startup's guess, 15x
+            // the link, grew the picture and its keyframes jammed the link for seconds)
+            let unqueued = self.video_rate.delivery().is_some_and(|delivery| !allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
+            self.video_rate.set_starting_up(link.starting_up && unqueued);
+        }
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
         let allocations = allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video);
         let latency_target = self.latency_target(&subscriptions, &allocations, link.bandwidth_bytes_per_sec);
         let (window, latency_capped) = link.window(Some(latency_target));
+        self.video_rate.pacer.set_queue_limit(latency_target);
         self.gate.configure(link.bandwidth_bytes_per_sec, budget, window, latency_capped);
         let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
         self.video_rate.set_cap_bytes_per_sec(video_granted);
         self.video_rate.set_link_bytes_per_sec(budget);
+        self.video_rate.pacer.set_rate(self.video_rate.pacing_bps());
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
             // at the cap there is nothing to probe for: a probe lifting every stream's spacing let low-priority streams
             // take what the allocation gave a high-priority one (19.8 Hz granted, 16 delivered)
@@ -407,7 +432,9 @@ impl PeerState {
     /// per `VIDEO_BRAKE_SPACING`; under a quarter of the target it grows 25% a round (back in about a second), and lets
     /// go once at the budget.
     fn video_cap(&self, now: Instant, budget: f64, video_delivered: f64) -> Option<f64> {
-        let queue_ms = self.video_rate.queue_delay_ms();
+        // a queue delay with no fresh feedback behind it says nothing (no video got through lately): held at its last value,
+        // it kept braking a link with no video on it for 15 s
+        let queue_ms = self.video_rate.delivery().map_or(0.0, |_| self.video_rate.queue_delay_ms());
         let target_ms = self.config.latency_target.as_secs_f64() * 1000.0;
         let (recent_most, high_rounds) = {
             let mut delivery = self.video_delivery.lock();
@@ -949,7 +976,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         }) {
             Ok((opts, resolved, track)) => {
                 let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone()));
-                register(opts.normalized(), ChannelStats::Sub(shared.clone()));
+                register(opts.normalized(matches!(shared.channel, Channel::Video(_))), ChannelStats::Sub(shared.clone()));
                 // checked once registered, so a lease taken meanwhile either sees this subscription or is seen here
                 if let Some(reason) = state.leases.subscribe_blocker(peer_id, &label.key) {
                     return Some(reason);
@@ -1023,8 +1050,22 @@ async fn close_after_client(dc: &Arc<dyn DataChannel>) {
 }
 
 /// The options a running subscription may change (the rest decide what it is, so they need a new subscription).
-const UPDATABLE: [&str; 10] =
-    ["maxHz", "minQuality", "qualityToHzTradeoff", "bandwidthPriority", "maxBitrate", "minResolutionScale", "minResolution", "maxResolution", "playoutDelay", "encodeOptions"];
+const UPDATABLE: [&str; 14] = [
+    "maxHz",
+    "minQuality",
+    "qualityToHzTradeoff",
+    "bandwidthPriority",
+    "maxBitrate",
+    "minResolutionScale",
+    "minResolution",
+    "maxResolution",
+    "frameDropping",
+    "keyframeIntervalMs",
+    "sceneChangeKeyframes",
+    "targetQp",
+    "playoutDelay",
+    "encodeOptions",
+];
 
 /// Changes a running subscription's options in place: same channel, same track, the next frame uses them.
 fn update_subscription(state: &PeerState, request: &ControlRequest) -> Value {
@@ -1068,7 +1109,7 @@ fn update_subscription(state: &PeerState, request: &ControlRequest) -> Value {
         let mut opts = SubOpts::parse(&merged)?;
         opts.resolve_encoding(&state.codecs)?;
         shared.retune(&opts);
-        entry.opts = opts.normalized();
+        entry.opts = opts.normalized(matches!(shared.channel, Channel::Video(_)));
         entry.label.opts = merged;
         Ok(json!({"opts": entry.opts}))
     })();

@@ -104,7 +104,7 @@ registerEncoding("text_uppercase", (bytes, msg) => new TextDecoder().decode(byte
 - `Priority` mirrors zenoh / zenoh-ts: REAL_TIME=1, INTERACTIVE_HIGH=2, INTERACTIVE_LOW=3, DATA_HIGH=4, DATA=5, DATA_LOW=6, BACKGROUND=7 (lower = more important).
 - Options are checked by the gateway: an unknown name or a bad value rejects the channel (`rejected`
   event with the reason: `state` becomes `"rejected"`, `ready()` rejects).
-- `bandwidthPriority` (default 1), `minQuality` (0), `encodeOptions.quality` (1), `qualityToHzTradeoff` (0.5) drive the
+- `bandwidthPriority` (default 1), `minQuality` (0), `encodeOptions.quality` (1), `qualityToHzTradeoff` (0.5; video 1) drive the
   per-frontend allocator ("Bandwidth allocation"); stats show them with defaults filled in. `maxBitrate`,
   `minResolutionScale` and `maxResolution` override the server's video policy ("Video"); on a non-video channel they
   reject the channel.
@@ -436,7 +436,11 @@ Chrome stopped assembling a reused receiver's frames after a few quick close-and
 track to the newest subscription that names it.
 Each video frame also sends a 64-byte metadata frame on the `sub` channel (`msg.video`), after the frame is written to
 the track. Nothing new is encoded while frames written to the connection's tracks would still wait in the
-RTP pacer over 50 ms (paced at 2.5x the larger of video's grant and the link's estimate): the newest sample goes once it drains.
+RTP pacer past one frame interval (paced at 2.5x the larger of video's grant and the link's estimate, a rate the
+gateway sets each allocation round as well as on feedback): the newest sample goes once it drains. A packet is dropped
+from the pacer once it waited the connection's latency target plus its frame's time to leave at the rate when it came
+(its frame's bits so far / the rate), which asks for a keyframe; a keyframe entering the queue drops its stream's older
+packets there without asking for another (as libwebrtc's pacer does).
 Video latency: the metadata names its frame by RTP timestamp and carries the gateway's times for it; a page's
 `requestVideoFrameCallback` `rtpTimestamp` says which frame is on screen, and the connection's clock sync (heartbeat
 `offsetMs`) brings gateway times to the page's clock, so `Subscription.watchVideoLatency(element)` / `videoLatency()`
@@ -458,10 +462,22 @@ Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden pe
   `min_bits_per_pixel` (0.1) there; then it shrinks just enough, never below `minResolution` ([160, 64], aspect kept: it stops when one side reaches its value) or `minResolutionScale` (0), whichever is larger. Below
   ~0.03 bit/pixel openh264 overshoots its target even at its coarsest quantizer, while above it a full-size picture
   beat every smaller one at the same bitrate on the bench scene (after upscaling).
+- The picture is sized for the link's bandwidth (times its gain while the link model probes), not the bitrate a brake
+  or GCC cut holds video to, so a cut lowers the bitrate, not the size (each new size is a keyframe). In the link
+  model's startup, video gets at most its gain times what video measurably delivered (never under the first guess),
+  and the picture grows at once while video isn't queued at the link.
+- On encoders that report their quantizer (openh264), the picture shrinks below that while frames come out coarser
+  than `targetQp` (30) and the encoder spends its bitrate: pixels × (bitrate now / then) × 2^((targetQp − QP) / 6)
+  over the last second (H.264's bits halve each +6 QP), as libwebrtc's quality scaler does with thresholds instead.
 - Quality, for video, is the share of the most bits per frame: 0 is the smallest picture at the bit-per-pixel floor,
-  1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other encodings.
-- openh264 applies bitrate changes in place (no keyframe); a size change restarts it with one.
-Keyframes: the first frame each viewer gets, on PLI/FIR from the browser (`keyframeRequests`), and every 60 s (a periodic keyframe is 5-10x a frame: every 3 s, they were a 1 Mbit/s link's latency p95).
+  1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other encodings, but video's
+  `qualityToHzTradeoff` defaults to 1: it keeps its frame rate and shrinks the picture.
+- openh264 runs with frame skipping on (`frameDropping`: it holds its bitrate only by skipping frames; libwebrtc does
+  the same) and frames timestamped one frame interval apart; bitrate and frame rate changes apply in place (no
+  keyframe); a size change, or a change of its options, restarts it with one. Scene-change keyframes are off
+  (`sceneChangeKeyframes`).
+Keyframes: the first frame each viewer gets, on PLI/FIR from the browser (`keyframeRequests`), and every
+`keyframeIntervalMs` (60 s: a periodic keyframe is 5-10x a frame; every 3 s, they were a 1 Mbit/s link's latency p95).
 Send-side congestion control: TWCC feedback into GCC (webrtc-rs interceptors), whose target feeds the
 allocator.
 Inbound PLI/FIR reach the encoder through an interceptor that marks them for the application (the

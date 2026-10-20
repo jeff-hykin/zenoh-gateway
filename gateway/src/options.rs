@@ -55,6 +55,11 @@ pub struct SubOpts {
     pub min_resolution_scale: Option<f64>,
     pub min_resolution: Option<(u32, u32)>,
     pub max_resolution: Option<(u32, u32)>,
+    /// video channels: the encoder may skip frames to hold its bitrate, and a keyframe at least this often (ms) (see `VideoPolicy`)
+    pub frame_dropping: Option<bool>,
+    pub keyframe_interval_ms: Option<f64>,
+    pub scene_change_keyframes: Option<bool>,
+    pub target_qp: Option<f64>,
     /// video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once)
     pub playout_delay: Option<(f64, f64)>,
 }
@@ -108,6 +113,8 @@ impl SubOpts {
         check_positive("maxAge", parsed.max_age)?;
         check_positive("maxHz", parsed.max_hz)?;
         check_positive("maxBitrate", parsed.max_bitrate)?;
+        check_positive("keyframeIntervalMs", parsed.keyframe_interval_ms)?;
+        check("targetQp", parsed.target_qp, |qp| (0.0..=51.0).contains(&qp), "within [0, 51]")?;
         check("minResolutionScale", parsed.min_resolution_scale, |scale| (0.0..=1.0).contains(&scale), "within [0, 1]")?;
         if parsed.min_resolution.is_some_and(|(width, height)| width < 16 || height < 16) {
             return Err("minResolution must be at least [16, 16]".into());
@@ -159,8 +166,18 @@ impl SubOpts {
         let channel = channel.unwrap_or_else(|| Channel::default_for(encoding.output(), VideoFormat::H264));
         let output = encoding.output_on(channel, &self.encoding_options())?;
         let video = matches!(channel, Channel::Video(_));
-        if !video && (self.max_bitrate.is_some() || self.min_resolution_scale.is_some() || self.min_resolution.is_some() || self.max_resolution.is_some() || self.playout_delay.is_some()) {
-            return Err(format!("maxBitrate, minResolutionScale, minResolution, maxResolution and playoutDelay are for video channels, not {}", channel.as_str()));
+        if !video
+            && (self.max_bitrate.is_some()
+                || self.min_resolution_scale.is_some()
+                || self.min_resolution.is_some()
+                || self.max_resolution.is_some()
+                || self.frame_dropping.is_some()
+                || self.keyframe_interval_ms.is_some()
+                || self.scene_change_keyframes.is_some()
+                || self.target_qp.is_some()
+                || self.playout_delay.is_some())
+        {
+            return Err(format!("maxBitrate, minResolutionScale, minResolution, maxResolution, frameDropping, keyframeIntervalMs, sceneChangeKeyframes, targetQp and playoutDelay are for video channels, not {}", channel.as_str()));
         }
         if let Channel::Video(format) = channel {
             registry.video_encoder(&*encoding, format)?;
@@ -191,6 +208,10 @@ impl SubOpts {
             min_resolution_scale: self.min_resolution_scale.unwrap_or(server.min_resolution_scale),
             min_resolution: self.min_resolution.unwrap_or(server.min_resolution),
             max_resolution: self.max_resolution.or(server.max_resolution),
+            frame_dropping: self.frame_dropping.unwrap_or(server.frame_dropping),
+            keyframe_interval: self.keyframe_interval_ms.map_or(server.keyframe_interval, |ms| crate::secs(ms / 1000.0)),
+            scene_change_keyframes: self.scene_change_keyframes.unwrap_or(server.scene_change_keyframes),
+            target_qp: self.target_qp.unwrap_or(server.target_qp),
             ..server
         }
     }
@@ -211,8 +232,14 @@ impl SubOpts {
         self.max_hz.map(|hz| crate::secs(1.0 / hz))
     }
 
-    /// Every option with its default filled in, for stats.
-    pub fn normalized(&self) -> Value {
+    /// `qualityToHzTradeoff`, default 1 on a video channel (keep the frame rate, shrink the picture: libwebrtc's camera
+    /// default; at 0.5 a 500 kbit/s link showed a big picture at 3 frames/s), else 0.5.
+    pub fn tradeoff(&self, video: bool) -> f64 {
+        self.quality_to_hz_tradeoff.unwrap_or(if video { 1.0 } else { 0.5 })
+    }
+
+    /// Every option with its default filled in, for stats (`video`: on a video channel).
+    pub fn normalized(&self, video: bool) -> Value {
         json!({
             "delivery": self.delivery,
             "priority": self.priority,
@@ -220,7 +247,7 @@ impl SubOpts {
             "maxAge": self.max_age,
             "maxHz": self.max_hz,
             "minQuality": self.min_quality.unwrap_or(0.0),
-            "qualityToHzTradeoff": self.quality_to_hz_tradeoff.unwrap_or(0.5),
+            "qualityToHzTradeoff": self.tradeoff(video),
             "encoding": self.encoding,
             "channel": self.channel,
             "encodeOptions": self.encode_options,
@@ -229,6 +256,10 @@ impl SubOpts {
             "minResolutionScale": self.min_resolution_scale,
             "minResolution": self.min_resolution,
             "maxResolution": self.max_resolution,
+            "frameDropping": self.frame_dropping,
+            "keyframeIntervalMs": self.keyframe_interval_ms,
+            "sceneChangeKeyframes": self.scene_change_keyframes,
+            "targetQp": self.target_qp,
             "playoutDelay": self.playout_delay.unwrap_or((0.0, 0.0)),
         })
     }
@@ -345,7 +376,7 @@ mod tests {
         let compress = |opts: &str| {
             let mut parsed = sub(opts)?;
             parsed.resolve_encoding(&registry)?;
-            Ok::<_, String>(parsed.normalized()["compress"].as_str().unwrap().to_owned())
+            Ok::<_, String>(parsed.normalized(false)["compress"].as_str().unwrap().to_owned())
         };
         assert!(resolve(r#"{"encoding":"jpeg"}"#).unwrap_err().contains("unknown encoding"));
         assert!(resolve(r#"{"encoding":"camera","delivery":"reliable"}"#).unwrap_err().contains("lossy"), "video is lossy");
@@ -386,10 +417,13 @@ mod tests {
         let policy = video.video_policy(VideoPolicy::default());
         assert_eq!((policy.max_bitrate, policy.max_resolution, policy.min_resolution_scale), (Some(4e6), Some((640, 480)), 0.0));
         assert_eq!(sub(r#"{"minResolution":[320,180]}"#).unwrap().video_policy(VideoPolicy::default()).min_resolution, (320, 180));
+        let encoder = sub(r#"{"frameDropping":false,"keyframeIntervalMs":2000}"#).unwrap().video_policy(VideoPolicy::default());
+        assert_eq!((encoder.frame_dropping, encoder.keyframe_interval), (false, std::time::Duration::from_secs(2)));
+        assert!(sub(r#"{"keyframeIntervalMs":0}"#).is_err());
         assert!(sub(r#"{"minResolution":[8,64]}"#).is_err());
         let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"minQuality":0.3,"encodeOptions":{"quality":0.9},"qualityToHzTradeoff":0.7}"#).unwrap();
         assert_eq!(full.quality_range(), (0.3, 0.9));
-        assert_eq!((full.normalized()["bandwidthPriority"].as_f64(), full.normalized()["qualityToHzTradeoff"].as_f64()), (Some(2.0), Some(0.7)));
+        assert_eq!((full.normalized(false)["bandwidthPriority"].as_f64(), full.normalized(true)["qualityToHzTradeoff"].as_f64()), (Some(2.0), Some(0.7)));
         assert_eq!(full.min_interval(), Some(Duration::from_millis(50)));
         // a page can ask for any positive number: none of them may panic a Duration
         assert_eq!(sub(r#"{"maxHz":1e-300}"#).unwrap().min_interval(), Some(Duration::from_secs(86_400)));

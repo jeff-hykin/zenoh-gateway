@@ -106,7 +106,7 @@ async fn send_pcm(opus: &mut Option<Opus>, pending: &mut Vec<i16>, pcm: &AudioPc
         let packet = opus.encode(&pending[..packet_samples])?;
         pending.drain(..packet_samples);
         bytes += packet.len();
-        track.write(packet, PACKET, (0, 0), None).await?;
+        track.write(packet, PACKET, (0, 0), None, false).await?;
     }
     Ok(bytes)
 }

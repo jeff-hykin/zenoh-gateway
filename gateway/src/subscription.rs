@@ -204,13 +204,13 @@ pub struct Tuning {
 }
 
 impl Tuning {
-    fn new(opts: &SubOpts, server_policy: VideoPolicy) -> Self {
+    fn new(opts: &SubOpts, server_policy: VideoPolicy, video: bool) -> Self {
         Tuning {
             min_interval: opts.min_interval(),
             max_hz: opts.max_hz,
             bandwidth_priority: opts.bandwidth_priority.unwrap_or(1.0),
             quality_range: opts.quality_range(),
-            tradeoff: opts.quality_to_hz_tradeoff.unwrap_or(0.5),
+            tradeoff: opts.tradeoff(video),
             video_policy: opts.video_policy(server_policy),
             playout_delay: opts.playout_delay_units(),
         }
@@ -277,7 +277,7 @@ impl SubShared {
             stream_id: NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
             sample_priority: AtomicU8::new(0),
             delivery: opts.delivery(),
-            tuning: Mutex::new(Tuning::new(opts, codecs.video_policy)),
+            tuning: Mutex::new(Tuning::new(opts, codecs.video_policy, matches!(channel, Channel::Video(_)))),
             priority_override: opts.priority,
             key_prefix: codec.as_ref().and_then(|codec| codec.key_prefix()).map(|prefix| format!("{}/", prefix.trim_end_matches('/'))),
             codec,
@@ -300,7 +300,7 @@ impl SubShared {
 
     /// Applies new options to the running subscription (`updateSubscription`); the next frame uses them.
     pub fn retune(&self, opts: &SubOpts) {
-        *self.tuning.lock() = Tuning::new(opts, self.codecs.video_policy);
+        *self.tuning.lock() = Tuning::new(opts, self.codecs.video_policy, matches!(self.channel, Channel::Video(_)));
         self.data_ready.notify_one();
     }
 
