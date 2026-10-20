@@ -1,10 +1,10 @@
-#!/usr/bin/env -S deno run --allow-all
+#!/usr/bin/env -S deno run --allow-all --no-lock
 // One-command latency/throughput harness: a headless Chrome page subscribes through a zenoh-gateway (never asking for
 // a lease) the way the dimos Controller does, and this prints, per stream, what the bus carries vs what the gateway
 // received, sent and the page got, plus video end-to-end latency by stage (bench/latency_page.js has the method).
 //
-//   deno run -A bench/latency.ts --url http://127.0.0.1:5555/zenoh-gateway         # an existing gateway (e.g. Desktop's)
-//   deno run -A bench/latency.ts --gateway ./zenoh-gateway --zenoh-config z.json5    # starts its own on a free port
+//   deno run -A --no-lock bench/latency.ts --url http://127.0.0.1:5555/zenoh-gateway         # an existing gateway (e.g. Desktop's)
+//   deno run -A --no-lock bench/latency.ts --gateway ./zenoh-gateway --zenoh-config z.json5    # starts its own on a free port
 //   ... --python ~/repos/dimos/.venv/bin/python   # also probe the bus itself (rate, bytes, header-stamp lag)
 //
 // The bus probe is a second zenoh subscriber: the publisher sends it its own copy (a raw 720p camera is ~150 Mbit/s).
@@ -19,6 +19,8 @@ const { options } = await new Command()
     .option("--url <url:string>", "Gateway base URL (the client's connect() URL), e.g. http://127.0.0.1:5555/zenoh-gateway")
     .option("--gateway <path:string>", "Start this zenoh-gateway binary on a free port instead of using --url")
     .option("--zenoh-config <path:string>", "zenoh config for --gateway")
+    .option("--gateway-arg <arg:string>", "Extra argument for --gateway (repeatable), e.g. --gateway-arg=--max-bandwidth-bytes-per-sec=150000", { collect: true })
+    .option("--gateway-log <path:string>", "--gateway's stderr goes here (RUST_LOG from the environment, default warn)")
     .option("--gateway-pid <pid:number>", "Sample this process's CPU (e.g. Desktop's, for --url)")
     .option("--token <token:string>", "Bearer token for the gateway")
     .option("--seconds <seconds:number>", "How long to measure", { default: 30 })
@@ -28,6 +30,7 @@ const { options } = await new Command()
     .option("--cloud <key:string>", "PointCloud2 keys (repeatable)", { collect: true, default: ["dimos/lidar/**", "dimos/cloud/**"] })
     .option("--cloud-options <json:string>", "Extra cloud subscribe options (JSON)", { default: '{"maxHz":20,"encodeOptions":{"quality":1}}' })
     .option("--small <key:string>", "Small state keys, reliable (repeatable)", { collect: true, default: ["dimos/tf/**", "dimos/odom/**"] })
+    .option("--small-options <json:string>", "Extra options for the small keys (JSON), e.g. '{\"priority\":2}' (strict: never waits behind bulk)", { default: "{}" })
     .option("--python <path:string>", "A python with eclipse-zenoh: probe the bus itself (rate, bytes, header-stamp lag)")
     .option("--probe-config <json:string>", "zenoh config insertions for the probe (JSON object)", { default: '{"mode":"peer","listen/endpoints":["tcp/127.0.0.1:0"],"scouting/multicast/interface":"lo0"}' })
     .option("--client <url:string>", "Load the browser client from this URL instead of bundling client/zenoh_gateway.ts")
@@ -58,8 +61,12 @@ if (options.gateway) {
     const listener = Deno.listen({ port: 0, hostname: "127.0.0.1" })
     const port = (listener.addr as Deno.NetAddr).port
     listener.close()
-    const args = ["--port", String(port), ...(options.zenohConfig ? ["--zenoh-config", options.zenohConfig] : [])]
-    const child = new Deno.Command(options.gateway, { args, stdout: "null", stderr: "null", env: { RUST_LOG: "warn" } }).spawn()
+    const args = ["--port", String(port), ...(options.zenohConfig ? ["--zenoh-config", options.zenohConfig] : []), ...(options.gatewayArg ?? [])]
+    const log = options.gatewayLog ? await Deno.open(options.gatewayLog, { create: true, write: true, truncate: true }) : null
+    const child = new Deno.Command(options.gateway, { args, stdout: "null", stderr: log ? "piped" : "null", env: { RUST_LOG: Deno.env.get("RUST_LOG") ?? "warn" } }).spawn()
+    if (log) {
+        child.stderr.pipeTo(log.writable).catch(() => {})
+    }
     spawned.push(child)
     gatewayPid = child.pid
     gatewayUrl = `http://127.0.0.1:${port}`
@@ -104,7 +111,7 @@ const pageUrl = new URL(`http://127.0.0.1:${server.addr.port}/`)
 const subscriptions = [
     ...(options.video ? [{ key: options.video, kind: "video", options: { delivery: "latest", encoding: options.videoEncoding, bandwidthPriority: 1, ...JSON.parse(options.videoOptions) } }] : []),
     ...options.cloud.map((key) => ({ key, kind: "cloud", options: { delivery: "latest", encoding: "dimos_lcm_pointcloud2", ...JSON.parse(options.cloudOptions) } })),
-    ...options.small.map((key) => ({ key, kind: "small", options: { delivery: "reliable", bandwidthPriority: 4 } })),
+    ...options.small.map((key) => ({ key, kind: "small", options: { delivery: "reliable", bandwidthPriority: 4, ...JSON.parse(options.smallOptions) } })),
 ]
 pageUrl.searchParams.set("config", JSON.stringify({ gateway: gatewayUrl, client: new URL(clientUrl, pageUrl).href, token: options.token, subscriptions }))
 
@@ -259,7 +266,7 @@ if (options.video) {
     const third = Math.max(1, Math.floor(samples.length / 3))
     const early = samples.slice(0, third).flatMap((sample) => sample.video?.frames.map((frame: any) => frame.total) ?? [])
     const late = samples.slice(-third).flatMap((sample) => sample.video?.frames.map((frame: any) => frame.total) ?? [])
-    console.log(`  drift: total p50 ${fmt(percentile(early, 0.5))} ms in the first third, ${fmt(percentile(late, 0.5))} ms in the last; match error p50 ${fmt(percentile(frames.map((frame: any) => Math.abs(frame.matchErrorMs ?? NaN)), 0.5), 1)} ms, RTP jumps re-anchored ${last.video?.rtpJumps ?? 0}`)
+    console.log(`  drift: total p50 ${fmt(percentile(early, 0.5))} ms in the first third, ${fmt(percentile(late, 0.5))} ms in the last; match error p50 ${fmt(percentile(frames.map((frame: any) => Math.abs(frame.matchErrorMs ?? NaN)), 0.5), 1)} ms, ${last.video?.exact ? `exact frame matching (media time), unmatched ${last.video?.unmatched ?? 0}` : `estimated matching (RTP gaps), RTP jumps re-anchored ${last.video?.rtpJumps ?? 0}`}`)
 }
 console.log(`\nper-second samples: ${options.out ?? "(pass --out)"}`)
 

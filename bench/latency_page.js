@@ -1,7 +1,9 @@
 // The latency harness's page (bench/latency.ts serves it): connects to a zenoh-gateway without a lease, subscribes the
 // way the Controller does, and keeps per-second counters that window.sample() hands to the harness and resets.
 //
-// Video frame timing, per presented frame (requestVideoFrameCallback):
+// Video frame timing, per presented frame (requestVideoFrameCallback). Gateways from 0.5.20 put each frame's media time
+// on the track and its write time in its metadata message: a presented frame's rtpTimestamp then names its message
+// exactly (rtp - rtp of the first frame = mediaTimeMs - mediaTimeMs of that frame's message). Older gateways:
 // - the gateway sends a metadata message on the subscription's data channel right after it writes each encoded frame
 //   to the track, carrying the sample's gateway-receive time: its arrival here is the frame's write time (+ a localhost
 //   data-channel hop) and `timestamp` is when the gateway got the sample;
@@ -56,6 +58,36 @@ function attachVideo(mediaStream) {
             return
         }
         let best = null
+        if (video.meta[0].mediaTimeMs !== undefined) {
+            // exact: the metadata whose media time is this frame's (anchored once on the newest message)
+            video.rtpBase ??= { rtp: frame.rtpTimestamp, mediaTimeMs: video.meta.at(-1).mediaTimeMs }
+            let ticks = frame.rtpTimestamp - video.rtpBase.rtp
+            if (ticks < -(2 ** 31)) {
+                ticks += 2 ** 32
+            }
+            const mediaTimeMs = video.rtpBase.mediaTimeMs + ticks / 90
+            for (let i = video.meta.length - 1; i >= 0; i--) {
+                if (best === null || Math.abs(video.meta[i].mediaTimeMs - mediaTimeMs) < Math.abs(best.mediaTimeMs - mediaTimeMs)) {
+                    best = video.meta[i]
+                }
+            }
+            if (!best || Math.abs(best.mediaTimeMs - mediaTimeMs) > 2) {
+                video.unmatched = (video.unmatched ?? 0) + 1
+                return
+            }
+            best.estimateError = best.mediaTimeMs - mediaTimeMs
+            const writeAt = best.writtenPage
+            video.presented++
+            video.window.frames.push({
+                total: present - best.rxPage,
+                rxToWrite: writeAt - best.rxPage,
+                writeToReceive: receive === null ? null : receive - writeAt,
+                receiveToPresent: receive === null ? null : present - receive,
+                matchErrorMs: best.estimateError,
+                processingMs: frame.processingDuration === undefined ? null : frame.processingDuration * 1000,
+            })
+            return
+        }
         if (video.anchor === null) {
             best = video.meta.at(-1)
         } else {
@@ -108,13 +140,13 @@ async function main() {
             if (kind === "video") {
                 if (message.video) {
                     const arrival = nowEpoch()
-                    video.meta.push({ index: video.metaIndex = (video.metaIndex ?? 0) + 1, arrival, rxPage, bytes: message.video.encodedBytes, keyframe: message.video.keyframe })
+                    video.meta.push({ index: video.metaIndex = (video.metaIndex ?? 0) + 1, arrival, rxPage, bytes: message.video.encodedBytes, keyframe: message.video.keyframe, mediaTimeMs: message.video.mediaTimeMs, writtenPage: message.video.writtenMs === undefined ? arrival : message.video.writtenMs - offset })
                     if (video.meta.length > 2000) {
                         video.meta.splice(0, 1000)
                     }
                     video.window.meta++
                     video.window.metaBytes += message.video.encodedBytes
-                    video.window.rxToWrite.push(arrival - rxPage)
+                    video.window.rxToWrite.push((message.video.writtenMs === undefined ? arrival : message.video.writtenMs - offset) - rxPage)
                     video.window.size = [message.video.width, message.video.height]
                     video.window.quality = message.video.quality
                 }
@@ -167,6 +199,8 @@ window.sample = async () => {
             presentedTotal: video.presented,
             metaTotal: video.metaIndex ?? 0,
             rtpJumps: video.rtpJumps ?? 0,
+            unmatched: video.unmatched ?? 0,
+            exact: video.meta[0]?.mediaTimeMs !== undefined,
             inbound: inbound && {
                 framesReceived: inbound.framesReceived,
                 framesDecoded: inbound.framesDecoded,
