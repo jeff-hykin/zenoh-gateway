@@ -3,7 +3,7 @@
 // a lease) the way the dimos Controller does, and this prints, per stream, what the bus carries vs what the gateway
 // received, sent and the page got, plus video end-to-end latency by stage (bench/latency_page.js has the method).
 //
-//   deno run -A --no-lock bench/latency.ts --url http://127.0.0.1:5555/zenoh-gateway --referer http://127.0.0.1:5555/   # Desktop's
+//   deno run -A --no-lock bench/latency.ts --url http://127.0.0.1:5555/zenoh-gateway --referer http://127.0.0.1:5555/apps/dim-controller/   # Desktop's (an app's Referer: the root one is granted nothing)
 //   deno run -A --no-lock bench/latency.ts --gateway ./zenoh-gateway --zenoh-config z.json5    # starts its own on a free port
 //   ... --python ~/repos/dimos/.venv/bin/python   # also probe the bus itself (rate, bytes, header-stamp lag)
 //
