@@ -13,6 +13,8 @@ import { openPage, waitForOtherBrowserTests } from "./browser.ts"
 import { shapedLink } from "./shaped_link.ts"
 
 const blackoutSeconds = Number(Deno.env.get("BLACKOUT_S") ?? 40)
+// a restart: as long as Desktop's takes
+const restartSeconds = Number(Deno.env.get("RESTART_S") ?? 5)
 const darkAt = 8
 await waitForOtherBrowserTests()
 const root = new URL("../..", import.meta.url).pathname
@@ -32,22 +34,22 @@ const targetDir = Deno.env.get("CARGO_TARGET_DIR") ?? `${root}gateway/target`
 const serverLog = Deno.env.get("SERVER_LOG")
 
 /** Seconds from the page coming back to the first frame decoded after it, or null if none came in 30 s. */
-async function resumeSeconds(freshAfterMs: number, heartbeat: boolean, freeze: boolean): Promise<number | null> {
-    const { seconds, log } = await resume(freshAfterMs, heartbeat, freeze)
+async function resumeSeconds(freshAfterMs: number, heartbeat: boolean, freeze: boolean, restart = false): Promise<number | null> {
+    const { seconds, log } = await resume(freshAfterMs, heartbeat, freeze, restart)
     if (seconds === null || Deno.env.get("VERBOSE") === "1") {
         console.log(`  freshAfterMs ${freshAfterMs} heartbeat ${heartbeat}:\n    ${log.join("\n    ")}`)
     }
     return seconds
 }
 
-/** `freeze`: the page is hidden and frozen (Chrome's Page Lifecycle freeze) on a healthy link, instead of the link going dark */
-async function resume(freshAfterMs: number, heartbeat: boolean, freeze: boolean): Promise<{ seconds: number | null; log: string[] }> {
-    const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], env: { CAMS: "1", CAM_SIZE: "1280x720", CAM_NOISE: "4", CLOUD_BYTES: "0", MAP_BYTES: "0", RUST_LOG: Deno.env.get("RUST_LOG") ?? "warn" }, stdout: "piped", stderr: serverLog ? "piped" : "null" }).spawn()
+/** A degrade_server on `port` (0: any): the process and its URL. */
+async function startServer(port: number) {
+    const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], env: { CAMS: "1", CAM_SIZE: "1280x720", CAM_NOISE: "4", CLOUD_BYTES: "0", MAP_BYTES: "0", PORT: String(port), RUST_LOG: Deno.env.get("RUST_LOG") ?? "warn" }, stdout: "piped", stderr: serverLog ? "piped" : "null" }).spawn()
     if (serverLog) {
         const file = await Deno.open(serverLog, { write: true, create: true, append: true })
         server.stderr.pipeTo(file.writable)
     }
-    const serverUrl = await (async () => {
+    const url = await (async () => {
         for await (const chunk of server.stdout.pipeThrough(new TextDecoderStream())) {
             const match = chunk.match(/listening on (\S+)/)
             if (match) {
@@ -56,7 +58,14 @@ async function resume(freshAfterMs: number, heartbeat: boolean, freeze: boolean)
         }
         throw new Error("degrade_server exited")
     })()
-    const schedule: [number, number][] = freeze ? [[0, 1_000_000]] : [[0, 1_000_000], [darkAt, 0], [darkAt + blackoutSeconds, 1_000_000]]
+    return { server, url }
+}
+
+/** `freeze`: the page is hidden and frozen (Chrome's Page Lifecycle freeze) on a healthy link, instead of the link going
+ *  dark; `restart`: the gateway restarts (killed, a new one on the same port `restartSeconds` later) while the page stays */
+async function resume(freshAfterMs: number, heartbeat: boolean, freeze: boolean, restart = false): Promise<{ seconds: number | null; log: string[] }> {
+    let { server, url: serverUrl } = await startServer(0)
+    const schedule: [number, number][] = freeze || restart ? [[0, 1_000_000]] : [[0, 1_000_000], [darkAt, 0], [darkAt + blackoutSeconds, 1_000_000]]
     const link = shapedLink(serverUrl, { schedule, delayMs: 20, jitterMs: 0, loss: 0 })
     const page = await openPage(`${link.url}/blank.html`, (darkAt + blackoutSeconds + 60) * 1000)
     try {
@@ -112,7 +121,7 @@ async function resume(freshAfterMs: number, heartbeat: boolean, freeze: boolean)
             // Page Lifecycle freeze, so shown frames can't tell)
             const decoded = async () => {
                 let frames = 0
-                for (const report of (await (client._peer as RTCPeerConnection | null)?.getStats().catch(() => null))?.values() ?? []) {
+                for (const report of ((await (client._peer as RTCPeerConnection | null)?.getStats().catch(() => null)) as any)?.values() ?? []) {
                     if (report.type === "inbound-rtp" && report.kind === "video") {
                         frames += Number(report.framesDecoded ?? 0)
                     }
@@ -148,6 +157,17 @@ async function resume(freshAfterMs: number, heartbeat: boolean, freeze: boolean)
             await new Promise((resolve) => setTimeout(resolve, Math.max(0, link.startedAt() + seconds * 1000 - performance.now())))
         }
         await at(darkAt)
+        if (restart) {
+            const port = Number(new URL(serverUrl).port)
+            server.kill("SIGKILL")
+            await server.status
+            await new Promise((resolve) => setTimeout(resolve, restartSeconds * 1000))
+            ;({ server } = await startServer(port))
+            await page.evaluate(async () => {
+                ;(window as any).back = performance.now()
+            }, [])
+            return await watching
+        }
         await page.evaluate(async () => (window as any).setVisibility("hidden"), [])
         if (freeze) {
             await page.freeze!(true)
@@ -173,12 +193,13 @@ const scenarios = [
     { name: "link dark, heartbeat 5 Hz", heartbeat: true, freeze: false },
     // (Chrome only: a backgrounded tab's freeze)
     ...(Deno.env.get("BROWSER") === "firefox" ? [] : [{ name: "page frozen, heartbeat 5 Hz", heartbeat: true, freeze: true }]),
-]
-for (const { name, heartbeat, freeze } of scenarios) {
-    const fresh = await resumeSeconds(2000, heartbeat, freeze)
+    { name: `gateway restarted (${restartSeconds} s down), page visible`, heartbeat: true, freeze: false, restart: true },
+].filter((scenario) => !Deno.env.get("ONLY") || scenario.name.includes(Deno.env.get("ONLY")!))
+for (const { name, heartbeat, freeze, restart } of scenarios) {
+    const fresh = await resumeSeconds(2000, heartbeat, freeze, restart)
     // (as before freshAfterMs: wait for the browser to call the old connection failed, or catch up on it)
-    const off = await resumeSeconds(1e9, heartbeat, freeze)
-    console.log(`${name}: after ${blackoutSeconds} s away, frames again: freshAfterMs 2000 ${show(fresh)}, off ${show(off)}`)
+    const off = await resumeSeconds(1e9, heartbeat, freeze, restart)
+    console.log(`${name}: ${restart ? "after the restart" : `after ${blackoutSeconds} s away`}, frames again: freshAfterMs 2000 ${show(fresh)}, off ${show(off)}`)
     // back within freshAfterMs + 2 s
     failed ||= fresh === null || fresh > 4
 }

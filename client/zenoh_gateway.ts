@@ -1394,6 +1394,33 @@ export class ZenohGateway {
         }
     }
 
+    /** the gateway process this connection talks to (`/zenoh-gateway/health`'s bootId) */
+    #bootId: string | null = null
+
+    async #fetchBootId(): Promise<string | null> {
+        try {
+            const response = await fetch(`${this.url}/zenoh-gateway/health`, { signal: AbortSignal.timeout(pingTimeoutMs) })
+            return response.ok ? String((await response.json()).bootId ?? "") || null : null
+        } catch {
+            return null
+        }
+    }
+
+    /** A ping failed: if the gateway answers as a new process, it restarted (a killed one says nothing), so this
+     *  connection is gone: start a fresh one now instead of waiting 6-25 s for ICE to give up. A slow link keeps the
+     *  same process and the connection. */
+    async #checkRestarted(): Promise<void> {
+        const generation = this.#generation
+        const known = this.#bootId
+        if (known === null || !this.options.reconnect || this.#closed) {
+            return
+        }
+        const now = await this.#fetchBootId()
+        if (now !== null && now !== known && generation === this.#generation && !this.#closed) {
+            this.#startFresh()
+        }
+    }
+
     /** Drops the connection and opens a new one now: its subscriptions and declarations come back fresh. A reconnect
      *  waiting out its retry delay tries again now. */
     #startFresh(): void {
@@ -1584,6 +1611,12 @@ export class ZenohGateway {
         }
         this.#setState("connected")
         this.#markConnected()
+        // (an older gateway has no bootId: restarts are then noticed as before)
+        this.#fetchBootId().then((bootId) => {
+            if (generation === this.#generation) {
+                this.#bootId = bootId
+            }
+        })
     }
 
     /** A 401 is final: no reconnecting with a token the gateway refuses (or revoked). */
@@ -1940,6 +1973,7 @@ export class ZenohGateway {
             if (this.state === "connected") {
                 this.#setState("degraded")
             }
+            this.#checkRestarted()
             return
         }
         if (performance.now() < this.#statsDueAt) {

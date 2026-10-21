@@ -523,8 +523,18 @@ impl RunningServer {
     }
 }
 
+/// This process's id: a client whose pings stop compares it with the one it connected to, and a new one (the gateway
+/// restarted, a killed one says nothing) reconnects at once instead of waiting for ICE to give up (6-25 s).
+fn boot_id() -> &'static str {
+    static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT_ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
+        format!("{:x}-{:x}", std::process::id(), nanos)
+    })
+}
+
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"service": "zenoh-gateway", "version": env!("CARGO_PKG_VERSION")}))
+    Json(serde_json::json!({"service": "zenoh-gateway", "version": env!("CARGO_PKG_VERSION"), "bootId": boot_id()}))
 }
 
 async fn ice_servers(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> Response {

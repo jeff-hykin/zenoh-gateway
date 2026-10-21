@@ -1,5 +1,6 @@
 //! `cargo run --release --example degrade_server -- <serve dir>`: an isolated zenoh-gateway server on 127.0.0.1 serving
-//! `<serve dir>` with a Controller-like load that can be degraded, for `client/test/degrade.ts`. Prints `listening on <url>`.
+//! `<serve dir>` with a Controller-like load that can be degraded, for `client/test/degrade.ts`. Prints `listening on <url>`
+//! (on PORT, else any free port).
 //! - robot/cam0, robot/cam1 (CAMS of them): `test-cam`, a CAM_SIZE (640x480) moving picture at CAM_HZ (30) with per-pixel
 //!   noise of CAM_NOISE levels (32: hard to compress; a real camera's is a few), for video channels;
 //! - robot/cloud0, robot/cloud1: `test-cloud`, CLOUD_BYTES (200 KB) of 12-byte points at 10 Hz, quality q keeping 1 point
@@ -110,7 +111,7 @@ async fn main() -> Result<()> {
     // samples carry a zenoh timestamp, as a timestamping publisher's do (video latency is measured from it)
     config.insert_json5("timestamping/enabled", "true").map_err(anyhow::Error::msg)?;
     let session = zenoh::open(config).await.map_err(anyhow::Error::msg)?;
-    let running = Server::builder().session(session.clone()).serve_dir(serve_dir).encoding(cam()?).encoding(Cloud).build().await?.bind("127.0.0.1:0").await?;
+    let running = Server::builder().session(session.clone()).serve_dir(serve_dir).encoding(cam()?).encoding(Cloud).build().await?.bind(format!("127.0.0.1:{}", std::env::var("PORT").unwrap_or_else(|_| "0".into()))).await?;
     let env = |name: &str, default: f64| std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default);
     let (cloud, map, cam_hz) = (env("CLOUD_BYTES", 200_000.0) as usize, env("MAP_BYTES", 400_000.0) as usize, env("CAM_HZ", 30.0));
     let (cams, map_hz) = (env("CAMS", 2.0) as usize, env("MAP_HZ", 1.0));
