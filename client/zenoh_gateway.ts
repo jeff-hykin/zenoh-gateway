@@ -303,6 +303,8 @@ const backedUpBytes = 64 * 1024
 const resumeBytes = 16 * 1024
 const gatherTimeoutMs = 3000
 const openTimeoutMs = 10000
+/** a video or audio subscription whose renegotiation failed on the connection still in use tries again after this (doubling while it keeps failing) */
+const renegotiationRetryMs = 1000
 const pingTimeoutMs = 3000
 const reconnectDelayMs = 1000
 // consumption acks let the gateway stop sending while this page's JS is behind; at most one per channel per ackDelayMs
@@ -685,6 +687,8 @@ export class Subscription extends Endpoint {
     readonly channelName: Channel
     #warnedNoDecoder = false
     #transceiver: RTCRtpTransceiver | null = null
+    /** renegotiations failed in a row: each retry waits twice as long, up to 30 s */
+    #renegotiationFailures = 0
     /** drops before the current channel (each new channel restarts seq at 0) */
     #droppedBefore = 0
     #firstSeq = -1
@@ -853,10 +857,23 @@ export class Subscription extends Endpoint {
                 this.owner._releaseTransceiver(peer, transceiver)
                 return
             }
+            this.#renegotiationFailures = 0
             this.#transceiver = transceiver
             this.mediaStream = new MediaStream([transceiver.receiver.track])
             this.#openChannel(peer, acceptance, transceiver.mid)
-        }, (error: Error) => acceptance.reject(new Error(`zenoh-gateway: ${channelName} renegotiation for ${this.key} failed: ${error.message}`)))
+        }, (error: Error) => {
+            acceptance.reject(new Error(`zenoh-gateway: ${channelName} renegotiation for ${this.key} failed: ${error.message}`))
+            // still the connection in use: try again (nothing else would; a replaced connection attaches every endpoint itself)
+            if (!this.closed && this.rejectionReason === null && acceptance === this.acceptance && peer === this.owner._peer && peer.connectionState !== "closed") {
+                const delay = Math.min(renegotiationRetryMs * 2 ** this.#renegotiationFailures++, 30_000)
+                console.warn(`zenoh-gateway: ${channelName} renegotiation for ${this.key} failed (${error.message}); retrying in ${delay} ms`)
+                setTimeout(() => {
+                    if (!this.closed && this.rejectionReason === null && acceptance === this.acceptance && peer === this.owner._peer && peer.connectionState !== "closed") {
+                        this.attach(peer)
+                    }
+                }, delay)
+            }
+        })
     }
 
     #openChannel(peer: RTCPeerConnection, acceptance: Acceptance, mid: string | null): void {
@@ -1482,12 +1499,21 @@ export class ZenohGateway {
             if (kind === "video") {
                 offerCaptureTime(transceiver)
             }
-            await peer.setLocalDescription(await peer.createOffer())
-            const offer = peer.localDescription
-            const response = await this._request({ op: "renegotiate", channel, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
-            await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
-            if (response.mid !== transceiver.mid) {
-                throw new Error(`gateway bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
+            try {
+                await peer.setLocalDescription(await peer.createOffer())
+                const offer = peer.localDescription
+                const response = await this._request({ op: "renegotiate", channel, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
+                await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
+                if (response.mid !== transceiver.mid) {
+                    throw new Error(`gateway bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
+                }
+            } catch (error) {
+                // (a failed attempt's offer is rolled back and its m-line goes, so a retry doesn't leave one behind each time)
+                if (peer.signalingState === "have-local-offer") {
+                    await peer.setLocalDescription({ type: "rollback" }).catch(() => {})
+                }
+                this._releaseTransceiver(peer, transceiver)
+                throw error
             }
             return transceiver
         }
