@@ -57,6 +57,8 @@ const VIDEO_DELIVERY_WINDOW: Duration = Duration::from_secs(2);
 pub struct AllocationConfig {
     /// cap on each frontend's budget, bytes/s
     pub max_bandwidth: Option<f64>,
+    /// each frontend's link bandwidth as the host knows it, bytes/s, in place of the estimate (a grant's own wins)
+    pub link_bandwidth: Option<f64>,
     /// what data may take to reach the page while the path is faster than that (`allocator::LinkModel::window`)
     pub latency_target: Duration,
     /// how long anything unanswered (an unacked frame, an unfinished query, a quiet key) is waited on
@@ -240,7 +242,14 @@ impl PeerState {
         token: Option<String>,
         grant: Grant,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<(Instant, Value)>) {
-        let config = gateway.allocation;
+        let granted_bandwidth = grant.link_bandwidth_bytes_per_sec.filter(|known| {
+            let valid = known.is_finite() && *known > 0.0;
+            if !valid {
+                log::warn!("peer {peer_id}: ignoring the grant's link bandwidth {known} (not a positive number of bytes/s)");
+            }
+            valid
+        });
+        let config = AllocationConfig { link_bandwidth: granted_bandwidth.or(gateway.allocation.link_bandwidth), ..gateway.allocation };
         let (api_events, api_events_receiver) = tokio::sync::mpsc::unbounded_channel();
         LIVE_PEER_STATES.fetch_add(1, Ordering::Relaxed);
         let state = PeerState {
@@ -343,13 +352,18 @@ impl PeerState {
             log::debug!(target: "zenoh_gateway::link", "peer {}: round {round:?} video {:?} link-limited {video_link_limited} delivered {:.0}", self.peer_id, delivery.map(|delivery| delivery.bytes_per_sec), per_sec(delivered));
             link.update(now, interval_secs, round, delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
             log::debug!(target: "zenoh_gateway::link", "peer {}: bandwidth {:.0} gain {:.2} starting up {} probing rtt {} window {:?}", self.peer_id, link.bandwidth_bytes_per_sec, link.gain, link.starting_up, link.probing_rtt(), link.window(Some(self.config.latency_target)));
-            link.clone()
+            match self.config.link_bandwidth {
+                Some(known) => link.with_known_bandwidth(known),
+                None => link.clone(),
+            }
         };
         let (budget, at_cap) = self.budget(&link);
         // video gets the budget, but no more than its queue brake allows, nor GCC's target while GCC brakes
         let video_estimate = if has_video {
             let brake = self.video_cap(now, budget, per_sec(video_through));
             let estimate = self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget).min(brake.unwrap_or(budget));
+            // (a known link: what the host said, in place of GCC's estimate and the brake's)
+            let estimate = if self.config.link_bandwidth.is_some() { budget } else { estimate };
             // in startup, at most the startup gain times what video measurably delivered, as BBR's startup paces at its
             // gain times the delivery it measured (the budget is that times a first guess, 64 KB/s: video sent 15x a
             // 100 kbit/s link and its queue held even the page's requests for 13 s; nor, before any delivery is measured, the
@@ -476,6 +490,10 @@ impl PeerState {
     /// The frontend's budget, and whether it is the cap (`max_bandwidth`) rather than the link.
     fn budget(&self, link: &LinkModel) -> (f64, bool) {
         let (rate, _) = link.pacing(None);
+        if self.config.link_bandwidth.is_some() {
+            // (a known link has nothing to probe for)
+            return (self.config.max_bandwidth.map_or(rate, |cap| cap.min(rate)), true);
+        }
         match self.config.max_bandwidth {
             // a probe could reach the cap: the link carries about the cap, so probing past it (and draining what that
             // queued) only dipped the budget under the cap (a 480 KB/s cap budgeted 333 KB/s in the drain round)

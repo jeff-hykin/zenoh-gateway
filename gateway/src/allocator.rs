@@ -435,6 +435,11 @@ impl LinkModel {
         self.probing_rtt
     }
 
+    /// This model with the host's known `bandwidth` (bytes/s) in place of its estimate: no startup, no probes.
+    pub fn with_known_bandwidth(&self, bandwidth: f64) -> Self {
+        Self { bandwidth_bytes_per_sec: bandwidth, gain: 1.0, starting_up: false, probing_rtt: false, ..self.clone() }
+    }
+
     /// The pacing rate (bytes/s) and the most that may be in flight (bytes), see `window`.
     pub fn pacing(&self, latency_target: Option<std::time::Duration>) -> (f64, usize) {
         (self.bandwidth_bytes_per_sec * self.gain, self.window(latency_target).0)
@@ -591,6 +596,13 @@ mod tests {
         let held = model.bandwidth_bytes_per_sec * 0.020;
         let window = model.pacing(None).1 as f64;
         assert!(window >= held - 1.0 && window <= 1.25 * held + 1.0, "bandwidth x round trip, plus a probe's headroom: {window} vs {held}");
+    }
+
+    #[test]
+    fn a_known_bandwidth_skips_startup_and_probes() {
+        let model = LinkModel::default().with_known_bandwidth(50_000_000.0);
+        assert!(!model.starting_up && !model.probing_bandwidth() && !model.probing_rtt());
+        assert_eq!(model.pacing(None).0, 50_000_000.0);
     }
 
     #[test]
