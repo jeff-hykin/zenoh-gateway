@@ -62,6 +62,9 @@ pub struct SubOpts {
     pub target_qp: Option<f64>,
     /// video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once)
     pub playout_delay: Option<(f64, f64)>,
+    /// each message's own header (stamp, frame id, seq; see `MessageEncoding::header`) sent with it: true = on every
+    /// channel, false = never; unset (pages before 0.5.32) = only on video, as 0.5.31 sent it
+    pub metadata: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -261,6 +264,7 @@ impl SubOpts {
             "sceneChangeKeyframes": self.scene_change_keyframes,
             "targetQp": self.target_qp,
             "playoutDelay": self.playout_delay.unwrap_or((0.0, 0.0)),
+            "metadata": self.metadata,
         })
     }
 }

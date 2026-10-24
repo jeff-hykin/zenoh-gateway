@@ -218,7 +218,16 @@ impl EncodingRegistry {
     }
 
     pub fn decode_shared(&self, codec: &dyn MessageEncoding, sample: &EncodingSample<'_>, hash: u64, channel: Channel) -> (Result<Arc<DecodedFrame>, String>, bool) {
-        self.decoded.get_or_compute((codec.name().to_owned(), channel.kind(), hash), self.encode_timeout, || codec.decode(sample, channel).map_err(|error| format!("{error:#}")))
+        self.decoded.get_or_compute((codec.name().to_owned(), channel.kind(), hash), self.encode_timeout, || {
+            // a picture goes with its sample's header even when the decode left it out
+            match codec.decode(sample, channel).map_err(|error| format!("{error:#}"))? {
+                DecodedFrame::Video(image) if image.message_header().is_none() => Ok(DecodedFrame::Video(match codec.header(sample) {
+                    Some(header) => image.with_message_header(header),
+                    None => image,
+                })),
+                decoded => Ok(decoded),
+            }
+        })
     }
 
     /// Blocking: a data encoding's bytes for `sample` with `options`, compressed as asked (or another frontend's).

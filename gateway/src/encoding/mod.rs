@@ -189,6 +189,33 @@ pub enum PixelFormat {
     I420,
 }
 
+/// A message's own header (ROS `std_msgs/Header`, dimos LCM's): when it was taken, exactly, and the TF frame it is in.
+/// [`MessageEncoding::header`] reads it so the gateway can send it with every message ([`frame::encode_header`](crate::frame::encode_header)).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MessageHeader {
+    /// whole seconds since the epoch
+    pub sec: i32,
+    /// nanoseconds past `sec`
+    pub nanosec: u32,
+    /// the TF frame it was taken in
+    pub frame_id: String,
+    /// its sequence number, where the message type has one (dimos LCM does, ROS 2 doesn't)
+    pub seq: Option<u32>,
+}
+
+impl MessageHeader {
+    /// The stamp in seconds (to about a microsecond: an `f64` can't hold every nanosecond since 1970).
+    pub fn stamp(&self) -> f64 {
+        self.sec as f64 + self.nanosec as f64 * 1e-9
+    }
+
+    /// From a stamp in seconds, which is all some sources have.
+    pub fn from_stamp(stamp: f64, frame_id: impl Into<String>) -> Self {
+        let sec = stamp.floor();
+        MessageHeader { sec: sec as i32, nanosec: (((stamp - sec) * 1e9).round() as u32).min(999_999_999), frame_id: frame_id.into(), seq: None }
+    }
+}
+
 /// An uncompressed picture that a video encoding hands to the gateway's video encoders.
 #[derive(Clone, PartialEq, Eq)]
 pub struct VideoImage {
@@ -196,8 +223,7 @@ pub struct VideoImage {
     height: u32,
     format: PixelFormat,
     data: Vec<u8>,
-    /// (its message header's stamp as f64 bits, to keep `Eq`; frame id)
-    header: Option<(u64, String)>,
+    header: Option<MessageHeader>,
 }
 
 impl fmt::Debug for VideoImage {
@@ -244,14 +270,25 @@ impl VideoImage {
 
     /// With its message's header (`stamp` in seconds, `frame_id` its TF frame): each picture's goes to the page with its
     /// per-frame metadata (`msg.video.stamp`, `msg.video.frameId`).
-    pub fn with_header(mut self, stamp: f64, frame_id: impl Into<String>) -> Self {
-        self.header = Some((stamp.to_bits(), frame_id.into()));
+    pub fn with_header(self, stamp: f64, frame_id: impl Into<String>) -> Self {
+        self.with_message_header(MessageHeader::from_stamp(stamp, frame_id))
+    }
+
+    /// With its message's whole header (exact stamp, frame id, seq). The gateway also fills it from
+    /// [`MessageEncoding::header`] when the encoding leaves it out.
+    pub fn with_message_header(mut self, header: MessageHeader) -> Self {
+        self.header = Some(header);
         self
     }
 
-    /// The message header's stamp (seconds) and frame id, if the encoding gave one ([`with_header`](Self::with_header)).
+    /// The message header's stamp (seconds) and frame id, if there is one ([`with_header`](Self::with_header)).
     pub fn header(&self) -> Option<(f64, &str)> {
-        self.header.as_ref().map(|(stamp, frame_id)| (f64::from_bits(*stamp), frame_id.as_str()))
+        self.header.as_ref().map(|header| (header.stamp(), header.frame_id.as_str()))
+    }
+
+    /// The whole message header, if there is one.
+    pub fn message_header(&self) -> Option<&MessageHeader> {
+        self.header.as_ref()
     }
 
     /// Box-filtered to `width × height` as I420 (BT.601 limited range), e.g. to a [`VideoTarget`]'s size; keeps the header.
@@ -421,6 +458,14 @@ pub trait MessageEncoding: Send + Sync {
     /// whatever [`encode`](Self::encode) takes. An error skips the message and is counted in the subscription's
     /// `encodingErrors` stats.
     fn decode(&self, sample: &EncodingSample<'_>, channel: Channel) -> Result<DecodedFrame>;
+
+    /// The sample's own header (stamp, frame id, seq), read cheaply (it is called for every message sent). The gateway
+    /// sends it with the message on every channel unless the subscription says `metadata: false`, since what an
+    /// encoding keeps of a message must never lose where and when it was taken. Default `None`: the type has none.
+    fn header(&self, sample: &EncodingSample<'_>) -> Option<MessageHeader> {
+        let _ = sample;
+        None
+    }
 
     /// Data channel: the bytes to send for `frame` with `options` (`options.quality`: 0 = smallest, 1 = best, picked
     /// by the bandwidth allocator within the subscription's `minQuality..encodeOptions.quality`). Results are shared

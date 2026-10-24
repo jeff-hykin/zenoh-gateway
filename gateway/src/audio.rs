@@ -68,6 +68,8 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             shared.wait_for_data(wake_at).await;
             continue;
         };
+        // the per-sample frame carries the sample's header (its stamp) when asked
+        let header = shared.sends_header().then(|| subscription::sample_header(&*codec, &key, &item)).flatten();
         let decoding = start_decode(&shared, &codec, key, item);
         let crate::media::Decoding { key, item, task } = decoding;
         let decoded = match crate::media::finish_decode(task, shared.codecs.encode_timeout).await {
@@ -85,7 +87,11 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             Ok(bytes) => shared.record_media_bytes(bytes),
             Err(error) => shared.record_encoding_error(&format!("{error:#}")),
         }
-        if subscription::send_small_frame(&dc, &key, item.timestamp_ms, item.seq, frame_id, &[]).await.is_err() && shared.is_closed() {
+        let (flags, message) = match &header {
+            Some(header) => (crate::frame::HEADER, crate::frame::with_header(header, &[])),
+            None => (0, Vec::new()),
+        };
+        if subscription::send_small_frame(&dc, &key, item.timestamp_ms, item.seq, frame_id, flags, &message).await.is_err() && shared.is_closed() {
             break;
         }
         frame_id = frame_id.wrapping_add(1);

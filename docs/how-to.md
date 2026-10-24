@@ -80,11 +80,13 @@ const camera = app.zenoh.subscribe("dimos/color_image/*", { encoding: "dimos_lcm
 <video autoplay muted playsinline></video>
 ```
 
-## How do I know which TF frame and time a video picture is from?
+## How do I know which TF frame and time a message is from?
 
-An encoding that sets the picture's header (`VideoImage::with_header`, as zenoh-dimos-codecs' image codecs do) sends it
-with each frame's metadata: `msg.video.frameId` and `msg.video.stamp` (seconds). For the picture on screen rather than
-the latest one, look it up by the frame the element shows:
+An encoding that reads its message's header (`MessageEncoding::header`, as every zenoh-dimos-codecs codec does) sends
+it with whatever it makes of the message, on every channel: `msg.header` is `{ stamp, sec, nanosec, frameId, seq? }`
+(`stamp` in seconds; `sec` + `nanosec` exact). Pass `metadata: false` to `subscribe` to go without it. On video it is
+also `msg.video.frameId` / `msg.video.stamp`; for the picture on screen rather than the latest one, look it up by the
+frame the element shows:
 
 ```js
 const onShown = (_now, frame) => {

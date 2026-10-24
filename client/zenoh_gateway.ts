@@ -96,6 +96,23 @@ export interface VideoFrameInfo {
      * encoding gave one (e.g. zenoh-dimos-codecs' image codecs); absent from gateways before 0.5.31 */
     stamp?: number
     frameId?: string
+    /** the same header whole (exact `sec`/`nanosec`, `seq`), as `msg.header` carries it */
+    header?: MessageHeader
+    /** the picture's zenoh sample encoding and attachment, when they say something (0.5.32+; also `msg.encoding` / `msg.attachment`) */
+    encoding?: string
+    attachment?: Uint8Array
+}
+
+/** A message's own header (ROS `std_msgs/Header`, dimos LCM's), which the gateway sends with what an encoding made of it. */
+export interface MessageHeader {
+    /** seconds since the epoch (to about a microsecond; `sec` + `nanosec` are exact) */
+    stamp: number
+    sec: number
+    nanosec: number
+    /** the TF frame it was taken in */
+    frameId: string
+    /** its sequence number, where the type has one (dimos LCM does, ROS 2 doesn't) */
+    seq?: number
 }
 
 /** Percentiles of one latency, ms. */
@@ -134,9 +151,9 @@ export interface Message {
     kind: "put" | "delete"
     /** the payload (decompressed): raw sample bytes, or the encoding's output */
     bytes: Uint8Array
-    /** the sample's encoding, when not the default (raw messages only) */
+    /** the sample's zenoh encoding, when not the default (raw messages; encoded ones with `header`, 0.5.32+) */
     encoding?: string
-    /** the sample's attachment (raw messages only) */
+    /** the sample's zenoh attachment (raw messages; encoded ones with `header`, 0.5.32+) */
     attachment?: Uint8Array
     timestamp: number
     seq: number
@@ -144,6 +161,9 @@ export interface Message {
     decoded?: unknown
     video?: VideoFrameInfo
     mediaStream?: MediaStream
+    /** the sample's own header (stamp, frameId, seq) on encoded messages of any channel, unless the subscription says
+     * `metadata: false` (raw messages are the whole sample, header and all); absent from gateways before 0.5.32 but on video */
+    header?: MessageHeader
 }
 
 export interface SubscribeOptions {
@@ -181,6 +201,9 @@ export interface SubscribeOptions {
     targetQp?: number
     /** video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once) */
     playoutDelay?: [number, number]
+    /** each encoded message comes with its sample's own header (`msg.header`: stamp, frameId, seq), default true; false
+     * saves its few bytes a message when nothing reads where or when it was taken. Gateways before 0.5.32 ignore it. */
+    metadata?: boolean
 }
 
 /** What `Subscription.update` may change on a running subscription; `null` puts an option back to its default. */
@@ -395,6 +418,8 @@ const fieldsFlag = 2
 const deleteFlag = 4
 /** frame flag: the message starts with the sample's encoding and attachment (see `splitMeta`) */
 const metaFlag = 8
+/** frame flag: the message (before decompression) starts with `u16 len | len bytes of its sample's header` (`decodeHeader`) */
+const headerFlag = 16
 
 /** u16 encodingLen | encoding | u32 attachmentLen | attachment | payload */
 function splitMeta(message: Uint8Array): { encoding: string, attachment?: Uint8Array, payload: Uint8Array } {
@@ -492,9 +517,50 @@ export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
         ...(bytes.byteLength >= 44 ? { mediaTimeMs: view.getFloat64(28, true), writtenMs: view.getFloat64(36, true) } : {}),
         ...(bytes.byteLength >= 64 && (bytes[1] & 2) !== 0 ? { rtpTimestamp: view.getUint32(44, true) } : {}),
         ...(bytes.byteLength >= 64 ? { receivedMs: view.getFloat64(48, true), encodedMs: view.getFloat64(56, true) } : {}),
-        ...(bytes.byteLength >= 74 && (bytes[1] & 4) !== 0 && 74 + view.getUint16(72, true) <= bytes.byteLength
-            ? { stamp: view.getFloat64(64, true), frameId: keyDecoder.decode(bytes.subarray(74, 74 + view.getUint16(72, true))) }
-            : {}),
+        ...headerFields((bytes[1] & 4) !== 0 ? decodeHeader(bytes.subarray(64)) : undefined),
+    }
+}
+
+function headerFields(decoded: DecodedHeader | undefined): Partial<VideoFrameInfo> {
+    if (decoded === undefined) {
+        return {}
+    }
+    const { header, encoding, attachment } = decoded
+    return { stamp: header.stamp, frameId: header.frameId, header, ...(encoding === undefined ? {} : { encoding }), ...(attachment === undefined ? {} : { attachment }) }
+}
+
+/** A message's header with its zenoh sample's encoding and attachment, when they came. */
+export interface DecodedHeader {
+    header: MessageHeader
+    encoding?: string
+    attachment?: Uint8Array
+}
+
+/** A message header as the gateway sends it: `f64 stamp | u16 frameIdLen | frameId | i32 sec | u32 nanosec | u8 flags |
+ * u32 seq`, flags bit0: seq is set, bit1: `u16 encodingLen | encoding | u32 attachmentLen | attachment` (the zenoh
+ * sample's) follow; 0.5.31 sent only up to frameId. Undefined if it is cut short. */
+export function decodeHeader(bytes: Uint8Array): DecodedHeader | undefined {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    if (bytes.byteLength < 10 || 10 + view.getUint16(8, true) > bytes.byteLength) {
+        return undefined
+    }
+    const stamp = view.getFloat64(0, true)
+    const end = 10 + view.getUint16(8, true)
+    const frameId = keyDecoder.decode(bytes.subarray(10, end))
+    if (bytes.byteLength < end + 13) {
+        const sec = Math.floor(stamp)
+        return { header: { stamp, sec, nanosec: Math.min(Math.round((stamp - sec) * 1e9), 999_999_999), frameId } }
+    }
+    const flags = bytes[end + 8]
+    const header: MessageHeader = { stamp, sec: view.getInt32(end, true), nanosec: view.getUint32(end + 4, true), frameId, ...((flags & 1) !== 0 ? { seq: view.getUint32(end + 9, true) } : {}) }
+    if ((flags & 2) === 0) {
+        return { header }
+    }
+    try {
+        const { encoding, attachment } = splitMeta(bytes.subarray(end + 13))
+        return { header, encoding, ...(attachment === undefined ? {} : { attachment }) }
+    } catch {
+        return undefined
     }
 }
 
@@ -893,7 +959,10 @@ export class Subscription extends Endpoint {
     }
 
     #openChannel(peer: RTCPeerConnection, acceptance: Acceptance, mid: string | null): void {
-        const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts: this.options, ...(mid === null ? {} : { mid }) })
+        // (a gateway before 0.5.32 refuses the option it doesn't know)
+        const { metadata, ...options } = this.options
+        const opts = this.owner.features.includes("metadata") ? { ...options, metadata: metadata ?? true } : options
+        const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts, ...(mid === null ? {} : { mid }) })
         const channel = peer.createDataChannel(label, channelInit(this.options.delivery, this.options.maxAge))
         channel.binaryType = "arraybuffer"
         channel.onmessage = (event: MessageEvent) => {
@@ -984,6 +1053,9 @@ export class Subscription extends Endpoint {
         try {
             if (this.channelName !== "data") {
                 message.video = this.channelName.startsWith("video-") ? decodeVideoFrameInfo(message.bytes) : undefined
+                message.header ??= message.video?.header
+                message.encoding ??= message.video?.encoding
+                message.attachment ??= message.video?.attachment
                 message.mediaStream = this.mediaStream ?? undefined
                 return true
             }
@@ -1008,6 +1080,19 @@ export class Subscription extends Endpoint {
     }
 
     #deliver(message: Message, flags: number): void {
+        if ((flags & headerFlag) !== 0) {
+            const length = message.bytes.byteLength >= 2 ? message.bytes[0] | (message.bytes[1] << 8) : Infinity
+            const decoded = 2 + length <= message.bytes.byteLength ? decodeHeader(message.bytes.subarray(2, 2 + length)) : undefined
+            if (decoded === undefined) {
+                this.decodeErrors++
+                console.error(`zenoh-gateway: bad message header on ${message.key}`)
+                return
+            }
+            message.header = decoded.header
+            message.encoding = decoded.encoding
+            message.attachment = decoded.attachment
+            message.bytes = message.bytes.subarray(2 + length)
+        }
         if ((flags & zstdFlag) !== 0) {
             try {
                 message.bytes = zstdDecompress(message.bytes) as Uint8Array
@@ -1339,6 +1424,8 @@ export class ZenohGateway {
     congestion: Congestion | null = null
     /** the message encodings the gateway runs, fetched on connect */
     encodings: readonly EncodingInfo[] = []
+    /** what the gateway supports beyond 0.5.31 (e.g. "metadata": the subscribe option), fetched with the encodings */
+    features: readonly string[] = []
     /** the ICE servers in use (the gateway's unless given) */
     iceServers: RTCIceServer[] = []
     /** leases held, by group */
@@ -1615,7 +1702,9 @@ export class ZenohGateway {
             }
             await peer.setRemoteDescription(await response.json())
             await waitOpen(control, openTimeoutMs)
-            this.encodings = Object.freeze((await this._request({ op: "encodings" }, pingTimeoutMs)).encodings as EncodingInfo[])
+            const listed = await this._request({ op: "encodings" }, pingTimeoutMs)
+            this.encodings = Object.freeze(listed.encodings as EncodingInfo[])
+            this.features = Object.freeze((listed.features ?? []) as string[])
             // a few quick samples so the gateway knows the clock offset before the first put
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()

@@ -154,6 +154,9 @@ pub struct SubscribeOptions {
     pub target_qp: Option<f64>,
     /// video channels: (min, max) ms the browser may hold a frame to smooth out jitter (default (0, 0): show at once)
     pub playout_delay: Option<(f64, f64)>,
+    /// each encoded message with its sample's own header (stamp, frame id, seq): Some(true) everywhere, Some(false)
+    /// nowhere; None = the gateway's default for clients that don't say (video only)
+    pub metadata: Option<bool>,
 }
 
 /// What [`Client::lease_with`] asks for.
@@ -218,10 +221,12 @@ pub struct DataMessage {
     pub fields: Option<BTreeMap<String, Field>>,
     /// a delete sample (no payload), not a put
     pub delete: bool,
-    /// the sample's encoding, when not the default (raw messages only)
+    /// the sample's zenoh encoding, when not the default (raw messages; encoded ones with `header`, 0.5.32+)
     pub encoding: Option<String>,
-    /// the sample's attachment (raw messages only)
+    /// the sample's zenoh attachment (raw messages; encoded ones with `header`, 0.5.32+)
     pub attachment: Option<Vec<u8>>,
+    /// the sample's own header (stamp, frame id, seq), on encoded messages of a subscription with `metadata: true` (0.5.32+)
+    pub header: Option<crate::MessageHeader>,
 }
 
 /// An encoded video frame as the gateway's encoder produced it.
@@ -276,6 +281,11 @@ pub struct VideoFrameInfo {
     pub stamp: Option<f64>,
     /// its picture's message header frame id (its TF frame), when its encoding gave one (0.5.31+)
     pub frame_id: Option<String>,
+    /// that header whole (exact stamp, seq; 0.5.32+, from 0.5.31 rounded from `stamp`)
+    pub header: Option<crate::MessageHeader>,
+    /// its sample's zenoh encoding and attachment, when they say something (0.5.32+, with `header`)
+    pub encoding: Option<String>,
+    pub attachment: Option<Vec<u8>>,
 }
 
 /// One Opus packet.
@@ -1293,13 +1303,21 @@ fn reassemble(partials: &mut BTreeMap<u32, Partial>, header: &frame::FrameHeader
 
 /// A whole data-channel message as what the subscription's channel makes of it (fields when the frame says so).
 fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flags: u8, bytes: Vec<u8>) -> Result<Option<Message>> {
+    let (header, sample, bytes) = match flags & frame::HEADER != 0 {
+        true => frame::split_header(&bytes).map(|(header, sample, rest)| (Some(header), sample, rest.to_vec())).context("bad message header")?,
+        false => (None, None, bytes),
+    };
     let bytes = if flags & frame::ZSTD != 0 { zstd::decode_all(&bytes[..])? } else { bytes };
     Ok(match kind {
         Some("video") => {
             ensure!(bytes.len() >= media::METADATA_LEN_V1 && bytes[0] == 1, "not a video metadata frame");
             let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
             let float = |at: usize| f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-            let id_end = (bytes.len() >= media::METADATA_LEN + 10 && bytes[1] & media::METADATA_FLAG_HEADER != 0).then(|| media::METADATA_LEN + 10 + u16::from_le_bytes([bytes[72], bytes[73]]) as usize).filter(|end| *end <= bytes.len());
+            let (header, sample) = match (bytes[1] & media::METADATA_FLAG_HEADER != 0).then(|| bytes.get(media::METADATA_LEN..).and_then(frame::decode_header)).flatten() {
+                Some((header, sample)) => (Some(header), sample),
+                None => (None, None),
+            };
+            let (encoding, attachment) = sample.unzip();
             Some(Message::VideoInfo(VideoFrameInfo {
                 key,
                 timestamp_ms,
@@ -1316,8 +1334,11 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
                 rtp_timestamp: (bytes.len() >= media::METADATA_LEN && bytes[1] & media::METADATA_FLAG_RTP != 0).then(|| word(44)),
                 received_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(48)),
                 encoded_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(56)),
-                stamp: id_end.map(|_| float(64)),
-                frame_id: id_end.map(|end| String::from_utf8_lossy(&bytes[74..end]).into_owned()),
+                stamp: header.as_ref().map(|header| header.stamp()),
+                frame_id: header.as_ref().map(|header| header.frame_id.clone()),
+                header,
+                encoding,
+                attachment: attachment.flatten(),
             }))
         }
         // one empty frame per sample, for a browser callback
@@ -1328,10 +1349,12 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
                 let (encoding, attachment, payload) = frame::decode_meta(&bytes).context("bad META header")?;
                 (Some(encoding.to_owned()), (!attachment.is_empty()).then(|| attachment.to_vec()), payload.to_vec())
             } else {
-                (None, None, bytes)
+                // an encoded message's came in its header
+                let (encoding, attachment) = sample.unzip();
+                (encoding, attachment.flatten(), bytes)
             };
             let fields = if flags & frame::FIELDS != 0 && !delete { Some(fields::parse(&bytes)?) } else { None };
-            Some(Message::Data(DataMessage { key, bytes, timestamp_ms, seq, fields, delete, encoding, attachment }))
+            Some(Message::Data(DataMessage { key, bytes, timestamp_ms, seq, fields, delete, encoding, attachment, header }))
         }
     })
 }

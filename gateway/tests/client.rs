@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 use tokio::time::timeout;
 use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, LeaseOptions, PublisherOptions, SubscribeOptions, VideoFrame};
-use zenoh_gateway::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, RunningServer, Server, VideoImage, zenoh};
+use zenoh_gateway::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, MessageHeader, RunningServer, Server, VideoImage, zenoh};
 
 /// `[r, g, b, width u16, height u16]` → a solid picture.
 struct SolidColor;
@@ -48,6 +48,10 @@ impl MessageEncoding for ByteFields {
         Ok(DecodedFrame::data(sample.payload.to_vec()))
     }
 
+    fn header(&self, sample: &EncodingSample<'_>) -> Option<MessageHeader> {
+        Some(MessageHeader { sec: 1_761_350_400, nanosec: 987_654_321, frame_id: format!("frame_{}", sample.payload.len()), seq: Some(42) })
+    }
+
     fn encode(&self, frame: &DecodedFrame, _options: &EncodeOptions) -> Result<Vec<u8>> {
         let bytes = frame.downcast::<Vec<u8>>()?;
         Ok(Fields::new().scalar("count", bytes.len() as u32).array("data", bytes).text("name", "bytes").build())
@@ -75,6 +79,16 @@ fn keep_putting(session: &zenoh::Session, key: &str, payload: Vec<u8>) -> tokio:
     tokio::spawn(async move {
         loop {
             session.put(&key, payload.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+}
+
+fn keep_putting_attached(session: &zenoh::Session, key: &str, payload: Vec<u8>, encoding: &'static str, attachment: Vec<u8>) -> tokio::task::JoinHandle<()> {
+    let (session, key) = (session.clone(), key.to_owned());
+    tokio::spawn(async move {
+        loop {
+            session.put(&key, payload.clone()).encoding(encoding).attachment(attachment.clone()).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
@@ -123,6 +137,27 @@ async fn raw_subscribe_is_byte_exact_with_zstd() {
     let stats = client.stats().await.unwrap();
     let sent: f64 = stats["channels"].as_array().unwrap().iter().map(|channel| channel["stats"]["bytesSent"].as_f64().unwrap_or_default()).sum();
     assert!(sent > 0.0 && sent < 100_000.0, "zstd on the wire: {sent} bytes sent");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encoded_messages_carry_their_sample_s_header_when_asked() {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let _putter = keep_putting(&session, "fields/x", vec![3, 1, 4]);
+    let _attached = keep_putting_attached(&session, "fields/attached", vec![2, 7], "application/cdr", vec![5, 6]);
+    let mut attached = client.subscribe("fields/attached", SubscribeOptions { encoding: Some("test-fields".into()), metadata: Some(true), ..Default::default() }).await.unwrap();
+    let Message::Data(message) = timeout(Duration::from_secs(10), attached.recv()).await.unwrap().unwrap() else { panic!("not data") };
+    assert_eq!((message.encoding.as_deref(), message.attachment.as_deref(), message.header.map(|header| header.frame_id)), (Some("application/cdr"), Some(&[5u8, 6][..]), Some("frame_2".into())), "the zenoh sample's encoding and attachment too");
+    let exact = MessageHeader { sec: 1_761_350_400, nanosec: 987_654_321, frame_id: "frame_3".into(), seq: Some(42) };
+    for (metadata, compress, expected) in [(Some(true), None, Some(exact.clone())), (Some(true), Some(Compress::Zstd), Some(exact)), (Some(false), None, None), (None, None, None)] {
+        let mut subscription = client.subscribe("fields/x", SubscribeOptions { encoding: Some("test-fields".into()), metadata, compress, ..Default::default() }).await.unwrap();
+        let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
+        assert_eq!(message.fields.expect("fields")["data"].values(), [3.0, 1.0, 4.0], "the message itself unchanged");
+        // (None: a page that doesn't say may not be able to read it)
+        assert_eq!(message.header, expected, "metadata {metadata:?}, compress {compress:?}");
+    }
     client.close().await;
     running.shutdown().await.unwrap();
 }

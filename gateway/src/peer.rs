@@ -1353,7 +1353,8 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             "setDeadman" => set_deadman(&state, &request).await,
             "encodings" => {
                 let encodings: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
-                ok(&request.id, json!({"encodings": encodings}))
+                // features: what a page may use beyond 0.5.31 (the subscribe option `metadata`)
+                ok(&request.id, json!({"encodings": encodings, "features": ["metadata"]}))
             }
             "lease" => {
                 let response = take_lease(&state, &request);

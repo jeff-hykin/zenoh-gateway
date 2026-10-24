@@ -148,6 +148,12 @@ the small messages these carry (big streams belong on subscriptions). Every requ
   bit3 a message that starts with its encoding and attachment ("Wire format"). They are only sent when
   they say something (an attachment, or an encoding other than the default), and only on raw data
   messages (an encoding's output is its own format; deletes skip the encoding).
+- Encoded messages carry their sample's own header (`MessageEncoding::header`: exact stamp `sec`/`nanosec`, `frameId`,
+  `seq` where the type has one), so nothing an encoding drops loses where and when it was taken: `msg.header` on every
+  channel (data: frame flag bit4; video: after the metadata's 64 bytes; audio: the per-sample frame). The subscribe option
+  `metadata` (JS client default true, sent when the gateway lists the `metadata` feature in its `encodings` reply) turns
+  it on everywhere or, false, off; a page that doesn't say (clients before 0.5.32) gets it on video only, as 0.5.31 sent it.
+  Raw messages are the whole sample, header included.
 
 ## Delivery → transport mapping
 
@@ -435,7 +441,8 @@ another format). Renegotiations run one at a time. A closed subscription's trans
 Chrome stopped assembling a reused receiver's frames after a few quick close-and-reopen switches. The gateway gives a
 track to the newest subscription that names it.
 Each video frame also sends a 64-byte metadata frame on the `sub` channel (`msg.video`), after the frame is written to
-the track, followed by its picture's message header (stamp, frame id) when the encoding gave one; `Subscription.videoFrameInfo(rtpTimestamp)`
+the track, followed by its picture's message header (the bit4 layout above; 0.5.31 sent only up to `frameId`) when the
+encoding gave one and the subscription's `metadata` isn't false; `Subscription.videoFrameInfo(rtpTimestamp)`
 looks up the metadata of the frame a video element shows. Nothing new is encoded while frames written to the connection's tracks would still wait in the
 RTP pacer past one frame interval (paced at 2.5x the larger of video's grant and the link's estimate, a rate the
 gateway sets each allocation round as well as on feedback): the newest sample goes once it drains. A packet is dropped
@@ -757,7 +764,9 @@ resolving so the gateway has an offset before the first put.
   `frameId` it has processed with a 4-byte `u32` message on the same channel. `flags` bit0: the
   message (its chunks joined) is zstd-compressed; bit1: it is a Fields message (the client decodes it); bit2: the sample is a delete;
   bit3: the message (decompressed) starts with `u16 encodingLen | encoding utf8 | u32 attachmentLen | attachment`
-  ahead of the payload.
+  ahead of the payload; bit4: the message (before decompression) starts with `u16 len |` that many bytes of its
+  sample's header, `f64 stamp (s) | u16 frameIdLen | frameId utf8 | i32 sec | u32 nanosec | u8 flags (bit0: seq set) | u32 seq`.
+- `encodings` replies `{encodings: [{name, output}], features: ["metadata"]}` (no `features` before 0.5.32).
 - All chunks of one message have the same size, at most 64 KiB (bulk streams use smaller ones, see
   "Bandwidth allocation").
 - Browser → gateway put: `f64 sentAtMs (browser clock) | payload`, little endian.

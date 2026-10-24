@@ -72,7 +72,7 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 
 | member | |
 |---|---|
-| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, kind, bytes, encoding?, attachment?, timestamp, seq, decoded?, video?, mediaStream? }` (`kind`: `"put"` / `"delete"`) |
+| `subscribe(key, options, callback)` → `Subscription` | `callback(msg)`: `{ key, kind, bytes, encoding?, attachment?, timestamp, seq, decoded?, video?, mediaStream?, header? }` (`kind`: `"put"` / `"delete"`) |
 | `publisher(key, options)` → `Publisher` | |
 | `get(key, { parameters, payload, encoding, attachment, target, consolidation, timeoutMs = 5000, priority, congestionControl, express })` → `[{ key, bytes, kind, encoding, attachment?, timestamp? }` or `{ error: true, bytes, encoding }]` | zenoh query |
 | `querier(key, getOptions)` → `Querier` | fixed-option queries: `querier.get({ parameters, payload })`, `querier.matchingStatus()` |
@@ -119,6 +119,7 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 | `keyframeIntervalMs` | 60000 | video channels: a keyframe at least this often, on top of the ones the browser asks for after a loss |
 | `targetQp` | 30 | video channels: the quantizer (H.264's 0-51) the picture's size aims for, on encoders that report it (openh264 does): the picture shrinks below what its bitrate affords while frames come out coarser, and grows back while finer. Lower = smaller, sharper |
 | `sceneChangeKeyframes` | false | video channels: a keyframe when the encoder sees a new scene (with frames skipped at low bitrates, a smoothly moving picture tripped it every few seconds) |
+| `metadata` | `true` | each encoded message comes with its sample's own header, `msg.header`: `{ stamp, sec, nanosec, frameId, seq? }`; `false` goes without (gateways before 0.5.32: video only) |
 | `playoutDelay` | `[0, 0]` | video channels: `[min, max]` ms the browser may hold a frame to smooth out jitter; `[0, 0]` shows each frame at once (after a non-zero min on the same track, `[10, 10]`: Firefox can't go back) |
 
 `Subscription`: `ready()` (resolves when the gateway accepted it and the channel is open, rejects with

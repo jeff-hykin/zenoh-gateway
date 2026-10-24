@@ -229,6 +229,8 @@ pub struct SubShared {
     /// the encoding's key prefix with its trailing `/`
     key_prefix: Option<String>,
     compress: Compress,
+    /// the subscribe option `metadata`: send each message's header (see [`SubShared::sends_header`])
+    metadata: Option<bool>,
     /// the server's encodings, with the caches that share work across frontends
     pub codecs: Arc<EncodingRegistry>,
     /// the options `updateSubscription` may change while it runs
@@ -285,6 +287,7 @@ impl SubShared {
             output,
             encode_options: opts.encoding_options(),
             compress: opts.compress.unwrap_or_default(),
+            metadata: opts.metadata,
             codecs,
             state: Mutex::new(SubState::default()),
             data_ready: Notify::new(),
@@ -292,6 +295,12 @@ impl SubShared {
             closed_signal: tokio::sync::watch::Sender::new(false),
             leased_away: AtomicBool::new(false),
         }
+    }
+
+    /// Whether messages go with their sample's header: as asked, else (pages before 0.5.32, which can't read it on the
+    /// data channel) only on video.
+    pub fn sends_header(&self) -> bool {
+        self.metadata.unwrap_or(matches!(self.channel, Channel::Video(_)))
     }
 
     pub fn tuning(&self) -> Tuning {
@@ -940,6 +949,18 @@ async fn encode(shared: &SubShared, codec: Arc<dyn MessageEncoding>, key: &str, 
     None
 }
 
+/// The sample's zenoh encoding and attachment, when they say something ([`needs_meta`]).
+pub(crate) fn sample_meta(item: &Pending) -> frame::SampleMeta {
+    needs_meta(item).then(|| (item.encoding.to_string(), item.attachment.as_ref().map(|attachment| attachment.to_bytes().into_owned())))
+}
+
+/// The sample's own header (and zenoh encoding and attachment) as [`frame::encode_header`] sends it, if its encoding
+/// reads one.
+pub(crate) fn sample_header(codec: &dyn MessageEncoding, key: &str, item: &Pending) -> Option<Vec<u8>> {
+    let payload = item.payload.to_bytes();
+    frame::encode_header(&codec.header(&EncodingSample::new(key, &payload, &item.encoding))?, &sample_meta(item))
+}
+
 async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
     let mut sender = MessageSender::new();
     while !shared.closed.load(Ordering::Relaxed) {
@@ -977,7 +998,15 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
         if (shared.codec.is_none() || item.kind == SampleKind::Delete) && needs_meta(&item) {
             flags |= frame::META;
         }
-        if sender.send(&dc, &shared, &key, &item, body.bytes(), flags).await == Sent::Closed {
+        // (a raw message is the whole sample, header and all)
+        let headed = match &shared.codec {
+            Some(codec) if item.kind != SampleKind::Delete && shared.sends_header() => sample_header(&**codec, &key, &item).map(|header| frame::with_header(&header, body.bytes())),
+            _ => None,
+        };
+        if headed.is_some() {
+            flags |= frame::HEADER;
+        }
+        if sender.send(&dc, &shared, &key, &item, headed.as_deref().unwrap_or(body.bytes()), flags).await == Sent::Closed {
             return;
         }
     }
@@ -1066,8 +1095,8 @@ impl MessageSender {
 }
 
 /// Sends one small frame (e.g. a video frame's metadata) without pacing; returns its size.
-pub async fn send_small_frame(dc: &Arc<dyn DataChannel>, key: &str, timestamp_ms: f64, seq: u32, frame_id: u32, payload: &[u8]) -> Result<usize, webrtc::error::Error> {
-    let frame = frame::encode(&frame::FrameHeader { key, timestamp_ms, seq, frame_id, chunk_index: 0, chunk_count: 1, flags: 0 }, payload);
+pub async fn send_small_frame(dc: &Arc<dyn DataChannel>, key: &str, timestamp_ms: f64, seq: u32, frame_id: u32, flags: u8, payload: &[u8]) -> Result<usize, webrtc::error::Error> {
+    let frame = frame::encode(&frame::FrameHeader { key, timestamp_ms, seq, frame_id, chunk_index: 0, chunk_count: 1, flags }, payload);
     let length = frame.len();
     dc.send(frame).await.map(|_| length)
 }

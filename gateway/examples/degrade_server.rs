@@ -16,7 +16,7 @@ use anyhow::Result;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 use std::time::Duration;
-use zenoh_gateway::{Channel, DecodedFrame, EncodeOptions, EncodingOutput, EncodingSample, MessageEncoding, Server, VideoImage, zenoh};
+use zenoh_gateway::{Channel, DecodedFrame, EncodeOptions, EncodingOutput, EncodingSample, MessageEncoding, MessageHeader, Server, VideoImage, zenoh};
 
 struct Cam {
     width: u32,
@@ -51,9 +51,19 @@ impl MessageEncoding for Cam {
                 data[i + 2] = (moving * 200 + noise).min(255) as u8;
             }
         }
-        // (a message header as an image codec's: client/test/video_latency.ts reads it back per shown frame)
-        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, data)?.with_header(frame as f64 / 30.0, "test_cam_optical")))
+        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, data)?))
     }
+    // (a message header as an image codec's, which the gateway puts on the decoded picture: client/test/video_latency.ts
+    // and metadata.ts read it back)
+    fn header(&self, sample: &EncodingSample<'_>) -> Option<MessageHeader> {
+        Some(test_header(sample, 30, "test_cam_optical"))
+    }
+}
+
+/// A header from the sample's frame counter at `hz`: `seq` the counter, the stamp exact to the nanosecond.
+fn test_header(sample: &EncodingSample<'_>, hz: u32, frame_id: &str) -> MessageHeader {
+    let frame = u32::from_le_bytes(sample.payload[..4].try_into().unwrap());
+    MessageHeader { sec: (frame / hz) as i32, nanosec: frame % hz * (1_000_000_000 / hz) + 7, frame_id: frame_id.into(), seq: Some(frame) }
 }
 
 struct Cloud;
@@ -67,6 +77,9 @@ impl MessageEncoding for Cloud {
     }
     fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         Ok(DecodedFrame::data(sample.payload.to_vec()))
+    }
+    fn header(&self, sample: &EncodingSample<'_>) -> Option<MessageHeader> {
+        Some(test_header(sample, 10, "test_lidar"))
     }
     fn encode(&self, frame: &DecodedFrame, options: &EncodeOptions) -> Result<Vec<u8>> {
         let bytes = frame.downcast::<Vec<u8>>()?;
