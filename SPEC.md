@@ -435,7 +435,8 @@ another format). Renegotiations run one at a time. A closed subscription's trans
 Chrome stopped assembling a reused receiver's frames after a few quick close-and-reopen switches. The gateway gives a
 track to the newest subscription that names it.
 Each video frame also sends a 64-byte metadata frame on the `sub` channel (`msg.video`), after the frame is written to
-the track. Nothing new is encoded while frames written to the connection's tracks would still wait in the
+the track, followed by its picture's message header (stamp, frame id) when the encoding gave one; `Subscription.videoFrameInfo(rtpTimestamp)`
+looks up the metadata of the frame a video element shows. Nothing new is encoded while frames written to the connection's tracks would still wait in the
 RTP pacer past one frame interval (paced at 2.5x the larger of video's grant and the link's estimate, a rate the
 gateway sets each allocation round as well as on feedback): the newest sample goes once it drains. A packet is dropped
 from the pacer once it waited the connection's latency target plus its frame's time to leave at the rate when it came
@@ -767,4 +768,7 @@ resolving so the gateway has an offset before the first put.
   gateways before 0.5.20 send the first 28): `mediaTimeMs` is the frame's RTP timestamp less the track's first, in ms,
   `writtenMs` when it went to the track, `rtpTimestamp` the frame's (valid when flags bit1 is set: a page's
   `requestVideoFrameCallback` `rtpTimestamp` names the frame it shows), `receivedMs`/`encodedMs` when the gateway got
-  its sample and finished encoding it (unix ms, gateway clock); the frame header's timestamp is the sample's own. A fields message is "Fields", any other data-channel encoding's its own format.
+  its sample and finished encoding it (unix ms, gateway clock); the frame header's timestamp is the sample's own.
+  With flags bit2 (0.5.31+) the picture's message header follows: `f64 stamp (seconds) | u16 frameIdLength | frameId
+  (UTF-8)` (`msg.video.stamp`, `msg.video.frameId`; set by an encoding with `VideoImage::with_header`), so a page places
+  each picture in its own TF frame; readers of the first 64 bytes ignore it. A fields message is "Fields", any other data-channel encoding's its own format.

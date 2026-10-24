@@ -4,7 +4,8 @@
 // - nearly every shown frame is named exactly by its RTP timestamp (unmatched < 5%);
 // - the stages add up to the total (within 1 ms), each is >= -2 ms (clock-sync slack), the total p50 < 300 ms locally;
 // - source-to-shown from the stamp in the frame's own RTP packets (abs-capture-time, Chrome) agrees within 2 ms (p50);
-// - a 200 ms playout delay asked for shows up in trackToShown and nowhere before the track (+150..300 ms).
+// - a 200 ms playout delay asked for shows up in trackToShown and nowhere before the track (+150..300 ms);
+// - nearly every shown frame's metadata (`videoFrameInfo(rtpTimestamp)`) carries its picture's header (stamp, frameId).
 // BROWSER=firefox runs it in Playwright's Firefox (no abs-capture-time there: the in-packet check is Chrome's).
 // Usage: deno run --allow-all client/test/video_latency.ts   (SECONDS per phase, default 8)
 
@@ -53,9 +54,17 @@ try {
                 document.body.append(element)
                 element.play()
                 stop = subscription.watchVideoLatency(element)
+                const onShown = (_now: number, frame: { rtpTimestamp?: number }) => {
+                    const info = frame.rtpTimestamp === undefined ? undefined : subscription.videoFrameInfo(frame.rtpTimestamp)
+                    headers.shown++
+                    headers.named += info?.frameId === "test_cam_optical" && typeof info.stamp === "number" ? 1 : 0
+                    element?.requestVideoFrameCallback(onShown as any)
+                }
+                element.requestVideoFrameCallback(onShown as any)
             }
         })
         let stop = () => {}
+        const headers = { shown: 0, named: 0 }
         // (past the first second: a new track's first frames wait on its decoder)
         await new Promise((resolve) => setTimeout(resolve, 2_000))
         const warm = subscription.videoLatency()?.frames ?? 0
@@ -65,7 +74,7 @@ try {
         stop()
         subscription.close()
         element?.remove()
-        return { latency, warm, clockOffsetMs: client.clockOffsetMs, gateway: JSON.stringify(stats).match(/"videoLatency":(\{[^}]*\})/)?.[1] ?? null }
+        return { latency, warm, headers, clockOffsetMs: client.clockOffsetMs, gateway: JSON.stringify(stats).match(/"videoLatency":(\{[^}]*\})/)?.[1] ?? null }
     }, [serverUrl, playoutDelay, seconds])
 
     const base = await measure([0, 0])
@@ -94,6 +103,10 @@ try {
             failures.push("no in-packet stamp from Chrome: abs-capture-time not read")
         } else if (Math.abs(latency.captureToShown.p50 - latency.total.p50) > 2) {
             failures.push(`Chrome's capture-to-shown p50 ${latency.captureToShown.p50.toFixed(1)} vs ours ${latency.total.p50.toFixed(1)} (> 2 ms apart)`)
+        }
+        console.log(`shown frames naming their picture's header: ${base.headers.named} of ${base.headers.shown}`)
+        if (base.headers.shown === 0 || base.headers.named < base.headers.shown * 0.95) {
+            failures.push(`${base.headers.named} of ${base.headers.shown} shown frames' metadata named their picture's header`)
         }
         if (!base.gateway) {
             failures.push("gateway stats have no videoLatency")

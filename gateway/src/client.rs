@@ -239,7 +239,7 @@ pub struct VideoFrame {
     pub received_at: Instant,
 }
 
-/// The 28-byte metadata frame the gateway sends per video frame (SPEC "Wire format").
+/// The metadata frame the gateway sends per video frame (SPEC "Wire format").
 #[derive(Debug, Clone)]
 pub struct VideoFrameInfo {
     /// the sample's key
@@ -272,6 +272,10 @@ pub struct VideoFrameInfo {
     pub received_ms: Option<f64>,
     /// when the gateway finished encoding it (unix ms, gateway clock; 0.5.20+)
     pub encoded_ms: Option<f64>,
+    /// its picture's message header stamp (seconds), when its encoding gave one (0.5.31+)
+    pub stamp: Option<f64>,
+    /// its picture's message header frame id (its TF frame), when its encoding gave one (0.5.31+)
+    pub frame_id: Option<String>,
 }
 
 /// One Opus packet.
@@ -1295,6 +1299,7 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
             ensure!(bytes.len() >= media::METADATA_LEN_V1 && bytes[0] == 1, "not a video metadata frame");
             let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
             let float = |at: usize| f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            let id_end = (bytes.len() >= media::METADATA_LEN + 10 && bytes[1] & media::METADATA_FLAG_HEADER != 0).then(|| media::METADATA_LEN + 10 + u16::from_le_bytes([bytes[72], bytes[73]]) as usize).filter(|end| *end <= bytes.len());
             Some(Message::VideoInfo(VideoFrameInfo {
                 key,
                 timestamp_ms,
@@ -1311,6 +1316,8 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
                 rtp_timestamp: (bytes.len() >= media::METADATA_LEN && bytes[1] & media::METADATA_FLAG_RTP != 0).then(|| word(44)),
                 received_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(48)),
                 encoded_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(56)),
+                stamp: id_end.map(|_| float(64)),
+                frame_id: id_end.map(|end| String::from_utf8_lossy(&bytes[74..end]).into_owned()),
             }))
         }
         // one empty frame per sample, for a browser callback

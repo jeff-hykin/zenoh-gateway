@@ -73,6 +73,8 @@ pub const METADATA_LEN_V1: usize = 28;
 pub const METADATA_LEN_V2: usize = 44;
 /// metadata flag: bytes 44..48 hold the frame's RTP timestamp
 pub const METADATA_FLAG_RTP: u8 = 2;
+/// metadata flag: the frame's message header follows byte 64 (`f64 stamp | u16 frameIdLength | frameId`, 0.5.31+)
+pub const METADATA_FLAG_HEADER: u8 = 4;
 
 /// The track format of a payload type the gateway (and the Rust client) offers.
 #[cfg(feature = "client")]
@@ -799,9 +801,10 @@ fn rand_ssrc() -> u32 {
 /// tell which frame it is showing; `written_ms`: when it went to the track (unix ms, the gateway's clock).
 /// Then `u32 rtpTimestamp` (valid when flags bit1 is set: a requestVideoFrameCallback `rtpTimestamp` names the frame
 /// exactly) | `f64 receivedMs | f64 encodedMs`: when the gateway got the sample and finished encoding it (unix ms).
-/// The frame header's timestamp is the sample's own (its zenoh timestamp, else `receivedMs`).
-fn metadata(frame: &EncodedVideo, source: (u32, u32), quality: f64, written: &Written, times: FrameTimes) -> [u8; METADATA_LEN] {
-    let mut out = [0u8; METADATA_LEN];
+/// The frame header's timestamp is the sample's own (its zenoh timestamp, else `receivedMs`). With flags bit2, the
+/// picture's message header follows: `f64 stamp (seconds) | u16 frameIdLength | frameId (UTF-8)`.
+pub(crate) fn metadata(frame: &EncodedVideo, source: (u32, u32), quality: f64, written: &Written, times: FrameTimes, header: Option<&(f64, String)>) -> Vec<u8> {
+    let mut out = vec![0u8; METADATA_LEN];
     out[28..36].copy_from_slice(&written.media_time_ms.to_le_bytes());
     out[36..44].copy_from_slice(&times.written_ms.to_le_bytes());
     out[44..48].copy_from_slice(&written.rtp_timestamp.unwrap_or(0).to_le_bytes());
@@ -815,14 +818,21 @@ fn metadata(frame: &EncodedVideo, source: (u32, u32), quality: f64, written: &Wr
     out[16..20].copy_from_slice(&source.1.to_le_bytes());
     out[20..24].copy_from_slice(&(quality as f32).to_le_bytes());
     out[24..28].copy_from_slice(&(frame.data.len() as u32).to_le_bytes());
+    // (a frame id past 64 KiB goes without a header: nothing real is that long)
+    if let Some((stamp, frame_id)) = header.filter(|(_, frame_id)| frame_id.len() <= u16::MAX as usize) {
+        out[1] |= METADATA_FLAG_HEADER;
+        out.extend_from_slice(&stamp.to_le_bytes());
+        out.extend_from_slice(&(frame_id.len() as u16).to_le_bytes());
+        out.extend_from_slice(frame_id.as_bytes());
+    }
     out
 }
 
 /// A video frame's gateway times (unix ms, the gateway's clock).
-struct FrameTimes {
-    received_ms: f64,
-    encoded_ms: f64,
-    written_ms: f64,
+pub(crate) struct FrameTimes {
+    pub(crate) received_ms: f64,
+    pub(crate) encoded_ms: f64,
+    pub(crate) written_ms: f64,
 }
 
 /// A decoded frame and whether another frontend's decode was reused, or the decode error.
@@ -1050,6 +1060,8 @@ struct SessionFrame {
     received_ms: f64,
     encoded_ms: f64,
     encoded_by: u64,
+    /// its picture's message header (stamp seconds, frame id), if the encoding gave one
+    header: Option<(f64, String)>,
 }
 
 impl EncodeSession {
@@ -1159,11 +1171,11 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
     let newer = state.last_input.is_none_or(|(timestamp_ms, hash)| if hash == input.hash { input.timestamp_ms > timestamp_ms + SAME_SAMPLE_MS } else { input.timestamp_ms >= timestamp_ms });
     if newer {
         state.last_input = Some((input.timestamp_ms, input.hash));
-        let is_picture = if let DecodedFrame::Video(image) = &*input.decoded {
+        let (is_picture, header) = if let DecodedFrame::Video(image) = &*input.decoded {
             state.source = (image.width(), image.height());
-            true
+            (true, image.header().map(|(stamp, frame_id)| (stamp, frame_id.to_owned())))
         } else {
-            false
+            (false, None)
         };
         let grants: Vec<(f64, f64, f64, bool)> = session.grants.lock().values().copied().collect();
         let starting_up = grants.iter().any(|grant| grant.3);
@@ -1225,7 +1237,7 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
                         state.keyframe_wanted &= !frame.keyframe;
                         let seq = state.next_seq;
                         state.next_seq += 1;
-                        let logged = SessionFrame { seq, source: state.source, frame, timestamp_ms: input.timestamp_ms, received_ms: input.received_ms, encoded_ms: crate::subscription::now_unix_ms(), encoded_by: member.id };
+                        let logged = SessionFrame { seq, source: state.source, frame, timestamp_ms: input.timestamp_ms, received_ms: input.received_ms, encoded_ms: crate::subscription::now_unix_ms(), encoded_by: member.id, header };
                         state.log.push_back(Arc::new(logged));
                         if state.log.len() > SESSION_LOG {
                             state.log.pop_front();
@@ -1382,7 +1394,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             };
             let times = FrameTimes { received_ms: logged.received_ms, encoded_ms: logged.encoded_ms, written_ms: crate::subscription::now_unix_ms() };
             shared.record_video_latency(times.received_ms - logged.timestamp_ms, times.encoded_ms - times.received_ms, times.written_ms - times.encoded_ms, track.pacer_delay_percentiles());
-            let meta = metadata(frame, logged.source, quality, &written, times);
+            let meta = metadata(frame, logged.source, quality, &written, times, logged.header.as_ref());
             let shared_encode = logged.encoded_by != member.id;
             shared.record_video_frame(frame.data.len(), (frame.width, frame.height), quality, frame.keyframe, shared_encode, track.keyframe_requests.load(Ordering::Relaxed));
             if subscription::send_small_frame(&dc, &key, logged.timestamp_ms, item.seq, next_frame_id, &meta).await.is_err() && shared.is_closed() {
@@ -1612,5 +1624,32 @@ mod tests {
         }
         sessions.leave(&session, 1);
         assert_eq!(sessions.count(), 0, "a session ends with its last viewer");
+    }
+
+    #[tokio::test]
+    async fn a_picture_s_header_rides_its_frame_s_metadata() {
+        let codec: Arc<dyn MessageEncoding> = Arc::new(Camera(Arc::default()));
+        let codecs = Arc::new(EncodingRegistry::new([codec.clone()]).unwrap());
+        let mut viewer = Member { id: 0, session: None, next_seq: None, synced: false, registry: None };
+        let mut sent = Vec::new();
+        for (sample, frame_id) in [(0u64, "cam_optical"), (1, "cam_optical"), (2, "cam2_optical")] {
+            let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0 + sample as f64 * 0.5, frame_id);
+            let session = codecs.video_sessions.place(viewer.session.take(), 0, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, 30.0, 4e6, false));
+            viewer.session = Some(session.clone());
+            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false };
+            sent.extend(step(session, &mut viewer, input, codecs.clone(), codec.clone()).await.frames);
+        }
+        codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
+        let headers: Vec<_> = sent.iter().map(|frame| frame.header.clone().unwrap()).collect();
+        assert_eq!(headers, vec![(100.0, "cam_optical".into()), (100.5, "cam_optical".into()), (101.0, "cam2_optical".into())], "each frame its own picture's");
+        let times = || super::FrameTimes { received_ms: 1.0, encoded_ms: 2.0, written_ms: 3.0 };
+        let written = super::Written { media_time_ms: 0.0, rtp_timestamp: Some(90) };
+        let mut bare = super::metadata(&sent[2].frame, (64, 48), 1.0, &written, times(), None);
+        assert_eq!((bare.len(), bare[1] & super::METADATA_FLAG_HEADER), (super::METADATA_LEN, 0), "no header: the 64 bytes as before");
+        let with = super::metadata(&sent[2].frame, (64, 48), 1.0, &written, times(), sent[2].header.as_ref());
+        bare[1] |= super::METADATA_FLAG_HEADER;
+        assert_eq!(&with[..super::METADATA_LEN], &bare[..], "the first 64 bytes unchanged but the flag");
+        assert_eq!(f64::from_le_bytes(with[64..72].try_into().unwrap()), 101.0);
+        assert_eq!((u16::from_le_bytes([with[72], with[73]]), &with[74..]), (12, &b"cam2_optical"[..]));
     }
 }

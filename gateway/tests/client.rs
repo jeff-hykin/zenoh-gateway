@@ -28,7 +28,7 @@ impl MessageEncoding for SolidColor {
     fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         let p = sample.payload;
         let (width, height) = (u16::from_le_bytes([p[3], p[4]]) as u32, u16::from_le_bytes([p[5], p[6]]) as u32);
-        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, p[..3].repeat((width * height) as usize))?))
+        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, p[..3].repeat((width * height) as usize))?.with_header(12.5, "solid_optical")))
     }
 }
 
@@ -189,6 +189,13 @@ async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
     let (size, mean) = decode_all(&frames);
     assert_eq!(size, (320, 240));
     assert_color(mean, [200, 40, 90]);
+    // each frame's metadata carries its picture's header
+    let info = loop {
+        if let Message::VideoInfo(info) = timeout(Duration::from_secs(10), camera.recv()).await.unwrap().unwrap() {
+            break info;
+        }
+    };
+    assert_eq!((info.stamp, info.frame_id.as_deref()), (Some(12.5), Some("solid_optical")));
     // the gateway's own keyframes come every 3 s; one asked for comes at once
     while next_video(&mut camera).await.keyframe {}
     camera.request_keyframe().await.unwrap();

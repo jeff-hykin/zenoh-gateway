@@ -51,7 +51,8 @@ impl MessageEncoding for Cam {
                 data[i + 2] = (moving * 200 + noise).min(255) as u8;
             }
         }
-        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, data)?))
+        // (a message header as an image codec's: client/test/video_latency.ts reads it back per shown frame)
+        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, data)?.with_header(frame as f64 / 30.0, "test_cam_optical")))
     }
 }
 

@@ -92,6 +92,10 @@ export interface VideoFrameInfo {
      * the message's `timestamp`); absent from gateways before 0.5.20 */
     receivedMs?: number
     encodedMs?: number
+    /** the picture's message header (its `stamp`, seconds, and `frameId`, the TF frame it was taken in), when the
+     * encoding gave one (e.g. zenoh-dimos-codecs' image codecs); absent from gateways before 0.5.31 */
+    stamp?: number
+    frameId?: string
 }
 
 /** Percentiles of one latency, ms. */
@@ -474,7 +478,7 @@ export function decodeFields(message: Uint8Array): Record<string, FieldValue> {
     return fields
 }
 
-/** Video metadata frame (28 bytes) sent on a video subscription's channel per frame. */
+/** Video metadata frame (64 bytes, then the picture's header if flags bit2) sent on a video subscription's channel per frame. */
 export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
     return {
@@ -488,6 +492,9 @@ export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
         ...(bytes.byteLength >= 44 ? { mediaTimeMs: view.getFloat64(28, true), writtenMs: view.getFloat64(36, true) } : {}),
         ...(bytes.byteLength >= 64 && (bytes[1] & 2) !== 0 ? { rtpTimestamp: view.getUint32(44, true) } : {}),
         ...(bytes.byteLength >= 64 ? { receivedMs: view.getFloat64(48, true), encodedMs: view.getFloat64(56, true) } : {}),
+        ...(bytes.byteLength >= 74 && (bytes[1] & 4) !== 0 && 74 + view.getUint16(72, true) <= bytes.byteLength
+            ? { stamp: view.getFloat64(64, true), frameId: keyDecoder.decode(bytes.subarray(74, 74 + view.getUint16(72, true))) }
+            : {}),
     }
 }
 
@@ -767,6 +774,12 @@ export class Subscription extends Endpoint {
             stopped = true
             element.cancelVideoFrameCallback(handle)
         }
+    }
+
+    /** The metadata of the frame a video element shows (a requestVideoFrameCallback's `rtpTimestamp`), e.g. its `stamp`
+     * and `frameId` to place the picture on screen in its own TF frame; undefined if it is not among the latest 512. */
+    videoFrameInfo(rtpTimestamp: number): VideoFrameInfo | undefined {
+        return this.#videoTimes.get(rtpTimestamp)?.info
     }
 
     /** End-to-end latency of the frames a watched video element showed lately (see `watchVideoLatency`): its latest 300,

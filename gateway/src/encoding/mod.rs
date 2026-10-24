@@ -196,6 +196,8 @@ pub struct VideoImage {
     height: u32,
     format: PixelFormat,
     data: Vec<u8>,
+    /// (its message header's stamp as f64 bits, to keep `Eq`; frame id)
+    header: Option<(u64, String)>,
 }
 
 impl fmt::Debug for VideoImage {
@@ -209,7 +211,7 @@ impl VideoImage {
     pub fn rgb8(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
         ensure!(width > 0 && height > 0, "empty image ({width}x{height})");
         ensure!(data.len() == width as usize * height as usize * 3, "rgb8 {width}x{height} needs {} bytes, got {}", width as usize * height as usize * 3, data.len());
-        Ok(VideoImage { width, height, format: PixelFormat::Rgb8, data })
+        Ok(VideoImage { width, height, format: PixelFormat::Rgb8, data, header: None })
     }
 
     /// Planar I420; fails unless both sizes are even and non-zero and `data` is exactly
@@ -217,7 +219,7 @@ impl VideoImage {
     pub fn i420(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
         ensure!(width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2), "i420 needs even, non-zero sizes, got {width}x{height}");
         ensure!(data.len() == width as usize * height as usize * 3 / 2, "i420 {width}x{height} needs {} bytes, got {}", width as usize * height as usize * 3 / 2, data.len());
-        Ok(VideoImage { width, height, format: PixelFormat::I420, data })
+        Ok(VideoImage { width, height, format: PixelFormat::I420, data, header: None })
     }
 
     /// Width in pixels.
@@ -240,10 +242,22 @@ impl VideoImage {
         &self.data
     }
 
-    /// Box-filtered to `width × height` as I420 (BT.601 limited range), e.g. to a [`VideoTarget`]'s size.
+    /// With its message's header (`stamp` in seconds, `frame_id` its TF frame): each picture's goes to the page with its
+    /// per-frame metadata (`msg.video.stamp`, `msg.video.frameId`).
+    pub fn with_header(mut self, stamp: f64, frame_id: impl Into<String>) -> Self {
+        self.header = Some((stamp.to_bits(), frame_id.into()));
+        self
+    }
+
+    /// The message header's stamp (seconds) and frame id, if the encoding gave one ([`with_header`](Self::with_header)).
+    pub fn header(&self) -> Option<(f64, &str)> {
+        self.header.as_ref().map(|(stamp, frame_id)| (f64::from_bits(*stamp), frame_id.as_str()))
+    }
+
+    /// Box-filtered to `width × height` as I420 (BT.601 limited range), e.g. to a [`VideoTarget`]'s size; keeps the header.
     pub fn to_i420(&self, width: u32, height: u32) -> Result<VideoImage> {
         ensure!(width.is_multiple_of(2) && height.is_multiple_of(2), "i420 needs even sizes, got {width}x{height}");
-        VideoImage::i420(width, height, video::to_i420(self, width, height))
+        Ok(VideoImage { header: self.header.clone(), ..VideoImage::i420(width, height, video::to_i420(self, width, height))? })
     }
 }
 

@@ -80,6 +80,20 @@ const camera = app.zenoh.subscribe("dimos/color_image/*", { encoding: "dimos_lcm
 <video autoplay muted playsinline></video>
 ```
 
+## How do I know which TF frame and time a video picture is from?
+
+An encoding that sets the picture's header (`VideoImage::with_header`, as zenoh-dimos-codecs' image codecs do) sends it
+with each frame's metadata: `msg.video.frameId` and `msg.video.stamp` (seconds). For the picture on screen rather than
+the latest one, look it up by the frame the element shows:
+
+```js
+const onShown = (_now, frame) => {
+    const info = camera.videoFrameInfo(frame.rtpTimestamp) // { frameId, stamp, ... } or undefined
+    video.requestVideoFrameCallback(onShown)
+}
+video.requestVideoFrameCallback(onShown)
+```
+
 ## How do I change a running video's quality or resolution?
 
 ```js
