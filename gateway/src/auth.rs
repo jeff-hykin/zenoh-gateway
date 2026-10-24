@@ -40,9 +40,6 @@ pub struct Grant {
     pub subject: Option<String>,
     /// zenoh access-control rules for this connection, in place of the lists above when set ([`Acl`])
     pub acl: Option<Acl>,
-    /// this connection's link bandwidth as the host knows it, bytes/s, in place of the estimate (e.g. a browser on the
-    /// gateway's own machine); see [`crate::ServerBuilder::link_bandwidth_bytes_per_sec`]
-    pub link_bandwidth_bytes_per_sec: Option<f64>,
 }
 
 /// zenoh's access-control model ([zenoh docs](https://zenoh.io/docs/manual/access-control/)) for one connection, with

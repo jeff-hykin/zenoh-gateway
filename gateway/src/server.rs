@@ -67,7 +67,6 @@ pub struct ServerBuilder {
     connect: Vec<String>,
     serve_dir: Option<PathBuf>,
     max_bandwidth_bytes_per_sec: Option<f64>,
-    link_bandwidth_bytes_per_sec: Option<f64>,
     latency_target: Duration,
     stale_after: Duration,
     put_timeout: Duration,
@@ -91,7 +90,6 @@ impl Default for ServerBuilder {
             connect: Vec::new(),
             serve_dir: None,
             max_bandwidth_bytes_per_sec: None,
-            link_bandwidth_bytes_per_sec: None,
             latency_target: crate::allocator::DEFAULT_LATENCY_TARGET,
             stale_after: crate::allocator::DEFAULT_STALE_AFTER,
             put_timeout: crate::peer::DEFAULT_PUT_TIMEOUT,
@@ -146,14 +144,6 @@ impl ServerBuilder {
     /// Caps every browser's bandwidth budget (bytes/s) below its estimate, e.g. for a known-slow link. Default: no cap.
     pub fn max_bandwidth_bytes_per_sec(mut self, bytes_per_sec: f64) -> Self {
         self.max_bandwidth_bytes_per_sec = Some(bytes_per_sec);
-        self
-    }
-
-    /// Every browser's link bandwidth (bytes/s) as you know it, used in place of the estimate: no probing, and video
-    /// sized for it from the first frame. A [`Grant::link_bandwidth_bytes_per_sec`] sets it per connection (e.g. from
-    /// `authorize`, for a browser on this machine). Default: estimated per connection.
-    pub fn link_bandwidth_bytes_per_sec(mut self, bytes_per_sec: f64) -> Self {
-        self.link_bandwidth_bytes_per_sec = Some(bytes_per_sec);
         self
     }
 
@@ -315,9 +305,6 @@ impl ServerBuilder {
         if let Some(cap) = self.max_bandwidth_bytes_per_sec {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
-        if let Some(known) = self.link_bandwidth_bytes_per_sec {
-            ensure!(known.is_finite() && known > 0.0, "link bandwidth must be a positive number of bytes/s, got {known}");
-        }
         ensure!(!self.latency_target.is_zero(), "latency target must be more than 0");
         ensure!(!self.stale_after.is_zero(), "stale_after must be more than 0");
         ensure!(!self.put_timeout.is_zero() && !self.encode_timeout.is_zero() && !self.signalling_timeout.is_zero(), "put, encode and signalling timeouts must be more than 0");
@@ -340,7 +327,6 @@ impl ServerBuilder {
         let leases = Leases::new(self.lease_groups, self.slowest_lease_heartbeat_allowed);
         let gateway = Gateway::new(session.clone(), codecs, AllocationConfig {
             max_bandwidth: self.max_bandwidth_bytes_per_sec,
-            link_bandwidth: self.link_bandwidth_bytes_per_sec,
             latency_target: self.latency_target,
             stale_after: self.stale_after,
             put_timeout: self.put_timeout,

@@ -1875,7 +1875,7 @@ export class ZenohGateway {
     #linkBandwidth: number | undefined
 
     /** Tells the gateway the link's known bandwidth (bytes/s), used in place of its estimate (`undefined`: back to the
-     *  host's, else estimated); kept across reconnects. */
+     *  estimate); kept across reconnects. */
     async setLinkBandwidth(bytesPerSec: number | undefined): Promise<void> {
         this.#linkBandwidth = bytesPerSec
         if (this.state === "connected" || this.state === "degraded") {

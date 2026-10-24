@@ -57,8 +57,6 @@ const VIDEO_DELIVERY_WINDOW: Duration = Duration::from_secs(2);
 pub struct AllocationConfig {
     /// cap on each frontend's budget, bytes/s
     pub max_bandwidth: Option<f64>,
-    /// each frontend's link bandwidth as the host knows it, bytes/s, in place of the estimate (a grant's own wins)
-    pub link_bandwidth: Option<f64>,
     /// what data may take to reach the page while the path is faster than that (`allocator::LinkModel::window`)
     pub latency_target: Duration,
     /// how long anything unanswered (an unacked frame, an unfinished query, a quiet key) is waited on
@@ -190,7 +188,7 @@ struct PeerState {
     tracks: Mutex<HashMap<String, Arc<MediaTrack>>>,
     video_rate: Arc<media::VideoRate>,
     config: AllocationConfig,
-    /// the link bandwidth (bytes/s) used in place of the estimate: the page's (`setLinkBandwidth`), else the host's
+    /// the link bandwidth (bytes/s) the page gave (`setLinkBandwidth`), used in place of the estimate
     known_bandwidth: Mutex<Option<f64>>,
     gate: Arc<SendGate>,
     link: Mutex<LinkModel>,
@@ -244,14 +242,7 @@ impl PeerState {
         token: Option<String>,
         grant: Grant,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<(Instant, Value)>) {
-        let granted_bandwidth = grant.link_bandwidth_bytes_per_sec.filter(|known| {
-            let valid = known.is_finite() && *known > 0.0;
-            if !valid {
-                log::warn!("peer {peer_id}: ignoring the grant's link bandwidth {known} (not a positive number of bytes/s)");
-            }
-            valid
-        });
-        let config = AllocationConfig { link_bandwidth: granted_bandwidth.or(gateway.allocation.link_bandwidth), ..gateway.allocation };
+        let config = gateway.allocation;
         let (api_events, api_events_receiver) = tokio::sync::mpsc::unbounded_channel();
         LIVE_PEER_STATES.fetch_add(1, Ordering::Relaxed);
         let state = PeerState {
@@ -265,7 +256,7 @@ impl PeerState {
             peer_id,
             session: gateway.session.clone(),
             codecs: gateway.codecs.clone(),
-            known_bandwidth: Mutex::new(config.link_bandwidth),
+            known_bandwidth: Mutex::new(None),
             channels: Mutex::new(HashMap::new()),
             next_channel: AtomicU64::new(0),
             connection_state: Mutex::new(None),
@@ -366,7 +357,7 @@ impl PeerState {
         let video_estimate = if has_video {
             let brake = self.video_cap(now, budget, per_sec(video_through));
             let estimate = self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget).min(brake.unwrap_or(budget));
-            // (a known link: what the page or host said, in place of GCC's estimate and the brake's)
+            // (a known link: what the page said, in place of GCC's estimate and the brake's)
             let estimate = if known_bandwidth.is_some() { budget } else { estimate };
             // in startup, at most the startup gain times what video measurably delivered, as BBR's startup paces at its
             // gain times the delivery it measured (the budget is that times a first guess, 64 KB/s: video sent 15x a
@@ -1269,7 +1260,7 @@ struct ControlRequest {
     /// updateSubscription: the subscription's channel id, and the options to change
     sub_id: Option<u64>,
     opts: Option<Value>,
-    /// setLinkBandwidth: the link's known bandwidth, bytes/s (absent or null: back to the host's, else the estimate)
+    /// setLinkBandwidth: the link's known bandwidth, bytes/s (absent or null: back to the estimate)
     bytes_per_sec: Option<f64>,
 }
 
@@ -1374,7 +1365,7 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             "setLinkBandwidth" => match request.bytes_per_sec {
                 Some(known) if !(known.is_finite() && known > 0.0) => fail(&request.id, format!("bytesPerSec must be a positive number of bytes/s, got {known}")),
                 known => {
-                    *state.known_bandwidth.lock() = known.or(state.config.link_bandwidth);
+                    *state.known_bandwidth.lock() = known;
                     ok(&request.id, json!({}))
                 }
             },

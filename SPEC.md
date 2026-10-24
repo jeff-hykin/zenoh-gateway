@@ -240,7 +240,6 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
 
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
-`link_bandwidth_bytes_per_sec` (a known link speed used in place of the estimate: no probing; a grant's own wins),
 `encoding`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `ice_servers_fn`, `cloudflare_turn`, `udp_ports`,
 `video_encoder` (a factory per video format for every encoding without its own encoder, e.g. a hardware one from
 zenoh-dimos-codecs' encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
@@ -611,8 +610,7 @@ per-browser layer on top, with reasons.
   matching for subscribers), `queryable` (queryables the frontend declares), `liveliness` (tokens it declares,
   keys it watches or `livelinessGet`s), `query`
   (`get`), `listTopics` (which keys a listing shows), and the lease rights `leaseGroups` (names, `"*"` =
-  any), `maxLeaseSecs` and `forceExpire`, and optionally `linkBandwidthBytesPerSec` (this connection's known link speed,
-  in place of the estimate, e.g. for a browser on the gateway's machine). A request is allowed when one of the list's expressions
+  any), `maxLeaseSecs` and `forceExpire`. A request is allowed when one of the list's expressions
   includes its key (zenoh's `includes`: `robot/**` includes `robot/arm/cmd` and `robot/arm/**`, not
   `**`). Two optional lists narrow `publish` and `liveliness` when set: `delete` (session `delete`s) and
   `livelinessTokens` (tokens it declares; `liveliness` then only watches and gets). `subject` (optional) names
@@ -747,7 +745,7 @@ resolving so the gateway has an offset before the first put.
 - One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
   `encodings`, `renegotiate`, `setDeadman`, `clearDeadman`, `lease {group, keys?, maxSeconds?}`,
   `releaseLease {group}`, `expireLease {group}`, `setLinkBandwidth {bytesPerSec}` (the link's known speed in place of
-  the estimate, over the grant's and the host's; null: back to theirs, else the estimate), `updateSubscription {subId, opts}` (changes a running
+  the estimate; null: back to the estimate), `updateSubscription {subId, opts}` (changes a running
   subscription's maxHz, minQuality, qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale,
   maxResolution, playoutDelay or encodeOptions.quality; replies `{opts}`, the options now in force), plus the ops in "The rest of the zenoh API") and events:
   `accepted` / `rejected` (per sub/pub channel, by label id), `tripped`, `leaseLost {group, reason}`, `query`,
