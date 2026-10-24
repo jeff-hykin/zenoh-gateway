@@ -746,7 +746,8 @@ resolving so the gateway has an offset before the first put.
   The heartbeat channel is `{"type":"heartbeat", "opts":{"hz":..., "misses":...}}`.
 - One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
   `encodings`, `renegotiate`, `setDeadman`, `clearDeadman`, `lease {group, keys?, maxSeconds?}`,
-  `releaseLease {group}`, `expireLease {group}`, `updateSubscription {subId, opts}` (changes a running
+  `releaseLease {group}`, `expireLease {group}`, `setLinkBandwidth {bytesPerSec}` (the link's known speed in place of
+  the estimate, over the grant's and the host's; null: back to theirs, else the estimate), `updateSubscription {subId, opts}` (changes a running
   subscription's maxHz, minQuality, qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale,
   maxResolution, playoutDelay or encodeOptions.quality; replies `{opts}`, the options now in force), plus the ops in "The rest of the zenoh API") and events:
   `accepted` / `rejected` (per sub/pub channel, by label id), `tripped`, `leaseLost {group, reason}`, `query`,

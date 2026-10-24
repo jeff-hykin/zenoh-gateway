@@ -190,6 +190,8 @@ struct PeerState {
     tracks: Mutex<HashMap<String, Arc<MediaTrack>>>,
     video_rate: Arc<media::VideoRate>,
     config: AllocationConfig,
+    /// the link bandwidth (bytes/s) used in place of the estimate: the page's (`setLinkBandwidth`), else the host's
+    known_bandwidth: Mutex<Option<f64>>,
     gate: Arc<SendGate>,
     link: Mutex<LinkModel>,
     /// `SendGate::acked_total` at the last allocation
@@ -263,6 +265,7 @@ impl PeerState {
             peer_id,
             session: gateway.session.clone(),
             codecs: gateway.codecs.clone(),
+            known_bandwidth: Mutex::new(config.link_bandwidth),
             channels: Mutex::new(HashMap::new()),
             next_channel: AtomicU64::new(0),
             connection_state: Mutex::new(None),
@@ -342,6 +345,7 @@ impl PeerState {
         let video_received = self.video_rate.received_bytes();
         let video_through = video_received.saturating_sub(self.video_received.swap(video_received, Ordering::Relaxed)) as f64;
         let delivered = acked + video_through;
+        let known_bandwidth = *self.known_bandwidth.lock();
         let link = {
             let mut link = self.link.lock();
             // video is held back by the link while it queues there (not by a cut, GCC's or its own brake's: those hold it
@@ -352,18 +356,18 @@ impl PeerState {
             log::debug!(target: "zenoh_gateway::link", "peer {}: round {round:?} video {:?} link-limited {video_link_limited} delivered {:.0}", self.peer_id, delivery.map(|delivery| delivery.bytes_per_sec), per_sec(delivered));
             link.update(now, interval_secs, round, delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
             log::debug!(target: "zenoh_gateway::link", "peer {}: bandwidth {:.0} gain {:.2} starting up {} probing rtt {} window {:?}", self.peer_id, link.bandwidth_bytes_per_sec, link.gain, link.starting_up, link.probing_rtt(), link.window(Some(self.config.latency_target)));
-            match self.config.link_bandwidth {
+            match known_bandwidth {
                 Some(known) => link.with_known_bandwidth(known),
                 None => link.clone(),
             }
         };
-        let (budget, at_cap) = self.budget(&link);
+        let (budget, at_cap) = self.budget(&link, known_bandwidth.is_some());
         // video gets the budget, but no more than its queue brake allows, nor GCC's target while GCC brakes
         let video_estimate = if has_video {
             let brake = self.video_cap(now, budget, per_sec(video_through));
             let estimate = self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget).min(brake.unwrap_or(budget));
-            // (a known link: what the host said, in place of GCC's estimate and the brake's)
-            let estimate = if self.config.link_bandwidth.is_some() { budget } else { estimate };
+            // (a known link: what the page or host said, in place of GCC's estimate and the brake's)
+            let estimate = if known_bandwidth.is_some() { budget } else { estimate };
             // in startup, at most the startup gain times what video measurably delivered, as BBR's startup paces at its
             // gain times the delivery it measured (the budget is that times a first guess, 64 KB/s: video sent 15x a
             // 100 kbit/s link and its queue held even the page's requests for 13 s; nor, before any delivery is measured, the
@@ -488,9 +492,9 @@ impl PeerState {
 
     /// What the streams may use: the link's bandwidth x its gain, within the cap.
     /// The frontend's budget, and whether it is the cap (`max_bandwidth`) rather than the link.
-    fn budget(&self, link: &LinkModel) -> (f64, bool) {
+    fn budget(&self, link: &LinkModel, known: bool) -> (f64, bool) {
         let (rate, _) = link.pacing(None);
-        if self.config.link_bandwidth.is_some() {
+        if known {
             // (a known link has nothing to probe for)
             return (self.config.max_bandwidth.map_or(rate, |cap| cap.min(rate)), true);
         }
@@ -1265,6 +1269,8 @@ struct ControlRequest {
     /// updateSubscription: the subscription's channel id, and the options to change
     sub_id: Option<u64>,
     opts: Option<Value>,
+    /// setLinkBandwidth: the link's known bandwidth, bytes/s (absent or null: back to the host's, else the estimate)
+    bytes_per_sec: Option<f64>,
 }
 
 fn ok(id: &Value, extra: Value) -> Value {
@@ -1365,6 +1371,13 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 continue;
             }
             "updateSubscription" => update_subscription(&state, &request),
+            "setLinkBandwidth" => match request.bytes_per_sec {
+                Some(known) if !(known.is_finite() && known > 0.0) => fail(&request.id, format!("bytesPerSec must be a positive number of bytes/s, got {known}")),
+                known => {
+                    *state.known_bandwidth.lock() = known.or(state.config.link_bandwidth);
+                    ok(&request.id, json!({}))
+                }
+            },
             "releaseLease" => {
                 state.leases.end(request.group.as_deref().unwrap_or_default(), |holder, _| holder == state.peer_id);
                 ok(&request.id, json!({}))

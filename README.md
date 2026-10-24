@@ -62,6 +62,7 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 | `token` | none | sent as `Authorization: Bearer <token>` (see [Auth](#auth)); a refused token rejects `connect` and stops reconnecting |
 | `iceServers` | the gateway's | `RTCIceServer[]`; by default fetched from the gateway (`GET /zenoh-gateway/ice`, TURN credentials minted per client), `[]` on a gateway without any |
 | `iceTransportPolicy` | the `/zenoh-gateway/ice` reply's, else `"all"` | `"relay"` sends everything through TURN |
+| `linkBandwidthBytesPerSec` | estimated | the link's known speed (bytes/s), used by the gateway in place of its estimate: no probing, video sized for it from the first frame (e.g. a page on the gateway's machine); the host's `max_bandwidth_bytes_per_sec` still caps it. `z.setLinkBandwidth(n)` changes it while connected (`undefined`: back to the estimate); kept across reconnects |
 | `reconnect` | `true` | re-open the connection and every live channel after a loss |
 | `freshAfterMs` | 2000 | a page hidden or frozen this long (a phone's background tab), or a connection "disconnected" this long, starts a fresh connection at once instead of catching up or waiting for the browser to call it failed |
 | `statsIntervalMs` | 1000 | how often `z.stats` / `z.gatewayStats` refresh |

@@ -199,6 +199,9 @@ export interface ConnectOptions {
     iceTransportPolicy?: RTCIceTransportPolicy
     /** sent as `Authorization: Bearer <token>`; the gateway's authorize hook turns it into a grant */
     token?: string
+    /** the link's known bandwidth (bytes/s), used by the gateway in place of its estimate (no probing; video sized for it
+     *  from the first frame), e.g. for a page on the gateway's own machine; the host's cap still applies. Default: estimated */
+    linkBandwidthBytesPerSec?: number
     reconnect?: boolean
     /** ms the page may be hidden or frozen, or the connection "disconnected", before the client starts a fresh
      *  connection at once instead of catching up or waiting for the browser to declare the old one failed (default 2000;
@@ -1307,7 +1310,7 @@ export class Lease {
     }
 }
 
-type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token">
+type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec">
 
 export class ZenohGateway {
     state: ConnectionState = "connecting"
@@ -1363,6 +1366,7 @@ export class ZenohGateway {
     constructor(url: string, options: ConnectOptions = {}) {
         this.url = url.replace(/\/+$/, "")
         this.options = { reconnect: true, freshAfterMs: 2000, statsIntervalMs: 1000, heartbeatHz: 0, heartbeatMisses: 3, ...options }
+        this.#linkBandwidth = this.options.linkBandwidthBytesPerSec
         this.now = this.options.clock ?? (() => performance.timeOrigin + performance.now())
         if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
             document.addEventListener("visibilitychange", this.#onVisibility)
@@ -1602,6 +1606,9 @@ export class ZenohGateway {
             // a few quick samples so the gateway knows the clock offset before the first put
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()
+            }
+            if (this.#linkBandwidth !== undefined) {
+                await this._request({ op: "setLinkBandwidth", bytesPerSec: this.#linkBandwidth }, pingTimeoutMs)
             }
             await this.#redeclare()
         } catch (error) {
@@ -1862,6 +1869,18 @@ export class ZenohGateway {
         await listener._declare()
         this.#apiHandles.add(listener)
         return listener
+    }
+
+    /** the link bandwidth this page gave the gateway (bytes/s), re-sent on every reconnect */
+    #linkBandwidth: number | undefined
+
+    /** Tells the gateway the link's known bandwidth (bytes/s), used in place of its estimate (`undefined`: back to the
+     *  host's, else estimated); kept across reconnects. */
+    async setLinkBandwidth(bytesPerSec: number | undefined): Promise<void> {
+        this.#linkBandwidth = bytesPerSec
+        if (this.state === "connected" || this.state === "degraded") {
+            await this._request({ op: "setLinkBandwidth", bytesPerSec: bytesPerSec ?? null }, pingTimeoutMs)
+        }
     }
 
     /** The gateway's zenoh session: its id, and the routers and peers it is connected to. */
