@@ -450,7 +450,7 @@ zenoh API from a page) are in
 [zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli), which builds them against this crate.
 
 ## Known limitations
-
+- Encodings shipped from the browser as WASM are not yet implemented. 
 - Topic listing sees liveliness tokens (incl. AdvancedPublishers with publisher detection) and keys
   that publish during its probe; plain declarations without a token are invisible.
 - The default video encoder is software H.264 (openh264). Viewers of one stream at similar grants share one encode,
@@ -458,6 +458,5 @@ zenoh API from a page) are in
 - Audio goes to the browser only; the microphone direction is designed (SPEC "Audio") but not built.
 - Signaling is plain HTTP: a bearer token crosses the network in the clear unless the gateway sits behind
   HTTPS (a reverse proxy).
-- Leases bind only this gateway's clients, and aren't re-taken after a reconnect.
-- Encodings are compiled into the application (encodings shipped from the browser as WASM are a later phase).
 - Changing a subscription's options means closing it and subscribing again.
+
