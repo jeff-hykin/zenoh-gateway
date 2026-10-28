@@ -327,6 +327,4 @@ The end-to-end suites (real zenoh peer, server and headless Chrome) live in
 - Topic listing only sees keys with a liveliness token or that publish during its probe.
 - The default video encoder is software H.264: each stream costs CPU unless the server has a hardware encoder.
 - Audio goes to the browser only; the microphone direction isn't built.
-- Signaling is plain HTTP, so tokens travel in the clear unless the gateway sits behind HTTPS.
-- `update(changes)` can't change the key, `delivery`, `priority`, the encoding or `encodeOptions` other than `quality`;
-  for those, close the subscription and subscribe again.
+- Changes to certain keys, like `delivery`, `priority`, the encoding, or `encodeOptions` require a re-subscribe to take effect
