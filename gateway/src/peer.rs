@@ -15,7 +15,7 @@ use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -34,8 +34,7 @@ use zenoh::qos::{CongestionControl, Priority, Reliability};
 /// Largest message we accept from (and advertise to) the browser; Chrome sends 256 KiB too.
 const MAX_MESSAGE_SIZE: u32 = 256 * 1024;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_LIST_PROBE_MS: u64 = 600;
-/// A page's probeMs is capped: its `**` subscriber recorded every key and kept the peer alive until it ended.
+/// A page's probeMs is capped: its subscriber on the filter kept the peer alive until it ended.
 const MAX_LIST_PROBE_MS: u64 = 10_000;
 const LIVELINESS_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// A connection that stays `disconnected` this long is treated as gone.
@@ -157,6 +156,7 @@ struct PeerState {
     peer_id: u64,
     session: zenoh::Session,
     codecs: Arc<EncodingRegistry>,
+    catalog: Arc<crate::catalog::TopicCatalog>,
     channels: Mutex<HashMap<u64, ChannelEntry>>,
     next_channel: AtomicU64,
     connection_state: Mutex<Option<RTCPeerConnectionState>>,
@@ -239,6 +239,7 @@ impl PeerState {
             peer_id,
             session: gateway.session.clone(),
             codecs: gateway.codecs.clone(),
+            catalog: gateway.catalog.clone(),
             channels: Mutex::new(HashMap::new()),
             next_channel: AtomicU64::new(0),
             connection_state: Mutex::new(None),
@@ -467,6 +468,8 @@ struct PeerEntry {
 pub struct Gateway {
     session: zenoh::Session,
     codecs: Arc<EncodingRegistry>,
+    /// every topic seen since the gateway started (SPEC "Topic enumeration")
+    pub catalog: Arc<crate::catalog::TopicCatalog>,
     allocation: AllocationConfig,
     peers: Mutex<HashMap<u64, PeerEntry>>,
     next_peer: AtomicU64,
@@ -477,10 +480,11 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub fn new(session: zenoh::Session, codecs: EncodingRegistry, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
+    pub fn new(session: zenoh::Session, codecs: EncodingRegistry, catalog: Arc<crate::catalog::TopicCatalog>, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
         Arc::new(Gateway {
             session,
             codecs: Arc::new(codecs),
+            catalog,
             allocation,
             peers: Mutex::new(HashMap::new()),
             next_peer: AtomicU64::new(1),
@@ -823,7 +827,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
                 register(opts.normalized(), ChannelStats::Sub(shared.clone()));
                 state.leases.changed();
                 state.send_accepted(label.id).await;
-                subscription::run(dc.clone(), label.clone(), session, shared, track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
+                subscription::run(dc.clone(), label.clone(), session, state.catalog.clone(), shared, track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
                 None
             }
             Err(error) => Some(error),
@@ -1113,7 +1117,7 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 let (dc, state) = (dc.clone(), state.clone());
                 tokio::spawn(async move {
                     let response = match request.op.as_str() {
-                        "listTopics" => handle_list_topics(&state.session, &request, &state.grant).await,
+                        "listTopics" => handle_list_topics(&state.session, &state.catalog, &request, &state.grant).await,
                         "expireLease" => expire_lease(&state, &request).await,
                         _ => handle_renegotiate(&state, &request).await,
                     };
@@ -1264,54 +1268,51 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
     ok(&request.id, json!({}))
 }
 
-/// Every key the gateway can find live under `filter`, with where it was seen:
+/// Every topic under `filter`, with where it was seen:
 /// - `advancedPublisher`: liveliness tokens of zenoh-ext AdvancedPublishers with publisher_detection
 /// - `token`: any other liveliness token
-/// - `sample`: data seen on a `filter` subscription during `probe` (catches undeclared publishers);
-///   a zero `probe` skips that subscription
+/// - `sample`: a key some subscription received within the catalog's memory, or that published during `probe`
 ///
-/// Plain publishers, subscribers and queryables without a token are invisible.
-async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) -> anyhow::Result<Vec<Value>> {
-    let found: Arc<Mutex<BTreeMap<String, BTreeSet<&'static str>>>> = Arc::default();
-    let note = |found: &Mutex<BTreeMap<String, BTreeSet<&'static str>>>, key: &str, source: &'static str| {
-        found.lock().entry(key.to_owned()).or_default().insert(source);
-    };
-    let sink = found.clone();
-    // probe 0 = tokens only: no subscription, so publishers that only send while matched (matching
-    // listeners) aren't woken by a listing
-    let probe_subscriber = match probe.is_zero() {
-        true => None,
-        false => Some(
-            session
-                .declare_subscriber(filter)
-                .callback(move |sample| note(&sink, sample.key_expr().as_str(), "sample"))
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
-        ),
-    };
-    for selector in [filter.to_owned(), format!("{filter}/@adv/pub/**")] {
-        let Ok(replies) = session.liveliness().get(selector.as_str()).timeout(LIVELINESS_QUERY_TIMEOUT).await else {
-            continue;
-        };
-        while let Ok(reply) = replies.recv_async().await {
-            if let Ok(sample) = reply.result() {
-                let token = sample.key_expr().as_str();
-                match token.split_once("/@adv/pub/") {
-                    Some((key, _)) => note(&found, key, "advancedPublisher"),
-                    None => note(&found, token, "token"),
+/// The catalog answers at once; a non-zero `probe` also subscribes to `filter` that long (catching quiet,
+/// undeclared publishers) and remembers what it saw. Plain publishers without a token are seen only by their samples.
+async fn list_topics(session: &zenoh::Session, catalog: &Arc<crate::catalog::TopicCatalog>, filter: &str, probe: Duration) -> anyhow::Result<Vec<Value>> {
+    let filter_expr = zenoh::key_expr::KeyExpr::try_from(filter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // probe 0 = no subscription, so publishers that only send while matched (matching listeners) aren't woken by a listing
+    if !probe.is_zero() {
+        let sink = catalog.clone();
+        let probe_subscriber = session
+            .declare_subscriber(filter)
+            .callback(move |sample| sink.note_sample(sample.key_expr().as_str()))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tokio::time::sleep(probe).await;
+        drop(probe_subscriber);
+    }
+    let mut found = catalog.list(&filter_expr);
+    // the catalog follows `**`, which never matches verbatim chunks like rmw_zenoh's `@ros2_lv/...`: ask for those
+    if !zenoh::key_expr::KeyExpr::try_from("**").is_ok_and(|all| all.includes(&filter_expr)) {
+        for selector in [filter.to_owned(), format!("{filter}/@adv/pub/**")] {
+            let Ok(replies) = session.liveliness().get(selector.as_str()).timeout(LIVELINESS_QUERY_TIMEOUT).await else {
+                continue;
+            };
+            while let Ok(reply) = replies.recv_async().await {
+                if let Ok(sample) = reply.result() {
+                    let token = sample.key_expr().as_str();
+                    let (key, source) = match token.split_once("/@adv/pub/") {
+                        Some((key, _)) => (key, "advancedPublisher"),
+                        None => (token, "token"),
+                    };
+                    found.entry(key.to_owned()).or_default().insert(source);
                 }
             }
         }
     }
-    tokio::time::sleep(probe).await;
-    drop(probe_subscriber);
-    let found = found.lock();
-    Ok(found.iter().map(|(key, sources)| json!({"key": key, "sources": sources})).collect())
+    Ok(crate::catalog::to_json(found))
 }
 
-async fn handle_list_topics(session: &zenoh::Session, request: &ControlRequest, grant: &Grant) -> Value {
+async fn handle_list_topics(session: &zenoh::Session, catalog: &Arc<crate::catalog::TopicCatalog>, request: &ControlRequest, grant: &Grant) -> Value {
     let filter = if request.key.is_empty() { "**" } else { &request.key };
-    match list_topics(session, filter, Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS).min(MAX_LIST_PROBE_MS))).await {
+    match list_topics(session, catalog, filter, Duration::from_millis(request.probe_ms.unwrap_or(0).min(MAX_LIST_PROBE_MS))).await {
         Ok(mut topics) => {
             topics.retain(|topic| grant.allows(crate::auth::Action::List, topic["key"].as_str().unwrap_or_default()).is_ok());
             ok(&request.id, json!({"topics": topics}))
@@ -1367,6 +1368,7 @@ mod tests {
                     config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).unwrap();
                 }
                 let session = zenoh::open(config).await.unwrap();
+                let catalog = crate::catalog::TopicCatalog::start(&session, Duration::from_secs(60)).await.unwrap();
                 let deadline = Instant::now() + Duration::from_secs(3);
                 let mut tasks = Vec::new();
                 for worker in 0..3 {
@@ -1381,10 +1383,12 @@ mod tests {
                     }));
                 }
                 for _ in 0..3 {
-                    let session = session.clone();
+                    let (session, catalog) = (session.clone(), catalog.clone());
                     tasks.push(tokio::spawn(async move {
                         while Instant::now() < deadline {
-                            list_topics(&session, "**", Duration::ZERO).await.unwrap();
+                            list_topics(&session, &catalog, "**", Duration::ZERO).await.unwrap();
+                            // a filter outside `**` still asks liveliness live
+                            list_topics(&session, &catalog, "@ros2_lv/**", Duration::ZERO).await.unwrap();
                             // what listTopics used to ask: the gateway's own declarations, from the admin space
                             let replies = session.get("@/*/*/subscriber/**").timeout(Duration::from_secs(1)).await.unwrap();
                             while replies.recv_async().await.is_ok() {}

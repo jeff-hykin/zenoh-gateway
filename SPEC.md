@@ -69,7 +69,7 @@ await z.expireLease("arm")        // end another client's lease (needs the grant
 
 const replies = await z.get("some/key/**", { parameters: "a=1", payload, encoding, attachment, target, consolidation, timeoutMs })
                                              // [{ key, bytes, kind, encoding, attachment, timestamp } | { error: true, bytes, encoding }]
-const topics = await z.listTopics("robot/**")  // [{ key, sources }], see "Topic enumeration"
+const topics = await z.listTopics("robot/**")  // [{ key, sources }] at once, see "Topic enumeration"
 
 // the rest of zenoh's API, see "The rest of the zenoh API"
 await z.put("some/key", bytes, { encoding: "text/plain", attachment, priority, congestionControl: "block", express: true, timestamp })
@@ -575,16 +575,22 @@ drop-tail queue, 30 ms each way), three 200 KB point clouds at 10 Hz, a 400 KB m
 
 ## Topic enumeration
 
-`z.listTopics(filter = "**", { probeMs = 600 })` merges what the gateway can see, each key tagged with its sources:
+`z.listTopics(filter = "**", { probeMs = 0 })` answers at once from the gateway's topic catalog, which runs
+for the gateway's lifetime, each key tagged with its sources:
 
 | source | what it sees |
 |---|---|
-| `token` | liveliness tokens (`liveliness().get`) |
+| `token` | liveliness tokens, followed live (a liveliness subscriber on `**` with history) |
 | `advancedPublisher` | zenoh-ext AdvancedPublishers with publisher_detection (their `@adv/pub` token) |
-| `sample` | keys that published during a `probeMs` subscription on `filter`, declared or not |
+| `sample` | keys any page's subscription received, or that published during a `probeMs` listen, declared or not |
 
-`probeMs: 0` skips the `sample` probe entirely (no subscription on `filter`), so a publisher that
-only sends while it has a matching subscriber (a zenoh matching listener) isn't woken by a listing.
+The gateway doesn't subscribe to all data (that would pull every message through it), so a quiet publisher
+nothing subscribes to is only found by a probe: `probeMs` subscribes to `filter` that long before answering,
+and what it hears joins the catalog. `probeMs: 0` (the default) never subscribes, so a publisher that only
+sends while it has a matching subscriber (a zenoh matching listener) isn't woken by a listing. A `sample` key
+is forgotten after `ServerBuilder::topic_memory` (default 5 minutes) without a message; a token key stays
+while its token lives. Filters the catalog's `**` can't match (verbatim chunks like `@ros2_lv/...`) also
+ask liveliness directly.
 
 It can't see plain publishers, subscribers and queryables that hold no token (a publisher that puts
 during the probe is still seen): zenoh's admin space would list the gateway's routing tables, but

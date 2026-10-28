@@ -31,11 +31,11 @@ impl MessageEncoding for Cam {
                 seed ^= seed << 13;
                 seed ^= seed >> 17;
                 seed ^= seed << 5;
-                let noise = (seed & 31) as u32;
+                let noise = seed & 31;
                 let moving = ((x + frame * 4) / 32 + (y + frame * 2) / 32) % 2;
                 let i = ((y * width + x) * 3) as usize;
-                data[i] = ((x * 255 / width) as u32 + noise).min(255) as u8;
-                data[i + 1] = ((y * 255 / height) as u32 + noise).min(255) as u8;
+                data[i] = (x * 255 / width + noise).min(255) as u8;
+                data[i + 1] = (y * 255 / height + noise).min(255) as u8;
                 data[i + 2] = (moving * 200 + noise).min(255) as u8;
             }
         }

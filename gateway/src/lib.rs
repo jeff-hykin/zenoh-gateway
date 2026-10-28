@@ -43,6 +43,7 @@ mod allocator;
 mod api;
 mod audio;
 mod auth;
+mod catalog;
 #[cfg(feature = "client")]
 pub mod client;
 mod encoding;

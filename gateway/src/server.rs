@@ -76,6 +76,7 @@ pub struct ServerBuilder {
     video_encoders: Vec<(VideoFormat, VideoEncoderFactory)>,
     video_policy: VideoPolicy,
     zenoh_signalling: Option<String>,
+    topic_memory: Duration,
     tls: Option<TlsSource>,
 }
 
@@ -102,6 +103,7 @@ impl Default for ServerBuilder {
             video_policy: VideoPolicy::default(),
             zenoh_signalling: None,
             tls: None,
+            topic_memory: Duration::from_secs(300),
         }
     }
 }
@@ -265,6 +267,13 @@ impl ServerBuilder {
         self
     }
 
+    /// How long `listTopics` keeps listing a topic it only knew from samples (a subscription received them, or a
+    /// probe saw them) after the last one; topics with a liveliness token stay listed while the token lives. Default 5 minutes.
+    pub fn topic_memory(mut self, memory: Duration) -> Self {
+        self.topic_memory = memory;
+        self
+    }
+
     /// Validates the options, registers the encodings and opens the zenoh session (unless one was given).
     pub async fn build(self) -> Result<Server> {
         let fraction = self.bandwidth_target_fraction;
@@ -301,7 +310,8 @@ impl ServerBuilder {
             }
         };
         let leases = Leases::new(self.lease_groups);
-        let gateway = Gateway::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction }, leases, self.connect_config);
+        let catalog = crate::catalog::TopicCatalog::start(&session, self.topic_memory).await?;
+        let gateway = Gateway::new(session.clone(), codecs, catalog, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction }, leases, self.connect_config);
         let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, tls, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {
             ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");

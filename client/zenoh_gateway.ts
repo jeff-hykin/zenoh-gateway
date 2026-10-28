@@ -1561,11 +1561,11 @@ export class ZenohGateway {
     }
 
     /**
-     * Keys currently live on the zenoh network under `filter`, including ones never subscribed to.
-     * See SPEC.md "Topic enumeration" for which kinds of keys can and can't be seen.
-     * `probeMs: 0` lists liveliness tokens only, without subscribing to `filter`.
+     * Topics under `filter`, including ones never subscribed to, answered at once from what the gateway has seen
+     * since it started (SPEC.md "Topic enumeration"). `probeMs` also listens on `filter` that long first, to catch
+     * quiet publishers nothing else has seen.
      */
-    async listTopics(filter = "**", { probeMs = 600 }: { probeMs?: number } = {}): Promise<Topic[]> {
+    async listTopics(filter = "**", { probeMs = 0 }: { probeMs?: number } = {}): Promise<Topic[]> {
         const response = await this._request({ op: "listTopics", key: filter, probeMs }, probeMs + 5000)
         return response.topics as Topic[]
     }

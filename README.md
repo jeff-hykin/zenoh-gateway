@@ -65,7 +65,7 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 | `declareToken(key)`, `livelinessSubscribe(key, { history }, fn)`, `livelinessGet(key)` | liveliness |
 | `matchingStatus(key, "subscribers" \| "queryables")`, `matchingListener(key, target, fn)` | would anyone receive it |
 | `info()` → `{ zid, routers, peers }` | the gateway's zenoh session |
-| `listTopics(filter = "**", { probeMs = 600 })` → `[{ key, sources }]` | live keys (`probeMs: 0` skips the probe) |
+| `listTopics(filter = "**", { probeMs = 0 })` → `[{ key, sources }]` | topics the gateway has seen, at once; `probeMs` listens that long first |
 | `encodings` | `[{ name, output }]` the gateway runs |
 | `stats`, `gatewayStats`, `pollStats()` | per-key counters and allocation; link estimate, budget, queue delay |
 | `rttMs`, `clockOffsetMs`, `now()` | round trip, clock offset, the page clock |
@@ -325,7 +325,8 @@ The end-to-end suites (real zenoh peer, server and headless Chrome) live in
 ## Known limitations
 
 - Encodings shipped from the browser as WASM are not yet implemented.
-- Topic listing only sees keys with a liveliness token or that publish during its probe.
+- Topic listing knows a topic from its liveliness token, or from messages the gateway received on it (any page's
+  subscription, or a `probeMs` listen). A quiet topic with neither is missing until it publishes during a probe.
 - The default video encoder is software H.264: each stream costs CPU unless the server has a hardware encoder.
 - Audio goes to the browser only; the microphone direction isn't built.
 - Changes to certain keys, like `delivery`, `priority`, the encoding, or `encodeOptions` require a re-subscribe to take effect

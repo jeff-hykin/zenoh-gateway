@@ -106,6 +106,37 @@ async fn list_topics_and_get() {
     running.shutdown().await.unwrap();
 }
 
+/// The gateway's topic catalog: tokens and subscribed keys list at once, a probe catches quiet publishers and
+/// remembers them, and a token that goes is unlisted.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_topics_from_the_catalog() {
+    let (running, session, url) = start().await;
+    let token = session.liveliness().declare_token("catalog/arm").await.unwrap();
+    let _subscribed = keep_putting(&session, "catalog/odom", b"odom".to_vec());
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let mut subscription = client.subscribe("catalog/odom", SubscribeOptions::default()).await.unwrap();
+    timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap();
+    // no probe: answered from the catalog
+    let sources = |topics: &[zenoh_gateway::client::Topic], key: &str| topics.iter().find(|topic| topic.key == key).map(|topic| topic.sources.clone());
+    let topics = client.list_topics("catalog/**", Some(0)).await.unwrap();
+    assert_eq!(sources(&topics, "catalog/arm"), Some(vec!["token".to_owned()]), "{topics:?}");
+    assert_eq!(sources(&topics, "catalog/odom"), Some(vec!["sample".to_owned()]), "{topics:?}");
+    // a plain publisher nothing subscribes to: only a probe hears it, then the catalog remembers it
+    let _quiet = keep_putting(&session, "catalog/quiet", b"q".to_vec());
+    assert_eq!(sources(&client.list_topics("catalog/**", Some(0)).await.unwrap(), "catalog/quiet"), None);
+    assert_eq!(sources(&client.list_topics("catalog/**", Some(500)).await.unwrap(), "catalog/quiet"), Some(vec!["sample".to_owned()]));
+    assert_eq!(sources(&client.list_topics("catalog/**", Some(0)).await.unwrap(), "catalog/quiet"), Some(vec!["sample".to_owned()]));
+    token.undeclare().await.unwrap();
+    let gone = async {
+        while sources(&client.list_topics("catalog/**", Some(0)).await.unwrap(), "catalog/arm").is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    timeout(Duration::from_secs(5), gone).await.expect("an undeclared token leaves the catalog");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn raw_subscribe_is_byte_exact_with_zstd() {
     let (running, session, url) = start().await;
@@ -219,7 +250,7 @@ async fn a_running_video_subscription_changes_its_options_in_place() {
     // the new size starts at a keyframe on the same subscription
     let resized = loop {
         let frame = next_video(&mut camera).await;
-        if frame.keyframe && decode_all(&[frame.clone()]).0 == (160, 120) {
+        if frame.keyframe && decode_all(std::slice::from_ref(&frame)).0 == (160, 120) {
             break frame;
         }
     };

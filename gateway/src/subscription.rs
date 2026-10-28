@@ -704,12 +704,13 @@ impl Drop for Unsubscribe {
 
 /// Runs a `sub` channel until it closes. Video and audio channels send frames to `track` instead of `dc`.
 /// `rules`: a grant with an ACL, whose put/delete egress rules decide which samples reach the browser.
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, shared: Arc<SubShared>, track: Option<crate::media::TrackClaim>, rules: Option<Arc<crate::Grant>>) {
+pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, catalog: Arc<crate::catalog::TopicCatalog>, shared: Arc<SubShared>, track: Option<crate::media::TrackClaim>, rules: Option<Arc<crate::Grant>>) {
     let _ = dc.set_buffered_amount_low_threshold((shared.gate.window_bytes() / 2) as u32).await;
     let feed = shared.clone();
     let subscriber = session
         .declare_subscriber(shared.zenoh_key(&label.key))
         .callback(move |sample| {
+            catalog.note_sample(sample.key_expr().as_str());
             if let Some(rules) = &rules {
                 let message = if sample.kind() == SampleKind::Delete { crate::auth::AclMessage::Delete } else { crate::auth::AclMessage::Put };
                 // dropped like zenoh's egress ACL drops it

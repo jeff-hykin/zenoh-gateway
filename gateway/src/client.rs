@@ -799,10 +799,10 @@ impl Client {
         self.inner.shared.clock.lock().rtt_ms
     }
 
-    /// Keys live under `filter` (SPEC "Topic enumeration"); `probe_ms` (default 600) also catches
-    /// publishers that put meanwhile, 0 lists liveliness tokens only.
+    /// Topics under `filter`, answered at once from what the gateway has seen since it started (SPEC "Topic
+    /// enumeration"); `probe_ms` (default 0) also listens on `filter` that long first, to catch quiet publishers.
     pub async fn list_topics(&self, filter: &str, probe_ms: Option<u64>) -> Result<Vec<Topic>> {
-        let probe_ms = probe_ms.unwrap_or(600);
+        let probe_ms = probe_ms.unwrap_or(0);
         let mut reply = self.inner.request(json!({"op": "listTopics", "key": filter, "probeMs": probe_ms}), Duration::from_millis(probe_ms + 5000)).await?;
         Ok(serde_json::from_value(reply["topics"].take())?)
     }
