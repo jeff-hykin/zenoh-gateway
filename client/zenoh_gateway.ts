@@ -705,10 +705,6 @@ export class Subscription extends Endpoint {
     }
 
     /**
-     * Changes the running subscription's options in place: same channel and track, no resubscribe; the gateway's
-     * next frame uses them. Reconnects keep them too.
-     */
-    /**
      * Measures end-to-end latency on each frame `element` shows of this video subscription (requestVideoFrameCallback:
      * Chrome, Firefox, Safari): the frame's RTP timestamp names its metadata, whose gateway times the connection's
      * clock sync brings to this clock. Read it with `videoLatency()`; returns a function that stops measuring.
@@ -793,6 +789,10 @@ export class Subscription extends Endpoint {
         }
     }
 
+    /**
+     * Changes the running subscription's options in place: same channel and track, no resubscribe; the gateway's
+     * next frame uses them. Reconnects keep them too.
+     */
     async update(changes: SubscriptionUpdate): Promise<void> {
         await this.ready()
         await this.owner._request({ op: "updateSubscription", subId: this.id, opts: changes }, pingTimeoutMs)

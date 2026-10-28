@@ -124,7 +124,7 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 the gateway's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed"`), `mediaStream`
 (video and audio channels), `channelName` (the channel in use), `received`, `dropped`, `partialDropped`,
 `decodeErrors`, `gatewayStats`, `close()`, and `update(changes)`: changes `maxHz`, `minQuality`,
-`qualityToHzTradeoff`, `bandwidthPriority`, `maxBitrate`, `minResolutionScale`, `maxResolution`, `frameDropping`,
+`qualityToHzTradeoff`, `bandwidthPriority`, `maxBitrate`, `minResolutionScale`, `minResolution`, `maxResolution`, `frameDropping`,
 `keyframeIntervalMs`, `sceneChangeKeyframes`, `targetQp`, `playoutDelay` or
 `encodeOptions.quality` on the running subscription (same channel and track, no resubscribe; `null` puts one back
 to its default). A changed picture size starts at a keyframe.
@@ -485,4 +485,5 @@ zenoh API from a page) are in
   HTTPS (a reverse proxy).
 - Leases bind only this gateway's clients, and aren't re-taken after a reconnect.
 - Encodings are compiled into the application (encodings shipped from the browser as WASM are a later phase).
-- Changing a subscription's options means closing it and subscribing again.
+- `update(changes)` changes only the rate, quality and bandwidth options; changing the key, `delivery`, `priority`,
+  the encoding or the rest of `encodeOptions` means closing the subscription and subscribing again.
