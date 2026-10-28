@@ -52,7 +52,6 @@ pub type Authorize = dyn Fn(Option<&str>, &HeaderMap) -> Result<Grant, String> +
 /// let server = zenoh_gateway::Server::builder()
 ///     .connect("tcp/192.168.1.2:7447")
 ///     .serve_dir("examples")
-///     .bandwidth_target_fraction(0.75)
 ///     .build()
 ///     .await?;
 /// let running = server.bind(("0.0.0.0", 7448)).await?;
@@ -68,10 +67,15 @@ pub struct ServerBuilder {
     connect: Vec<String>,
     serve_dir: Option<PathBuf>,
     max_bandwidth_bytes_per_sec: Option<f64>,
-    bandwidth_target_fraction: f64,
+    latency_target: Duration,
+    stale_after: Duration,
+    put_timeout: Duration,
+    encode_timeout: Duration,
+    signalling_timeout: Duration,
     encodings: Vec<Arc<dyn MessageEncoding>>,
     authorize: Option<Arc<Authorize>>,
     lease_groups: HashMap<String, Vec<String>>,
+    slowest_lease_heartbeat_allowed: Duration,
     connect_config: ConnectConfig,
     video_encoders: Vec<(VideoFormat, VideoEncoderFactory)>,
     video_policy: VideoPolicy,
@@ -94,10 +98,15 @@ impl Default for ServerBuilder {
             connect: Vec::new(),
             serve_dir: None,
             max_bandwidth_bytes_per_sec: None,
-            bandwidth_target_fraction: 0.75,
+            latency_target: crate::allocator::DEFAULT_LATENCY_TARGET,
+            stale_after: crate::allocator::DEFAULT_STALE_AFTER,
+            put_timeout: crate::peer::DEFAULT_PUT_TIMEOUT,
+            encode_timeout: crate::encoding::registry::DEFAULT_ENCODE_TIMEOUT,
+            signalling_timeout: crate::peer::DEFAULT_SIGNALLING_TIMEOUT,
             encodings: Vec::new(),
             authorize: None,
             lease_groups: HashMap::new(),
+            slowest_lease_heartbeat_allowed: Duration::from_secs(60),
             connect_config: ConnectConfig::default(),
             video_encoders: Vec::new(),
             video_policy: VideoPolicy::default(),
@@ -161,9 +170,49 @@ impl ServerBuilder {
         self
     }
 
-    /// Share of the estimated bandwidth the allocator hands out, in (0, 1]; the rest keeps queues short. Default 0.75.
-    pub fn bandwidth_target_fraction(mut self, fraction: f64) -> Self {
-        self.bandwidth_target_fraction = fraction;
+    /// What data should take to reach a browser (default 300 ms). While the path itself is faster than that, latency
+    /// comes first: nothing is in flight longer, at the cost of throughput on a slow link. A path slower than that alone
+    /// (Wi-Fi whose delay swings) gets throughput first: the target times the square root of its speed over 500 kbit/s,
+    /// never less than the path's own round trip. A subscription's `maxAge` tightens it.
+    pub fn latency_target(mut self, latency: Duration) -> Self {
+        self.latency_target = latency;
+        self
+    }
+
+    /// How long the gateway waits on anything a browser or zenoh leaves unanswered before forgetting it (default 60 s):
+    /// a frame the page never acks, a query it never finalizes, a wildcard subscription's key whose publisher went
+    /// quiet. Nothing waits forever.
+    pub fn stale_after(mut self, after: Duration) -> Self {
+        self.stale_after = after;
+        self
+    }
+
+    /// The longest a put waits on zenoh (default 5 s): a browser's publisher (its `latencyLimit` instead, when set),
+    /// a put or delete over the control channel, a deadman. A blocking (reliable) put held back longer by congestion is
+    /// given up and counted as a failure, so a stuck zenoh never stalls a browser's channels.
+    pub fn put_timeout(mut self, timeout: Duration) -> Self {
+        self.put_timeout = timeout;
+        self
+    }
+
+    /// The longest one decode or encode may take (default 5 s). One that takes longer is skipped (an error in the
+    /// stream's stats); a video encoder that hung is rebuilt, and other frontends waiting on that shared work give up too.
+    pub fn encode_timeout(mut self, timeout: Duration) -> Self {
+        self.encode_timeout = timeout;
+        self
+    }
+
+    /// The longest answering an offer (`POST /offer`, or over zenoh) or a renegotiation may take (default 20 s); past it
+    /// the request fails and what it set up is closed.
+    pub fn signalling_timeout(mut self, timeout: Duration) -> Self {
+        self.signalling_timeout = timeout;
+        self
+    }
+
+    /// No longer used: a link is measured by what it delivers, so handing out a fraction of it only shrank the measure.
+    /// The in-flight window keeps queues short; cap a frontend with [`max_bandwidth_bytes_per_sec`](Self::max_bandwidth_bytes_per_sec).
+    #[deprecated(note = "the link model sends what the link delivers; cap it with max_bandwidth_bytes_per_sec")]
+    pub fn bandwidth_target_fraction(self, _fraction: f64) -> Self {
         self
     }
 
@@ -189,6 +238,13 @@ impl ServerBuilder {
     /// Defines a lease group: while a client holds it, other clients of this gateway can't publish on these keys.
     pub fn lease_group(mut self, name: impl Into<String>, keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.lease_groups.insert(name.into(), keys.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// The slowest heartbeat a client may hold a lease with (default 60 s): `heartbeatMisses / heartbeatHz` longer than
+    /// this is refused a lease, since a page that froze keeps its leases until that much silence.
+    pub fn slowest_lease_heartbeat_allowed(mut self, deadline: Duration) -> Self {
+        self.slowest_lease_heartbeat_allowed = deadline;
         self
     }
 
@@ -276,13 +332,14 @@ impl ServerBuilder {
 
     /// Validates the options, registers the encodings and opens the zenoh session (unless one was given).
     pub async fn build(self) -> Result<Server> {
-        let fraction = self.bandwidth_target_fraction;
-        ensure!(fraction > 0.0 && fraction <= 1.0, "bandwidth target fraction must be within (0, 1], got {fraction}");
         if let Some(cap) = self.max_bandwidth_bytes_per_sec {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
+        ensure!(!self.latency_target.is_zero(), "latency target must be more than 0");
+        ensure!(!self.stale_after.is_zero(), "stale_after must be more than 0");
+        ensure!(!self.put_timeout.is_zero() && !self.encode_timeout.is_zero() && !self.signalling_timeout.is_zero(), "put, encode and signalling timeouts must be more than 0");
         self.video_policy.validate()?;
-        let codecs = EncodingRegistry::new(self.encodings)?.with_video(self.video_encoders, self.video_policy);
+        let codecs = EncodingRegistry::new(self.encodings)?.with_video(self.video_encoders, self.video_policy).with_encode_timeout(self.encode_timeout);
         let mut config = self.zenoh_config.unwrap_or_default();
         if config.get_json("adminspace/enabled").is_ok_and(|enabled| enabled == "true") {
             log::warn!("adminspace/enabled: zenoh 1.7.0 through 1.10.1 deadlock answering the admin space while a declaration waits for the routing tables");
@@ -309,9 +366,15 @@ impl ServerBuilder {
                 Some(tls::server_config(&cert_pem, &key_pem)?)
             }
         };
-        let leases = Leases::new(self.lease_groups);
+        let leases = Leases::new(self.lease_groups, self.slowest_lease_heartbeat_allowed);
         let catalog = crate::catalog::TopicCatalog::start(&session, self.topic_memory).await?;
-        let gateway = Gateway::new(session.clone(), codecs, catalog, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction }, leases, self.connect_config);
+        let gateway = Gateway::new(session.clone(), codecs, catalog, AllocationConfig {
+            max_bandwidth: self.max_bandwidth_bytes_per_sec,
+            latency_target: self.latency_target,
+            stale_after: self.stale_after,
+            put_timeout: self.put_timeout,
+            signalling_timeout: self.signalling_timeout,
+        }, leases, self.connect_config);
         let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, tls, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {
             ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");
@@ -461,7 +524,8 @@ impl Server {
         }
         self.inner.gateway.shutdown().await;
         if self.inner.owns_session {
-            self.inner.session.close().await.map_err(|error| anyhow!("closing the zenoh session: {error}"))?;
+            let timeout = self.inner.gateway.signalling_timeout();
+            tokio::time::timeout(timeout, self.inner.session.close()).await.map_err(|_| anyhow!("closing the zenoh session took over {timeout:?}"))?.map_err(|error| anyhow!("closing the zenoh session: {error}"))?;
         }
         info!("shut down");
         Ok(())
@@ -506,8 +570,18 @@ impl RunningServer {
     }
 }
 
+/// This process's id: a client whose pings stop compares it with the one it connected to, and a new one (the gateway
+/// restarted, a killed one says nothing) reconnects at once instead of waiting for ICE to give up (6-25 s).
+fn boot_id() -> &'static str {
+    static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT_ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
+        format!("{:x}-{:x}", std::process::id(), nanos)
+    })
+}
+
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"service": "zenoh-gateway", "version": env!("CARGO_PKG_VERSION")}))
+    Json(serde_json::json!({"service": "zenoh-gateway", "version": env!("CARGO_PKG_VERSION"), "bootId": boot_id()}))
 }
 
 async fn ice_servers(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> Response {
@@ -530,7 +604,13 @@ async fn answer(inner: &Inner, headers: &HeaderMap, offer: RTCSessionDescription
         info!("offer refused: {reason}");
         (StatusCode::UNAUTHORIZED, reason)
     })?;
-    inner.gateway.answer(offer, token, grant).await.map_err(|error| {
+    // past the timeout the answer is dropped, and with it the connection it was setting up
+    let timeout = inner.gateway.signalling_timeout();
+    let answered = tokio::time::timeout(timeout, inner.gateway.answer(offer, token, grant)).await.map_err(|_| {
+        error!("offer took over {timeout:?}");
+        (StatusCode::GATEWAY_TIMEOUT, format!("answering the offer took over {timeout:?}"))
+    })?;
+    answered.map_err(|error| {
         error!("offer failed: {error:#}");
         (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
     })
@@ -560,17 +640,29 @@ mod signalling {
             let queryable = inner.session.declare_queryable(format!("{SIGNALLING_PREFIX}/{name}/{op}")).await.map_err(|error| anyhow!("declaring the signalling queryable: {error}"))?;
             let inner = Arc::downgrade(inner);
             tasks.push(tokio::spawn(async move {
-                while let Ok(query) = queryable.recv_async().await {
+                // each query's answer runs here, so aborting this task at shutdown aborts them too
+                let mut answering = tokio::task::JoinSet::new();
+                loop {
+                    let query = tokio::select! {
+                        query = queryable.recv_async() => match query {
+                            Ok(query) => query,
+                            Err(_) => break,
+                        },
+                        Some(_) = answering.join_next() => continue,
+                    };
                     let Some(inner) = inner.upgrade() else { break };
-                    tokio::spawn(async move {
+                    answering.spawn(async move {
                         let reply = respond(&inner, op, query.payload().map(|payload| payload.to_bytes().to_vec()).unwrap_or_default()).await;
                         let key = query.key_expr().clone();
+                        let timeout = inner.gateway.signalling_timeout();
                         let sent = match reply {
-                            Ok(body) => query.reply(key, body.to_string()).await,
-                            Err((status, reason)) => query.reply_err(serde_json::json!({"status": status.as_u16(), "error": reason}).to_string()).await,
+                            Ok(body) => tokio::time::timeout(timeout, query.reply(key, body.to_string())).await,
+                            Err((status, reason)) => tokio::time::timeout(timeout, query.reply_err(serde_json::json!({"status": status.as_u16(), "error": reason}).to_string())).await,
                         };
-                        if let Err(error) = sent {
-                            error!("signalling reply failed: {error}");
+                        match sent {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => error!("signalling reply failed: {error}"),
+                            Err(_) => error!("signalling reply took over {timeout:?}"),
                         }
                     });
                 }

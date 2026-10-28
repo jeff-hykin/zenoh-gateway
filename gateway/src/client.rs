@@ -138,12 +138,43 @@ pub struct SubscribeOptions {
     pub compress: Option<Compress>,
     /// video channels: most bits/s the stream asks for (default: the server's)
     pub max_bitrate: Option<f64>,
-    /// video channels: smallest share of the source's width and height the picture may shrink to (default 0.25)
+    /// video channels: smallest share of the source's width and height the picture may shrink to (default 0)
     pub min_resolution_scale: Option<f64>,
+    /// video channels: (width, height) the picture never shrinks below, aspect kept (default (160, 64))
+    pub min_resolution: Option<(u32, u32)>,
     /// video channels: (width, height) box the picture is fitted into
     pub max_resolution: Option<(u32, u32)>,
+    /// video channels: the encoder may skip frames to hold its bitrate (default true)
+    pub frame_dropping: Option<bool>,
+    /// video channels: a keyframe at least this often, ms, on top of the ones asked for after a loss (default 60000)
+    pub keyframe_interval_ms: Option<f64>,
+    /// video channels: a keyframe when the encoder sees a new scene (default false)
+    pub scene_change_keyframes: Option<bool>,
+    /// video channels: the quantizer (H.264's 0-51) the picture's size aims for, on encoders that report it (default 30)
+    pub target_qp: Option<f64>,
     /// video channels: (min, max) ms the browser may hold a frame to smooth out jitter (default (0, 0): show at once)
     pub playout_delay: Option<(f64, f64)>,
+    /// each encoded message with its sample's own header (stamp, frame id, seq): Some(true) everywhere, Some(false)
+    /// nowhere; None = the gateway's default for clients that don't say (video only)
+    pub metadata: Option<bool>,
+}
+
+/// What [`Client::lease_with`] asks for.
+#[derive(Debug, Clone, Default)]
+pub struct LeaseOptions {
+    /// a group the server defines (its keys and grants), or a name for this one; None = unnamed
+    pub group: Option<String>,
+    /// keys only the holder may publish on
+    pub publish: Vec<String>,
+    /// keys only the holder may subscribe to
+    pub subscribe: Vec<String>,
+    /// a newer lease on overlapping keys takes this one over ("takenOver") instead of being refused
+    pub allow_takeover: bool,
+    /// it ends after this many seconds
+    pub max_seconds: Option<f64>,
+    /// heartbeat silence (ms) that ends it, instead of the connection's heartbeat deadline (so deadmen can stay tight
+    /// while a lease rides out a stall); at most the server's `slowest_lease_heartbeat_allowed`
+    pub timeout_ms: Option<f64>,
 }
 
 /// Publisher options.
@@ -190,10 +221,12 @@ pub struct DataMessage {
     pub fields: Option<BTreeMap<String, Field>>,
     /// a delete sample (no payload), not a put
     pub delete: bool,
-    /// the sample's encoding, when not the default (raw messages only)
+    /// the sample's zenoh encoding, when not the default (raw messages; encoded ones with `header`, 0.5.32+)
     pub encoding: Option<String>,
-    /// the sample's attachment (raw messages only)
+    /// the sample's zenoh attachment (raw messages; encoded ones with `header`, 0.5.32+)
     pub attachment: Option<Vec<u8>>,
+    /// the sample's own header (stamp, frame id, seq), on encoded messages of a subscription with `metadata: true` (0.5.32+)
+    pub header: Option<crate::MessageHeader>,
 }
 
 /// An encoded video frame as the gateway's encoder produced it.
@@ -211,7 +244,7 @@ pub struct VideoFrame {
     pub received_at: Instant,
 }
 
-/// The 28-byte metadata frame the gateway sends per video frame (SPEC "Wire format").
+/// The metadata frame the gateway sends per video frame (SPEC "Wire format").
 #[derive(Debug, Clone)]
 pub struct VideoFrameInfo {
     /// the sample's key
@@ -234,6 +267,25 @@ pub struct VideoFrameInfo {
     pub quality: f32,
     /// the encoded frame's bytes
     pub encoded_bytes: u32,
+    /// the frame's media time on its track (its RTP timestamp less the track's first, ms); `None` from gateways before 0.5.20
+    pub media_time_ms: Option<f64>,
+    /// when the gateway wrote it to the track (unix ms, gateway clock); `None` from gateways before 0.5.20
+    pub written_ms: Option<f64>,
+    /// its RTP timestamp, when the gateway knew it (0.5.20+)
+    pub rtp_timestamp: Option<u32>,
+    /// when the gateway got its sample (unix ms, gateway clock; 0.5.20+)
+    pub received_ms: Option<f64>,
+    /// when the gateway finished encoding it (unix ms, gateway clock; 0.5.20+)
+    pub encoded_ms: Option<f64>,
+    /// its picture's message header stamp (seconds), when its encoding gave one (0.5.31+)
+    pub stamp: Option<f64>,
+    /// its picture's message header frame id (its TF frame), when its encoding gave one (0.5.31+)
+    pub frame_id: Option<String>,
+    /// that header whole (exact stamp, seq; 0.5.32+, from 0.5.31 rounded from `stamp`)
+    pub header: Option<crate::MessageHeader>,
+    /// its sample's zenoh encoding and attachment, when they say something (0.5.32+, with `header`)
+    pub encoding: Option<String>,
+    pub attachment: Option<Vec<u8>>,
 }
 
 /// One Opus packet.
@@ -436,8 +488,9 @@ impl Shared {
         };
         let id = message["id"].as_u64().unwrap_or_default();
         let Some(event) = message["event"].as_str() else {
+            // an unnamed lease learns its group from the reply
             if let Some((group, ending)) = self.pending_leases.lock().remove(&id).filter(|_| message["ok"] == true)
-                && let Some(previous) = self.leases.lock().insert(group, ending)
+                && let Some(previous) = self.leases.lock().insert(message["group"].as_str().map_or(group, str::to_owned), ending)
             {
                 previous.end("renewed".into());
             }
@@ -568,6 +621,18 @@ struct Inner {
     heartbeat_paused: Arc<AtomicBool>,
 }
 
+/// Removes a request's reply slot when dropped.
+struct PendingRequest<'a> {
+    requests: &'a Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+    id: u64,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.requests.lock().remove(&self.id);
+    }
+}
+
 impl Inner {
     async fn request(&self, body: Value, timeout: Duration) -> Result<Value> {
         self.request_as(self.next_id.fetch_add(1, Ordering::Relaxed), body, timeout).await
@@ -579,9 +644,10 @@ impl Inner {
         let op = body["op"].as_str().unwrap_or_default().to_owned();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.shared.requests.lock().insert(id, reply_tx);
+        // however this ends (a failed send, the timeout, the caller dropping it), the entry goes
+        let _pending = PendingRequest { requests: &self.shared.requests, id };
         self.control.send_text(&body.to_string()).await.map_err(|error| anyhow!("{op}: {error}"))?;
         let reply = tokio::time::timeout(timeout, reply_rx).await;
-        self.shared.requests.lock().remove(&id);
         let reply = reply.map_err(|_| anyhow!("{op} timed out"))?.map_err(|_| anyhow!("{op}: connection lost"))?;
         ensure!(reply["ok"] == true, "zenoh-gateway: {}", reply["error"].as_str().unwrap_or("error"));
         Ok(reply)
@@ -893,15 +959,29 @@ impl Client {
     /// server's group, or `keys` for one it doesn't define (SPEC "Leases"). Needs a heartbeat; it ends
     /// when the heartbeat stops, at `max_seconds`, on disconnect, on [`Lease::release`] or by force-expiry.
     pub async fn lease(&self, group: &str, keys: Option<Vec<String>>, max_seconds: Option<f64>) -> Result<Lease> {
+        self.lease_with(LeaseOptions { group: Some(group.to_owned()), publish: keys.unwrap_or_default(), max_seconds, ..Default::default() }).await
+    }
+
+    /// Takes a lease on keys to publish and keys to subscribe to (SPEC "Leases"): while held, the gateway drops other
+    /// clients' puts on `publish` and ends their subscriptions to `subscribe`.
+    pub async fn lease_with(&self, options: LeaseOptions) -> Result<Lease> {
         ensure!(self.inner.options.heartbeat_hz > 0.0, "a lease needs a heartbeat (ClientOptions::heartbeat_hz)");
         let (id, ending) = (self.inner.next_id.fetch_add(1, Ordering::Relaxed), Arc::new(Ending::new()));
         // registered by the control reader as it reads the reply (renewing a lease held before)
-        self.inner.shared.pending_leases.lock().insert(id, (group.to_owned(), ending.clone()));
-        let reply = self.inner.request_as(id, json!({"op": "lease", "group": group, "keys": keys, "maxSeconds": max_seconds}), PING_TIMEOUT).await;
+        self.inner.shared.pending_leases.lock().insert(id, (options.group.clone().unwrap_or_default(), ending.clone()));
+        let request = json!({"op": "lease", "group": options.group, "publish": options.publish, "subscribe": options.subscribe, "allowTakeover": options.allow_takeover, "maxSeconds": options.max_seconds, "timeoutMs": options.timeout_ms});
+        let reply = self.inner.request_as(id, request, PING_TIMEOUT).await;
         self.inner.shared.pending_leases.lock().remove(&id);
         let reply = reply?;
-        let keys = serde_json::from_value(reply["keys"].clone())?;
-        Ok(Lease { group: group.to_owned(), keys, expires_in_ms: reply["expiresInMs"].as_u64(), ending, client: Arc::downgrade(&self.inner) })
+        Ok(Lease {
+            group: reply["group"].as_str().map(str::to_owned).or(options.group).unwrap_or_default(),
+            keys: serde_json::from_value(reply["keys"].clone())?,
+            subscribe: serde_json::from_value(reply["subscribe"].clone()).unwrap_or_default(),
+            timeout_ms: reply["timeoutMs"].as_f64(),
+            expires_in_ms: reply["expiresInMs"].as_u64(),
+            ending,
+            client: Arc::downgrade(&self.inner),
+        })
     }
 
     /// Ends another client's lease on `group` (needs the grant's force-expire right).
@@ -1045,8 +1125,8 @@ impl Subscription {
     }
 
     /// Changes the running subscription's options in place (same channel and track): any of maxHz, minQuality,
-    /// qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale, maxResolution, playoutDelay and
-    /// encodeOptions.quality, as JSON (`null` puts one back to its default). Returns the options now in force.
+    /// qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale, minResolution, maxResolution, frameDropping,
+    /// keyframeIntervalMs, sceneChangeKeyframes, targetQp, playoutDelay and encodeOptions.quality, as JSON (`null` puts one back to its default). Returns the options now in force.
     pub async fn update(&self, changes: Value) -> Result<Value> {
         let inner = self.client.upgrade().context("the client closed")?;
         let mut reply = inner.request(json!({"op": "updateSubscription", "subId": self.id, "opts": changes}), PING_TIMEOUT).await?;
@@ -1223,11 +1303,21 @@ fn reassemble(partials: &mut BTreeMap<u32, Partial>, header: &frame::FrameHeader
 
 /// A whole data-channel message as what the subscription's channel makes of it (fields when the frame says so).
 fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flags: u8, bytes: Vec<u8>) -> Result<Option<Message>> {
+    let (header, sample, bytes) = match flags & frame::HEADER != 0 {
+        true => frame::split_header(&bytes).map(|(header, sample, rest)| (Some(header), sample, rest.to_vec())).context("bad message header")?,
+        false => (None, None, bytes),
+    };
     let bytes = if flags & frame::ZSTD != 0 { zstd::decode_all(&bytes[..])? } else { bytes };
     Ok(match kind {
         Some("video") => {
-            ensure!(bytes.len() >= media::METADATA_LEN && bytes[0] == 1, "not a video metadata frame");
+            ensure!(bytes.len() >= media::METADATA_LEN_V1 && bytes[0] == 1, "not a video metadata frame");
             let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let float = |at: usize| f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            let (header, sample) = match (bytes[1] & media::METADATA_FLAG_HEADER != 0).then(|| bytes.get(media::METADATA_LEN..).and_then(frame::decode_header)).flatten() {
+                Some((header, sample)) => (Some(header), sample),
+                None => (None, None),
+            };
+            let (encoding, attachment) = sample.unzip();
             Some(Message::VideoInfo(VideoFrameInfo {
                 key,
                 timestamp_ms,
@@ -1239,6 +1329,16 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
                 source_height: word(16),
                 quality: f32::from_bits(word(20)),
                 encoded_bytes: word(24),
+                media_time_ms: (bytes.len() >= media::METADATA_LEN_V2).then(|| float(28)),
+                written_ms: (bytes.len() >= media::METADATA_LEN_V2).then(|| float(36)),
+                rtp_timestamp: (bytes.len() >= media::METADATA_LEN && bytes[1] & media::METADATA_FLAG_RTP != 0).then(|| word(44)),
+                received_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(48)),
+                encoded_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(56)),
+                stamp: header.as_ref().map(|header| header.stamp()),
+                frame_id: header.as_ref().map(|header| header.frame_id.clone()),
+                header,
+                encoding,
+                attachment: attachment.flatten(),
             }))
         }
         // one empty frame per sample, for a browser callback
@@ -1249,10 +1349,12 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
                 let (encoding, attachment, payload) = frame::decode_meta(&bytes).context("bad META header")?;
                 (Some(encoding.to_owned()), (!attachment.is_empty()).then(|| attachment.to_vec()), payload.to_vec())
             } else {
-                (None, None, bytes)
+                // an encoded message's came in its header
+                let (encoding, attachment) = sample.unzip();
+                (encoding, attachment.flatten(), bytes)
             };
             let fields = if flags & frame::FIELDS != 0 && !delete { Some(fields::parse(&bytes)?) } else { None };
-            Some(Message::Data(DataMessage { key, bytes, timestamp_ms, seq, fields, delete, encoding, attachment }))
+            Some(Message::Data(DataMessage { key, bytes, timestamp_ms, seq, fields, delete, encoding, attachment, header }))
         }
     })
 }
@@ -1473,10 +1575,14 @@ impl Drop for Publisher {
 
 /// An exclusive right to publish on a group of keys among the gateway's clients ([`Client::lease`]).
 pub struct Lease {
-    /// the group
+    /// the group (`#<n>` for an unnamed lease)
     pub group: String,
-    /// the keys it covers
+    /// the keys only its holder publishes on
     pub keys: Vec<String>,
+    /// the keys only its holder subscribes to
+    pub subscribe: Vec<String>,
+    /// the heartbeat silence (ms) that ends it, as the gateway applies it; None: the connection's heartbeat deadline
+    pub timeout_ms: Option<f64>,
     /// when it expires (`max_seconds`), None without a limit
     pub expires_in_ms: Option<u64>,
     ending: Arc<Ending>,
@@ -1484,7 +1590,7 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// Why it ended (`"heartbeat"`, `"maxSeconds"`, `"disconnected"`, `"released"`, `"renewed"`, force-expiry), None while held.
+    /// Why it ended (`"takenOver"`, `"heartbeat"`, `"maxSeconds"`, `"disconnected"`, `"released"`, `"renewed"`, force-expiry), None while held.
     pub fn lost(&self) -> Option<String> {
         self.ending.reason()
     }

@@ -4,7 +4,9 @@
 //! that share its `seq` (chunk size is per message, at most `CHUNK_BYTES`). `frameId` numbers frames per channel; the page acks frameIds.
 //! `flags` bit0 ([`ZSTD`]): the whole message (all its chunks joined) is zstd-compressed; bit1 ([`FIELDS`]): it is a
 //! zenoh-gateway fields message, which the client decodes into `msg.decoded`; bit2 ([`DELETE`]): the sample is a delete;
-//! bit3 ([`META`]): the message (after decompression) starts with [`encode_meta`]'s header: the sample's encoding and attachment.
+//! bit3 ([`META`]): the message (after decompression) starts with [`encode_meta`]'s header: the sample's encoding and attachment;
+//! bit4 ([`HEADER`], 0.5.32+): the message (before decompression) starts with `u16 len | len bytes of`
+//! [`encode_header`]: the sample's own message header (stamp, frame id, seq), which an encoding would otherwise drop.
 
 use bytes::{BufMut, BytesMut};
 
@@ -17,6 +19,8 @@ pub const FIELDS: u8 = 2;
 pub const DELETE: u8 = 4;
 /// `flags` bit: the message starts with the sample's encoding and attachment (see [`encode_meta`]).
 pub const META: u8 = 8;
+/// `flags` bit: the message starts with its sample's message header (see [`encode_header`]).
+pub const HEADER: u8 = 16;
 /// Payload bytes per frame; well under the 256 KiB SCTP message limit, small enough to interleave.
 pub const CHUNK_BYTES: usize = 64 * 1024;
 
@@ -47,6 +51,76 @@ pub fn encode(header: &FrameHeader, chunk: &[u8]) -> BytesMut {
     frame.put_u8(header.flags);
     frame.put_slice(chunk);
     frame
+}
+
+/// An encoded message's zenoh sample encoding and attachment, when they say something (as a raw message's [`META`]).
+pub type SampleMeta = Option<(String, Option<Vec<u8>>)>;
+
+/// A message header as sent, on the data channel (behind [`HEADER`]) and after a video frame's 64 metadata bytes:
+/// `f64 stamp (s) | u16 frameIdLen | frameId utf8 | i32 sec | u32 nanosec | u8 flags | u32 seq`, flags bit0: `seq` is
+/// set; bit1: the sample's zenoh encoding and attachment follow (`u16 encodingLen | encoding utf8 | u32 attachmentLen |
+/// attachment`, e.g. rmw_zenoh's seq, timestamp and gid). (0.5.31 sent only up to `frameId`; readers take what is
+/// there.) None for a frame id or encoding past 64 KiB: nothing real is.
+pub fn encode_header(header: &crate::MessageHeader, sample: &SampleMeta) -> Option<Vec<u8>> {
+    let frame_id = header.frame_id.as_bytes();
+    let frame_id_len = u16::try_from(frame_id.len()).ok()?;
+    let mut out = Vec::with_capacity(8 + 2 + frame_id.len() + 13);
+    out.extend_from_slice(&header.stamp().to_le_bytes());
+    out.extend_from_slice(&frame_id_len.to_le_bytes());
+    out.extend_from_slice(frame_id);
+    out.extend_from_slice(&header.sec.to_le_bytes());
+    out.extend_from_slice(&header.nanosec.to_le_bytes());
+    out.push(header.seq.is_some() as u8 | if sample.is_some() { 2 } else { 0 });
+    out.extend_from_slice(&header.seq.unwrap_or(0).to_le_bytes());
+    if let Some((encoding, attachment)) = sample {
+        out.extend_from_slice(&u16::try_from(encoding.len()).ok()?.to_le_bytes());
+        out.extend_from_slice(encoding.as_bytes());
+        let attachment = attachment.as_deref().unwrap_or_default();
+        out.extend_from_slice(&u32::try_from(attachment.len()).ok()?.to_le_bytes());
+        out.extend_from_slice(attachment);
+    }
+    Some(out)
+}
+
+/// `message` behind its [`HEADER`] block (`u16 len | encode_header`).
+pub fn with_header(header: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + header.len() + message.len());
+    out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    out.extend_from_slice(header);
+    out.extend_from_slice(message);
+    out
+}
+
+/// Reads [`encode_header`]'s bytes (or 0.5.31's shorter form, which has no exact stamp or seq): the header and the
+/// sample's encoding and attachment, if they came.
+#[cfg(any(test, feature = "client"))]
+pub fn decode_header(bytes: &[u8]) -> Option<(crate::MessageHeader, SampleMeta)> {
+    let stamp = f64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+    let frame_id_len = u16::from_le_bytes(bytes.get(8..10)?.try_into().ok()?) as usize;
+    let frame_id = std::str::from_utf8(bytes.get(10..10 + frame_id_len)?).ok()?.to_owned();
+    let at = 10 + frame_id_len;
+    let Some(exact) = bytes.get(at..at + 13) else {
+        return Some((crate::MessageHeader::from_stamp(stamp, frame_id), None));
+    };
+    let word = |at: usize| u32::from_le_bytes(exact[at..at + 4].try_into().unwrap());
+    let header = crate::MessageHeader { sec: word(0) as i32, nanosec: word(4), frame_id, seq: (exact[8] & 1 != 0).then(|| word(9)) };
+    if exact[8] & 2 == 0 {
+        return Some((header, None));
+    }
+    let rest = &bytes[at + 13..];
+    let encoding_len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
+    let encoding = std::str::from_utf8(rest.get(2..2 + encoding_len)?).ok()?.to_owned();
+    let attachment_len = u32::from_le_bytes(rest.get(2 + encoding_len..6 + encoding_len)?.try_into().ok()?) as usize;
+    let attachment = rest.get(6 + encoding_len..6 + encoding_len + attachment_len)?;
+    Some((header, Some((encoding, (!attachment.is_empty()).then(|| attachment.to_vec())))))
+}
+
+/// Splits a [`HEADER`] message into (its header, the sample's encoding and attachment, the rest).
+#[cfg(any(test, feature = "client"))]
+pub fn split_header(message: &[u8]) -> Option<(crate::MessageHeader, SampleMeta, &[u8])> {
+    let len = u16::from_le_bytes(message.get(..2)?.try_into().ok()?) as usize;
+    let (header, sample) = decode_header(message.get(2..2 + len)?)?;
+    Some((header, sample, &message[2 + len..]))
 }
 
 /// A frame's header and chunk (what [`encode`] wrote), None if it is malformed.
@@ -92,6 +166,25 @@ pub fn chunk(payload: &[u8], index: u32, chunk_bytes: usize) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_message_header_round_trips_exactly_and_reads_0_5_31_s_shorter_form() {
+        let header = crate::MessageHeader { sec: 1_761_350_400, nanosec: 123_456_789, frame_id: "mid360_link".into(), seq: Some(7) };
+        let bytes = super::encode_header(&header, &None).unwrap();
+        assert_eq!(super::decode_header(&bytes), Some((header.clone(), None)), "nanoseconds an f64 stamp would lose survive");
+        let message = super::with_header(&bytes, b"payload");
+        assert_eq!(super::split_header(&message), Some((header.clone(), None, &b"payload"[..])));
+        let sample = Some(("application/cdr".to_owned(), Some(vec![1, 2, 3])));
+        let with_sample = super::encode_header(&header, &sample).unwrap();
+        assert_eq!(super::decode_header(&with_sample), Some((header.clone(), sample)), "the zenoh sample's encoding and attachment");
+        assert_eq!(super::decode_header(&with_sample[..bytes.len()]), None, "cut short");
+        let short = &bytes[..10 + header.frame_id.len()];
+        let (old, _) = super::decode_header(short).unwrap();
+        assert_eq!((old.sec, old.frame_id.as_str(), old.seq), (header.sec, "mid360_link", None), "0.5.31: stamp and frame id only");
+        assert!((old.nanosec as i64 - 123_456_789).abs() < 1_000, "rounded from the f64 stamp");
+        assert_eq!(super::encode_header(&crate::MessageHeader { frame_id: "x".repeat(70_000), ..header }, &None), None, "no frame id is that long");
+        assert_eq!(super::decode_header(&bytes[..9]), None, "cut short");
+    }
+
     use super::*;
 
     #[test]

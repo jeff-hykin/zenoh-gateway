@@ -1,6 +1,6 @@
 //! One browser = one PeerConnection; each data channel it opens is dispatched by its label.
 
-use crate::allocator::{self, Estimator};
+use crate::allocator::{self, LinkModel};
 use crate::api;
 use crate::auth::{Grant, Leases};
 use crate::ice::{self, IceServer};
@@ -17,7 +17,7 @@ use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -47,23 +47,31 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often each frontend's bandwidth is re-estimated and re-allocated.
 const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
-/// The RTT baseline is the minimum over this window (a standing queue lasting longer would become the baseline).
-const RTT_BASELINE_WINDOW: Duration = Duration::from_secs(60);
-/// The video pacer's floor (32 kbit/s), whatever the allocator lets video take.
-const VIDEO_HEADROOM_BYTES_PER_SEC: f64 = 4_000.0;
-/// GCC below this fraction of what video sent is congestion for the whole link.
-const VIDEO_OVERUSE_FRACTION: f64 = 0.85;
-/// The send window covers the highest RTT over this window.
-const WINDOW_RTT_WINDOW: Duration = Duration::from_secs(10);
+/// Video's queue brake (see `PeerState::video_cap`): cuts at most this often, after the queue was high this many rounds
+/// in a row, from the most video delivered over this long.
+const VIDEO_BRAKE_SPACING: Duration = Duration::from_millis(500);
+const VIDEO_QUEUE_ROUNDS: u32 = 2;
+const VIDEO_DELIVERY_WINDOW: Duration = Duration::from_secs(2);
 
 /// Gateway-wide allocation settings (builder options / command-line flags).
 #[derive(Debug, Clone, Copy)]
 pub struct AllocationConfig {
     /// cap on each frontend's budget, bytes/s
     pub max_bandwidth: Option<f64>,
-    /// fraction of the estimate the allocator hands out (`--bandwidth-target-fraction`)
-    pub target_fraction: f64,
+    /// what data may take to reach the page while the path is faster than that (`allocator::LinkModel::window`)
+    pub latency_target: Duration,
+    /// how long anything unanswered (an unacked frame, an unfinished query, a quiet key) is waited on
+    pub stale_after: Duration,
+    /// the longest a put (a publisher's, a control-channel put or delete, a deadman) waits on zenoh
+    pub put_timeout: Duration,
+    /// the longest answering an offer or a renegotiation may take
+    pub signalling_timeout: Duration,
 }
+
+/// What `ServerBuilder::put_timeout` defaults to.
+pub const DEFAULT_PUT_TIMEOUT: Duration = Duration::from_secs(5);
+/// What `ServerBuilder::signalling_timeout` defaults to.
+pub const DEFAULT_SIGNALLING_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How the gateway's side of each connection reaches browsers (builder options / command-line flags).
 #[derive(Debug, Clone, Default)]
@@ -82,45 +90,49 @@ pub struct ConnectConfig {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BandwidthStats {
-    /// the link's capacity estimate, video and data together (see allocator::Estimator)
+    /// the link's bandwidth, video and data together: the most it delivered in a round lately (`allocator::LinkModel`)
     data_estimate_bytes_per_sec: f64,
-    /// most the video tracks may take: GCC's target from TWCC feedback (only while a video track is in use; GCC grows while
-    /// video sends less, so it caps video's share of the link estimate, never adds to it)
+    /// what the page acked plus what video sent, last round
+    delivered_bytes_per_sec: f64,
+    /// most the video tracks may take: GCC's target from TWCC feedback (only while a video track is in use)
     video_estimate_bytes_per_sec: f64,
     /// what the video tracks sent
     video_sent_bytes_per_sec: f64,
+    /// how long video waited in a queue per the latest transport feedback, and the cap its queue brake holds it to
+    video_queue_delay_ms: f64,
+    /// how long a packet written to a video track now would wait in the RTP pacer, and the packets it dropped for waiting
+    /// past the latency target and their frame's time to leave (ever)
+    pacer_delay_ms: f64,
+    pacer_dropped_packets: u64,
+    video_brake_bytes_per_sec: Option<f64>,
     /// `--max-bandwidth-bytes-per-sec`
     cap_bytes_per_sec: Option<f64>,
-    /// min(cap, target fraction x the link estimate): what the allocator divides
+    /// min(cap, bandwidth x gain): what the allocator divides and the pacing rate
     budget_bytes_per_sec: f64,
-    target_fraction: f64,
-    /// latest RTT minus its 60 s minimum (the delay trigger's input)
-    queue_delay_ms: Option<f64>,
+    /// the link model's gain this round, and whether it is still starting up
+    gain: f64,
+    starting_up: bool,
+    /// least send-to-ack time over 10 s, the median over 2 s (the window covers that), how far acks ran ahead of the
+    /// bandwidth lately, and whether the window is down to its minimum to re-measure the round trip
     min_rtt_ms: Option<f64>,
-    delay_events: u64,
-    backlog_events: u64,
-    blocked_events: u64,
-    video_overuse_events: u64,
-    /// queue delay that counts as congestion (5 ms + the spread of the path's queue delays over 10 s, at most 505 ms)
-    delay_threshold_ms: f64,
-    /// bulk bytes allowed in flight (`null`: no strict stream to protect, so no limit)
-    bulk_inflight_limit: Option<usize>,
-    /// bytes/s reserved for strict-priority and reliable streams
+    typical_rtt_ms: Option<f64>,
+    extra_acked_bytes: f64,
+    probing_rtt: bool,
+    /// what data may take to reach the page (the gateway's target, tightened by the streams' maxAge), the path's own round
+    /// trip (from frames sent with almost nothing of ours in flight), and whether the path is under the target so latency comes first
+    latency_target_ms: f64,
+    path_rtt_ms: Option<f64>,
+    latency_first: bool,
+    /// bytes sent the page hasn't acked, and the most allowed
+    in_flight_bytes: usize,
+    window_bytes: usize,
+    /// bytes/s strict-priority and audio streams sent (never squeezed)
     reserved_bytes_per_sec: f64,
     bulk_chunk_bytes: usize,
     demand_bytes_per_sec: f64,
     sent_bytes_per_sec: f64,
-    /// what the browser acknowledged over the last second (data channels, plus what video sent)
-    delivered_bytes_per_sec: f64,
+    /// share of the round bulk senders waited on the window (the link or the page behind)
     network_blocked_fraction: f64,
-    /// share of the interval senders waited for the page (its JS behind on what arrived) rather than the network
-    page_blocked_fraction: f64,
-    /// how long the page has had the oldest frame it hasn't gotten past, and how long before channels wait
-    page_lag_ms: f64,
-    max_page_lag_ms: f64,
-    /// how long the oldest frame SCTP hasn't delivered has been in it, and how long before channels wait
-    network_lag_ms: f64,
-    max_network_lag_ms: f64,
     constrained: bool,
 }
 
@@ -169,6 +181,8 @@ struct PeerState {
     deadmen: Mutex<HashMap<u64, Deadman>>,
     control: Mutex<Option<Arc<dyn DataChannel>>>,
     heartbeat: Mutex<HeartbeatStats>,
+    /// when the last heartbeat arrived (or the connection was made), for leases with a `timeoutMs` of their own
+    last_beat: Mutex<Instant>,
     /// set once built; cleared when the peer goes (it holds the handler, which holds us)
     connection: Mutex<Option<Arc<dyn PeerConnection>>>,
     /// one renegotiation at a time
@@ -181,15 +195,18 @@ struct PeerState {
     sender_reports: Arc<media::SenderReports>,
     video_rate: Arc<media::VideoRate>,
     config: AllocationConfig,
+    /// the link bandwidth (bytes/s) the page gave (`setLinkBandwidth`), used in place of the estimate
+    known_bandwidth: Mutex<Option<f64>>,
     gate: Arc<SendGate>,
-    /// (when, rtt ms) reported by the browser's clock sync
-    rtt_samples: Mutex<VecDeque<(Instant, f64)>>,
-    last_allocation: Mutex<Instant>,
-    estimator: Mutex<Estimator>,
-    /// `SendGate::delivered_total` at the last allocation
-    delivered_total: AtomicU64,
-    /// wire bytes per frame byte sent lately (`subscription::PACKET_OVERHEAD_BYTES`), to read acknowledged frame bytes
-    wire_scale: Mutex<f64>,
+    link: Mutex<LinkModel>,
+    /// `SendGate::acked_total` at the last allocation
+    acked_total: AtomicU64,
+    /// `media::VideoRate::received_bytes` as of the previous allocation round
+    video_received: AtomicU64,
+    /// video's own brake: (its cap in bytes/s, when it was last cut), see `video_cap`
+    video_brake: Mutex<Option<(f64, Instant)>>,
+    /// (when, bytes/s) video delivered over the last `VIDEO_DELIVERY_WINDOW`, and the rounds in a row its queue was high
+    video_delivery: Mutex<(std::collections::VecDeque<(Instant, f64)>, u32)>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
     /// flips to true when the peer is dropped: its channel tasks end on it, since a closed connection's data channels
@@ -206,7 +223,7 @@ struct PeerState {
     /// queryables, liveliness, matching listeners it declared through the control channel
     api: api::ApiState,
     /// events from those (queries, liveliness, matching), forwarded to the control channel
-    api_events: tokio::sync::mpsc::UnboundedSender<Value>,
+    api_events: api::Events,
 }
 
 /// PeerStates alive: a browser connection's state must go when the connection does.
@@ -232,13 +249,13 @@ impl PeerState {
         sender_reports: Arc<media::SenderReports>,
         token: Option<String>,
         grant: Grant,
-    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<(Instant, Value)>) {
         let config = gateway.allocation;
         let (api_events, api_events_receiver) = tokio::sync::mpsc::unbounded_channel();
         LIVE_PEER_STATES.fetch_add(1, Ordering::Relaxed);
         let state = PeerState {
-            api: api::ApiState::default(),
-            api_events,
+            api: api::ApiState::new(config.stale_after),
+            api_events: api::Events(api_events),
             gateway: Arc::downgrade(gateway),
             token,
             grant,
@@ -247,6 +264,7 @@ impl PeerState {
             peer_id,
             session: gateway.session.clone(),
             codecs: gateway.codecs.clone(),
+            known_bandwidth: Mutex::new(None),
             catalog: gateway.catalog.clone(),
             channels: Mutex::new(HashMap::new()),
             next_channel: AtomicU64::new(0),
@@ -256,6 +274,7 @@ impl PeerState {
             deadmen: Mutex::new(HashMap::new()),
             control: Mutex::new(None),
             heartbeat: Mutex::new(HeartbeatStats::default()),
+            last_beat: Mutex::new(Instant::now()),
             connection: Mutex::new(None),
             negotiation: tokio::sync::Mutex::new(()),
             tracks: Mutex::new(HashMap::new()),
@@ -264,13 +283,13 @@ impl PeerState {
             sender_reports,
             video_rate,
             config,
-            gate: Arc::default(),
-            rtt_samples: Mutex::new(VecDeque::new()),
-            last_allocation: Mutex::new(Instant::now()),
-            estimator: Mutex::new(Estimator::default()),
-            delivered_total: AtomicU64::new(0),
-            wire_scale: Mutex::new(1.0),
-            bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, target_fraction: config.target_fraction, ..Default::default() }),
+            gate: Arc::new(SendGate::new(config.stale_after)),
+            link: Mutex::new(LinkModel::default()),
+            acked_total: AtomicU64::new(0),
+            video_received: AtomicU64::new(0),
+            video_brake: Mutex::new(None),
+            video_delivery: Mutex::new(Default::default()),
+            bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, ..Default::default() }),
             gone: AtomicBool::new(false),
             gone_signal: tokio::sync::watch::Sender::new(false),
             ever_connected: AtomicBool::new(false),
@@ -301,102 +320,207 @@ impl PeerState {
         channels.values().filter_map(|entry| if let ChannelStats::Sub(shared) = &entry.stats { Some(shared.clone()) } else { None }).collect()
     }
 
-    /// (queue delay, minimum RTT): the smallest RTT since `since` minus the window's minimum. A
-    /// standing queue raises every sample; scheduling noise in the browser only some of them.
-    fn queue_delay(&self, since: Instant) -> (Option<f64>, Option<f64>) {
-        let samples = self.rtt_samples.lock();
-        let minimum = samples.iter().map(|(_, rtt)| *rtt).reduce(f64::min);
-        let newest = samples.iter().filter(|(at, _)| *at >= since).map(|(_, rtt)| *rtt).reduce(f64::min);
-        (newest.zip(minimum).map(|(newest, minimum)| newest - minimum), minimum)
+    /// Sizes of everything this frontend holds (each must stay flat while the page runs; growth is a resource not freed).
+    fn memory_counts(&self) -> serde_json::Value {
+        let subscriptions: Vec<serde_json::Value> = self.subscriptions().iter().map(|shared| shared.counts()).collect();
+        let sum = |field: &str| subscriptions.iter().map(|counts| counts[field].as_u64().unwrap_or(0)).sum::<u64>();
+        json!({
+            "tracks": self.tracks.lock().len(),
+            "channels": self.channels.lock().len(),
+            "deadmen": self.deadmen.lock().len(),
+            "subscriptions": subscriptions.len(),
+            "subscriptionKeys": sum("keys"),
+            "queued": sum("queued"),
+            "queuedBytes": sum("queuedBytes"),
+            "unacked": sum("unacked"),
+            "gate": self.gate.counts(),
+            "api": self.api.counts(),
+            "livePeerStates": live_peer_states(),
+            "sharedResults": { "decoded": self.codecs.cached().0, "encoded": self.codecs.cached().1 },
+        })
     }
 
-    /// The highest RTT over the last `WINDOW_RTT_WINDOW` (what a send window must cover).
-    fn high_rtt(&self, now: Instant) -> Option<f64> {
-        let samples = self.rtt_samples.lock();
-        samples.iter().filter(|(at, _)| now.duration_since(*at) <= WINDOW_RTT_WINDOW).map(|(_, rtt)| *rtt).reduce(f64::max)
-    }
-
-    /// One allocation round: measure, update the estimate, divide the budget among streams.
+    /// One allocation round: measure what reached the page, update the link model, pace and divide its budget.
     fn allocate(&self, interval_secs: f64) {
         let now = Instant::now();
-        let since = std::mem::replace(&mut *self.last_allocation.lock(), now);
-        let (queue_delay_ms, min_rtt_ms) = self.queue_delay(since);
-        let high_rtt_ms = self.high_rtt(now);
+        self.api.reap_queries();
         let subscriptions = self.subscriptions();
         let usages: Vec<subscription::Usage> = subscriptions.iter().map(|shared| shared.usage(interval_secs)).collect();
         let data_usages = || usages.iter().filter(|usage| !usage.on_track);
-        let sent: u64 = usages.iter().map(|usage| usage.bytes_sent).sum();
-        let video_sent = usages.iter().filter(|usage| usage.on_track).map(|usage| usage.bytes_sent).sum::<u64>() as f64 / interval_secs.max(1e-3);
+        let per_sec = |bytes: f64| bytes / interval_secs.max(1e-3);
+        let sent = usages.iter().map(|usage| usage.bytes_sent).sum::<u64>() as f64;
+        let video_sent = usages.iter().filter(|usage| usage.on_track).map(|usage| usage.bytes_sent).sum::<u64>() as f64;
         let has_video = usages.iter().any(|usage| usage.on_track);
-        let gcc = self.video_rate.gcc_bytes_per_sec();
-        let video_overuse = has_video && video_sent > VIDEO_HEADROOM_BYTES_PER_SEC && gcc < VIDEO_OVERUSE_FRACTION * video_sent;
-        let blocked_ms: f64 = data_usages().map(|usage| usage.network_blocked_ms).sum();
-        let page_blocked_ms: f64 = data_usages().map(|usage| usage.page_blocked_ms).sum();
-        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.network_blocked_ms > 0.0 || usage.page_blocked_ms > 0.0).count();
+        let blocked_ms: f64 = data_usages().map(|usage| usage.blocked_ms).sum();
+        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.blocked_ms > 0.0).count();
         let total_demand: f64 = usages.iter().map(|usage| usage.demand.wants()).sum();
-        // acknowledged frame bytes, scaled to the wire as what was sent was (frames + per-packet overhead)
-        let data_sent = data_usages().map(|usage| usage.bytes_sent).sum::<u64>() as f64;
-        let data_frame_bytes = data_usages().map(|usage| usage.frame_bytes).sum::<u64>() as f64;
-        let wire_scale = {
-            // the latest interval that sent anything (acks of a burst keep arriving after it)
-            let mut scale = self.wire_scale.lock();
-            if data_frame_bytes > 0.0 {
-                *scale = (data_sent / data_frame_bytes).max(1.0);
+        // (the gate counts each frame as it is on the wire: payload plus per-packet overhead)
+        let acked_total = self.gate.acked_total();
+        let acked = acked_total.saturating_sub(self.acked_total.swap(acked_total, Ordering::Relaxed)) as f64;
+        // video got through as far as the browser's transport feedback says it arrived
+        let video_received = self.video_rate.received_bytes();
+        let video_through = video_received.saturating_sub(self.video_received.swap(video_received, Ordering::Relaxed)) as f64;
+        let delivered = acked + video_through;
+        let known_bandwidth = *self.known_bandwidth.lock();
+        let link = {
+            let mut link = self.link.lock();
+            // video is held back by the link while it queues there (not by a cut, GCC's or its own brake's: those hold it
+            // under the link, and counting their rounds as the link's speed lowered the bandwidth with every cut, a spiral)
+            let delivery = self.video_rate.delivery();
+            let video_link_limited = delivery.is_some_and(|delivery| allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
+            let round = self.gate.take_round();
+            log::debug!(target: "zenoh_gateway::link", "peer {}: round {round:?} video {:?} link-limited {video_link_limited} delivered {:.0}", self.peer_id, delivery.map(|delivery| delivery.bytes_per_sec), per_sec(delivered));
+            link.update(now, interval_secs, round, delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
+            log::debug!(target: "zenoh_gateway::link", "peer {}: bandwidth {:.0} gain {:.2} starting up {} probing rtt {} window {:?}", self.peer_id, link.bandwidth_bytes_per_sec, link.gain, link.starting_up, link.probing_rtt(), link.window(Some(self.config.latency_target)));
+            match known_bandwidth {
+                Some(known) => link.with_known_bandwidth(known),
+                None => link.clone(),
             }
-            *scale
         };
-        let delivered_total = self.gate.delivered_total();
-        let delivered = delivered_total.saturating_sub(self.delivered_total.swap(delivered_total, Ordering::Relaxed)) as f64 * wire_scale + video_sent * interval_secs;
-        let estimator = {
-            let mut estimator = self.estimator.lock();
-            estimator.update(allocator::Interval { now, secs: interval_secs, sent_bytes: sent as f64, blocked_secs: blocked_ms / 1000.0, page_blocked_secs: page_blocked_ms / 1000.0, active_senders: active, data_demand: total_demand, queue_delay_ms, video_overuse, delivered_bytes: delivered });
-            estimator.clone()
+        let (budget, at_cap) = self.budget(&link, known_bandwidth.is_some());
+        // video gets the budget, but no more than its queue brake allows, nor GCC's target while GCC brakes
+        let video_estimate = if has_video {
+            let brake = self.video_cap(now, budget, per_sec(video_through));
+            let estimate = self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget).min(brake.unwrap_or(budget));
+            // (a known link: what the page said, in place of GCC's estimate and the brake's)
+            let estimate = if known_bandwidth.is_some() { budget } else { estimate };
+            // in startup, at most the startup gain times what video measurably delivered, as BBR's startup paces at its
+            // gain times the delivery it measured (the budget is that times a first guess, 64 KB/s: video sent 15x a
+            // 100 kbit/s link and its queue held even the page's requests for 13 s; nor, before any delivery is measured, the
+            // gain times a guess: the guess alone)
+            match (link.starting_up, self.video_rate.delivery()) {
+                // (never under the guess: a picture that compresses to little delivers little, and held to that its frame
+                // rate fell)
+                (true, Some(delivery)) => estimate.min((delivery.bytes_per_sec * link.gain).max(allocator::INITIAL_BANDWIDTH)),
+                (true, None) => estimate.min(allocator::INITIAL_BANDWIDTH),
+                (false, _) => estimate,
+            }
+        } else {
+            0.0
         };
-        let video_estimate = if has_video { gcc } else { 0.0 };
-        let usable = estimator.data_bytes_per_sec * self.config.target_fraction;
-        let budget = self.config.max_bandwidth.map_or(usable, |cap| cap.min(usable));
-        self.video_rate.set_cap_bytes_per_sec(video_estimate.min(budget).max(VIDEO_HEADROOM_BYTES_PER_SEC));
+        if video_estimate > 0.0 {
+            // while the link model probes (startup, a probe-up round) the picture is sized for its gain too, so video probes
+            // the link as data does (sized only for the bandwidth, video held its bitrate and never filled the link: stuck at
+            // 93 KB/s on a 1 MB/s link)
+            // (in startup: what video may send, which follows its own measured delivery)
+            let sized_for = if link.starting_up { video_estimate } else { link.bandwidth_bytes_per_sec * link.gain.max(1.0) };
+            self.video_rate.set_size_ratio(sized_for / video_estimate);
+            // (only while fresh feedback shows video isn't queued at the link: on a 100 kbit/s link the startup's guess, 15x
+            // the link, grew the picture and its keyframes jammed the link for seconds)
+            let unqueued = self.video_rate.delivery().is_some_and(|delivery| !allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
+            self.video_rate.set_starting_up(link.starting_up && unqueued);
+        }
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
         let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
         let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
-        // the in-flight limit only protects strict streams' latency; without one it only costs throughput
-        let strict_present = subscriptions.iter().any(|shared| shared.is_strict());
-        self.gate.configure((budget - reserved).max(0.0), min_rtt_ms, allocator::DELAY_THRESHOLD_MS, strict_present);
-        self.gate.set_window(budget, min_rtt_ms, high_rtt_ms);
         let allocations = allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video);
+        let latency_target = self.latency_target(&subscriptions, &allocations, link.bandwidth_bytes_per_sec);
+        let (window, latency_capped) = link.window(Some(latency_target));
+        self.video_rate.pacer.set_queue_limit(latency_target);
+        self.gate.configure(link.bandwidth_bytes_per_sec, budget, window, latency_capped);
         let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
-        let bulk_budget = (budget - video_granted - reserved).max(0.0);
+        self.video_rate.set_cap_bytes_per_sec(video_granted);
+        self.video_rate.set_link_bytes_per_sec(budget);
+        self.video_rate.pacer.set_rate(self.video_rate.pacing_bps());
         for (shared, allocation) in subscriptions.iter().zip(allocations) {
-            shared.apply(allocation, bulk_budget);
+            // at the cap there is nothing to probe for: a probe lifting every stream's spacing let low-priority streams
+            // take what the allocation gave a high-priority one (19.8 Hz granted, 16 delivered)
+            shared.apply(allocation, link.probing_bandwidth() && !at_cap);
         }
         *self.bandwidth.lock() = BandwidthStats {
-            data_estimate_bytes_per_sec: estimator.data_bytes_per_sec,
+            data_estimate_bytes_per_sec: link.bandwidth_bytes_per_sec,
+            delivered_bytes_per_sec: link.delivered_bytes_per_sec,
             video_estimate_bytes_per_sec: video_estimate,
-            video_sent_bytes_per_sec: video_sent,
+            video_sent_bytes_per_sec: per_sec(video_sent),
+            video_queue_delay_ms: self.video_rate.queue_delay_ms(),
+            pacer_delay_ms: self.video_rate.pacer_delay().as_secs_f64() * 1000.0,
+            pacer_dropped_packets: self.video_rate.pacer.dropped_packets(),
+            video_brake_bytes_per_sec: self.video_brake.lock().map(|(cap, _)| cap),
             cap_bytes_per_sec: self.config.max_bandwidth,
             budget_bytes_per_sec: budget,
-            target_fraction: self.config.target_fraction,
-            queue_delay_ms,
-            min_rtt_ms,
-            delay_events: estimator.delay_events,
-            backlog_events: estimator.backlog_events,
-            blocked_events: estimator.blocked_events,
-            video_overuse_events: estimator.video_overuse_events,
-            delay_threshold_ms: estimator.delay_threshold_ms,
-            bulk_inflight_limit: self.gate.inflight_limit(),
+            gain: link.gain,
+            starting_up: link.starting_up,
+            min_rtt_ms: link.min_rtt_ms,
+            typical_rtt_ms: link.typical_rtt_ms,
+            extra_acked_bytes: link.extra_acked,
+            probing_rtt: link.probing_rtt(),
+            latency_target_ms: latency_target.as_secs_f64() * 1000.0,
+            path_rtt_ms: link.path_rtt_ms,
+            latency_first: latency_capped || link.path_rtt_ms.or(link.min_rtt_ms).is_some_and(|rtt| rtt < latency_target.as_secs_f64() * 1000.0),
+            in_flight_bytes: self.gate.in_flight(),
+            window_bytes: window,
             reserved_bytes_per_sec: reserved,
             bulk_chunk_bytes: self.gate.chunk_bytes(),
             demand_bytes_per_sec: total_demand,
-            sent_bytes_per_sec: estimator.sent_bytes_per_sec,
-            delivered_bytes_per_sec: estimator.delivered_bytes_per_sec,
-            network_blocked_fraction: estimator.network_blocked_fraction,
-            page_blocked_fraction: estimator.page_blocked_fraction,
-            page_lag_ms: self.gate.page_lag(now).as_secs_f64() * 1000.0,
-            max_page_lag_ms: self.gate.max_page_lag().as_secs_f64() * 1000.0,
-            network_lag_ms: self.gate.network_lag(now).as_secs_f64() * 1000.0,
-            max_network_lag_ms: self.gate.max_network_lag().as_secs_f64() * 1000.0,
+            sent_bytes_per_sec: per_sec(sent),
+            network_blocked_fraction: (blocked_ms / 1000.0 / (interval_secs * active.max(1) as f64)).min(1.0),
             constrained: total_demand > budget,
         };
+    }
+
+    /// Video's own brake, from how long its packets wait in a queue (transport feedback's arrival times): video bypasses
+    /// the send window, so without it the latency target held data only, and at full quality a camera kept a Wi-Fi
+    /// queue of 150-650 ms. When the queue stays over half the latency target (one way, so about the target in a round
+    /// trip) for `VIDEO_QUEUE_ROUNDS` rounds, video is cut to 85% of the most it delivered over `VIDEO_DELIVERY_WINDOW`
+    /// (cut from the last round's, a cut lowered what it delivered and the next cut went lower: a spiral), at most once
+    /// per `VIDEO_BRAKE_SPACING`; under a quarter of the target it grows 25% a round (back in about a second), and lets
+    /// go once at the budget.
+    fn video_cap(&self, now: Instant, budget: f64, video_delivered: f64) -> Option<f64> {
+        // a queue delay with no fresh feedback behind it says nothing (no video got through lately): held at its last value,
+        // it kept braking a link with no video on it for 15 s
+        let queue_ms = self.video_rate.delivery().map_or(0.0, |_| self.video_rate.queue_delay_ms());
+        let target_ms = self.config.latency_target.as_secs_f64() * 1000.0;
+        let (recent_most, high_rounds) = {
+            let mut delivery = self.video_delivery.lock();
+            delivery.0.push_back((now, video_delivered));
+            while delivery.0.front().is_some_and(|(at, _)| now.duration_since(*at) > VIDEO_DELIVERY_WINDOW) {
+                delivery.0.pop_front();
+            }
+            delivery.1 = if queue_ms > target_ms / 2.0 { delivery.1 + 1 } else { 0 };
+            (delivery.0.iter().map(|(_, rate)| *rate).fold(0.0, f64::max), delivery.1)
+        };
+        let mut brake = self.video_brake.lock();
+        if high_rounds >= VIDEO_QUEUE_ROUNDS && recent_most > 0.0 {
+            if brake.is_none_or(|(_, at)| now.duration_since(at) >= VIDEO_BRAKE_SPACING) {
+                let cap = brake.map_or(recent_most, |(cap, _)| cap.min(recent_most)) * 0.85;
+                *brake = Some((cap, now));
+            }
+        } else if queue_ms < target_ms / 4.0
+            && let Some((cap, at)) = *brake
+        {
+            *brake = (cap * 1.25 < budget).then_some((cap * 1.25, at));
+        }
+        brake.map(|(cap, _)| cap)
+    }
+
+    /// What data may take to reach the page: the gateway's target, tightened by the latency tolerances the page's streams
+    /// state (maxAge, `SubShared::latency_tolerance`), averaged weighted by the bandwidth each was granted. (Only
+    /// robot-to-page data crosses this queue; what the page publishes, cmd_vel and heartbeats, travels the other way.)
+    fn latency_target(&self, subscriptions: &[Arc<SubShared>], allocations: &[allocator::Allocation], bandwidth: f64) -> Duration {
+        let weighted = subscriptions.iter().zip(allocations).filter_map(|(shared, allocation)| {
+            let weight = allocation.budget_bytes_per_sec;
+            shared.latency_tolerance(bandwidth).filter(|_| weight > 0.0).map(|tolerance| (weight, tolerance))
+        });
+        let (weights, sum) = weighted.fold((0.0, 0.0), |(weights, sum), (weight, tolerance)| (weights + weight, sum + weight * tolerance));
+        let target = self.config.latency_target;
+        if weights > 0.0 { target.min(crate::secs(sum / weights)) } else { target }
+    }
+
+    /// What the streams may use: the link's bandwidth x its gain, within the cap.
+    /// The frontend's budget, and whether it is the cap (`max_bandwidth`) rather than the link.
+    fn budget(&self, link: &LinkModel, known: bool) -> (f64, bool) {
+        let (rate, _) = link.pacing(None);
+        if known {
+            // (a known link has nothing to probe for)
+            return (self.config.max_bandwidth.map_or(rate, |cap| cap.min(rate)), true);
+        }
+        match self.config.max_bandwidth {
+            // a probe could reach the cap: the link carries about the cap, so probing past it (and draining what that
+            // queued) only dipped the budget under the cap (a 480 KB/s cap budgeted 333 KB/s in the drain round)
+            Some(cap) if link.bandwidth_bytes_per_sec * allocator::PROBE_UP_GAIN >= cap => (cap, true),
+            Some(cap) => (cap.min(rate), false),
+            None => (rate, false),
+        }
     }
 
     /// Clock sample reported by the browser (it has all four NTP timestamps).
@@ -406,12 +530,6 @@ impl PeerState {
         }
         if let Some(rtt) = rtt_ms.filter(|v| v.is_finite() && *v >= 0.0) {
             *self.rtt_ms.lock() = Some(rtt);
-            let now = Instant::now();
-            let mut samples = self.rtt_samples.lock();
-            samples.push_back((now, rtt));
-            while samples.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_BASELINE_WINDOW) {
-                samples.pop_front();
-            }
         }
     }
 
@@ -457,17 +575,17 @@ impl PeerState {
             // trip first, so a put racing in behind the deadman can't undo it
             deadman.shared.tripped.store(true, Ordering::Release);
             deadman.shared.stats.lock().deadman_armed = false;
-            let result = self
+            let put = self
                 .session
                 .put(deadman.key.as_str(), deadman.bytes)
                 .priority(Priority::RealTime)
                 .congestion_control(CongestionControl::Block)
                 .reliability(Reliability::Reliable)
-                .express(true)
-                .await;
-            match result {
-                Ok(()) => info!("peer {}: deadman fired on {:?} ({reason})", self.peer_id, deadman.key),
-                Err(error) => warn!("peer {}: deadman on {:?} failed: {error}", self.peer_id, deadman.key),
+                .express(true);
+            match tokio::time::timeout(self.config.put_timeout, put).await {
+                Ok(Ok(())) => info!("peer {}: deadman fired on {:?} ({reason})", self.peer_id, deadman.key),
+                Ok(Err(error)) => warn!("peer {}: deadman on {:?} failed: {error}", self.peer_id, deadman.key),
+                Err(_) => warn!("peer {}: deadman on {:?} failed: zenoh held it past {:?}", self.peer_id, deadman.key, self.config.put_timeout),
             }
             let control = self.control.lock().clone();
             if let Some(control) = control {
@@ -505,9 +623,20 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(session: zenoh::Session, codecs: EncodingRegistry, catalog: Arc<crate::catalog::TopicCatalog>, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
+        let codecs = Arc::new(codecs);
+        // the shared decode/encode results expire whether or not any frontend is left to ask
+        let weak = Arc::downgrade(&codecs);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let Some(codecs) = weak.upgrade() else { break };
+                codecs.sweep();
+            }
+        });
         Arc::new(Gateway {
             session,
-            codecs: Arc::new(codecs),
+            codecs,
             catalog,
             allocation,
             peers: Mutex::new(HashMap::new()),
@@ -516,6 +645,11 @@ impl Gateway {
             connect_config,
             udp_ports_in_use: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The longest answering an offer or a renegotiation may take (`ServerBuilder::signalling_timeout`).
+    pub fn signalling_timeout(&self) -> Duration {
+        self.allocation.signalling_timeout
     }
 
     /// A port of `udp_ports` no other connection uses and nothing else has bound, reserved for `peer_id`.
@@ -546,6 +680,26 @@ impl Gateway {
             _ => None,
         }).collect::<Vec<_>>());
         channels.collect()
+    }
+
+    /// Ends every other connection's subscription to keys overlapping `keys` (`holder` just leased them), telling each
+    /// one `rejected` with why.
+    async fn end_leased_subscriptions(&self, keys: &[String], holder: u64) {
+        let ended: Vec<(Arc<PeerState>, Option<u64>, String)> = {
+            let peers = self.peers.lock();
+            peers.iter().filter(|(peer_id, _)| **peer_id != holder).flat_map(|(peer_id, entry)| entry.state.channels.lock().values().filter_map(|channel| match &channel.stats {
+                ChannelStats::Sub(shared) if !shared.is_closed() && let Some(reason) = self.leases.subscribe_blocker(*peer_id, &channel.label.key) && crate::auth::overlaps(keys, std::slice::from_ref(&channel.label.key)) => {
+                    shared.leased_away.store(true, Ordering::Relaxed);
+                    shared.close();
+                    Some((entry.state.clone(), channel.label.id, reason))
+                }
+                _ => None,
+            }).collect::<Vec<_>>()).collect()
+        };
+        for (state, sub_id, reason) in ended {
+            info!("peer {}: subscription {sub_id:?} ended: {reason}", state.peer_id);
+            state.send_event(json!({"event": "rejected", "id": sub_id, "reason": reason})).await;
+        }
     }
 
     /// Ends `group`'s lease, telling its holder `reason`; false when nobody holds it.
@@ -582,8 +736,20 @@ impl Gateway {
         let state = Arc::new(state);
         let mut pending = PendingPeer { gateway: Arc::downgrade(self), peer_id, state: state.clone(), connection: None, armed: true };
         let forwarder = Arc::downgrade(&state);
+        let (stale_after, mut gone) = (self.allocation.stale_after, state.gone_signal.subscribe());
         tokio::spawn(async move {
-            while let Some(event) = api_events.recv().await {
+            loop {
+                let (at, event) = tokio::select! {
+                    next = api_events.recv() => match next {
+                        Some(next) => next,
+                        None => break,
+                    },
+                    _ = gone.wait_for(|gone| *gone) => break,
+                };
+                // an event that waited this long behind a control channel that stopped draining is dropped
+                if at.elapsed() > stale_after {
+                    continue;
+                }
                 let Some(state) = forwarder.upgrade() else {
                     break;
                 };
@@ -683,7 +849,7 @@ impl Gateway {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }
-                let _ = entry.connection.close().await;
+                let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()).await;
             });
         }
     }
@@ -691,13 +857,10 @@ impl Gateway {
     /// Fires every frontend's deadmen ("shutdown") and closes its connection.
     pub async fn shutdown(&self) {
         let peers: Vec<PeerEntry> = self.peers.lock().drain().map(|(_, entry)| entry).collect();
-        for entry in &peers {
-            entry.state.fire_deadmen("shutdown").await;
-        }
+        // every frontend's at once (each put waits at most put_timeout), so many browsers don't add up
+        futures::future::join_all(peers.iter().map(|entry| entry.state.fire_deadmen("shutdown"))).await;
         // a peer whose transport is already broken can take forever to close; never hold up exit
-        for entry in peers {
-            let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()).await;
-        }
+        futures::future::join_all(peers.iter().map(|entry| tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()))).await;
     }
 }
 
@@ -711,9 +874,15 @@ async fn run_allocator(state: Weak<PeerState>) {
         if state.gone.load(Ordering::Relaxed) {
             break;
         }
-        // what the browser acknowledged, read now: senders only read it while sending, and a burst's last reading
-        // before its acks came in would look like a growing backlog
-        state.gate.refresh_delivered().await;
+        // a page that acked nothing of a frame for stale_after stopped reading: what is queued for it in SCTP (strict
+        // and small frames, control) can't be taken back, so it goes with its connection
+        if state.gate.expire_stale() {
+            warn!("peer {}: the page acked nothing for {:?}: dropping it", state.peer_id, state.config.stale_after);
+            if let Some(gateway) = state.gateway.upgrade() {
+                gateway.drop_peer(state.peer_id, "stopped reading");
+            }
+            break;
+        }
         let now = Instant::now();
         state.allocate(now.duration_since(last).as_secs_f64());
         last = now;
@@ -742,7 +911,7 @@ impl Drop for PendingPeer {
         self.state.gone_signal.send_replace(true);
         if let (Some(connection), Ok(runtime)) = (self.connection.take(), tokio::runtime::Handle::try_current()) {
             runtime.spawn(async move {
-                let _ = connection.close().await;
+                let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, connection.close()).await;
             });
         }
     }
@@ -873,10 +1042,18 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         }) {
             Ok((opts, resolved, track)) => {
                 let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone()));
-                register(opts.normalized(), ChannelStats::Sub(shared.clone()));
+                register(opts.normalized(matches!(shared.channel, Channel::Video(_))), ChannelStats::Sub(shared.clone()));
+                // checked once registered, so a lease taken meanwhile either sees this subscription or is seen here
+                if let Some(reason) = state.leases.subscribe_blocker(peer_id, &label.key) {
+                    return Some(reason);
+                }
                 state.leases.changed();
                 state.send_accepted(label.id).await;
-                subscription::run(dc.clone(), label.clone(), session, state.catalog.clone(), shared, track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
+                subscription::run(dc.clone(), label.clone(), session, state.catalog.clone(), shared.clone(), track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
+                // like a rejected channel, the client closes it itself
+                if shared.leased_away.load(Ordering::Relaxed) {
+                    close_after_client(&dc).await;
+                }
                 None
             }
             Err(error) => Some(error),
@@ -905,7 +1082,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
                             microphone::run(dc.clone(), label.clone(), opts, session, shared, microphone::Microphone { track, encoding, sender_reports: state.sender_reports.clone(), clock_offset_ms: state.clock_offset_ms.clone() }, blocker).await;
                         }
                     }
-                    _ => publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker).await,
+                    _ => publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker, state.config.put_timeout).await,
                 }
                 None
             }
@@ -928,18 +1105,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     if let Some(error) = rejected {
         warn!("peer {peer_id}: rejected channel {raw_label}: {error}");
         state.send_event(json!({"event": "rejected", "id": label.id, "reason": error})).await;
-        // the client closes a rejected channel itself; closing it from both ends at once lets the second reset land on
-        // the next channel that reuses its stream id (it then closes before opening)
-        let client_closed = async {
-            while let Some(event) = dc.poll().await {
-                if matches!(event, DataChannelEvent::OnClose) {
-                    break;
-                }
-            }
-        };
-        if tokio::time::timeout(Duration::from_secs(5), client_closed).await.is_err() {
-            let _ = dc.close().await;
-        }
+        close_after_client(&dc).await;
     }
     if state.channels.lock().remove(&entry_id).is_some_and(|entry| matches!(entry.stats, ChannelStats::Sub(_))) {
         state.leases.changed();
@@ -949,6 +1115,21 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         && let Some(id) = label.id
     {
         state.deadmen.lock().remove(&id);
+    }
+}
+
+/// Waits up to 5 s for the client to close `dc`, then closes it: closing it from both ends at once lets the second
+/// reset land on the next channel that reuses its stream id (it then closes before opening).
+async fn close_after_client(dc: &Arc<dyn DataChannel>) {
+    let client_closed = async {
+        while let Some(event) = dc.poll().await {
+            if matches!(event, DataChannelEvent::OnClose) {
+                break;
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(5), client_closed).await.is_err() {
+        let _ = dc.close().await;
     }
 }
 
@@ -974,8 +1155,22 @@ fn microphone_encoding(state: &PeerState, label: &Label, opts: &PubOpts) -> Resu
 }
 
 /// The options a running subscription may change (the rest decide what it is, so they need a new subscription).
-const UPDATABLE: [&str; 9] =
-    ["maxHz", "minQuality", "qualityToHzTradeoff", "bandwidthPriority", "maxBitrate", "minResolutionScale", "maxResolution", "playoutDelay", "encodeOptions"];
+const UPDATABLE: [&str; 14] = [
+    "maxHz",
+    "minQuality",
+    "qualityToHzTradeoff",
+    "bandwidthPriority",
+    "maxBitrate",
+    "minResolutionScale",
+    "minResolution",
+    "maxResolution",
+    "frameDropping",
+    "keyframeIntervalMs",
+    "sceneChangeKeyframes",
+    "targetQp",
+    "playoutDelay",
+    "encodeOptions",
+];
 
 /// Changes a running subscription's options in place: same channel, same track, the next frame uses them.
 fn update_subscription(state: &PeerState, request: &ControlRequest) -> Value {
@@ -1019,7 +1214,7 @@ fn update_subscription(state: &PeerState, request: &ControlRequest) -> Value {
         let mut opts = SubOpts::parse(&merged)?;
         opts.resolve_encoding(&state.codecs)?;
         shared.retune(&opts);
-        entry.opts = opts.normalized();
+        entry.opts = opts.normalized(matches!(shared.channel, Channel::Video(_)));
         entry.label.opts = merged;
         Ok(json!({"opts": entry.opts}))
     })();
@@ -1101,6 +1296,7 @@ async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc
                 Some(DataChannelEvent::OnMessage(message)) => {
                     let t1 = now_unix_ms();
                     last_beat = tokio::time::Instant::now();
+                    *state.last_beat.lock() = Instant::now();
                     fired_since_last_beat = false;
                     state.heartbeat.lock().beats += 1;
                     if let Ok(sample) = serde_json::from_slice::<ClockSample>(&message.data) {
@@ -1117,7 +1313,8 @@ async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc
                 state.heartbeat.lock().deadlines_missed += 1;
                 warn!("peer {}: heartbeat missed for {deadline:?}", state.peer_id);
                 state.fire_deadmen("heartbeat").await;
-                for group in state.leases.release_all(state.peer_id) {
+                // a lease with a timeoutMs of its own outlasts the connection's deadline (see watch_lease_timeout)
+                for group in state.leases.release_on_heartbeat_deadline(state.peer_id) {
                     state.lease_lost(&group, "heartbeat").await;
                 }
             }
@@ -1142,13 +1339,21 @@ struct ControlRequest {
     sdp: Option<RTCSessionDescription>,
     /// renegotiate: add a track for this channel (`video-h264`, `audio-opus`, ...)
     channel: Option<String>,
-    /// lease ops: the group, its keys (a group the server doesn't define) and maxSeconds
+    /// lease ops: the group, its keys (a group the server doesn't define: `publish`, or `keys` from older clients;
+    /// `subscribe`), allowTakeover and maxSeconds
     group: Option<String>,
     keys: Option<Vec<String>>,
+    publish: Option<Vec<String>>,
+    subscribe: Option<Vec<String>>,
+    allow_takeover: Option<bool>,
+    /// lease: heartbeat silence (ms) that ends it, instead of the connection's heartbeat deadline
+    timeout_ms: Option<f64>,
     max_seconds: Option<f64>,
     /// updateSubscription: the subscription's channel id, and the options to change
     sub_id: Option<u64>,
     opts: Option<Value>,
+    /// setLinkBandwidth: the link's known bandwidth, bytes/s (absent or null: back to the estimate)
+    bytes_per_sec: Option<f64>,
 }
 
 fn ok(id: &Value, extra: Value) -> Value {
@@ -1179,9 +1384,16 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
         {
             let (dc, state) = (dc.clone(), state.clone());
             let slow = api::SLOW_OPS.contains(&request.op.as_str());
+            // a get waits its own timeout (at most MAX_GET_TIMEOUT_MS); anything else as long as a put may
+            let limit = state.config.put_timeout + if slow { Duration::from_millis(api::MAX_GET_TIMEOUT_MS) } else { Duration::ZERO };
             let task = async move {
-                let context = api::Context { session: &state.session, access: state.access(), api: &state.api, events: state.api_events.clone() };
-                let response = api::handle(context, request).await;
+                let id = request.id.clone();
+                let context = api::Context { session: &state.session, access: state.access(), api: &state.api, events: state.api_events.clone(), put_timeout: state.config.put_timeout };
+                let response = tokio::select! {
+                    response = tokio::time::timeout(limit, api::handle(context, request)) => response.unwrap_or_else(|_| fail(&id, format!("timed out after {limit:?}"))),
+                    // a peer that left takes its pending ops with it (each held its state)
+                    () = state.wait_gone() => return,
+                };
                 let _ = dc.send_text(&response.to_string()).await;
             };
             // ops that wait on the network don't hold up pings and stats
@@ -1204,10 +1416,17 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             "listTopics" | "renegotiate" | "expireLease" => {
                 let (dc, state) = (dc.clone(), state.clone());
                 tokio::spawn(async move {
-                    let response = match request.op.as_str() {
-                        "listTopics" => handle_list_topics(&state.session, &state.catalog, &request, &state.grant).await,
-                        "expireLease" => expire_lease(&state, &request).await,
-                        _ => handle_renegotiate(&state, &request).await,
+                    let handling = async {
+                        match request.op.as_str() {
+                            "listTopics" => handle_list_topics(&state.session, &state.catalog, &request, &state.grant).await,
+                            "expireLease" => expire_lease(&state, &request).await,
+                            _ => handle_renegotiate(&state, &request).await,
+                        }
+                    };
+                    // a peer that left takes its pending ops with it (each held its state)
+                    let response = tokio::select! {
+                        response = handling => response,
+                        () = state.wait_gone() => return,
                     };
                     let _ = dc.send_text(&response.to_string()).await;
                 });
@@ -1221,15 +1440,28 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock(), "rttMs": *state.rtt_ms.lock()});
                 let heartbeat = serde_json::to_value(state.heartbeat.lock().clone()).unwrap_or_default();
                 let bandwidth = serde_json::to_value(state.bandwidth.lock().clone()).unwrap_or_default();
-                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth}))
+                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth, "memory": state.memory_counts()}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
             "encodings" => {
                 let encodings: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
-                ok(&request.id, json!({"encodings": encodings}))
+                // features: what a page may use beyond 0.5.31 (the subscribe option `metadata`)
+                ok(&request.id, json!({"encodings": encodings, "features": ["metadata"]}))
             }
-            "lease" => take_lease(&state, &request),
+            "lease" => {
+                let response = take_lease(&state, &request);
+                let _ = dc.send_text(&response.to_string()).await;
+                state.leases.changed();
+                continue;
+            }
             "updateSubscription" => update_subscription(&state, &request),
+            "setLinkBandwidth" => match request.bytes_per_sec {
+                Some(known) if !(known.is_finite() && known > 0.0) => fail(&request.id, format!("bytesPerSec must be a positive number of bytes/s, got {known}")),
+                known => {
+                    *state.known_bandwidth.lock() = known;
+                    ok(&request.id, json!({}))
+                }
+            },
             "releaseLease" => {
                 state.leases.end(request.group.as_deref().unwrap_or_default(), |holder, _| holder == state.peer_id);
                 ok(&request.id, json!({}))
@@ -1264,31 +1496,113 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
     let Some(connection) = state.connection.lock().clone() else {
         return fail(&request.id, "peer is gone");
     };
-    let _negotiating = state.negotiation.lock().await;
-    match media::renegotiate(&connection, offer, mime).await {
-        Ok((answer, track)) => {
-            let mid = track.map(|track| {
-                let mid = track.mid.clone();
-                state.tracks.lock().insert(mid.clone(), track);
-                mid
-            });
-            ok(&request.id, json!({"sdp": answer, "mid": mid}))
+    let timeout = state.config.signalling_timeout;
+    let negotiating = async {
+        let _negotiating = state.negotiation.lock().await;
+        let live = media::live_mids(&offer.sdp);
+        match media::renegotiate(&connection, offer, mime, &state.video_rate).await {
+            Ok((answer, track)) => {
+                // tracks whose m-line the offer dropped (their subscription closed and the page stopped the transceiver)
+                let dropped: Vec<Arc<media::MediaTrack>> = {
+                    let mut tracks = state.tracks.lock();
+                    let gone: Vec<String> = tracks.keys().filter(|mid| !live.contains(*mid)).cloned().collect();
+                    gone.iter().filter_map(|mid| tracks.remove(mid)).collect()
+                };
+                if !dropped.is_empty() {
+                    info!("peer {}: stopping {} dropped track(s), {} left", state.peer_id, dropped.len(), state.tracks.lock().len());
+                }
+                media::stop_tracks(&connection, &dropped).await;
+                let mid = track.map(|track| {
+                    let mid = track.mid.clone();
+                    state.tracks.lock().insert(mid.clone(), track);
+                    mid
+                });
+                ok(&request.id, json!({"sdp": answer, "mid": mid}))
+            }
+            Err(error) => {
+                warn!("peer {}: renegotiation failed: {error:#}", state.peer_id);
+                fail(&request.id, format!("{error:#}"))
+            }
         }
-        Err(error) => {
-            warn!("peer {}: renegotiation failed: {error:#}", state.peer_id);
-            fail(&request.id, format!("{error:#}"))
+    };
+    // the WebRTC library answering (or a renegotiation queued behind a stuck one) never holds the page, or the lock, forever
+    tokio::select! {
+        response = tokio::time::timeout(timeout, negotiating) => response.unwrap_or_else(|_| {
+            warn!("peer {}: renegotiation took over {timeout:?}", state.peer_id);
+            fail(&request.id, format!("renegotiation timed out after {timeout:?}"))
+        }),
+        () = state.wait_gone() => fail(&request.id, "peer is gone"),
+    }
+}
+
+/// Ends lease `serial` of `group` once its holder's heartbeat has been silent for `timeout` ("heartbeat"); returns when
+/// the lease ends any other way or its holder goes. Holds the holder only weakly, between checks.
+async fn watch_lease_timeout(holder: Weak<PeerState>, group: String, serial: u64, timeout: Duration) {
+    loop {
+        let silent = {
+            let Some(state) = holder.upgrade() else { return };
+            if !state.leases.is_held(&group, serial) {
+                return;
+            }
+            state.last_beat.lock().elapsed()
+        };
+        if silent < timeout {
+            tokio::time::sleep(timeout - silent).await;
+            continue;
         }
+        let Some(state) = holder.upgrade() else { return };
+        if state.leases.end(&group, |_, lease_serial| lease_serial == serial).is_some() {
+            warn!("peer {}: heartbeat silent for {timeout:?}: lease {group:?} ends", state.peer_id);
+            state.lease_lost(&group, "heartbeat").await;
+        }
+        return;
     }
 }
 
 /// Takes (or renews) a lease; it ends at maxSeconds, when the heartbeat stops, or on disconnect.
 fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
-    if !state.heartbeat.lock().configured {
+    let heartbeat = state.heartbeat.lock().clone();
+    if !heartbeat.configured {
         return fail(&request.id, "a lease needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })");
     }
-    let group = request.group.clone().unwrap_or_default();
-    match state.leases.take(state.peer_id, &state.grant, &group, request.keys.clone(), request.max_seconds) {
-        Ok((keys, expires_in, serial)) => {
+    let timeout = match request.timeout_ms {
+        Some(ms) if !(ms.is_finite() && ms > 0.0) => return fail(&request.id, format!("timeoutMs must be a positive number, got {ms}")),
+        ms => ms.map(|ms| crate::secs(ms / 1000.0)),
+    };
+    let slowest = state.leases.slowest_heartbeat.as_secs_f64();
+    match timeout {
+        Some(timeout) if timeout.as_secs_f64() > slowest => {
+            return fail(&request.id, format!("timeoutMs must be at most {} (the server's slowest lease heartbeat), got {}", slowest * 1000.0, timeout.as_secs_f64() * 1000.0));
+        }
+        Some(_) => {}
+        None => {
+            let deadline_secs = heartbeat.misses as f64 / heartbeat.hz;
+            if deadline_secs > slowest {
+                return fail(&request.id, format!("a lease needs a heartbeat deadline (heartbeatMisses / heartbeatHz, or timeoutMs) of at most {slowest} s, got {deadline_secs} s"));
+            }
+        }
+    }
+    let asked = crate::auth::LeaseRequest {
+        publish: request.publish.clone().or_else(|| request.keys.clone()),
+        subscribe: request.subscribe.clone().unwrap_or_default(),
+        takeover: request.allow_takeover.unwrap_or(false),
+        max_secs: request.max_seconds,
+        timeout,
+    };
+    match state.leases.take(state.peer_id, &state.grant, request.group.as_deref(), asked) {
+        Ok(crate::auth::Taken { group, publish, subscribe, expires_in, serial, taken_over }) => {
+            let gateway = state.gateway.clone();
+            let (holder, ending) = (state.peer_id, subscribe.clone());
+            tokio::spawn(async move {
+                let Some(gateway) = gateway.upgrade() else { return };
+                for (lost, loser) in taken_over {
+                    gateway.lease_lost(loser, &lost, "takenOver").await;
+                }
+                gateway.end_leased_subscriptions(&ending, holder).await;
+            });
+            if let Some(timeout) = timeout {
+                tokio::spawn(watch_lease_timeout(Arc::downgrade(state), group.clone(), serial, timeout));
+            }
             if let Some(after) = expires_in {
                 let (gateway, group) = (state.gateway.clone(), group.clone());
                 tokio::spawn(async move {
@@ -1300,8 +1614,10 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
                     }
                 });
             }
-            info!("peer {}: leased {group:?} {keys:?}", state.peer_id);
-            ok(&request.id, json!({"group": group, "keys": keys, "expiresInMs": expires_in.map(|after| after.as_millis() as u64)}))
+            info!("peer {}: leased {group:?} publish {publish:?} subscribe {subscribe:?}", state.peer_id);
+            let expires_in_ms = expires_in.map(|after| after.as_millis() as u64);
+            let timeout_ms = timeout.map(|timeout| timeout.as_secs_f64() * 1000.0);
+            ok(&request.id, json!({"group": group, "keys": publish, "publish": publish, "subscribe": subscribe, "expiresInMs": expires_in_ms, "timeoutMs": timeout_ms}))
         }
         Err(error) => fail(&request.id, error),
     }

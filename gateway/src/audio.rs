@@ -68,15 +68,14 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             shared.wait_for_data(wake_at).await;
             continue;
         };
+        // the per-sample frame carries the sample's header (its stamp) when asked
+        let header = shared.sends_header().then(|| subscription::sample_header(&*codec, &key, &item)).flatten();
         let decoding = start_decode(&shared, &codec, key, item);
-        let decoded = match decoding.task.await {
-            Ok((Ok((decoded, _)), _, _)) => decoded,
-            Ok((Err(error), _, _)) => {
-                shared.record_encoding_error(&error);
-                continue;
-            }
+        let crate::media::Decoding { key, item, task } = decoding;
+        let decoded = match crate::media::finish_decode(task, shared.codecs.encode_timeout).await {
+            Ok((decoded, ..)) => decoded,
             Err(error) => {
-                shared.record_encoding_error(&format!("decoder task failed: {error}"));
+                shared.record_encoding_error(&error);
                 continue;
             }
         };
@@ -88,7 +87,11 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             Ok(bytes) => shared.record_media_bytes(bytes),
             Err(error) => shared.record_encoding_error(&format!("{error:#}")),
         }
-        if subscription::send_small_frame(&dc, &decoding.key, decoding.item.timestamp_ms, decoding.item.seq, frame_id, &[]).await.is_err() && shared.is_closed() {
+        let (flags, message) = match &header {
+            Some(header) => (crate::frame::HEADER, crate::frame::with_header(header, &[])),
+            None => (0, Vec::new()),
+        };
+        if subscription::send_small_frame(&dc, &key, item.timestamp_ms, item.seq, frame_id, flags, &message).await.is_err() && shared.is_closed() {
             break;
         }
         frame_id = frame_id.wrapping_add(1);
@@ -109,7 +112,7 @@ async fn send_pcm(opus: &mut Option<Opus>, pending: &mut Vec<i16>, pcm: &AudioPc
         let packet = opus.encode(&pending[..packet_samples])?;
         pending.drain(..packet_samples);
         bytes += packet.len();
-        track.write(packet, PACKET, (0, 0)).await?;
+        track.write(packet, PACKET, (0, 0), None, false).await?;
     }
     Ok(bytes)
 }

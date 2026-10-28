@@ -3,19 +3,18 @@
 //!
 //! The allocator grants each video stream bytes/s and a frame rate; the encoder runs at that bitrate. The picture keeps
 //! its full size unless the grant would leave fewer than `min_bits_per_pixel` there (an encoder at its coarsest
-//! quantizer overshoots below that), then it shrinks just enough, never below `min_resolution_scale`.
+//! quantizer overshoots below that), then it shrinks just enough, never below `MIN_RESOLUTION` (or `min_resolution_scale`).
 
 use crate::encoding::{DecodedFrame, PixelFormat, VideoImage};
 use anyhow::{Result, anyhow, ensure};
 use openh264::OpenH264API;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, MatrixCoefficients, Profile, RateControlMode, UsageType, VuiConfig};
 use openh264::formats::YUVBuffer;
+use std::time::Duration;
 
 const MIN_DIMENSION: u32 = 16;
-/// Keyframe at least this often (seconds), on top of PLI/FIR requests from the browser.
-const KEYFRAME_SECONDS: f64 = 3.0;
-/// Re-create the encoder when the frame rate drifts past this ratio (bitrate changes apply in place).
-const RECONFIGURE_RATIO: f64 = 1.3;
+/// The default smallest picture (`VideoPolicy::min_resolution`).
+pub const MIN_RESOLUTION: (u32, u32) = (160, 64);
 /// What the encoders signal: the BT.601 matrix (what the pictures are), BT.709 primaries and transfer (what browsers
 /// assume for video, so only the matrix differs from their guess).
 const VUI: VuiConfig = VuiConfig::bt709().matrix_coefficients(MatrixCoefficients::Smpte170M);
@@ -30,18 +29,34 @@ pub struct VideoPolicy {
     pub max_bitrate: Option<f64>,
     /// See `max_bitrate` (default 0.3: ~17 Mbit/s for 720p60).
     pub max_bits_per_pixel: f64,
-    /// Below this many bits per pixel per frame the picture shrinks (default 0.05: openh264's coarsest quantizer
-    /// still overshoots below ~0.03 on a busy scene).
+    /// Below this many bits per pixel per frame the picture shrinks (default 0.1: openh264's coarsest quantizer
+    /// still overshoots below ~0.03 on a busy scene, and at 0.05 a short link kept 720p at a few hundred kbit/s, whose
+    /// keyframes then queued in the pacer for hundreds of ms).
     pub min_bits_per_pixel: f64,
-    /// Smallest share of the source's width and height (default 0.25).
+    /// Smallest share of the source's width and height (default 0: down to `min_resolution`).
     pub min_resolution_scale: f64,
+    /// Smallest picture, aspect kept: it shrinks until one side reaches its side here (default `MIN_RESOLUTION`, 160x64).
+    pub min_resolution: (u32, u32),
     /// Box the picture is fitted into, aspect kept (default none: the source's size).
     pub max_resolution: Option<(u32, u32)>,
+    /// The encoder may skip a frame to hold its bitrate (default true; openh264's bEnableFrameSkip, which libwebrtc
+    /// turns on for cameras: without it openh264 can't hold its bitrate and sent 3x its grant on a 500 kbit/s link).
+    pub frame_dropping: bool,
+    /// A keyframe at least this often, on top of the ones the browser asks for after a loss (PLI/FIR) (default 60 s:
+    /// every 3 s, each keyframe, 5-10x a frame, took 0.3-0.5 s to cross a 1 Mbit/s link and held the frames behind it).
+    pub keyframe_interval: Duration,
+    /// The encoder sends a keyframe when it sees a new scene (default false; openh264's bEnableSceneChangeDetect: with
+    /// frames skipped to hold a 1 Mbit/s bitrate, a smoothly moving picture tripped it every ~4 s, each keyframe ~21 KB,
+    /// 170 ms of the link). A lost frame is still recovered by the browser's PLI.
+    pub scene_change_keyframes: bool,
+    /// The quantizer the picture's size aims for, on encoders that report theirs (default 30, H.264's 0-51 scale: the
+    /// middle of libwebrtc's 24-37, past which its quality scaler moves the picture). Lower: a smaller, sharper picture.
+    pub target_qp: f64,
 }
 
 impl Default for VideoPolicy {
     fn default() -> Self {
-        VideoPolicy { max_bitrate: None, max_bits_per_pixel: 0.3, min_bits_per_pixel: 0.05, min_resolution_scale: 0.25, max_resolution: None }
+        VideoPolicy { max_bitrate: None, max_bits_per_pixel: 0.3, min_bits_per_pixel: 0.1, min_resolution_scale: 0.0, min_resolution: MIN_RESOLUTION, max_resolution: None, frame_dropping: true, keyframe_interval: Duration::from_secs(60), scene_change_keyframes: false, target_qp: 30.0 }
     }
 }
 
@@ -50,14 +65,24 @@ impl VideoPolicy {
         let positive = |value: f64| value.is_finite() && value > 0.0;
         ensure!(self.max_bitrate.is_none_or(positive), "max bitrate must be a positive number of bits/s");
         ensure!(positive(self.max_bits_per_pixel) && positive(self.min_bits_per_pixel), "bits per pixel must be positive");
-        ensure!(self.min_resolution_scale > 0.0 && self.min_resolution_scale <= 1.0, "min resolution scale must be within (0, 1]");
+        ensure!((0.0..=1.0).contains(&self.min_resolution_scale), "min resolution scale must be within [0, 1]");
+        ensure!(self.min_resolution.0 >= MIN_DIMENSION && self.min_resolution.1 >= MIN_DIMENSION, "min resolution must be at least {MIN_DIMENSION}x{MIN_DIMENSION}");
         ensure!(self.max_resolution.is_none_or(|(width, height)| width >= MIN_DIMENSION && height >= MIN_DIMENSION), "max resolution must be at least {MIN_DIMENSION}x{MIN_DIMENSION}");
+        ensure!(!self.keyframe_interval.is_zero(), "keyframe interval must be positive");
+        ensure!((0.0..=51.0).contains(&self.target_qp), "target QP must be within [0, 51]");
         Ok(())
     }
 
     /// Share of the source's width and height that fits `max_resolution`.
     fn fit(&self, (width, height): (u32, u32)) -> f64 {
         self.max_resolution.map_or(1.0, |(max_width, max_height)| (max_width as f64 / width as f64).min(max_height as f64 / height as f64).min(1.0))
+    }
+
+    /// The smallest share of the source's width and height the picture shrinks to: `min_resolution` (aspect kept) or
+    /// `min_resolution_scale`, whichever is larger, never past the fitted size.
+    pub(crate) fn floor_scale(&self, (width, height): (u32, u32)) -> f64 {
+        let smallest = (self.min_resolution.0 as f64 / width.max(1) as f64).max(self.min_resolution.1 as f64 / height.max(1) as f64);
+        self.min_resolution_scale.max(smallest).min(self.fit((width, height)))
     }
 
     /// The least a frame at full size (fitted into `max_resolution`) takes: `min_bits_per_pixel`. A grant below it shrinks
@@ -74,16 +99,20 @@ impl VideoPolicy {
             Some(bps) => bps / frame_hz.max(0.1),
             None => self.max_bits_per_pixel * pixels * self.fit(source).powi(2),
         } / 8.0;
-        let least = (self.min_bits_per_pixel * pixels * self.min_resolution_scale.min(self.fit(source)).powi(2) / 8.0).min(most);
+        let least = (self.min_bits_per_pixel * pixels * self.floor_scale(source).powi(2) / 8.0).min(most);
         least + (most - least) * quality.clamp(0.0, 1.0)
     }
 
     /// Even output size (a scaled width a multiple of 16) for `bitrate_bps` at `fps`: the source's (fitted into `max_resolution`), shrunk only to keep
-    /// `min_bits_per_pixel` and to `scale_cap` (the CPU governor's), never below `min_resolution_scale`.
+    /// `min_bits_per_pixel` and to `scale_cap` (the CPU governor's), never below `floor_scale`.
     pub(crate) fn size(&self, source: (u32, u32), bitrate_bps: f64, fps: f64, scale_cap: f64) -> (u32, u32) {
-        let fit = self.fit(source);
         let affordable = (bitrate_bps / (fps.max(0.1) * source.0 as f64 * source.1 as f64 * self.min_bits_per_pixel)).sqrt();
-        let scale = fit.min(affordable).min(scale_cap).max(self.min_resolution_scale.min(fit));
+        self.scaled(source, affordable, scale_cap)
+    }
+
+    /// Even size at `scale` of the source's width and height, within the fitted size, `scale_cap` and `floor_scale`.
+    pub(crate) fn scaled(&self, source: (u32, u32), scale: f64, scale_cap: f64) -> (u32, u32) {
+        let scale = self.fit(source).min(scale).min(scale_cap).max(self.floor_scale(source));
         let scaled = |value: u32, step: u32| (((value as f64 * scale).round() as u32) & !(step - 1)).max(MIN_DIMENSION);
         let (width, height) = (scaled(source.0, 2), scaled(source.1, 2));
         // a scaled width is a whole number of macroblocks: phone decoders sheared 1362-wide H.264 (seen on the R1)
@@ -233,12 +262,20 @@ pub struct VideoTarget {
     pub fps: f64,
     /// A viewer joined or lost a frame (PLI/FIR): this frame must be a keyframe.
     pub keyframe: bool,
+    /// See `VideoPolicy::frame_dropping`.
+    pub frame_dropping: bool,
+    /// See `VideoPolicy::keyframe_interval`.
+    pub keyframe_interval: Duration,
+    /// See `VideoPolicy::scene_change_keyframes`.
+    pub scene_change_keyframes: bool,
 }
 
 impl VideoTarget {
-    /// `width × height` (even) at `bitrate_bps` and `fps`, quality 1, no keyframe asked for: e.g. to try an encoder.
+    /// `width × height` (even) at `bitrate_bps` and `fps`, quality 1, no keyframe asked for, the default policy's frame
+    /// dropping and keyframe interval: e.g. to try an encoder.
     pub fn new(width: u32, height: u32, bitrate_bps: u32, fps: f64) -> Self {
-        VideoTarget { quality: 1.0, width, height, bitrate_bps, fps, keyframe: false }
+        let policy = VideoPolicy::default();
+        VideoTarget { quality: 1.0, width, height, bitrate_bps, fps, keyframe: false, frame_dropping: policy.frame_dropping, keyframe_interval: policy.keyframe_interval, scene_change_keyframes: policy.scene_change_keyframes }
     }
 }
 
@@ -266,6 +303,12 @@ pub trait VideoEncoder: Send {
 
     /// Encodes one decoded frame at `target`; `None` while a pipelined encoder has nothing out yet.
     fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>>;
+
+    /// The average quantizer (H.264's 0-51 scale) of the frame `encode` last returned, if the encoder reports it: the
+    /// picture's size then follows it (`VideoPolicy::target_qp`).
+    fn last_qp(&self) -> Option<f64> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -273,13 +316,38 @@ struct Settings {
     width: u32,
     height: u32,
     fps: f32,
+    frame_dropping: bool,
+    keyframe_interval: Duration,
+    scene_change_keyframes: bool,
 }
 
 /// The default encoder: [`DecodedFrame::Video`] to H.264 with openh264 (BT.601 signaled), re-created when the
-/// target's size or rate moves; bitrate changes apply in place.
+/// target's size or encoder options change; bitrate and frame rate changes apply in place (as libwebrtc's does: a
+/// frame rate that followed each grant re-created it, and so sent a keyframe, ~1/s on a 500 kbit/s link).
 #[derive(Default)]
 pub struct H264Encoder {
-    encoder: Option<(Encoder, Settings, u32)>,
+    /// (encoder, its settings, bits/s, the next frame's timestamp in ms: frames one frame interval apart, which its rate
+    /// control paces by; at 0 it couldn't hold its bitrate, and by the wall clock it skipped frames that came a little
+    /// early, 6 of every 10 at 10 Hz)
+    encoder: Option<(Encoder, Settings, u32, f64)>,
+    last_qp: Option<f64>,
+}
+
+/// The average quantizer of the frame openh264 last encoded.
+fn frame_qp(encoder: &mut Encoder) -> Option<f64> {
+    let mut statistics = openh264_sys2::SEncoderStatistics::default();
+    // SAFETY: the encoder is initialized (it just encoded a frame) and `statistics` outlives the call
+    let status = unsafe { encoder.raw_api().get_option(openh264_sys2::ENCODER_OPTION_GET_STATISTICS, (&raw mut statistics).cast()) };
+    (status == 0).then_some(statistics.uiAverageFrameQP as f64)
+}
+
+/// Sets openh264's frame rate without a new encoder.
+fn set_frame_rate(encoder: &mut Encoder, fps: f32) -> Result<()> {
+    let mut fps = fps;
+    // SAFETY: the encoder is initialized (it encoded a frame) and `fps` outlives the call
+    let status = unsafe { encoder.raw_api().set_option(openh264_sys2::ENCODER_OPTION_FRAME_RATE, (&raw mut fps).cast()) };
+    ensure!(status == 0, "openh264 refused frame rate {fps} (status {status})");
+    Ok(())
 }
 
 /// Sets openh264's target bitrate and ceiling (the layer's; target ≤ ceiling holds at every step) without a new encoder.
@@ -300,12 +368,15 @@ impl VideoEncoder for H264Encoder {
         VideoFormat::H264
     }
 
+    fn last_qp(&self) -> Option<f64> {
+        self.last_qp
+    }
+
     fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>> {
         let DecodedFrame::Video(image) = frame else { return Err(anyhow!("the software H.264 encoder takes pictures, got {frame:?}")) };
-        let VideoTarget { width, height, bitrate_bps, fps: hz, .. } = *target;
-        let wanted = Settings { width, height, fps: hz as f32 };
-        let drifted = |old: f64, new: f64| old / new > RECONFIGURE_RATIO || new / old > RECONFIGURE_RATIO;
-        let reconfigure = self.encoder.as_ref().is_none_or(|(_, current, _)| (current.width, current.height) != (width, height) || drifted(current.fps as f64, hz));
+        let VideoTarget { width, height, bitrate_bps, fps: hz, frame_dropping, keyframe_interval, scene_change_keyframes, .. } = *target;
+        let wanted = Settings { width, height, fps: hz as f32, frame_dropping, keyframe_interval, scene_change_keyframes };
+        let reconfigure = self.encoder.as_ref().is_none_or(|(_, current, _, _)| (current.width, current.height, current.frame_dropping, current.keyframe_interval, current.scene_change_keyframes) != (width, height, frame_dropping, keyframe_interval, scene_change_keyframes));
         if reconfigure {
             let config = EncoderConfig::new()
                 .bitrate(BitRate::from_bps(bitrate_bps))
@@ -313,12 +384,17 @@ impl VideoEncoder for H264Encoder {
                 .rate_control_mode(RateControlMode::Bitrate)
                 .usage_type(UsageType::CameraVideoRealTime)
                 .profile(Profile::Baseline)
-                .skip_frames(false)
+                .skip_frames(frame_dropping)
+                .scene_change_detect(scene_change_keyframes)
                 .vui(VUI)
-                .intra_frame_period(IntraFramePeriod::from_num_frames(((hz * KEYFRAME_SECONDS).ceil() as u32).max(1)));
+                .intra_frame_period(IntraFramePeriod::from_num_frames(((hz * keyframe_interval.as_secs_f64()).ceil() as u32).max(1)));
             let encoder = Encoder::with_api_config(OpenH264API::from_source(), config).map_err(|e| anyhow!("openh264: {e}"))?;
-            self.encoder = Some((encoder, wanted, bitrate_bps));
-        } else if let Some((encoder, _, current_bps)) = self.encoder.as_mut() {
+            self.encoder = Some((encoder, wanted, bitrate_bps, 0.0));
+        } else if let Some((encoder, current, current_bps, _)) = self.encoder.as_mut() {
+            if current.fps != wanted.fps {
+                set_frame_rate(encoder, wanted.fps)?;
+                current.fps = wanted.fps;
+            }
             if *current_bps != bitrate_bps {
                 set_bitrate(encoder, *current_bps, bitrate_bps)?;
                 *current_bps = bitrate_bps;
@@ -328,19 +404,35 @@ impl VideoEncoder for H264Encoder {
                 encoder.force_intra_frame();
             }
         }
-        let (encoder, _, _) = self.encoder.as_mut().expect("encoder configured above");
+        let (encoder, _, _, clock_ms) = self.encoder.as_mut().expect("encoder configured above");
         let yuv = YUVBuffer::from_vec(to_i420(image, width, height), width as usize, height as usize);
-        let bitstream = encoder.encode(&yuv).map_err(|e| anyhow!("openh264: {e}"))?;
-        let keyframe = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);
-        Ok(Some(EncodedVideo { data: bitstream.to_vec(), width, height, keyframe }))
+        let at = openh264::Timestamp::from_millis(*clock_ms as u64);
+        *clock_ms += 1000.0 / hz.max(0.1);
+        let bitstream = encoder.encode_at(&yuv, at).map_err(|e| anyhow!("openh264: {e}"))?;
+        let (frame_type, data) = (bitstream.frame_type(), bitstream.to_vec());
+        // a frame the rate control skipped
+        if matches!(frame_type, FrameType::Skip) || data.is_empty() {
+            return Ok(None);
+        }
+        self.last_qp = frame_qp(encoder);
+        Ok(Some(EncodedVideo { data, width, height, keyframe: matches!(frame_type, FrameType::IDR | FrameType::I) }))
     }
 }
 
-/// The target for a grant of `bitrate_bps` at `hz` for a `source`-sized picture, at most `scale_cap` of its size.
-pub(crate) fn target(policy: &VideoPolicy, source: (u32, u32), quality: f64, bitrate_bps: f64, hz: f64, scale_cap: f64, keyframe: bool) -> VideoTarget {
+/// The target for a grant of `bitrate_bps` at `hz` for a `source`-sized picture, at most `scale_cap` of its size. The
+/// picture is sized for `size_bitrate_bps` (see `VideoRate::size_ratio`) at the policy's `min_bits_per_pixel`, or at
+/// `qp_scale` of the source (see `QpScaler`) when that is smaller: as libwebrtc picks a first size from the bitrate and
+/// its quality scaler takes it down while frames come out coarse (sized by the quantizer alone, a fast link's picture
+/// started small, where the encoder can't spend more bits, and stayed small).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn target(policy: &VideoPolicy, source: (u32, u32), quality: f64, bitrate_bps: f64, size_bitrate_bps: f64, qp_scale: Option<f64>, hz: f64, scale_cap: f64, keyframe: bool) -> VideoTarget {
     let (fps, bitrate_bps) = (hz.max(0.1), bitrate_bps.max(MIN_BITRATE));
-    let (width, height) = policy.size(source, bitrate_bps, fps, scale_cap);
-    VideoTarget { quality, width, height, bitrate_bps: bitrate_bps as u32, fps, keyframe }
+    let by_bitrate = policy.size(source, size_bitrate_bps.max(MIN_BITRATE), fps, scale_cap);
+    let (width, height) = match qp_scale.map(|scale| policy.scaled(source, scale, scale_cap)) {
+        Some(by_qp) if by_qp.0 < by_bitrate.0 => by_qp,
+        _ => by_bitrate,
+    };
+    VideoTarget { quality, width, height, bitrate_bps: bitrate_bps as u32, fps, keyframe, frame_dropping: policy.frame_dropping, keyframe_interval: policy.keyframe_interval, scene_change_keyframes: policy.scene_change_keyframes }
 }
 
 #[cfg(test)]
@@ -367,23 +459,27 @@ mod tests {
     fn full_size_until_the_bits_per_pixel_floor() {
         let policy = VideoPolicy::default();
         let hd = (1280, 720);
-        // 0.05 bits per pixel at 720p60 is 2.76 Mbit/s: above it the picture keeps its size
-        assert_eq!(policy.size(hd, 3e6, 60.0, 1.0), (1280, 720));
+        // 0.1 bits per pixel at 720p60 is 5.53 Mbit/s: above it the picture keeps its size
+        assert_eq!(policy.size(hd, 6e6, 60.0, 1.0), (1280, 720));
         assert_eq!(policy.size((321, 241), 1e9, 60.0, 1.0), (320, 240), "even sizes");
-        let (width, _) = policy.size(hd, 2.76e6 / 4.0, 60.0, 1.0);
+        let (width, _) = policy.size(hd, 5.53e6 / 4.0, 60.0, 1.0);
         assert!((624..=640).contains(&width), "a quarter of the bits: half the width, {width}");
         assert_eq!(policy.size((1920, 1536), 1e9, 60.0, 0.71), (1360, 1090), "a scaled width is a multiple of 16");
-        assert_eq!(policy.size(hd, 1e3, 60.0, 1.0), (320, 180), "never below min_resolution_scale");
+        assert_eq!(policy.size(hd, 1e3, 60.0, 1.0), (160, 90), "never below 160x64, aspect kept");
+        assert_eq!(policy.size((640, 480), 1e3, 30.0, 1.0), (160, 120));
+        assert_eq!(policy.size((1280, 200), 1e3, 30.0, 1.0), (400, 64), "64 high: a wide picture keeps more width");
+        assert_eq!(VideoPolicy { min_resolution_scale: 0.25, ..policy }.size(hd, 1e3, 60.0, 1.0), (320, 180), "or min_resolution_scale");
+        assert_eq!(VideoPolicy { min_resolution: (64, 64), ..policy }.size(hd, 1e3, 60.0, 1.0), (112, 64), "a page's own floor (a width multiple of 16)");
         assert_eq!(policy.size(hd, 1e9, 60.0, 0.5), (640, 360), "the CPU governor's cap");
         let boxed = VideoPolicy { max_resolution: Some((640, 640)), ..policy };
         assert_eq!(boxed.size(hd, 1e9, 60.0, 1.0), (640, 360), "fitted into max_resolution");
         // the price: the smallest picture at the floor (quality 0) to the most bits per frame (1)
         assert!((policy.frame_bytes(hd, 60.0, 1.0) - 0.3 * 1280.0 * 720.0 / 8.0).abs() < 1.0);
-        assert!((policy.frame_bytes(hd, 60.0, 0.0) - 0.05 * 320.0 * 180.0 / 8.0).abs() < 1.0);
+        assert!((policy.frame_bytes(hd, 60.0, 0.0) - 0.1 * 160.0 * 90.0 / 8.0).abs() < 1.0);
         let capped = VideoPolicy { max_bitrate: Some(6e6), ..policy };
         assert!((capped.frame_bytes(hd, 60.0, 1.0) - 12_500.0).abs() < 1e-6, "6 Mbit/s at 60 Hz");
         assert!(capped.frame_bytes(hd, 60.0, 0.3) < capped.frame_bytes(hd, 60.0, 0.6));
-        assert!(VideoPolicy { min_resolution_scale: 0.0, ..policy }.validate().is_err());
+        assert!(VideoPolicy { min_resolution_scale: 1.5, ..policy }.validate().is_err());
     }
 
     #[test]
@@ -408,7 +504,7 @@ mod tests {
     /// The default encoder's frame for `image` at `bitrate` bits/s, 10 Hz.
     fn encode(encoder: &mut H264Encoder, image: &VideoImage, bitrate: f64, keyframe: bool) -> EncodedVideo {
         let frame = DecodedFrame::Video(image.clone());
-        encoder.encode(&frame, &target(&VideoPolicy::default(), (image.width(), image.height()), 1.0, bitrate, 10.0, 1.0, keyframe)).unwrap().unwrap()
+        encoder.encode(&frame, &target(&VideoPolicy::default(), (image.width(), image.height()), 1.0, bitrate, bitrate, None, 10.0, 1.0, keyframe)).unwrap().unwrap()
     }
 
     #[test]
@@ -423,8 +519,8 @@ mod tests {
         assert!(!encode(&mut encoder, &frame, 2e6, false).keyframe, "a new bitrate applies in place");
         assert!(encode(&mut encoder, &frame, 2e6, true).keyframe, "asked for");
         let low = encode(&mut encoder, &frame, 1e3, false);
-        assert_eq!((low.width, low.height), (160, 122), "10 kbit/s (the floor) at 10 Hz keeps 0.05 bits per pixel at about half the width");
-        assert!(encoder.encode(&DecodedFrame::data(1u8), &target(&VideoPolicy::default(), (8, 8), 1.0, 1e6, 10.0, 1.0, false)).is_err(), "takes pictures only");
+        assert_eq!((low.width, low.height), (160, 120), "10 kbit/s (the bitrate floor) at 10 Hz: the smallest picture, 160 wide");
+        assert!(encoder.encode(&DecodedFrame::data(1u8), &target(&VideoPolicy::default(), (8, 8), 1.0, 1e6, 1e6, None, 10.0, 1.0, false)).is_err(), "takes pictures only");
     }
 
     #[test]

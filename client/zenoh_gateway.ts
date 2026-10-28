@@ -80,6 +80,69 @@ export interface VideoFrameInfo {
     quality: number
     keyframe: boolean
     encodedBytes: number
+    /** the frame's media time on its track (its RTP timestamp less the track's first, ms; a video element's
+     * requestVideoFrameCallback `rtpTimestamp` says which frame is showing); absent from gateways before 0.5.20 */
+    mediaTimeMs?: number
+    /** when the gateway wrote it to the track (unix ms, gateway clock); absent from gateways before 0.5.20 */
+    writtenMs?: number
+    /** the frame's RTP timestamp: a video element's requestVideoFrameCallback `rtpTimestamp` names this frame exactly
+     * (absent from gateways before 0.5.20, and until the gateway saw the track's first packet) */
+    rtpTimestamp?: number
+    /** when the gateway got the frame's sample and finished encoding it (unix ms, gateway clock; the sample's own time is
+     * the message's `timestamp`); absent from gateways before 0.5.20 */
+    receivedMs?: number
+    encodedMs?: number
+    /** the picture's message header (its `stamp`, seconds, and `frameId`, the TF frame it was taken in), when the
+     * encoding gave one (e.g. zenoh-dimos-codecs' image codecs); absent from gateways before 0.5.31 */
+    stamp?: number
+    frameId?: string
+    /** the same header whole (exact `sec`/`nanosec`, `seq`), as `msg.header` carries it */
+    header?: MessageHeader
+    /** the picture's zenoh sample encoding and attachment, when they say something (0.5.32+; also `msg.encoding` / `msg.attachment`) */
+    encoding?: string
+    attachment?: Uint8Array
+}
+
+/** A message's own header (ROS `std_msgs/Header`, dimos LCM's), which the gateway sends with what an encoding made of it. */
+export interface MessageHeader {
+    /** seconds since the epoch (to about a microsecond; `sec` + `nanosec` are exact) */
+    stamp: number
+    sec: number
+    nanosec: number
+    /** the TF frame it was taken in */
+    frameId: string
+    /** its sequence number, where the type has one (dimos LCM does, ROS 2 doesn't) */
+    seq?: number
+}
+
+/** Percentiles of one latency, ms. */
+export interface LatencySpread {
+    p50: number
+    p95: number
+}
+
+/** End-to-end video latency over the frames a video element showed lately (`Subscription.watchVideoLatency`), ms. */
+export interface VideoLatency {
+    /** frames measured, and shown frames no metadata named (lost, or from a gateway before 0.5.20) */
+    frames: number
+    unmatched: number
+    /** the sample's timestamp to the frame on screen */
+    total: LatencySpread
+    /** where it went: to the gateway (zenoh), decoding + encoding there, waiting to be written to the track, then RTP
+     * pacer + network + jitter buffer + decode to the screen; `toReceived`/`receivedToShown` split that last stage
+     * where the browser reports a frame's receive time (Chrome) */
+    stages: {
+        toGateway: LatencySpread
+        encoding: LatencySpread
+        toTrack: LatencySpread
+        trackToShown: LatencySpread
+        toReceived?: LatencySpread
+        receivedToShown?: LatencySpread
+    }
+    /** source-to-shown from the stamp the frame's own RTP packets carry (abs-capture-time, which Chrome reports in
+     * `getSynchronizationSources()`), on frames shown while they were the newest received: a check that the stamp
+     * that came with the video agrees with the one the metadata named */
+    captureToShown?: LatencySpread
 }
 
 export interface Message {
@@ -88,9 +151,9 @@ export interface Message {
     kind: "put" | "delete"
     /** the payload (decompressed): raw sample bytes, or the encoding's output */
     bytes: Uint8Array
-    /** the sample's encoding, when not the default (raw messages only) */
+    /** the sample's zenoh encoding, when not the default (raw messages; encoded ones with `header`, 0.5.32+) */
     encoding?: string
-    /** the sample's attachment (raw messages only) */
+    /** the sample's zenoh attachment (raw messages; encoded ones with `header`, 0.5.32+) */
     attachment?: Uint8Array
     timestamp: number
     seq: number
@@ -98,6 +161,9 @@ export interface Message {
     decoded?: unknown
     video?: VideoFrameInfo
     mediaStream?: MediaStream
+    /** the sample's own header (stamp, frameId, seq) on encoded messages of any channel, unless the subscription says
+     * `metadata: false` (raw messages are the whole sample, header and all); absent from gateways before 0.5.32 but on video */
+    header?: MessageHeader
 }
 
 export interface SubscribeOptions {
@@ -119,17 +185,30 @@ export interface SubscribeOptions {
     compress?: "zstd" | "none"
     /** video channels: most bits/s the stream asks for (default: the server's) */
     maxBitrate?: number
-    /** video channels: smallest share of the source's width and height the picture may shrink to (default 0.25) */
+    /** video channels: smallest share of the source's width and height the picture may shrink to (default 0) */
     minResolutionScale?: number
+    /** video channels: [width, height] the picture never shrinks below, aspect kept (default [160, 64]) */
+    minResolution?: [number, number]
     /** video channels: [width, height] box the picture is fitted into */
     maxResolution?: [number, number]
+    /** video channels: the encoder may skip frames to hold its bitrate (default true; libwebrtc does the same for cameras) */
+    frameDropping?: boolean
+    /** video channels: a keyframe at least this often, ms, on top of the ones the browser asks for after a loss (default 60000) */
+    keyframeIntervalMs?: number
+    /** video channels: a keyframe when the encoder sees a new scene (default false: at low bitrates they cost more than they fix) */
+    sceneChangeKeyframes?: boolean
+    /** video channels: the quantizer (H.264's 0-51) the picture's size aims for: lower = smaller, sharper (default 30) */
+    targetQp?: number
     /** video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once) */
     playoutDelay?: [number, number]
+    /** each encoded message comes with its sample's own header (`msg.header`: stamp, frameId, seq), default true; false
+     * saves its few bytes a message when nothing reads where or when it was taken. Gateways before 0.5.32 ignore it. */
+    metadata?: boolean
 }
 
 /** What `Subscription.update` may change on a running subscription; `null` puts an option back to its default. */
 export type SubscriptionUpdate = {
-    [option in "maxHz" | "minQuality" | "qualityToHzTradeoff" | "bandwidthPriority" | "maxBitrate" | "minResolutionScale" | "maxResolution" | "playoutDelay"]?:
+    [option in "maxHz" | "minQuality" | "qualityToHzTradeoff" | "bandwidthPriority" | "maxBitrate" | "minResolutionScale" | "minResolution" | "maxResolution" | "frameDropping" | "keyframeIntervalMs" | "sceneChangeKeyframes" | "targetQp" | "playoutDelay"]?:
         SubscribeOptions[option] | null
 } & { encodeOptions?: { quality?: number } }
 
@@ -157,7 +236,14 @@ export interface ConnectOptions {
     iceTransportPolicy?: RTCIceTransportPolicy
     /** sent as `Authorization: Bearer <token>`; the gateway's authorize hook turns it into a grant */
     token?: string
+    /** the link's known bandwidth (bytes/s), used by the gateway in place of its estimate (no probing; video sized for it
+     *  from the first frame), e.g. for a page on the gateway's own machine; the host's cap still applies. Default: estimated */
+    linkBandwidthBytesPerSec?: number
     reconnect?: boolean
+    /** ms the page may be hidden or frozen, or the connection "disconnected", before the client starts a fresh
+     *  connection at once instead of catching up or waiting for the browser to declare the old one failed (default 2000;
+     *  a phone drops a backgrounded tab's connection, which then took ~5 s to come back) */
+    freshAfterMs?: number
     statsIntervalMs?: number
     heartbeatHz?: number
     heartbeatMisses?: number
@@ -257,6 +343,8 @@ const backedUpBytes = 64 * 1024
 const resumeBytes = 16 * 1024
 const gatherTimeoutMs = 3000
 const openTimeoutMs = 10000
+/** a video or audio subscription whose renegotiation failed on the connection still in use tries again after this (doubling while it keeps failing) */
+const renegotiationRetryMs = 1000
 const pingTimeoutMs = 3000
 const reconnectDelayMs = 1000
 // consumption acks let the gateway stop sending while this page's JS is behind; at most one per channel per ackDelayMs
@@ -340,6 +428,8 @@ const fieldsFlag = 2
 const deleteFlag = 4
 /** frame flag: the message starts with the sample's encoding and attachment (see `splitMeta`) */
 const metaFlag = 8
+/** frame flag: the message (before decompression) starts with `u16 len | len bytes of its sample's header` (`decodeHeader`) */
+const headerFlag = 16
 
 /** u16 encodingLen | encoding | u32 attachmentLen | attachment | payload */
 function splitMeta(message: Uint8Array): { encoding: string, attachment?: Uint8Array, payload: Uint8Array } {
@@ -423,7 +513,7 @@ export function decodeFields(message: Uint8Array): Record<string, FieldValue> {
     return fields
 }
 
-/** Video metadata frame (28 bytes) sent on a video subscription's channel per frame. */
+/** Video metadata frame (64 bytes, then the picture's header if flags bit2) sent on a video subscription's channel per frame. */
 export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
     return {
@@ -434,7 +524,100 @@ export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
         sourceHeight: view.getUint32(16, true),
         quality: view.getFloat32(20, true),
         encodedBytes: view.getUint32(24, true),
+        ...(bytes.byteLength >= 44 ? { mediaTimeMs: view.getFloat64(28, true), writtenMs: view.getFloat64(36, true) } : {}),
+        ...(bytes.byteLength >= 64 && (bytes[1] & 2) !== 0 ? { rtpTimestamp: view.getUint32(44, true) } : {}),
+        ...(bytes.byteLength >= 64 ? { receivedMs: view.getFloat64(48, true), encodedMs: view.getFloat64(56, true) } : {}),
+        ...headerFields((bytes[1] & 4) !== 0 ? decodeHeader(bytes.subarray(64)) : undefined),
     }
+}
+
+function headerFields(decoded: DecodedHeader | undefined): Partial<VideoFrameInfo> {
+    if (decoded === undefined) {
+        return {}
+    }
+    const { header, encoding, attachment } = decoded
+    return { stamp: header.stamp, frameId: header.frameId, header, ...(encoding === undefined ? {} : { encoding }), ...(attachment === undefined ? {} : { attachment }) }
+}
+
+/** A message's header with its zenoh sample's encoding and attachment, when they came. */
+export interface DecodedHeader {
+    header: MessageHeader
+    encoding?: string
+    attachment?: Uint8Array
+}
+
+/** A message header as the gateway sends it: `f64 stamp | u16 frameIdLen | frameId | i32 sec | u32 nanosec | u8 flags |
+ * u32 seq`, flags bit0: seq is set, bit1: `u16 encodingLen | encoding | u32 attachmentLen | attachment` (the zenoh
+ * sample's) follow; 0.5.31 sent only up to frameId. Undefined if it is cut short. */
+export function decodeHeader(bytes: Uint8Array): DecodedHeader | undefined {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    if (bytes.byteLength < 10 || 10 + view.getUint16(8, true) > bytes.byteLength) {
+        return undefined
+    }
+    const stamp = view.getFloat64(0, true)
+    const end = 10 + view.getUint16(8, true)
+    const frameId = keyDecoder.decode(bytes.subarray(10, end))
+    if (bytes.byteLength < end + 13) {
+        const sec = Math.floor(stamp)
+        return { header: { stamp, sec, nanosec: Math.min(Math.round((stamp - sec) * 1e9), 999_999_999), frameId } }
+    }
+    const flags = bytes[end + 8]
+    const header: MessageHeader = { stamp, sec: view.getInt32(end, true), nanosec: view.getUint32(end + 4, true), frameId, ...((flags & 1) !== 0 ? { seq: view.getUint32(end + 9, true) } : {}) }
+    if ((flags & 2) === 0) {
+        return { header }
+    }
+    try {
+        const { encoding, attachment } = splitMeta(bytes.subarray(end + 13))
+        return { header, encoding, ...(attachment === undefined ? {} : { attachment }) }
+    } catch {
+        return undefined
+    }
+}
+
+const absCaptureTimeUri = "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
+/** ms from the NTP epoch (1900) to the unix epoch */
+const ntpUnixOffsetMs = 2_208_988_800_000
+
+/** Asks for the abs-capture-time RTP extension, which Chrome supports but doesn't offer by default (its header extension
+ * API); it gives `VideoLatency.captureToShown`. Browsers without the API go without. */
+function offerCaptureTime(transceiver: RTCRtpTransceiver): void {
+    const control = transceiver as unknown as {
+        getHeaderExtensionsToNegotiate?: () => { uri: string, direction: string }[]
+        setHeaderExtensionsToNegotiate?: (extensions: { uri: string, direction: string }[]) => void
+    }
+    try {
+        const extensions = control.getHeaderExtensionsToNegotiate?.()
+        if (extensions?.some((extension) => extension.uri === absCaptureTimeUri && extension.direction === "stopped")) {
+            control.setHeaderExtensionsToNegotiate!(extensions.map((extension) => extension.uri === absCaptureTimeUri ? { ...extension, direction: "recvonly" } : extension))
+        }
+    } catch (error) {
+        console.debug("zenoh-gateway: abs-capture-time not offered", error)
+    }
+}
+
+/** Video frames' metadata kept for matching shown frames, per subscription. */
+const videoTimesKept = 512
+/** Shown frames' latencies kept for `videoLatency()`. */
+const videoLatencyKept = 300
+
+/** One shown frame's latencies, ms (see `VideoLatency`). */
+interface FrameLatency {
+    /** when it was shown (the connection's clock) */
+    shownAt: number
+    total: number
+    toGateway: number
+    encoding: number
+    toTrack: number
+    trackToShown: number
+    toReceived?: number
+    receivedToShown?: number
+    captureToShown?: number
+}
+
+function spread(values: number[]): LatencySpread {
+    const sorted = [...values].sort((a, b) => a - b)
+    const at = (q: number) => sorted[Math.round((sorted.length - 1) * q)]
+    return { p50: at(0.5), p95: at(0.95) }
 }
 
 /** Browser -> gateway put: f64 sentAtMs (browser clock) | payload (little endian). */
@@ -590,6 +773,8 @@ export class Subscription extends Endpoint {
     readonly channelName: Channel
     #warnedNoDecoder = false
     #transceiver: RTCRtpTransceiver | null = null
+    /** renegotiations failed in a row: each retry waits twice as long, up to 30 s */
+    #renegotiationFailures = 0
     /** drops before the current channel (each new channel restarts seq at 0) */
     #droppedBefore = 0
     #firstSeq = -1
@@ -599,10 +784,105 @@ export class Subscription extends Endpoint {
     #bytesSinceAck = 0
     #ackTimer: ReturnType<typeof setTimeout> | null = null
     #partials = new Map<number, PartialMessage>()
+    /** video: recent frames' metadata by RTP timestamp, with their sample's timestamp */
+    #videoTimes = new Map<number, { info: VideoFrameInfo, sourceMs: number }>()
+    #frameLatencies: FrameLatency[] = []
+    #unmatchedFrames = 0
 
     constructor(owner: ZenohGateway, id: number, key: string, public options: SubscribeOptions, readonly callback: (message: Message) => void) {
         super(owner, id, key)
         this.channelName = channelOf(options, owner.encodings)
+    }
+
+    /**
+     * Measures end-to-end latency on each frame `element` shows of this video subscription (requestVideoFrameCallback:
+     * Chrome, Firefox, Safari): the frame's RTP timestamp names its metadata, whose gateway times the connection's
+     * clock sync brings to this clock. Read it with `videoLatency()`; returns a function that stops measuring.
+     */
+    watchVideoLatency(element: HTMLVideoElement): () => void {
+        let stopped = false
+        let handle = 0
+        const onFrame = (_now: number, frame: VideoFrameCallbackMetadata & { rtpTimestamp?: number, receiveTime?: number }) => {
+            if (stopped) {
+                return
+            }
+            handle = element.requestVideoFrameCallback(onFrame)
+            const offsetMs = this.owner.clockOffsetMs
+            if (frame.rtpTimestamp === undefined || offsetMs === null) {
+                return
+            }
+            const entry = this.#videoTimes.get(frame.rtpTimestamp)
+            const { info, sourceMs } = entry ?? {}
+            if (info?.receivedMs === undefined || info.encodedMs === undefined || info.writtenMs === undefined || sourceMs === undefined) {
+                this.#unmatchedFrames++
+                return
+            }
+            // performance.now() based times to the connection's clock, and the gateway's clock to it
+            const toLocal = (perfMs: number) => this.owner.now() - (performance.now() - perfMs)
+            // never before it was handed to the compositor: a headless Chrome (no display) reports an expectedDisplayTime
+            // whole vsyncs before even the callback, which read as a negative latency
+            const shown = toLocal(Math.max(frame.expectedDisplayTime ?? frame.presentationTime, frame.presentationTime))
+            const received = frame.receiveTime === undefined ? undefined : toLocal(frame.receiveTime)
+            const written = info.writtenMs - offsetMs
+            // the in-packet stamp, where the receiver reports it for this very frame (Chrome: NTP ms, gateway clock)
+            const source = (this.#transceiver?.receiver.getSynchronizationSources() as ({ rtpTimestamp: number, captureTimestamp?: number }[] | undefined))?.[0]
+            const captureMs = source?.rtpTimestamp === frame.rtpTimestamp && source.captureTimestamp !== undefined ? source.captureTimestamp - ntpUnixOffsetMs : undefined
+            this.#frameLatencies.push({
+                shownAt: shown,
+                total: shown - (sourceMs - offsetMs),
+                toGateway: info.receivedMs - sourceMs,
+                encoding: info.encodedMs - info.receivedMs,
+                toTrack: info.writtenMs - info.encodedMs,
+                trackToShown: shown - written,
+                ...(received === undefined ? {} : { toReceived: received - written, receivedToShown: shown - received }),
+                ...(captureMs === undefined ? {} : { captureToShown: shown - (captureMs - offsetMs) }),
+            })
+            if (this.#frameLatencies.length > videoLatencyKept) {
+                this.#frameLatencies.shift()
+            }
+        }
+        handle = element.requestVideoFrameCallback(onFrame)
+        return () => {
+            stopped = true
+            element.cancelVideoFrameCallback(handle)
+        }
+    }
+
+    /** The metadata of the frame a video element shows (a requestVideoFrameCallback's `rtpTimestamp`), e.g. its `stamp`
+     * and `frameId` to place the picture on screen in its own TF frame; undefined if it is not among the latest 512. */
+    videoFrameInfo(rtpTimestamp: number): VideoFrameInfo | undefined {
+        return this.#videoTimes.get(rtpTimestamp)?.info
+    }
+
+    /** End-to-end latency of the frames a watched video element showed lately (see `watchVideoLatency`): its latest 300,
+     * or those of the last `windowMs`; null before any. */
+    videoLatency(windowMs = Infinity): VideoLatency | null {
+        const since = this.owner.now() - windowMs
+        const frames = this.#frameLatencies.filter((frame) => frame.shownAt >= since)
+        if (frames.length === 0) {
+            return null
+        }
+        const optional = (pick: (frame: FrameLatency) => number | undefined) => {
+            const values = frames.map(pick).filter((value): value is number => value !== undefined)
+            return values.length === 0 ? undefined : spread(values)
+        }
+        const toReceived = optional((frame) => frame.toReceived)
+        const receivedToShown = optional((frame) => frame.receivedToShown)
+        const captureToShown = optional((frame) => frame.captureToShown)
+        return {
+            frames: frames.length,
+            unmatched: this.#unmatchedFrames,
+            total: spread(frames.map((frame) => frame.total)),
+            stages: {
+                toGateway: spread(frames.map((frame) => frame.toGateway)),
+                encoding: spread(frames.map((frame) => frame.encoding)),
+                toTrack: spread(frames.map((frame) => frame.toTrack)),
+                trackToShown: spread(frames.map((frame) => frame.trackToShown)),
+                ...(toReceived === undefined ? {} : { toReceived }),
+                ...(receivedToShown === undefined ? {} : { receivedToShown }),
+            },
+            ...(captureToShown === undefined ? {} : { captureToShown }),
+        }
     }
 
     /**
@@ -669,14 +949,30 @@ export class Subscription extends Endpoint {
                 this.owner._releaseTransceiver(peer, transceiver)
                 return
             }
+            this.#renegotiationFailures = 0
             this.#transceiver = transceiver
             this.mediaStream = new MediaStream([transceiver.receiver.track])
             this.#openChannel(peer, acceptance, transceiver.mid)
-        }, (error: Error) => acceptance.reject(new Error(`zenoh-gateway: ${channelName} renegotiation for ${this.key} failed: ${error.message}`)))
+        }, (error: Error) => {
+            acceptance.reject(new Error(`zenoh-gateway: ${channelName} renegotiation for ${this.key} failed: ${error.message}`))
+            // still the connection in use: try again (nothing else would; a replaced connection attaches every endpoint itself)
+            if (!this.closed && this.rejectionReason === null && acceptance === this.acceptance && peer === this.owner._peer && peer.connectionState !== "closed") {
+                const delay = Math.min(renegotiationRetryMs * 2 ** this.#renegotiationFailures++, 30_000)
+                console.warn(`zenoh-gateway: ${channelName} renegotiation for ${this.key} failed (${error.message}); retrying in ${delay} ms`)
+                setTimeout(() => {
+                    if (!this.closed && this.rejectionReason === null && acceptance === this.acceptance && peer === this.owner._peer && peer.connectionState !== "closed") {
+                        this.attach(peer)
+                    }
+                }, delay)
+            }
+        })
     }
 
     #openChannel(peer: RTCPeerConnection, acceptance: Acceptance, mid: string | null): void {
-        const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts: this.options, ...(mid === null ? {} : { mid }) })
+        // (a gateway before 0.5.32 refuses the option it doesn't know)
+        const { metadata, ...options } = this.options
+        const opts = this.owner.features.includes("metadata") ? { ...options, metadata: metadata ?? true } : options
+        const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts, ...(mid === null ? {} : { mid }) })
         const channel = peer.createDataChannel(label, channelInit(this.options.delivery, this.options.maxAge))
         channel.binaryType = "arraybuffer"
         channel.onmessage = (event: MessageEvent) => {
@@ -688,11 +984,22 @@ export class Subscription extends Endpoint {
         this.watchChannel(channel, acceptance)
     }
 
+    /** Also after it opened: another client's lease took its key, so its channel and track go. */
+    override _rejected(reason: string): void {
+        super._rejected(reason)
+        this.channel?.close()
+        this.#releaseTransceiver()
+    }
+
     override close(): void {
         if (this.closed) {
             return
         }
         super.close()
+        this.#releaseTransceiver()
+    }
+
+    #releaseTransceiver(): void {
         const peer = this.owner._peer
         if (this.#transceiver && peer) {
             this.owner._releaseTransceiver(peer, this.#transceiver)
@@ -756,6 +1063,9 @@ export class Subscription extends Endpoint {
         try {
             if (this.channelName !== "data") {
                 message.video = this.channelName.startsWith("video-") ? decodeVideoFrameInfo(message.bytes) : undefined
+                message.header ??= message.video?.header
+                message.encoding ??= message.video?.encoding
+                message.attachment ??= message.video?.attachment
                 message.mediaStream = this.mediaStream ?? undefined
                 return true
             }
@@ -780,6 +1090,19 @@ export class Subscription extends Endpoint {
     }
 
     #deliver(message: Message, flags: number): void {
+        if ((flags & headerFlag) !== 0) {
+            const length = message.bytes.byteLength >= 2 ? message.bytes[0] | (message.bytes[1] << 8) : Infinity
+            const decoded = 2 + length <= message.bytes.byteLength ? decodeHeader(message.bytes.subarray(2, 2 + length)) : undefined
+            if (decoded === undefined) {
+                this.decodeErrors++
+                console.error(`zenoh-gateway: bad message header on ${message.key}`)
+                return
+            }
+            message.header = decoded.header
+            message.encoding = decoded.encoding
+            message.attachment = decoded.attachment
+            message.bytes = message.bytes.subarray(2 + length)
+        }
         if ((flags & zstdFlag) !== 0) {
             try {
                 message.bytes = zstdDecompress(message.bytes) as Uint8Array
@@ -806,6 +1129,12 @@ export class Subscription extends Endpoint {
             // nothing to decode
         } else if (this.options.encoding !== undefined && !this.#decode(message, flags)) {
             return
+        }
+        if (message.video?.rtpTimestamp !== undefined) {
+            this.#videoTimes.set(message.video.rtpTimestamp, { info: message.video, sourceMs: message.timestamp })
+            if (this.#videoTimes.size > videoTimesKept) {
+                this.#videoTimes.delete(this.#videoTimes.keys().next().value!)
+            }
         }
         this.received++
         this.#receivedOnChannel++
@@ -1087,12 +1416,32 @@ export class AudioPublisher extends Publisher {
 }
 
 /** An exclusive right to publish on a group of keys among this gateway's clients (SPEC "Leases"). */
+export interface LeaseOptions {
+    /** a group the server defines (its keys and grants), or a name for this one; unset = unnamed */
+    group?: string
+    /** keys only the holder may publish on: the gateway drops other clients' puts there */
+    publish?: string[]
+    /** keys only the holder may subscribe to: the gateway ends and refuses other clients' subscriptions there */
+    subscribe?: string[]
+    /** a newer lease on overlapping keys takes this one over ("takenOver"); false: it is refused while this is held */
+    allowTakeover?: boolean
+    maxSeconds?: number
+    /** heartbeat silence (ms) that ends it, instead of the connection's heartbeat deadline, so deadmen can stay tight
+     * while the lease rides out a stall; at most the server's slowest lease heartbeat (default 60 s) */
+    timeoutMs?: number
+    onLost?: (reason: string) => void
+}
+
 export class Lease {
-    /** why it ended: "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" */
+    /** why it ended: "takenOver" | "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" | "renewed" */
     lost: string | null = null
+    /** the heartbeat silence that ends it, as the gateway applies it; null: the connection's heartbeat deadline (or a
+     * gateway older than 0.5.17, which ignores `timeoutMs`) */
+    timeoutMs: number | null = null
     #listeners = new Set<(reason: string) => void>()
 
-    constructor(readonly owner: ZenohGateway, readonly group: string, readonly keys: string[], readonly expiresInMs: number | null) {}
+    /** `keys`: the ones only we publish on; `subscribe`: the ones only we subscribe to */
+    constructor(readonly owner: ZenohGateway, readonly group: string, readonly keys: string[], readonly subscribe: string[], readonly expiresInMs: number | null) {}
 
     onLost(listener: (reason: string) => void): () => void {
         this.#listeners.add(listener)
@@ -1124,7 +1473,7 @@ export class Lease {
     }
 }
 
-type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token">
+type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec">
 
 export class ZenohGateway {
     state: ConnectionState = "connecting"
@@ -1140,6 +1489,8 @@ export class ZenohGateway {
     congestion: Congestion | null = null
     /** the message encodings the gateway runs, fetched on connect */
     encodings: readonly EncodingInfo[] = []
+    /** what the gateway supports beyond 0.5.31 (e.g. "metadata": the subscribe option), fetched with the encodings */
+    features: readonly string[] = []
     /** the ICE servers in use (the gateway's unless given) */
     iceServers: RTCIceServer[] = []
     /** leases held, by group */
@@ -1173,12 +1524,105 @@ export class ZenohGateway {
     /** resolves once the current peer connection is up (renegotiation needs `control`) */
     #connected: Promise<void> = new Promise(() => {})
     #markConnected: () => void = () => {}
+    /** fails `#connected` when its attempt is lost: a renegotiation waiting on an attempt that never connected held the
+     *  queue for good, so after a reconnect that took a failed attempt or two, video subscriptions never came back */
+    #abandonConnected: (error: Error) => void = () => {}
 
     constructor(url: string, options: ConnectOptions = {}) {
         this.url = url.replace(/\/+$/, "")
-        this.options = { reconnect: true, statsIntervalMs: 1000, heartbeatHz: 0, heartbeatMisses: 3, ...options }
+        this.options = { reconnect: true, freshAfterMs: 2000, statsIntervalMs: 1000, heartbeatHz: 0, heartbeatMisses: 3, ...options }
+        this.#linkBandwidth = this.options.linkBandwidthBytesPerSec
         this.now = this.options.clock ?? (() => performance.timeOrigin + performance.now())
+        if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+            document.addEventListener("visibilitychange", this.#onVisibility)
+            // the Page Lifecycle API's: a frozen page may never see a visibility change
+            document.addEventListener("freeze", this.#onAway)
+            document.addEventListener("resume", this.#onBack)
+        }
     }
+
+    /** the timer that starts a fresh connection once one stays "disconnected" `freshAfterMs` */
+    #freshTimer: ReturnType<typeof setTimeout> | undefined
+
+    /** when the page was hidden or frozen (performance.now()), while it is */
+    #awayAt: number | null = null
+
+    #onAway = (): void => {
+        this.#awayAt ??= performance.now()
+    }
+
+    /** Back from hidden or frozen: away longer than `freshAfterMs` (or not connected), it starts a fresh connection
+     *  rather than catch up. A connection kept through 40 s frozen (Chrome keeps it up below a frozen page) had heard
+     *  no acks, so the gateway had written its link off, and video took 12 s to climb back. */
+    #onBack = (): void => {
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+            return
+        }
+        const awayFor = this.#awayAt === null ? 0 : performance.now() - this.#awayAt
+        this.#awayAt = null
+        if (!this.options.reconnect || this.#closed) {
+            return
+        }
+        // (a connection on its way up is already fresh)
+        if (this.state === "connecting" || (this.#reconnecting && this.state !== "lost")) {
+            return
+        }
+        if (awayFor > this.options.freshAfterMs || this.state === "lost") {
+            this.#startFresh()
+        }
+    }
+
+    #onVisibility = (): void => {
+        if (document.visibilityState === "hidden") {
+            this.#onAway()
+        } else {
+            this.#onBack()
+        }
+    }
+
+    /** the gateway process this connection talks to (`/zenoh-gateway/health`'s bootId) */
+    #bootId: string | null = null
+
+    async #fetchBootId(): Promise<string | null> {
+        try {
+            const response = await fetch(`${this.url}/zenoh-gateway/health`, { signal: AbortSignal.timeout(pingTimeoutMs) })
+            return response.ok ? String((await response.json()).bootId ?? "") || null : null
+        } catch {
+            return null
+        }
+    }
+
+    /** A ping failed: if the gateway answers as a new process, it restarted (a killed one says nothing), so this
+     *  connection is gone: start a fresh one now instead of waiting 6-25 s for ICE to give up. A slow link keeps the
+     *  same process and the connection. */
+    async #checkRestarted(): Promise<void> {
+        const generation = this.#generation
+        const known = this.#bootId
+        if (known === null || !this.options.reconnect || this.#closed) {
+            return
+        }
+        const now = await this.#fetchBootId()
+        if (now !== null && now !== known && generation === this.#generation && !this.#closed) {
+            this.#startFresh()
+        }
+    }
+
+    /** Drops the connection and opens a new one now: its subscriptions and declarations come back fresh. A reconnect
+     *  waiting out its retry delay tries again now. */
+    #startFresh(): void {
+        clearTimeout(this.#freshTimer)
+        const generation = this.#generation
+        if (this.state !== "lost") {
+            this.#onLost(generation, 0)
+        } else if (!this.#reconnecting) {
+            this.#onLost(generation, 0, true)
+        } else {
+            this.#retryNow?.()
+        }
+    }
+
+    /** ends the reconnect loop's current wait between attempts */
+    #retryNow: (() => void) | undefined
 
     onState(listener: (state: ConnectionState) => void): () => void {
         this.#stateListeners.add(listener)
@@ -1248,12 +1692,24 @@ export class ZenohGateway {
             } else if (kind === "video") {
                 receiver.playoutDelayHint = 0
             }
-            await peer.setLocalDescription(await peer.createOffer())
-            const offer = peer.localDescription
-            const response = await this._request({ op: "renegotiate", channel, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
-            await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
-            if (response.mid !== transceiver.mid) {
-                throw new Error(`gateway bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
+            if (kind === "video") {
+                offerCaptureTime(transceiver)
+            }
+            try {
+                await peer.setLocalDescription(await peer.createOffer())
+                const offer = peer.localDescription
+                const response = await this._request({ op: "renegotiate", channel, sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
+                await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
+                if (response.mid !== transceiver.mid) {
+                    throw new Error(`gateway bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
+                }
+            } catch (error) {
+                // (a failed attempt's offer is rolled back and its m-line goes, so a retry doesn't leave one behind each time)
+                if (peer.signalingState === "have-local-offer") {
+                    await peer.setLocalDescription({ type: "rollback" }).catch(() => {})
+                }
+                this._releaseTransceiver(peer, transceiver)
+                throw error
             }
             return transceiver
         }
@@ -1295,9 +1751,12 @@ export class ZenohGateway {
         const generation = ++this.#generation
         this.#setState("connecting")
         this.#clockSamples = []
-        this.#connected = new Promise((resolve) => {
+        this.#abandonConnected(new Error("connection replaced"))
+        this.#connected = new Promise((resolve, reject) => {
             this.#markConnected = resolve
+            this.#abandonConnected = reject
         })
+        this.#connected.catch(() => {})
         const auth: Record<string, string> = this.options.token === undefined ? {} : { authorization: `Bearer ${this.options.token}` }
         let iceServers = this.options.iceServers
         let iceTransportPolicy = this.options.iceTransportPolicy
@@ -1325,7 +1784,15 @@ export class ZenohGateway {
                 this.#onLost(generation)
             } else if (connectionState === "disconnected") {
                 this.#setState("degraded")
+                // the browser takes many seconds to call it failed: past `freshAfterMs` a fresh connection is quicker
+                clearTimeout(this.#freshTimer)
+                this.#freshTimer = setTimeout(() => {
+                    if (generation === this.#generation && peer.connectionState !== "connected") {
+                        this.#startFresh()
+                    }
+                }, this.options.freshAfterMs)
             } else if (connectionState === "connected" && control.readyState === "open") {
+                clearTimeout(this.#freshTimer)
                 this.#setState("connected")
             }
         }
@@ -1349,10 +1816,15 @@ export class ZenohGateway {
             }
             await peer.setRemoteDescription(await response.json())
             await waitOpen(control, openTimeoutMs)
-            this.encodings = Object.freeze((await this._request({ op: "encodings" }, pingTimeoutMs)).encodings as EncodingInfo[])
+            const listed = await this._request({ op: "encodings" }, pingTimeoutMs)
+            this.encodings = Object.freeze(listed.encodings as EncodingInfo[])
+            this.features = Object.freeze((listed.features ?? []) as string[])
             // a few quick samples so the gateway knows the clock offset before the first put
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()
+            }
+            if (this.#linkBandwidth !== undefined) {
+                await this._request({ op: "setLinkBandwidth", bytesPerSec: this.#linkBandwidth }, pingTimeoutMs)
             }
             await this.#redeclare()
         } catch (error) {
@@ -1361,6 +1833,12 @@ export class ZenohGateway {
         }
         this.#setState("connected")
         this.#markConnected()
+        // (an older gateway has no bootId: restarts are then noticed as before)
+        this.#fetchBootId().then((bootId) => {
+            if (generation === this.#generation) {
+                this.#bootId = bootId
+            }
+        })
     }
 
     /** A 401 is final: no reconnecting with a token the gateway refuses (or revoked). */
@@ -1412,10 +1890,16 @@ export class ZenohGateway {
         }
     }
 
-    #onLost(generation: number): void {
-        if (generation !== this.#generation || this.state === "lost") {
+    /** reconnect attempts running (one at a time) */
+    #reconnecting = false
+
+    /** `delayMs`: before the first reconnect attempt; `again`: already lost, but no attempt is running */
+    #onLost(generation: number, delayMs = reconnectDelayMs, again = false): void {
+        if (generation !== this.#generation || (this.state === "lost" && !again)) {
             return
         }
+        clearTimeout(this.#freshTimer)
+        this.#abandonConnected(new Error("connection lost"))
         this.#setState("lost")
         // the gateway fires this frontend's deadmen when it loses us
         this.#tripArmedPublishers("disconnected")
@@ -1428,18 +1912,30 @@ export class ZenohGateway {
         }
         this.#requests.clear()
         this.#peer?.close()
-        if (this.options.reconnect && !this.#closed) {
+        if (this.options.reconnect && !this.#closed && !this.#reconnecting) {
+            this.#reconnecting = true
             setTimeout(async () => {
-                while (!this.#closed && generation === this.#generation) {
-                    try {
-                        await this._open()
-                        return
-                    } catch (error) {
-                        console.warn("zenoh-gateway: reconnect failed", error)
-                        await sleep(reconnectDelayMs)
+                try {
+                    while (!this.#closed && generation === this.#generation) {
+                        try {
+                            await this._open()
+                            return
+                        } catch (error) {
+                            console.warn("zenoh-gateway: reconnect failed", error)
+                            await new Promise<void>((resolve) => {
+                                const timer = setTimeout(resolve, reconnectDelayMs)
+                                this.#retryNow = () => {
+                                    clearTimeout(timer)
+                                    resolve()
+                                }
+                            })
+                            this.#retryNow = undefined
+                        }
                     }
+                } finally {
+                    this.#reconnecting = false
                 }
-            }, reconnectDelayMs)
+            }, delayMs)
         }
     }
 
@@ -1607,6 +2103,18 @@ export class ZenohGateway {
         return listener
     }
 
+    /** the link bandwidth this page gave the gateway (bytes/s), re-sent on every reconnect */
+    #linkBandwidth: number | undefined
+
+    /** Tells the gateway the link's known bandwidth (bytes/s), used in place of its estimate (`undefined`: back to the
+     *  estimate); kept across reconnects. */
+    async setLinkBandwidth(bytesPerSec: number | undefined): Promise<void> {
+        this.#linkBandwidth = bytesPerSec
+        if (this.state === "connected" || this.state === "degraded") {
+            await this._request({ op: "setLinkBandwidth", bytesPerSec: bytesPerSec ?? null }, pingTimeoutMs)
+        }
+    }
+
     /** The gateway's zenoh session: its id, and the routers and peers it is connected to. */
     async info(): Promise<SessionInfo> {
         const response = await this._request({ op: "info" }, pingTimeoutMs)
@@ -1668,18 +2176,28 @@ export class ZenohGateway {
     }
 
     /**
-     * Takes (or renews) the exclusive right to publish on `group`'s keys among this gateway's clients: the
-     * server's group, or `keys` for one it doesn't define. Needs a heartbeat; it ends when the heartbeat
-     * stops, at `maxSeconds`, on disconnect, by `release()` or by force-expiry (`onLost` says which).
+     * Takes (or renews) the exclusive right, among this gateway's clients, to publish on `publish` and subscribe to
+     * `subscribe` (or a server group's keys). Needs a heartbeat; it ends when the heartbeat stops, at `maxSeconds`, on
+     * disconnect, by `release()`, by force-expiry or, with `allowTakeover`, when a newer lease overlaps it (`onLost`
+     * says which). The older form `lease(group, { keys })` is `lease({ group, publish: keys })`.
      */
-    async lease(group: string, { keys, maxSeconds }: { keys?: string[], maxSeconds?: number } = {}): Promise<Lease> {
+    async lease(options: LeaseOptions): Promise<Lease>
+    async lease(group: string, options?: { keys?: string[], maxSeconds?: number }): Promise<Lease>
+    async lease(groupOrOptions: string | LeaseOptions, older: { keys?: string[], maxSeconds?: number } = {}): Promise<Lease> {
+        const options: LeaseOptions = typeof groupOrOptions === "string" ? { group: groupOrOptions, publish: older.keys, maxSeconds: older.maxSeconds } : groupOrOptions
         if (!this.options.heartbeatHz) {
             throw new Error("zenoh-gateway: a lease needs a heartbeat; connect(url, { heartbeatHz: 5, heartbeatMisses: 3 })")
         }
-        const response = await this._request({ op: "lease", group, keys, maxSeconds }, pingTimeoutMs)
-        const lease = new Lease(this, group, response.keys as string[], (response.expiresInMs as number | null) ?? null)
-        this._leases.get(group)?._lose("renewed")
-        this._leases.set(group, lease)
+        const { group, publish, subscribe, allowTakeover, maxSeconds, timeoutMs, onLost } = options
+        const response = await this._request({ op: "lease", group, publish, subscribe, allowTakeover, maxSeconds, timeoutMs }, pingTimeoutMs)
+        const granted = String(response.group)
+        const lease = new Lease(this, granted, response.keys as string[], (response.subscribe as string[] | undefined) ?? [], (response.expiresInMs as number | null) ?? null)
+        lease.timeoutMs = (response.timeoutMs as number | null | undefined) ?? null
+        if (onLost) {
+            lease.onLost(onLost)
+        }
+        this._leases.get(granted)?._lose("renewed")
+        this._leases.set(granted, lease)
         return lease
     }
 
@@ -1699,6 +2217,7 @@ export class ZenohGateway {
             if (this.state === "connected") {
                 this.#setState("degraded")
             }
+            this.#checkRestarted()
             return
         }
         if (performance.now() < this.#statsDueAt) {
@@ -1742,7 +2261,8 @@ export class ZenohGateway {
         const degraded = bandwidth?.constrained === true
         this.congestion = {
             degraded,
-            limitedBy: !degraded ? null : number("pageBlockedFraction") > number("networkBlockedFraction") ? "page" : "network",
+            // (the gateway counts the page as part of the path: a page behind on its acks holds sending back like a slow link)
+            limitedBy: degraded ? "network" : null,
             droppedPerSec: seconds > 0 ? dropped / seconds : 0,
             sentBytesPerSec: number("sentBytesPerSec"),
             wantedBytesPerSec: number("demandBytesPerSec"),
@@ -1784,6 +2304,12 @@ export class ZenohGateway {
 
     close(): void {
         this.#closed = true
+        clearTimeout(this.#freshTimer)
+        if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
+            document.removeEventListener("visibilitychange", this.#onVisibility)
+            document.removeEventListener("freeze", this.#onAway)
+            document.removeEventListener("resume", this.#onBack)
+        }
         if (this.#statsTimer) {
             clearInterval(this.#statsTimer)
         }

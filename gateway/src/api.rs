@@ -51,13 +51,12 @@ pub(crate) const SLOW_OPS: &[&str] = &["get", "livelinessGet", "matchingStatus"]
 
 const DEFAULT_GET_TIMEOUT_MS: u64 = 5000;
 /// A page's timeoutMs is capped: the query kept the peer alive until it ended.
-const MAX_GET_TIMEOUT_MS: u64 = 60_000;
-/// A query the frontend never finalizes is answered as final after this (the asker has long given up).
-const QUERY_LIFETIME: Duration = Duration::from_secs(120);
+pub(crate) const MAX_GET_TIMEOUT_MS: u64 = 60_000;
 
 /// One frontend's declared entities.
-#[derive(Default)]
 pub(crate) struct ApiState {
+    /// a query the frontend never finalizes is answered as final after this (`ServerBuilder::stale_after`)
+    stale_after: Duration,
     /// shared with queryable callbacks, which number the queries they receive
     next_id: Arc<AtomicU64>,
     queryables: Mutex<HashMap<u64, Queryable<()>>>,
@@ -76,6 +75,18 @@ enum MatchingEntity {
 }
 
 impl ApiState {
+    pub(crate) fn new(stale_after: Duration) -> Self {
+        ApiState {
+            stale_after,
+            next_id: Default::default(),
+            queryables: Default::default(),
+            queries: Default::default(),
+            tokens: Default::default(),
+            liveliness_subscribers: Default::default(),
+            matching: Default::default(),
+        }
+    }
+
     fn next(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -90,8 +101,22 @@ impl ApiState {
         self.matching.lock().clear();
     }
 
-    fn reap_queries(&self) {
-        self.queries.lock().retain(|_, (_, since)| since.elapsed() < QUERY_LIFETIME);
+    /// Entity counts, for the stats' memory section.
+    pub(crate) fn counts(&self) -> Value {
+        json!({
+            "queryables": self.queryables.lock().len(),
+            "openQueries": self.queries.lock().len(),
+            "livelinessTokens": self.tokens.lock().len(),
+            "livelinessSubscribers": self.liveliness_subscribers.lock().len(),
+            "matchingListeners": self.matching.lock().len(),
+        })
+    }
+
+    /// Called on every API request and every allocation round (a frontend that stopped making requests kept its
+    /// unfinished queries forever).
+    pub(crate) fn reap_queries(&self) {
+        let stale_after = self.stale_after;
+        self.queries.lock().retain(|_, (_, since)| since.elapsed() < stale_after);
     }
 }
 
@@ -133,13 +158,25 @@ pub(crate) struct ApiRequest {
     listener_id: Option<u64>,
 }
 
+/// Sends `{event: ...}` to the frontend, stamped with when it happened: the forwarder drops what waited longer than
+/// `stale_after` (a control channel that stopped draining must not grow the queue until the connection fails).
+#[derive(Clone)]
+pub(crate) struct Events(pub tokio::sync::mpsc::UnboundedSender<(Instant, Value)>);
+
+impl Events {
+    pub(crate) fn send(&self, event: Value) -> Result<(), tokio::sync::mpsc::error::SendError<(Instant, Value)>> {
+        self.0.send((Instant::now(), event))
+    }
+}
+
 /// What an op needs from the frontend's connection.
 pub(crate) struct Context<'a> {
     pub session: &'a Session,
     pub access: Access<'a>,
     pub api: &'a ApiState,
-    /// sends `{event: ...}` to the frontend
-    pub events: tokio::sync::mpsc::UnboundedSender<Value>,
+    pub events: Events,
+    /// the longest a put or delete may wait on zenoh (`ServerBuilder::put_timeout`)
+    pub put_timeout: Duration,
 }
 
 fn base64() -> base64::engine::general_purpose::GeneralPurpose {
@@ -260,7 +297,8 @@ pub(crate) async fn handle(context: Context<'_>, request: ApiRequest) -> Value {
 }
 
 async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String> {
-    let Context { session, access, api, events } = context;
+    let Context { session, access, api, events, put_timeout } = context;
+    let timed_out = || format!("{} timed out after {put_timeout:?} (zenoh held it back)", request.op);
     let grant = access.grant;
     api.reap_queries();
     let error = |error: zenoh::Error| error.to_string();
@@ -280,7 +318,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             if let Some(congestion_control) = congestion_control(&request.congestion_control)? {
                 builder = builder.congestion_control(congestion_control);
             }
-            builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp)).await.map_err(error)?;
+            tokio::time::timeout(put_timeout, builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp))).await.map_err(|_| timed_out())?.map_err(error)?;
             Ok(json!({}))
         }
         "delete" => {
@@ -295,7 +333,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             if let Some(congestion_control) = congestion_control(&request.congestion_control)? {
                 builder = builder.congestion_control(congestion_control);
             }
-            builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp)).await.map_err(error)?;
+            tokio::time::timeout(put_timeout, builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp))).await.map_err(|_| timed_out())?.map_err(error)?;
             Ok(json!({}))
         }
         "get" => {

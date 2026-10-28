@@ -1,0 +1,114 @@
+#!/usr/bin/env -S deno run --allow-all
+// Runs the test suites (and each browser battery's cells one at a time), skipping any whose inputs haven't changed
+// since it last passed: a suite's key is a hash of every file it depends on (tracked or not, ignored files aside), kept
+// in .test-cache/passed.json. Suites run one after another: two browser tests at once skew each other's latency.
+//
+//   bin/test                 # what changed since it last passed
+//   bin/test --all           # everything, cache or not
+//   bin/test --list          # each suite, and whether it would run
+//   bin/test battery degrade # only these (a group name, a suite, or group:cell)
+import { Command } from "jsr:@cliffy/command@1.0.0-rc.7"
+
+const root = new URL("..", import.meta.url).pathname
+const cacheDir = `${root}.test-cache`
+const passedFile = `${cacheDir}/passed.json`
+
+// what every gateway build depends on
+const gateway = ["gateway/src/", "gateway/Cargo.toml", "gateway/Cargo.lock", "gateway/build.rs"]
+const browser = [...gateway, "gateway/examples/degrade_server.rs", "client/zenoh_gateway.ts"]
+type Suite = { name: string; inputs: string[]; command: string[] }
+const cargo = (name: string, args: string[], test?: string): Suite => ({ name, inputs: [...gateway, ...(test ? [`gateway/tests/${test}.rs`] : [])], command: ["cargo", "test", ...args, "--features", "client", "--manifest-path", `${root}gateway/Cargo.toml`] })
+const deno = (name: string, file: string, extra: string[] = [], args: string[] = []): Suite => ({ name, inputs: [...browser, `client/test/${file}`, ...extra], command: [Deno.execPath(), "run", "--allow-all", "--unstable-net", `${root}client/test/${file}`, ...args] })
+const cells = async (file: string) => {
+    const output = await new Deno.Command(Deno.execPath(), { args: ["run", "--allow-all", "--unstable-net", `${root}client/test/${file}`, "--list-cells"] }).output()
+    return new TextDecoder().decode(output.stdout).split("\n").filter(Boolean)
+}
+
+const groups: Record<string, Suite[]> = {
+    rust: [cargo("rust:lib", ["--lib"]), ...["client", "leak", "zenoh_api", "backpressure"].map((test) => cargo(`rust:${test}`, ["--test", test], test))],
+    browser: [deno("browser:video_latency", "video_latency.ts", ["client/test/browser.ts"]), deno("browser:resubscribe", "resubscribe.ts"), deno("browser:backpressure", "backpressure.ts"), deno("browser:lease_takeover", "lease_takeover.ts")],
+    battery: (await cells("video_battery.ts")).map((cell) => deno(`battery:${cell}`, "video_battery.ts", ["client/test/shaped_link.ts", "client/test/browser.ts"], [cell])),
+    degrade: (await cells("degrade.ts")).map((cell) => deno(`degrade:${cell}`, "degrade.ts", ["client/test/shaped_link.ts"], [cell])),
+}
+
+/** The files under `inputs` (paths or directory prefixes) git doesn't ignore, hashed with their contents. */
+async function inputHash(inputs: string[]): Promise<string> {
+    const listed = await new Deno.Command("git", { args: ["ls-files", "--cached", "--others", "--exclude-standard", "--", ...inputs], cwd: root }).output()
+    const files = new TextDecoder().decode(listed.stdout).split("\n").filter(Boolean).sort()
+    const parts: Uint8Array[] = []
+    for (const file of files) {
+        parts.push(new TextEncoder().encode(`\0${file}\0`))
+        try {
+            parts.push(await Deno.readFile(`${root}${file}`))
+        } catch {
+            parts.push(new TextEncoder().encode("(deleted)"))
+        }
+    }
+    const all = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0))
+    let offset = 0
+    for (const part of parts) {
+        all.set(part, offset)
+        offset += part.length
+    }
+    return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", all)), (byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+await new Command()
+    .name("test")
+    .description("Runs the suites whose inputs changed since they last passed.")
+    .arguments("[only...:string]")
+    .option("--all", "Run everything, passed before or not")
+    .option("--list", "Only list the suites and whether they would run")
+    .action(async ({ all, list }, ...only: string[]) => {
+        const suites = Object.entries(groups).flatMap(([group, suites]) => suites.filter((suite) => only.length === 0 || only.some((name) => name === group || name === suite.name)))
+        await Deno.mkdir(`${cacheDir}/logs`, { recursive: true })
+        let passed: Record<string, string> = {}
+        try {
+            passed = JSON.parse(await Deno.readTextFile(passedFile))
+        } catch {
+            // no cache yet
+        }
+        const failed: string[] = []
+        for (const suite of suites) {
+            const hash = await inputHash(suite.inputs)
+            const fresh = !all && passed[suite.name] === hash
+            if (list) {
+                console.log(`${fresh ? "skip" : "run "} ${suite.name}`)
+                continue
+            }
+            if (fresh) {
+                console.log(`skip ${suite.name} (unchanged since it passed)`)
+                continue
+            }
+            const started = performance.now()
+            const log = `${cacheDir}/logs/${suite.name.replace(":", "_")}.log`
+            const file = await Deno.open(log, { write: true, create: true, truncate: true })
+            const child = new Deno.Command(suite.command[0], { args: suite.command.slice(1), cwd: root, stdout: "piped", stderr: "piped" }).spawn()
+            // (stdout and stderr interleaved as they come)
+            const copy = async (stream: ReadableStream<Uint8Array>) => {
+                for await (const chunk of stream) {
+                    await file.write(chunk)
+                }
+            }
+            await Promise.all([copy(child.stdout), copy(child.stderr)])
+            file.close()
+            const { code } = await child.status
+            const seconds = Math.round((performance.now() - started) / 1000)
+            if (code === 0) {
+                passed[suite.name] = hash
+                await Deno.writeTextFile(passedFile, JSON.stringify(passed, null, 1))
+                console.log(`pass ${suite.name} (${seconds} s)`)
+            } else {
+                delete passed[suite.name]
+                await Deno.writeTextFile(passedFile, JSON.stringify(passed, null, 1))
+                failed.push(suite.name)
+                const tail = (await Deno.readTextFile(log)).trimEnd().split("\n").slice(-15).join("\n")
+                console.log(`FAIL ${suite.name} (${seconds} s), log ${log}:\n${tail}`)
+            }
+        }
+        if (failed.length) {
+            console.log(`\n${failed.length} failed: ${failed.join(" ")}`)
+            Deno.exit(1)
+        }
+    })
+    .parse(Deno.args)

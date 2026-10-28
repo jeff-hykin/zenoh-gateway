@@ -13,10 +13,14 @@
 // Usage: deno run --allow-all --unstable-net client/test/degrade.ts [cell name ...]   (default: every cell)
 
 import { launch } from "jsr:@astral/astral@0.5.6"
+import { shapedLink } from "./shaped_link.ts"
+import { waitForOtherBrowserTests } from "./browser.ts"
 
 // slackMs: what the strict streams may take beyond the link's own round trip (300 ms; the floor cell's strict traffic is a
 // third of its link, and its packets queue behind each other)
-type Cell = { name: string; seconds: number; schedule: [number, number][]; delayMs: number; jitterMs: number; loss: number; slackMs?: number }
+// subscribe: which of the page's streams it subscribes (default all: cams clouds map pose tf cmd cmd_vel); serverEnv: the
+// degrade_server's load (CAMS, MAP_HZ, ...); shape cells check only the link model, tracing its stats every second
+type Cell = { name: string; seconds: number; schedule: [number, number][]; delayMs: number; jitterMs: number; loss: number; slackMs?: number; subscribe?: string[]; serverEnv?: Record<string, string>; shape?: boolean }
 const cells: Cell[] = [
     { name: "20mbit", seconds: 30, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
     { name: "8mbit", seconds: 30, schedule: [[0, 1_000_000]], delayMs: 30, jitterMs: 0, loss: 0 },
@@ -29,14 +33,35 @@ const cells: Cell[] = [
     { name: "wifi_loss2", seconds: 30, schedule: [[0, 625_000]], delayMs: 30, jitterMs: 210, loss: 0.02 },
     // at 5% loss each way the slowest 5% of messages are the ones resent: p95 lands on a retransmission
     { name: "loss5", seconds: 30, schedule: [[0, 625_000]], delayMs: 30, jitterMs: 0, loss: 0.05, slackMs: 500 },
+    // the R1 on 2.4 GHz Wi-Fi (2026-10-13): ~300 KB/s, 3 ms at best, 60-400 ms typical, frames retried; the estimate
+    // collapsed to 16 KB/s and blamed the page
+    { name: "r1_wifi", seconds: 45, schedule: [[0, 300_000]], delayMs: 2, jitterMs: 400, loss: 0.005, slackMs: 500 },
+    // memory soak, only when named: SOAK_SECONDS on a clean 20 Mbit/s link (DEGRADE_FEATURES=dhat-heap profiles the heap)
+    ...(Deno.args.includes("soak") ? [{ name: "soak", seconds: Number(Deno.env.get("SOAK_SECONDS") ?? 1200), schedule: [[0, 2_500_000]] as [number, number][], delayMs: 30, jitterMs: 0, loss: 0 }] : []),
+    // a 5 s Wi-Fi stall on a fast link: the estimate must not collapse with it (it once fell to 1 KB/s and took 4 min back)
+    { name: "stall", seconds: 50, schedule: [[0, 2_500_000], [20, 1_000], [25, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
     { name: "step", seconds: 90, schedule: [[0, 2_500_000], [30, 125_000], [60, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
+    // page shapes the full page never produces, only when named: the link model must find and keep the link's rate
+    // when nothing is link-limited, or only video is, or data comes in rare bursts
+    ...([
+        { name: "video_only", seconds: 60, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["cams"], serverEnv: { CAMS: "1" }, shape: true },
+        { name: "video_tf", seconds: 60, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["cams", "tf"], serverEnv: { CAMS: "1" }, shape: true },
+        { name: "video_slow", seconds: 60, schedule: [[0, 125_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["cams"], serverEnv: { CAMS: "1" }, shape: true },
+        { name: "map_sparse", seconds: 80, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["map"], serverEnv: { MAP_HZ: "0.05" }, shape: true },
+        { name: "tf_only", seconds: 40, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["tf"], shape: true },
+    ] as Cell[]).filter((cell) => Deno.args.includes(cell.name)),
 ]
+// (bin/test runs and caches each default cell on its own)
+if (Deno.args[0] === "--list-cells") {
+    console.log(cells.map((cell) => cell.name).join("\n"))
+    Deno.exit(0)
+}
 const chosen = Deno.args.length ? cells.filter((cell) => Deno.args.includes(cell.name)) : cells
-const queueSeconds = 1
 // DIAGNOSE=1: read the gateway's bandwidth stats every window (they otherwise come every few seconds on slow links)
 const diagnose = Deno.env.get("DIAGNOSE") === "1"
 const windowMs = 2000
 
+await waitForOtherBrowserTests()
 const root = new URL("../..", import.meta.url).pathname
 const scratch = await Deno.makeTempDir({ prefix: "zenoh-gateway-degrade-" })
 await Deno.mkdir(`${scratch}/client`)
@@ -45,67 +70,14 @@ const bundled = await new Deno.Command(Deno.execPath(), { args: ["bundle", "--qu
 if (bundled.code !== 0) {
     throw new Error(`deno bundle failed: ${new TextDecoder().decode(bundled.stderr)}`)
 }
-const build = await new Deno.Command("cargo", { args: ["build", "--release", "--example", "degrade_server"], cwd: `${root}gateway`, stderr: "inherit" }).output()
+const build = await new Deno.Command("cargo", { args: ["build", "--release", "--example", "degrade_server", ...(Deno.env.get("DEGRADE_FEATURES") ? ["--features", Deno.env.get("DEGRADE_FEATURES")!] : [])], cwd: `${root}gateway`, stderr: "inherit" }).output()
 if (build.code !== 0) {
     throw new Error("cargo build failed")
 }
 const targetDir = Deno.env.get("CARGO_TARGET_DIR") ?? `${root}gateway/target`
 
-/** One direction of the link: rate-limited (by the cell's schedule) drop-tail queue, then delay + jitter, with loss. */
-function shapedDirection(cell: Cell, linkStart: () => number, deliver: (data: Uint8Array) => void, offered: { bytes: number; packets: number }) {
-    const rateNow = () => {
-        const t = (performance.now() - linkStart()) / 1000
-        return cell.schedule.filter(([at]) => t >= at).at(-1)![1]
-    }
-    const queue: { data: Uint8Array; arrived: number }[] = []
-    let queuedBytes = 0
-    let freeAt = 0
-    let draining = false
-    let jitter = 0
-    let jitterDrawnAt = -Infinity
-    let lastDeliverAt = 0
-    const delayNow = (now: number) => {
-        if (now - jitterDrawnAt >= 200) {
-            jitterDrawnAt = now
-            jitter = Math.random() * cell.jitterMs
-        }
-        return cell.delayMs + jitter
-    }
-    const drain = () => {
-        const now = performance.now()
-        while (queue.length > 0) {
-            const { data, arrived } = queue[0]
-            const leaves = Math.max(freeAt, arrived) + (data.length / rateNow()) * 1000
-            if (leaves > now) {
-                setTimeout(drain, leaves - now)
-                return
-            }
-            queue.shift()
-            queuedBytes -= data.length
-            freeAt = leaves
-            // packets stay in order: a jitter drop never lets one overtake the one before it
-            lastDeliverAt = Math.max(lastDeliverAt, leaves + delayNow(leaves))
-            setTimeout(() => deliver(data), Math.max(0, lastDeliverAt - performance.now()))
-        }
-        draining = false
-    }
-    return (data: Uint8Array) => {
-        offered.bytes += data.length
-        offered.packets++
-        if (Math.random() < cell.loss || queuedBytes + data.length > Math.max(20_000, rateNow() * queueSeconds)) {
-            return
-        }
-        queue.push({ data, arrived: performance.now() })
-        queuedBytes += data.length
-        if (!draining) {
-            draining = true
-            drain()
-        }
-    }
-}
-
 async function runCell(cell: Cell) {
-    const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], stdout: "piped", stderr: "inherit" }).spawn()
+    const server = new Deno.Command(`${targetDir}/release/examples/degrade_server`, { args: [scratch], env: cell.serverEnv ?? {}, stdout: "piped", stderr: "inherit" }).spawn()
     const serverUrl = await (async () => {
         for await (const chunk of server.stdout.pipeThrough(new TextDecoderStream())) {
             const match = chunk.match(/listening on (\S+)/)
@@ -115,74 +87,25 @@ async function runCell(cell: Cell) {
         }
         throw new Error("degrade_server exited")
     })()
-    let linkStartedAt = 0
-    const sockets: Deno.DatagramConn[] = []
-    // what each side tried to send, for the summary: a saturated uplink delays the downlink too (its SCTP acks wait)
-    const offeredDown = { bytes: 0, packets: 0 }
-    const offeredUp = { bytes: 0, packets: 0 }
-    const startShaper = (targetPort: number) => {
-        const chromeSide = Deno.listenDatagram({ transport: "udp", hostname: "127.0.0.1", port: 0 })
-        const serverSide = Deno.listenDatagram({ transport: "udp", hostname: "127.0.0.1", port: 0 })
-        sockets.push(chromeSide, serverSide)
-        let chromeAddress: Deno.NetAddr | null = null
-        const down = shapedDirection(cell, () => linkStartedAt, (data) => {
-            if (chromeAddress) {
-                chromeSide.send(data, chromeAddress).catch(() => {})
-            }
-        }, offeredDown)
-        const up = shapedDirection(cell, () => linkStartedAt, (data) => {
-            serverSide.send(data, { transport: "udp", hostname: "127.0.0.1", port: targetPort }).catch(() => {})
-        }, offeredUp)
-        ;(async () => {
-            for await (const [data, address] of chromeSide) {
-                chromeAddress = address as Deno.NetAddr
-                up(data)
-            }
-        })().catch(() => {})
-        ;(async () => {
-            for await (const [data] of serverSide) {
-                down(data)
-            }
-        })().catch(() => {})
-        return (chromeSide.addr as Deno.NetAddr).port
-    }
-    // a signaling proxy rewrites the SDP so ICE can only use the shaper
-    const proxy = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (request) => {
-        const url = new URL(request.url)
-        if (url.pathname !== "/offer") {
-            return fetch(`${serverUrl}${url.pathname}${url.search}`)
-        }
-        const offer = await request.json()
-        offer.sdp = offer.sdp.split("\r\n").filter((line: string) => !line.startsWith("a=candidate")).join("\r\n")
-        const answer = await (await fetch(`${serverUrl}/offer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(offer) })).json()
-        const lines: string[] = answer.sdp.split("\r\n")
-        const loopback = lines.find((line) => line.startsWith("a=candidate") && line.includes(" 127.0.0.1 "))
-        const port = startShaper(Number(loopback?.split(" ")[5]))
-        linkStartedAt = performance.now()
-        let replaced = false
-        answer.sdp = lines.flatMap((line) => {
-            if (!line.startsWith("a=candidate")) {
-                return [line]
-            }
-            if (replaced) {
-                return []
-            }
-            replaced = true
-            return [`a=candidate:1 1 udp 2130706431 127.0.0.1 ${port} typ host`]
-        }).join("\r\n")
-        return Response.json(answer)
-    })
+    const link = shapedLink(serverUrl, cell)
     const browser = await launch({ headless: true, args: ["--no-sandbox", "--autoplay-policy=no-user-gesture-required"] })
     try {
-        const page = await browser.newPage(`http://127.0.0.1:${proxy.addr.port}/blank.html`)
+        const page = await browser.newPage(`${link.url}/blank.html`)
+        // the page's warnings and errors (a subscription that failed to open says why only here)
+        page.addEventListener("console", (event: any) => {
+            if (["error", "warn", "warning"].includes(event.detail?.type)) {
+                console.log(`  [page ${event.detail.type}] ${String(event.detail.text).slice(0, 300)}`)
+            }
+        })
         // astral retries evaluate 5x on a 10 s deadline: long runs need more
         ;(page as any).timeout = (cell.seconds + 60) * 1000
-        const windows = await page.evaluate(async (url: string, seconds: number, windowMs: number, diagnose: boolean) => {
+        const windows = await page.evaluate(async (url: string, seconds: number, windowMs: number, diagnose: boolean, subscribe: string[], trace: boolean) => {
+            const wants = (group: string) => subscribe.includes(group)
             const { connect, Priority } = await import("/client/zenoh_gateway.js")
             // at 5% loss the first connect can time out opening its channels; a page retries as dim-app does
             const client = await connect(url, { heartbeatHz: 5, heartbeatMisses: 50 }).catch(() => connect(url, { heartbeatHz: 5, heartbeatMisses: 50 }))
             const started = performance.now()
-            type Window = { rtt: number[]; echo: number[]; echoSent: number; ages: Record<string, number[]>; bytes: Record<string, number>; count: Record<string, number>; alloc: Record<string, any>; bw: any; statsBytes?: number }
+            type Window = { rtt: number[]; echo: number[]; echoSent: number; ages: Record<string, number[]>; bytes: Record<string, number>; count: Record<string, number>; alloc: Record<string, any>; bw: any; statsBytes?: number; trace?: any[] }
             const windows: Window[] = []
             const current = () => (windows[Math.floor((performance.now() - started) / windowMs)] ??= { rtt: [], echo: [], echoSent: 0, ages: {}, bytes: {}, count: {}, alloc: {}, bw: null })
             const record = (key: string, message: any) => {
@@ -191,7 +114,7 @@ async function runCell(cell: Cell) {
                 window.count[key] = (window.count[key] ?? 0) + 1
                 window.bytes[key] = (window.bytes[key] ?? 0) + (message.video ? message.video.encodedBytes : message.bytes.length)
             }
-            for (const key of ["robot/cam0", "robot/cam1"]) {
+            for (const key of wants("cams") ? ["robot/cam0", "robot/cam1"] : []) {
                 let attached = false
                 client.subscribe(key, { delivery: "latest", encoding: "test-cam", bandwidthPriority: 0.1 }, (message: any) => {
                     record(key, message)
@@ -207,20 +130,23 @@ async function runCell(cell: Cell) {
                     }
                 })
             }
-            for (const key of ["robot/cloud0", "robot/cloud1"]) {
+            for (const key of wants("clouds") ? ["robot/cloud0", "robot/cloud1"] : []) {
                 client.subscribe(key, { delivery: "latest", encoding: "test-cloud", minQuality: 0.0625, bandwidthPriority: 10 }, (message: any) => record(key, message))
             }
-            client.subscribe("robot/map", { delivery: "latest", bandwidthPriority: 0 }, (message: any) => record("robot/map", message))
-            client.subscribe("robot/pose", { delivery: "latest" }, (message: any) => record("robot/pose", message))
-            client.subscribe("robot/tf", { delivery: "reliable" }, (message: any) => record("robot/tf", message))
-            client.subscribe("robot/cmd", { delivery: "latest", priority: 1 }, (message: any) => record("robot/cmd", message))
+            if (wants("map")) client.subscribe("robot/map", { delivery: "latest", bandwidthPriority: 0 }, (message: any) => record("robot/map", message))
+            if (wants("pose")) client.subscribe("robot/pose", { delivery: "latest" }, (message: any) => record("robot/pose", message))
+            if (wants("tf")) client.subscribe("robot/tf", { delivery: "reliable" }, (message: any) => record("robot/tf", message))
+            if (wants("cmd")) client.subscribe("robot/cmd", { delivery: "latest", priority: 1 }, (message: any) => record("robot/cmd", message))
             // the page's commands: sent time in the payload, echoed back by the server
-            client.subscribe("robot/cmd_vel_echo", { delivery: "latest", priority: 1 }, (message: any) => {
+            if (wants("cmd_vel")) client.subscribe("robot/cmd_vel_echo", { delivery: "latest", priority: 1 }, (message: any) => {
                 const sentAt = new DataView(message.bytes.buffer, message.bytes.byteOffset).getFloat64(0)
                 current().echo.push(performance.now() - sentAt)
             })
             const cmdVel = client.publisher("robot/cmd_vel", { delivery: "latest", priority: Priority.REAL_TIME })
             const commander = setInterval(() => {
+                if (!wants("cmd_vel")) {
+                    return
+                }
                 const payload = new Uint8Array(48)
                 new DataView(payload.buffer).setFloat64(0, performance.now())
                 cmdVel.put(payload)
@@ -252,25 +178,36 @@ async function runCell(cell: Cell) {
                     }
                 }
             }, windowMs)
+            // shape cells: the link model every second (stats replies leave on the control channel, outside the model: a
+            // reply is several KB, and every 250 ms they took a third of video_slow's 125 KB/s link unseen, so video
+            // queued at the link delivered 40-80 KB/s and the estimate followed)
+            const tracer = setInterval(async () => {
+                if (!trace) {
+                    return
+                }
+                const at = performance.now() - started
+                const reply = await client._request({ op: "stats" }, 3000).catch(() => null)
+                const bw = reply?.bandwidth
+                if (bw) {
+                    ;(current().trace ??= []).push({ at, replyBytes: JSON.stringify(reply).length, est: bw.dataEstimateBytesPerSec, budget: bw.budgetBytesPerSec, startingUp: bw.startingUp, probingRtt: bw.probingRtt, video: bw.videoSentBytesPerSec, delivered: bw.deliveredBytesPerSec, gain: bw.gain, queue: bw.videoQueueDelayMs, brake: bw.videoBrakeBytesPerSec })
+                }
+            }, 1000)
             await new Promise((resolve) => setTimeout(resolve, seconds * 1000))
-            for (const timer of [commander, sampler, statsTimer]) {
+            for (const timer of [commander, sampler, statsTimer, tracer]) {
                 clearInterval(timer)
             }
             client.close()
             return windows.slice(0, Math.floor((seconds * 1000) / windowMs))
-        }, { args: [`http://127.0.0.1:${proxy.addr.port}`, cell.seconds, windowMs, diagnose] })
-        const seconds = (performance.now() - linkStartedAt) / 1000
+        }, { args: [link.url, cell.seconds, windowMs, diagnose, cell.subscribe ?? ["cams", "clouds", "map", "pose", "tf", "cmd", "cmd_vel"], cell.shape ?? false] })
+        const seconds = (performance.now() - link.startedAt()) / 1000
         const rate = (offered: { bytes: number; packets: number }) => `${Math.round(offered.bytes / seconds / 100) / 10} KB/s in ${Math.round(offered.packets / seconds)} packets/s`
-        console.log(`  offered: down ${rate(offeredDown)}, up ${rate(offeredUp)}`)
+        console.log(`  offered: down ${rate(link.offeredDown)}, up ${rate(link.offeredUp)}`)
         return windows
     } finally {
         await browser.close()
         server.kill("SIGTERM")
         await server.status
-        await proxy.shutdown()
-        for (const socket of sockets) {
-            socket.close()
-        }
+        await link.close()
     }
 }
 
@@ -336,13 +273,48 @@ function check(cell: Cell, windows: any[], from: number, to: number, label: stri
     return failures
 }
 
+/** A shape cell: once settled (10 s), the estimate must not fall under half what it reached, and startup must end. */
+function checkShape(cell: Cell, windows: any[]): string[] {
+    const trace = windows.flatMap((window) => window.trace ?? [])
+    const settled = trace.filter((point) => point.at >= 10_000)
+    const link = cell.schedule[0][1]
+    const peak = Math.max(...settled.map((point) => point.est))
+    const least = Math.min(...settled.map((point) => point.est))
+    // under half the most it had reached by then: before a page's first message (a map every 20 s) there is nothing to
+    // measure, and the first guess standing isn't a fall
+    let reached = 0
+    const dips = trace.filter((point) => {
+        reached = Math.max(reached, point.est)
+        return point.at >= 10_000 && point.est < 0.5 * reached
+    })
+    const startup = settled.filter((point) => point.startingUp).length
+    const probing = settled.filter((point) => point.probingRtt).length
+    const kb = (value: number) => `${Math.round(value / 1000)} KB/s`
+    console.log(`  shape      est ${kb(least)}..${kb(peak)} on ${kb(link)} | under half the most yet ${dips.length}/${settled.length} samples at ${dips.map((point) => (point.at / 1000).toFixed(1)).join(" ")} s | startup ${startup}/${settled.length} | probeRTT ${probing}/${settled.length}`)
+    for (const [index, window] of windows.entries()) {
+        const points = window.trace ?? []
+        const ages = Object.entries(window.ages as Record<string, number[]>).map(([key, values]) => `${key.replace("robot/", "")} ${window.count[key]} msgs ${kb(window.bytes[key] / (windowMs / 1000))} p95 age ${round(percentile(values, 0.95))} ms`).join(", ")
+        console.log(`    ${String(index * windowMs / 1000).padStart(3)} s est ${points.map((point: any) => Math.round(point.est / 1000)).join(" ")} KB/s | startup ${points.filter((point: any) => point.startingUp).length}/${points.length} | ${ages}`)
+    }
+    const failures: string[] = []
+    if (dips.length) {
+        failures.push(`${cell.name}: estimate fell under half what it had reached (peak ${kb(peak)}) ${dips.length} times after 10 s, least ${kb(least)}`)
+    }
+    if (startup === settled.length && settled.length) {
+        failures.push(`${cell.name}: still starting up after ${cell.seconds} s`)
+    }
+    return failures
+}
+
 const failures: string[] = []
 try {
     for (const cell of chosen) {
         console.log(`${cell.name}: ${JSON.stringify(cell.schedule)} B/s, ${cell.delayMs} ms each way, jitter ${cell.jitterMs} ms, loss ${cell.loss * 100}%`)
         const windows = await runCell(cell)
         await Deno.writeTextFile(`${scratch}/${cell.name}.json`, JSON.stringify({ cell, windows }))
-        if (cell.name === "step") {
+        if (cell.shape) {
+            failures.push(...checkShape(cell, windows))
+        } else if (cell.name === "step") {
             const [high, low] = [cell.schedule[0][1], cell.schedule[1][1]]
             failures.push(...check(cell, windows, 10, 30, "before", high))
             failures.push(...check(cell, windows, 40, 60, "dropped", low))

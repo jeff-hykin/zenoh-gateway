@@ -56,10 +56,11 @@ mod options;
 mod pacing;
 mod peer;
 mod publisher;
+mod rtp_pacer;
 mod server;
 mod subscription;
 
-pub use encoding::{AudioPcm, Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
+pub use encoding::{AudioPcm, Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, MessageHeader, EncodedVideo, H264Encoder, PixelFormat, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
 pub use auth::{Acl, AclMessage, AclRule, Flow, Grant, OnRefused, Permission};
 pub use fields::Fields;
 pub use ice::{ICE_HOOK_TIMEOUT, IceRequest, IceServer, IceServersFn, IceSide, turn_credentials};

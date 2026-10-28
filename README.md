@@ -49,7 +49,9 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 | `token` | none | sent as `Authorization: Bearer` ([Auth](#auth)); a refused token rejects `connect` |
 | `iceServers` | the gateway's | `RTCIceServer[]`, fetched from `GET /zenoh-gateway/ice` by default |
 | `iceTransportPolicy` | the gateway's, else `"all"` | `"relay"` forces TURN |
+| `linkBandwidthBytesPerSec` | estimated | the link's known speed (bytes/s) in place of the estimate; `z.setLinkBandwidth(n)` changes it live |
 | `reconnect` | `true` | reopen the connection and every live channel after a loss |
+| `freshAfterMs` | 2000 | a page hidden, frozen or disconnected this long starts a fresh connection instead of catching up |
 | `statsIntervalMs` | 1000 | how often `z.stats` / `z.gatewayStats` refresh |
 | `clock` | `performance.timeOrigin + performance.now()` | the page's clock in ms |
 
@@ -57,7 +59,7 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 
 | member | |
 |---|---|
-| `subscribe(key, options, callback)` → `Subscription` | `msg`: `{ key, kind, bytes, encoding?, attachment?, timestamp, seq, decoded?, video?, mediaStream? }` |
+| `subscribe(key, options, callback)` → `Subscription` | `msg`: `{ key, kind, bytes, encoding?, attachment?, timestamp, seq, decoded?, video?, mediaStream?, header? }` |
 | `publisher(key, options)` → `Publisher` | |
 | `publishAudio(key, track, { encoding, sampleRate?, priority?, latencyLimit? })` → `AudioPublisher` | a microphone to zenoh (below) |
 | `put(key, bytes, opts)`, `delete(key, opts)` | one zenoh put / delete |
@@ -71,7 +73,7 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 | `stats`, `gatewayStats`, `pollStats()` | per-key counters and allocation; link estimate, budget, queue delay |
 | `rttMs`, `clockOffsetMs`, `now()` | round trip, clock offset, the page clock |
 | `state`, `onState(fn)` | `"connecting"` / `"connected"` / `"degraded"` / `"lost"` |
-| `lease(group, { keys?, maxSeconds? })` → `Lease`, `expireLease(group)` | exclusive publishing ([Leases](#leases)) |
+| `lease({ publish?, subscribe?, allowTakeover?, maxSeconds?, onLost?, group? })` → `Lease`, `expireLease(group)` | exclusive publish/subscribe rights ([Leases](#leases)) |
 | `iceServers`, `pauseHeartbeat()`, `resumeHeartbeat()`, `close()` | |
 
 ### Subscribe options
@@ -84,20 +86,26 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 | `maxHz` | none | never send faster |
 | `bandwidthPriority` | 1 | higher keeps more when bandwidth is short; 0 gives up first |
 | `minQuality` | 0 | the lowest quality the allocator may pick |
-| `qualityToHzTradeoff` | 0.5 | 0 = keep quality, drop rate; 1 = keep rate, drop quality |
+| `qualityToHzTradeoff` | 0.5 (video: 1) | 0 = keep quality, drop rate; 1 = keep rate, drop quality (video: shrink the picture) |
 | `encoding` | none (raw bytes) | a name from `z.encodings` |
 | `channel` | from the encoding | `"video-h264"`, `"video-vp8"`, `"video-vp9"`, `"video-av1"`, `"audio-opus"` or `"data"` |
 | `encodeOptions` | `{}` | for the encoding; `quality` (0–1, default 1) is the most the allocator picks |
 | `compress` | the encoding's | `"zstd"` or `"none"` (data channels); `msg.bytes` is always decompressed |
 | `maxBitrate` | ~0.3 bit/pixel | video: the most bits/s it asks for |
-| `minResolutionScale` | 0.25 | video: full size unless the grant is under 0.05 bit/pixel, never smaller than this share |
+| `minResolutionScale` | 0 | video: full size unless the grant is under 0.1 bit/pixel, never smaller than this share |
+| `minResolution` | `[160, 64]` | video: never shrinks below this |
 | `maxResolution` | none | video: `[width, height]` box the picture fits in |
+| `frameDropping` | true | video: the encoder may skip a frame to hold its bitrate |
+| `keyframeIntervalMs` | 60000 | video: a keyframe at least this often |
+| `targetQp` | 30 | video: the quantizer the picture's size aims for (lower = smaller, sharper) |
+| `sceneChangeKeyframes` | false | video: a keyframe on a scene change |
+| `metadata` | `true` | `msg.header`: `{ stamp, sec, nanosec, frameId, seq? }` from the sample |
 | `playoutDelay` | `[0, 0]` | video: `[min, max]` ms the browser may hold a frame; `[0, 0]` shows each at once |
 
 `Subscription`: `ready()`, `state`, `mediaStream`, `channelName`, `received`, `dropped`, `partialDropped`,
 `decodeErrors`, `gatewayStats`, `rejectionReason`, `close()`, and `update(changes)`, which changes `maxHz`,
 `minQuality`, `qualityToHzTradeoff`, `bandwidthPriority`, `maxBitrate`, `minResolutionScale`, `maxResolution`,
-`playoutDelay` or `encodeOptions.quality` in place, with no resubscribe (`null` restores a default).
+`frameDropping`, `keyframeIntervalMs`, `sceneChangeKeyframes`, `targetQp`, `playoutDelay` or `encodeOptions.quality` in place, with no resubscribe (`null` restores a default).
 
 ### Publisher options and methods
 
@@ -255,11 +263,15 @@ tokens is up to the host (zenoh-gateway-cli's `--auth-file` is an example). SPEC
 
 ## Leases
 
-`const lease = await z.lease("drive", { maxSeconds: 60 })` lets only this page publish on the group's keys among the
-gateway's clients (others' puts are dropped; `publisher.blocked` says why). It ends when the heartbeat stops,
-`maxSeconds` passes, the page disconnects, `lease.release()`, or someone with `forceExpire` calls
-`z.expireLease("drive")`; `lease.onLost(reason)` says which. Groups come from the server (`lease_group`) or, for names
-it doesn't define, from the client (`{ keys: [...] }`), within the grant.
+```js
+const seat = await z.lease({ publish: ["robot/cmd_vel"], subscribe: ["robot/cam/**"], allowTakeover: true, onLost: banner })
+```
+
+gives this page those rights among the gateway's clients (others' puts are dropped and their subscriptions refused;
+`publisher.blocked` / `rejectionReason` say why). It ends on takeover (`"takenOver"`), heartbeat loss, `maxSeconds`,
+disconnect, `seat.release()`, or `z.expireLease(seat.group)` by a client with `forceExpire`; `onLost(reason)` says
+which. `group: "drive"` names a server-defined group (`lease_group`). Leases bind only this gateway's clients, not
+native zenoh publishers (use zenoh's `access_control`). SPEC "Leases".
 
 ## ICE and TURN
 
@@ -277,11 +289,10 @@ With `heartbeatHz` set, `await publisher.setDeadman(stopBytes)` stores one messa
 
 ## Bandwidth allocation
 
-Every 250 ms per browser: estimate the link (delivery rate + a delay trigger for data, GCC for video), take
-`bandwidth_target_fraction` of it (capped by `max_bandwidth_bytes_per_sec`), reserve strict and reliable streams, and
-split the rest by `demand / bandwidthPriority`. A stream granted a fraction r of its demand shrinks its message size by
-`r^qualityToHzTradeoff` and its rate by the rest. Bulk sends are paced so strict streams don't wait behind them.
-Numbers are in `z.stats`; SPEC "Bandwidth allocation".
+Per browser, every 250 ms: measure the link as BBR does (bandwidth = most delivered per round; round trip = least
+send-to-ack time; GCC for video), split it by `demand / bandwidthPriority` (strict streams reserved, priority 0 shrinks
+first), and pace bulk sends. **Set `maxAge` on anything latency-sensitive**: it sets how much the gateway lets queue in
+the network. Numbers are in `z.stats`; SPEC "Bandwidth allocation".
 
 ## Nix / cross compiling
 
@@ -322,9 +333,10 @@ shared.
 ```sh
 cd gateway && cargo test --all-features && cargo clippy --all-features --all-targets && cargo doc --no-deps
 deno task check                            # type-check the client
+bin/test                                   # every suite whose inputs changed since it last passed (--all, --list, or name some)
 ```
 
-The end-to-end suites (real zenoh peer, server and headless Chrome) live in
+`bin/test` also runs the browser suites in `client/test` (headless Chrome, shaped links). The end-to-end suites (real zenoh peer, server and headless Chrome) live in
 [zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli).
 
 ## Known limitations

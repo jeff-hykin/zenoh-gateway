@@ -6,10 +6,12 @@ mod relay_sketch;
 use anyhow::Result;
 use openh264::formats::YUVSource;
 use serde_json::json;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 use tokio::time::timeout;
-use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions, VideoFrame};
-use zenoh_gateway::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, RunningServer, Server, VideoImage, zenoh};
+use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, LeaseOptions, PublisherOptions, SubscribeOptions, VideoFrame};
+use zenoh_gateway::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, MessageHeader, RunningServer, Server, VideoImage, zenoh};
 
 /// `[r, g, b, width u16, height u16]` → a solid picture.
 struct SolidColor;
@@ -26,7 +28,7 @@ impl MessageEncoding for SolidColor {
     fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         let p = sample.payload;
         let (width, height) = (u16::from_le_bytes([p[3], p[4]]) as u32, u16::from_le_bytes([p[5], p[6]]) as u32);
-        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, p[..3].repeat((width * height) as usize))?))
+        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, p[..3].repeat((width * height) as usize))?.with_header(12.5, "solid_optical")))
     }
 }
 
@@ -44,6 +46,10 @@ impl MessageEncoding for ByteFields {
 
     fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         Ok(DecodedFrame::data(sample.payload.to_vec()))
+    }
+
+    fn header(&self, sample: &EncodingSample<'_>) -> Option<MessageHeader> {
+        Some(MessageHeader { sec: 1_761_350_400, nanosec: 987_654_321, frame_id: format!("frame_{}", sample.payload.len()), seq: Some(42) })
     }
 
     fn encode(&self, frame: &DecodedFrame, _options: &EncodeOptions) -> Result<Vec<u8>> {
@@ -73,6 +79,16 @@ fn keep_putting(session: &zenoh::Session, key: &str, payload: Vec<u8>) -> tokio:
     tokio::spawn(async move {
         loop {
             session.put(&key, payload.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+}
+
+fn keep_putting_attached(session: &zenoh::Session, key: &str, payload: Vec<u8>, encoding: &'static str, attachment: Vec<u8>) -> tokio::task::JoinHandle<()> {
+    let (session, key) = (session.clone(), key.to_owned());
+    tokio::spawn(async move {
+        loop {
+            session.put(&key, payload.clone()).encoding(encoding).attachment(attachment.clone()).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
@@ -157,6 +173,27 @@ async fn raw_subscribe_is_byte_exact_with_zstd() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn encoded_messages_carry_their_sample_s_header_when_asked() {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let _putter = keep_putting(&session, "fields/x", vec![3, 1, 4]);
+    let _attached = keep_putting_attached(&session, "fields/attached", vec![2, 7], "application/cdr", vec![5, 6]);
+    let mut attached = client.subscribe("fields/attached", SubscribeOptions { encoding: Some("test-fields".into()), metadata: Some(true), ..Default::default() }).await.unwrap();
+    let Message::Data(message) = timeout(Duration::from_secs(10), attached.recv()).await.unwrap().unwrap() else { panic!("not data") };
+    assert_eq!((message.encoding.as_deref(), message.attachment.as_deref(), message.header.map(|header| header.frame_id)), (Some("application/cdr"), Some(&[5u8, 6][..]), Some("frame_2".into())), "the zenoh sample's encoding and attachment too");
+    let exact = MessageHeader { sec: 1_761_350_400, nanosec: 987_654_321, frame_id: "frame_3".into(), seq: Some(42) };
+    for (metadata, compress, expected) in [(Some(true), None, Some(exact.clone())), (Some(true), Some(Compress::Zstd), Some(exact)), (Some(false), None, None), (None, None, None)] {
+        let mut subscription = client.subscribe("fields/x", SubscribeOptions { encoding: Some("test-fields".into()), metadata, compress, ..Default::default() }).await.unwrap();
+        let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
+        assert_eq!(message.fields.expect("fields")["data"].values(), [3.0, 1.0, 4.0], "the message itself unchanged");
+        // (None: a page that doesn't say may not be able to read it)
+        assert_eq!(message.header, expected, "metadata {metadata:?}, compress {compress:?}");
+    }
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fields_subscribe_is_parsed() {
     let (running, session, url) = start().await;
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
@@ -218,6 +255,13 @@ async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
     let (size, mean) = decode_all(&frames);
     assert_eq!(size, (320, 240));
     assert_color(mean, [200, 40, 90]);
+    // each frame's metadata carries its picture's header
+    let info = loop {
+        if let Message::VideoInfo(info) = timeout(Duration::from_secs(10), camera.recv()).await.unwrap().unwrap() {
+            break info;
+        }
+    };
+    assert_eq!((info.stamp, info.frame_id.as_deref()), (Some(12.5), Some("solid_optical")));
     // the gateway's own keyframes come every 3 s; one asked for comes at once
     while next_video(&mut camera).await.keyframe {}
     camera.request_keyframe().await.unwrap();
@@ -283,6 +327,71 @@ async fn video_keeps_flowing_at_the_source_rate() {
         frames += 1;
     }
     assert!(frames >= 35, "{frames} frames in 5 s at maxHz 10 from a 20 Hz source");
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+/// [`SolidColor`] that takes 100 ms or more to decode (a big jpeg on a slow core); the payload's 8th byte on is ignored, so
+/// each sample can differ (identical samples share one decode).
+struct SlowSolid;
+
+static SLOW_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static SLOW_MOST_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static SLOW_DECODES: AtomicUsize = AtomicUsize::new(0);
+static SLOW_DECODE_MICROS: AtomicUsize = AtomicUsize::new(0);
+
+impl MessageEncoding for SlowSolid {
+    fn name(&self) -> &str {
+        "test-slow-solid"
+    }
+
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Video
+    }
+
+    fn decode(&self, sample: &EncodingSample<'_>, channel: Channel) -> Result<DecodedFrame> {
+        let started = std::time::Instant::now();
+        SLOW_MOST_IN_FLIGHT.fetch_max(SLOW_IN_FLIGHT.fetch_add(1, SeqCst) + 1, SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        SLOW_IN_FLIGHT.fetch_sub(1, SeqCst);
+        SLOW_DECODES.fetch_add(1, SeqCst);
+        // (a loaded Mac's timer slack stretches the sleep, so the test measures what a decode took)
+        SLOW_DECODE_MICROS.fetch_add(started.elapsed().as_micros() as usize, SeqCst);
+        SolidColor.decode(&EncodingSample::new(sample.key, &sample.payload[..7], &zenoh::bytes::Encoding::default()), channel)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decode_slower_than_the_frame_interval_does_not_set_the_rate() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let running = Server::builder().session(session.clone()).encoding(SlowSolid).build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { encoding: Some("test-slow-solid".into()), max_hz: Some(30.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await.unwrap();
+    // 25 Hz, each sample its own
+    let _putter = tokio::spawn({
+        let session = session.clone();
+        async move {
+            for count in 0u32.. {
+                session.put("camera/front", [solid([200, 40, 90], 160, 120), count.to_le_bytes().to_vec()].concat()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
+    });
+    let first = next_video(&mut camera).await;
+    assert_color(decode_all(&[first]).1, [200, 40, 90]);
+    let (decodes_before, micros_before) = (SLOW_DECODES.load(SeqCst), SLOW_DECODE_MICROS.load(SeqCst));
+    let start = std::time::Instant::now();
+    let mut frames = 0;
+    while start.elapsed() < Duration::from_secs(3) {
+        next_video(&mut camera).await;
+        frames += 1;
+    }
+    let decode_secs = (SLOW_DECODE_MICROS.load(SeqCst) - micros_before) as f64 / 1e6 / (SLOW_DECODES.load(SeqCst) - decodes_before).max(1) as f64;
+    // one decode at a time could not pass 1 / decode_secs fps
+    let serial = 3.0 / decode_secs;
+    let most = SLOW_MOST_IN_FLIGHT.load(SeqCst);
+    assert!(most >= 2 && frames as f64 > 1.8 * serial, "{frames} frames in 3 s from a 25 Hz source, {decode_secs:.3} s a decode, at most {most} at once (one at a time: {serial:.0})");
     client.close().await;
     running.shutdown().await.unwrap();
 }
@@ -706,6 +815,64 @@ async fn encode_options_reach_the_encoding_and_quality_caps_it() {
     let refused = client.subscribe("echo/a", options(serde_json::json!({"colour": "red"}))).await.err().unwrap().to_string();
     assert!(refused.contains("prefix and fields"), "the encoding refuses options it doesn't know: {refused}");
     client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_lease_moves_the_cameras_to_the_newest_viewer() {
+    let (running, session, url) = start().await;
+    let _camera = keep_putting(&session, "robot/cam/front", b"frame".to_vec());
+    let _tf = keep_putting(&session, "robot/tf", b"tf".to_vec());
+    let options = ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 20, ..Default::default() };
+    let seat = || LeaseOptions { publish: vec!["robot/cmd_vel".into()], subscribe: vec!["robot/cam/**".into()], allow_takeover: true, ..Default::default() };
+    let old_viewer = Client::connect(&url, options.clone()).await.unwrap();
+    let old_lease = old_viewer.lease_with(seat()).await.unwrap();
+    assert!(old_lease.group.starts_with('#'), "unnamed: {}", old_lease.group);
+    let mut old_camera = old_viewer.subscribe("robot/cam/front", SubscribeOptions::default()).await.unwrap();
+    let mut old_tf = old_viewer.subscribe("robot/tf", SubscribeOptions::default()).await.unwrap();
+    assert!(timeout(Duration::from_secs(5), old_camera.recv()).await.unwrap().is_some());
+    // without the lease, another client's subscription to a leased key is refused
+    let bystander = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let refused = bystander.subscribe("robot/cam/front", SubscribeOptions::default()).await.err().expect("refused").to_string();
+    assert!(refused.contains("leased by another client"), "{refused}");
+    let new_viewer = Client::connect(&url, options).await.unwrap();
+    let new_lease = new_viewer.lease_with(seat()).await.unwrap();
+    assert_eq!(timeout(Duration::from_secs(5), old_lease.wait_lost()).await.unwrap(), "takenOver");
+    let ended = timeout(Duration::from_secs(8), async { while old_camera.recv().await.is_some() {} }).await;
+    assert!(ended.is_ok(), "the old viewer's camera ended with its lease");
+    assert!(timeout(Duration::from_secs(5), old_tf.recv()).await.unwrap().is_some(), "keys outside the lease stay");
+    let mut new_camera = new_viewer.subscribe("robot/cam/front", SubscribeOptions::default()).await.unwrap();
+    assert!(timeout(Duration::from_secs(5), new_camera.recv()).await.unwrap().is_some());
+    // a hard lease (no allowTakeover) takes over a takeover one, and then refuses the next
+    let hard = old_viewer.lease_with(LeaseOptions { subscribe: vec!["robot/cam/**".into()], ..Default::default() }).await.unwrap();
+    assert_eq!(timeout(Duration::from_secs(5), new_lease.wait_lost()).await.unwrap(), "takenOver");
+    let refused = new_viewer.lease_with(seat()).await.err().expect("a hard lease refuses").to_string();
+    assert!(refused.contains("held by another client"), "{refused}");
+    drop(hard);
+    // a lease's own timeoutMs outlasts the connection's 2 s heartbeat deadline, which still trips deadmen and leases without one
+    let stalling = Client::connect(&url, ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 20, ..Default::default() }).await.unwrap();
+    let patient = stalling.lease_with(LeaseOptions { publish: vec!["robot/patient".into()], timeout_ms: Some(5000.0), ..Default::default() }).await.unwrap();
+    assert_eq!(patient.timeout_ms, Some(5000.0), "the gateway says it applies the timeout");
+    let tight = stalling.lease_with(LeaseOptions { publish: vec!["robot/tight".into()], ..Default::default() }).await.unwrap();
+    stalling.pause_heartbeat(true);
+    assert_eq!(timeout(Duration::from_secs(4), tight.wait_lost()).await.unwrap(), "heartbeat");
+    assert!(patient.lost().is_none(), "3 s silent: the 5 s lease holds");
+    stalling.pause_heartbeat(false);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(patient.lost().is_none(), "beats resumed before 5 s: still held");
+    stalling.pause_heartbeat(true);
+    assert_eq!(timeout(Duration::from_secs(8), patient.wait_lost()).await.unwrap(), "heartbeat");
+    let refused = stalling.lease_with(LeaseOptions { publish: vec!["robot/x".into()], timeout_ms: Some(61_000.0), ..Default::default() }).await.err().expect("over 60 s").to_string();
+    assert!(refused.contains("timeoutMs must be at most 60000"), "{refused}");
+    stalling.close().await;
+    // a heartbeat slower than the server's slowest_lease_heartbeat_allowed (default 60 s) gets no lease
+    let sleepy = Client::connect(&url, ClientOptions { heartbeat_hz: 0.01, heartbeat_misses: 3, ..Default::default() }).await.unwrap();
+    let refused = sleepy.lease_with(LeaseOptions { publish: vec!["robot/arm".into()], ..Default::default() }).await.err().expect("too slow").to_string();
+    assert!(refused.contains("at most 60 s, got 300 s"), "{refused}");
+    sleepy.close().await;
+    for client in [old_viewer, new_viewer, bystander] {
+        client.close().await;
+    }
     running.shutdown().await.unwrap();
 }
 

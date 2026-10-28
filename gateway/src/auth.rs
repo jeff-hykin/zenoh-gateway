@@ -282,9 +282,40 @@ impl Access<'_> {
 
 struct Held {
     holder: u64,
-    keys: Vec<String>,
+    publish: Vec<String>,
+    subscribe: Vec<String>,
+    /// a newer lease on overlapping keys ends this one instead of being refused
+    takeover: bool,
+    /// heartbeat silence that ends it; None: the connection's heartbeat deadline
+    timeout: Option<Duration>,
     expires: Option<Instant>,
     serial: u64,
+}
+
+/// What a client asks to lease (`lease` op).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LeaseRequest {
+    /// keys only the holder may publish on (a server-defined group's own keys win)
+    pub publish: Option<Vec<String>>,
+    /// keys only the holder may subscribe to
+    pub subscribe: Vec<String>,
+    pub takeover: bool,
+    pub max_secs: Option<f64>,
+    /// heartbeat silence that ends it (`timeoutMs`); None: the connection's heartbeat deadline
+    pub timeout: Option<Duration>,
+}
+
+/// A lease taken.
+#[derive(Debug)]
+pub(crate) struct Taken {
+    /// its name: the one asked for, else `#<serial>`
+    pub group: String,
+    pub publish: Vec<String>,
+    pub subscribe: Vec<String>,
+    pub expires_in: Option<Duration>,
+    pub serial: u64,
+    /// (group, holder) of the takeover leases this one ended
+    pub taken_over: Vec<(String, u64)>,
 }
 
 /// The gateway's leases, shared by every frontend.
@@ -294,33 +325,45 @@ pub(crate) struct Leases {
     groups: HashMap<String, Vec<String>>,
     held: Mutex<HashMap<String, Held>>,
     serials: AtomicU64,
+    /// the longest heartbeat deadline (misses / hz) a lease holder may have (`ServerBuilder::slowest_lease_heartbeat_allowed`)
+    pub slowest_heartbeat: Duration,
     /// bumped when a lease is taken or ends, and when a subscription opens or closes ([`crate::Server::changes`])
     pub changes: tokio::sync::watch::Sender<u64>,
 }
 
-fn overlaps(a: &[String], b: &[String]) -> bool {
+pub(crate) fn overlaps(a: &[String], b: &[String]) -> bool {
     a.iter().any(|a| b.iter().any(|b| keyexpr::new(a).is_ok_and(|a| keyexpr::new(b).is_ok_and(|b| a.intersects(b)))))
 }
 
 impl Leases {
-    pub fn new(groups: HashMap<String, Vec<String>>) -> Self {
-        Leases { groups, ..Default::default() }
+    pub fn new(groups: HashMap<String, Vec<String>>, slowest_heartbeat: Duration) -> Self {
+        Leases { groups, slowest_heartbeat, ..Default::default() }
     }
 
-    /// Takes (or renews) `group` for `peer`: the server's keys for it, else `keys`, all within the grant.
-    /// Returns the keys, when it ends at the latest, and its serial number.
-    pub fn take(&self, peer: u64, grant: &Grant, group: &str, keys: Option<Vec<String>>, max_secs: Option<f64>) -> Result<(Vec<String>, Option<Duration>, u64), String> {
-        if !grant.lease_groups.iter().any(|allowed| allowed == "*" || allowed == group) {
-            return Err(format!("not authorized to lease {group:?}"));
+    /// Takes (or renews) `group` for `peer`: the server's publish keys for it, else the request's, all within the grant.
+    /// Another client's lease on the same group or overlapping keys refuses it, unless that lease is `takeover`: then
+    /// it ends (its holder is in `taken_over`). An unnamed lease needs a grant that may lease any group (`*`).
+    pub fn take(&self, peer: u64, grant: &Grant, group: Option<&str>, request: LeaseRequest) -> Result<Taken, String> {
+        if !grant.lease_groups.iter().any(|allowed| allowed == "*" || Some(allowed.as_str()) == group) {
+            return Err(match group {
+                Some(group) => format!("not authorized to lease {group:?}"),
+                None => "not authorized to lease without a group name".into(),
+            });
         }
-        let keys = match self.groups.get(group) {
-            Some(keys) => keys.clone(),
-            None => keys.filter(|keys| !keys.is_empty()).ok_or_else(|| format!("no lease group {group:?} on the server; pass keys to define it"))?,
-        };
-        for key in &keys {
-            grant.allows(Action::Publish, key).map_err(|_| format!("not authorized to lease {key:?}"))?;
+        let serial = self.serials.fetch_add(1, Ordering::Relaxed);
+        let group = group.map_or_else(|| format!("#{serial}"), str::to_owned);
+        let group = group.as_str();
+        let publish = self.groups.get(group).cloned().or(request.publish).unwrap_or_default();
+        let subscribe = request.subscribe;
+        if publish.is_empty() && subscribe.is_empty() {
+            return Err(format!("no lease group {group:?} on the server; pass publish or subscribe keys to define it"));
         }
-        let secs = match (max_secs, grant.max_lease_secs) {
+        for (action, keys) in [(Action::Publish, &publish), (Action::Subscribe, &subscribe)] {
+            for key in keys {
+                grant.allows(action, key).map_err(|_| format!("not authorized to lease {key:?}"))?;
+            }
+        }
+        let secs = match (request.max_secs, grant.max_lease_secs) {
             (Some(asked), Some(limit)) => Some(asked.min(limit)),
             (asked, limit) => asked.or(limit),
         };
@@ -328,13 +371,20 @@ impl Leases {
         let mut held = self.held.lock();
         let now = Instant::now();
         held.retain(|_, lease| lease.expires.is_none_or(|at| at > now));
-        if let Some((name, _)) = held.iter().find(|(name, lease)| lease.holder != peer && (*name == group || overlaps(&lease.keys, &keys))) {
+        let conflicts: Vec<String> = held
+            .iter()
+            .filter(|(name, lease)| lease.holder != peer && (*name == group || overlaps(&lease.publish, &publish) || overlaps(&lease.subscribe, &subscribe)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if let Some(name) = conflicts.iter().find(|name| !held[*name].takeover) {
             return Err(format!("lease {group:?} conflicts with {name:?}, held by another client"));
         }
-        let serial = self.serials.fetch_add(1, Ordering::Relaxed);
-        held.insert(group.to_owned(), Held { holder: peer, keys: keys.clone(), expires: expires_in.and_then(|after| now.checked_add(after)), serial });
-        self.changed();
-        Ok((keys, expires_in, serial))
+        let taken_over = conflicts.into_iter().filter_map(|name| held.remove(&name).map(|lease| (name, lease.holder))).collect();
+        let expires = expires_in.and_then(|after| now.checked_add(after));
+        held.insert(group.to_owned(), Held { holder: peer, publish: publish.clone(), subscribe: subscribe.clone(), takeover: request.takeover, timeout: request.timeout, expires, serial });
+        // no `changed()` here: the caller announces it once the holder has its reply, or something reacting to the
+        // change could end it and send `leaseLost` ahead of the grant (which the client then never matched)
+        Ok(Taken { group: group.to_owned(), publish, subscribe, expires_in, serial, taken_over })
     }
 
     /// Ends `group` if `which(holder, serial)` says so, returning the holder.
@@ -346,11 +396,25 @@ impl Leases {
         Some(holder)
     }
 
+    /// Whether `group` is still the lease numbered `serial`.
+    pub fn is_held(&self, group: &str, serial: u64) -> bool {
+        self.held.lock().get(group).is_some_and(|lease| lease.serial == serial)
+    }
+
     /// Ends every lease `peer` holds, returning their groups.
     pub fn release_all(&self, peer: u64) -> Vec<String> {
+        self.release_where(peer, |_| true)
+    }
+
+    /// Ends the leases `peer` holds that follow the connection's heartbeat deadline (no `timeout` of their own).
+    pub fn release_on_heartbeat_deadline(&self, peer: u64) -> Vec<String> {
+        self.release_where(peer, |lease| lease.timeout.is_none())
+    }
+
+    fn release_where(&self, peer: u64, which: impl Fn(&Held) -> bool) -> Vec<String> {
         let mut held = self.held.lock();
-        let groups: Vec<String> = held.iter().filter(|(_, lease)| lease.holder == peer).map(|(group, _)| group.clone()).collect();
-        held.retain(|_, lease| lease.holder != peer);
+        let groups: Vec<String> = held.iter().filter(|(_, lease)| lease.holder == peer && which(lease)).map(|(group, _)| group.clone()).collect();
+        held.retain(|group, _| !groups.contains(group));
         if !groups.is_empty() {
             self.changed();
         }
@@ -361,18 +425,27 @@ impl Leases {
         self.changes.send_modify(|version| *version += 1);
     }
 
-    /// The live leases: group and keys.
+    /// The live leases: group and publish keys.
     pub fn held(&self) -> Vec<(String, Vec<String>)> {
         let now = Instant::now();
-        self.held.lock().iter().filter(|(_, lease)| lease.expires.is_none_or(|at| at > now)).map(|(group, lease)| (group.clone(), lease.keys.clone())).collect()
+        self.held.lock().iter().filter(|(_, lease)| lease.expires.is_none_or(|at| at > now)).map(|(group, lease)| (group.clone(), lease.publish.clone())).collect()
     }
 
     /// Why `peer` may not publish on `key` right now: another client's live lease covers it.
     pub fn blocker(&self, peer: u64, key: &str) -> Option<String> {
+        self.find_blocker(peer, key, |lease| &lease.publish)
+    }
+
+    /// Why `peer` may not subscribe to `key` right now: another client's live lease covers it.
+    pub fn subscribe_blocker(&self, peer: u64, key: &str) -> Option<String> {
+        self.find_blocker(peer, key, |lease| &lease.subscribe)
+    }
+
+    fn find_blocker(&self, peer: u64, key: &str, keys: impl Fn(&Held) -> &Vec<String>) -> Option<String> {
         let held = self.held.lock();
         let now = Instant::now();
         held.iter()
-            .find(|(_, lease)| lease.holder != peer && lease.expires.is_none_or(|at| at > now) && overlaps(&lease.keys, &[key.to_owned()]))
+            .find(|(_, lease)| lease.holder != peer && lease.expires.is_none_or(|at| at > now) && overlaps(keys(lease), &[key.to_owned()]))
             .map(|(group, _)| format!("{key:?} is leased by another client (group {group:?})"))
     }
 }
@@ -382,7 +455,12 @@ mod tests {
     use super::*;
 
     fn grant(publish: &[&str], groups: &[&str], max: Option<f64>) -> Grant {
-        Grant { publish: publish.iter().map(|key| key.to_string()).collect(), lease_groups: groups.iter().map(|group| group.to_string()).collect(), max_lease_secs: max, ..Default::default() }
+        let keys: Vec<String> = publish.iter().map(|key| key.to_string()).collect();
+        Grant { subscribe: keys.clone(), publish: keys, lease_groups: groups.iter().map(|group| group.to_string()).collect(), max_lease_secs: max, ..Default::default() }
+    }
+
+    fn publish(keys: Option<Vec<String>>, max_secs: Option<f64>) -> LeaseRequest {
+        LeaseRequest { publish: keys, max_secs, ..Default::default() }
     }
 
     #[test]
@@ -407,21 +485,21 @@ mod tests {
 
     #[test]
     fn leases_exclude_other_clients() {
-        let leases = Leases::new(HashMap::from([("arm".to_owned(), vec!["robot/arm/**".to_owned()])]));
+        let leases = Leases::new(HashMap::from([("arm".to_owned(), vec!["robot/arm/**".to_owned()])]), Duration::from_secs(60));
         let writer = grant(&["robot/**"], &["*"], Some(10.0));
-        let (keys, expires_in, _) = leases.take(1, &writer, "arm", None, Some(60.0)).unwrap();
+        let (keys, expires_in, _) = leases.take(1, &writer, Some("arm"), publish(None, Some(60.0))).map(|taken| (taken.publish, taken.expires_in, taken.serial)).unwrap();
         assert_eq!((keys, expires_in), (vec!["robot/arm/**".to_owned()], Some(Duration::from_secs(10))));
         assert!(leases.blocker(1, "robot/arm/cmd").is_none(), "the holder publishes");
         assert_eq!(leases.blocker(2, "robot/arm/cmd").unwrap(), "\"robot/arm/cmd\" is leased by another client (group \"arm\")");
         assert!(leases.blocker(2, "robot/base/cmd").is_none());
         // a second client can't take it, nor an ad-hoc group overlapping it
-        assert!(leases.take(2, &writer, "arm", None, None).unwrap_err().contains("held by another client"));
-        assert!(leases.take(2, &writer, "mine", Some(vec!["robot/*/cmd".into()]), None).is_err());
-        assert!(leases.take(2, &writer, "base", Some(vec!["robot/base/**".into()]), None).is_ok());
+        assert!(leases.take(2, &writer, Some("arm"), publish(None, None)).unwrap_err().contains("held by another client"));
+        assert!(leases.take(2, &writer, Some("mine"), publish(Some(vec!["robot/*/cmd".into()]), None)).is_err());
+        assert!(leases.take(2, &writer, Some("base"), publish(Some(vec!["robot/base/**".into()]), None)).is_ok());
         // only the holder releases; then the other client may take it
         assert_eq!(leases.end("arm", |holder, _| holder == 2), None);
         assert_eq!(leases.end("arm", |holder, _| holder == 1), Some(1));
-        assert!(leases.take(2, &writer, "arm", None, None).is_ok());
+        assert!(leases.take(2, &writer, Some("arm"), publish(None, None)).is_ok());
         let mut released = leases.release_all(2);
         released.sort();
         assert_eq!(released, ["arm", "base"]);
@@ -431,22 +509,42 @@ mod tests {
     #[test]
     fn leases_respect_the_grant() {
         let leases = Leases::default();
-        assert!(leases.take(1, &grant(&["robot/**"], &["arm"], None), "base", Some(vec!["robot/base".into()]), None).unwrap_err().contains("not authorized to lease"));
-        assert!(leases.take(1, &grant(&["robot/arm/**"], &["*"], None), "x", Some(vec!["robot/**".into()]), None).unwrap_err().contains("not authorized to lease \"robot/**\""));
-        assert!(leases.take(1, &grant(&["**"], &["*"], None), "x", None, None).unwrap_err().contains("pass keys"));
-        assert!(leases.take(1, &grant(&["**"], &["*"], None), "x", Some(vec!["a".into()]), Some(-1.0)).is_err());
+        assert!(leases.take(1, &grant(&["robot/**"], &["arm"], None), Some("base"), publish(Some(vec!["robot/base".into()]), None)).unwrap_err().contains("not authorized to lease"));
+        assert!(leases.take(1, &grant(&["robot/arm/**"], &["*"], None), Some("x"), publish(Some(vec!["robot/**".into()]), None)).unwrap_err().contains("not authorized to lease \"robot/**\""));
+        assert!(leases.take(1, &grant(&["**"], &["*"], None), Some("x"), publish(None, None)).unwrap_err().contains("pass publish or subscribe keys"));
+        assert!(leases.take(1, &grant(&["**"], &["*"], None), Some("x"), publish(Some(vec!["a".into()]), Some(-1.0))).is_err());
+    }
+
+    #[test]
+    fn a_takeover_lease_goes_to_the_newest_and_a_hard_one_refuses() {
+        let leases = Leases::default();
+        let everything = grant(&["**"], &["*"], None);
+        let seat = |takeover| LeaseRequest { publish: Some(vec!["robot/cmd_vel".into()]), subscribe: vec!["robot/cam/**".into()], takeover, max_secs: None, timeout: None };
+        let first = leases.take(1, &everything, Some("robot_control"), seat(true)).unwrap();
+        assert!(first.taken_over.is_empty());
+        assert!(leases.subscribe_blocker(2, "robot/cam/front").is_some());
+        assert!(leases.subscribe_blocker(1, "robot/cam/front").is_none(), "the holder subscribes");
+        assert!(leases.subscribe_blocker(2, "robot/tf").is_none());
+        assert!(leases.blocker(2, "robot/cam/front").is_none(), "subscribe keys don't block publishing");
+        // overlapping only on subscribe keys, under another name: still taken over
+        let second = leases.take(2, &everything, Some("viewer"), LeaseRequest { subscribe: vec!["robot/cam/front".into()], ..Default::default() }).unwrap();
+        assert_eq!(second.taken_over, [("robot_control".to_owned(), 1)]);
+        assert!(leases.subscribe_blocker(1, "robot/cam/front").is_some());
+        assert!(leases.blocker(1, "robot/cmd_vel").is_none(), "the lost lease's publish keys are free");
+        // `viewer` isn't takeover: a third client is refused
+        assert!(leases.take(3, &everything, Some("robot_control"), seat(true)).unwrap_err().contains("held by another client"));
     }
 
     #[test]
     fn leases_expire() {
         let leases = Leases::default();
         let everything = grant(&["**"], &["*"], None);
-        let (_, _, first) = leases.take(1, &everything, "g", Some(vec!["a/b".into()]), Some(0.05)).unwrap();
+        let first = leases.take(1, &everything, Some("g"), publish(Some(vec!["a/b".into()]), Some(0.05))).unwrap().serial;
         assert!(leases.blocker(2, "a/b").is_some());
         std::thread::sleep(Duration::from_millis(80));
         assert!(leases.blocker(2, "a/b").is_none(), "past maxSeconds it blocks no one");
         // a renewal gets a new serial, so the old timer doesn't end it
-        let (_, _, renewed) = leases.take(1, &everything, "g", Some(vec!["a/b".into()]), None).unwrap();
+        let renewed = leases.take(1, &everything, Some("g"), publish(Some(vec!["a/b".into()]), None)).unwrap().serial;
         assert_eq!(leases.end("g", |_, serial| serial == first), None);
         assert_eq!(leases.end("g", |_, serial| serial == renewed), Some(1));
     }
