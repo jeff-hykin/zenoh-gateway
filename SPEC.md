@@ -425,9 +425,12 @@ Microphone (browser → zenoh), `publishAudio(key, track, { encoding, sampleRate
   the packet's own channel count) and handed to the encoding's `encode_pcm(&AudioPcm) -> Vec<u8>` (a `MessageEncoding`
   method with a default error; the encoding must be an audio one), whose bytes are put on the key. Unreadable packets
   and `encode_pcm` errors count as `malformed`;
-- the publish grant, leases (`blocked`), the deadman and `priority` are a data-channel publisher's; `latencyLimit`
-  compares each packet's arrival against its RTP time, relative to the least-delayed packet so far (the page's capture
-  clock and the gateway's needn't agree), and drops later ones;
+- the publish grant, leases (`blocked`), the deadman, `priority` and `latencyLimit` are a data-channel publisher's. A
+  packet's page time is its capture time: its RTP timestamp through the stream's newest RTCP sender report (RTP time ↔
+  the page's NTP wallclock, which Chrome keeps on the same system clock as `performance.timeOrigin + performance.now()`);
+  the connection's clock sync brings it to the gateway's clock, as for a data put's stamp, so the age in the stats
+  (`lastAgeMs`) is capture to arrival. Until the first sender report and clock offset, packets go out counted as
+  `unsynced`;
 - lost packets are skipped, not concealed (no PLC/FEC).
 
 ### Video

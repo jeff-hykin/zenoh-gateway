@@ -177,6 +177,8 @@ struct PeerState {
     /// the browser's own tracks (microphones) by mid, from their first packet on; the counter ticks on each new one
     remote_tracks: Mutex<HashMap<String, Arc<dyn TrackRemote>>>,
     remote_tracks_added: tokio::sync::watch::Sender<u64>,
+    /// the browser's RTCP sender reports: its tracks' RTP time on its wall clock
+    sender_reports: Arc<media::SenderReports>,
     video_rate: Arc<media::VideoRate>,
     config: AllocationConfig,
     gate: Arc<SendGate>,
@@ -227,6 +229,7 @@ impl PeerState {
         peer_id: u64,
         gateway: &Arc<Gateway>,
         video_rate: Arc<media::VideoRate>,
+        sender_reports: Arc<media::SenderReports>,
         token: Option<String>,
         grant: Grant,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<Value>) {
@@ -258,6 +261,7 @@ impl PeerState {
             tracks: Mutex::new(HashMap::new()),
             remote_tracks: Mutex::new(HashMap::new()),
             remote_tracks_added: tokio::sync::watch::Sender::new(0),
+            sender_reports,
             video_rate,
             config,
             gate: Arc::default(),
@@ -573,8 +577,8 @@ impl Gateway {
     async fn answer_as(self: &Arc<Self>, peer_id: u64, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
         let request = ice::IceRequest { side: ice::IceSide::Gateway, token: token.clone() };
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
-        let (media_engine, interceptors, video_rate) = media::media_setup()?;
-        let (state, mut api_events) = PeerState::new(peer_id, self, video_rate, token, grant);
+        let (media_engine, interceptors, video_rate, sender_reports) = media::media_setup()?;
+        let (state, mut api_events) = PeerState::new(peer_id, self, video_rate, sender_reports, token, grant);
         let state = Arc::new(state);
         let mut pending = PendingPeer { gateway: Arc::downgrade(self), peer_id, state: state.clone(), connection: None, armed: true };
         let forwarder = Arc::downgrade(&state);
@@ -898,7 +902,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
                             () = microphone::closed(&dc) => None,
                         };
                         if let Some(track) = track {
-                            microphone::run(dc.clone(), label.clone(), opts, session, shared, microphone::Microphone { track, encoding }, blocker).await;
+                            microphone::run(dc.clone(), label.clone(), opts, session, shared, microphone::Microphone { track, encoding, sender_reports: state.sender_reports.clone(), clock_offset_ms: state.clock_offset_ms.clone() }, blocker).await;
                         }
                     }
                     _ => publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker).await,

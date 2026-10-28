@@ -716,7 +716,7 @@ impl Client {
         };
         let ice_servers = ice_servers.into_iter().map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential }).collect();
         let policy = if options.relay_only || server_relay_only { RTCIceTransportPolicy::Relay } else { RTCIceTransportPolicy::All };
-        let (media_engine, interceptors, _) = media::media_setup()?;
+        let (media_engine, interceptors, _, _) = media::media_setup()?;
         let connection: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
                 .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).with_ice_transport_policy(policy).build())

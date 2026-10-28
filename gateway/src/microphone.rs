@@ -8,7 +8,8 @@ use crate::publisher::{self, Admission, PubShared};
 use anyhow::{Result, ensure};
 use log::debug;
 use std::sync::Arc;
-use std::time::Instant;
+use crate::media::SenderReports;
+use parking_lot::Mutex;
 use unsafe_libopus::{OpusDecoder, opus_decode, opus_decoder_create, opus_decoder_destroy, opus_packet_get_nb_channels, opus_packet_get_nb_samples};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
@@ -57,46 +58,41 @@ impl Drop for Decoder {
     }
 }
 
-/// How late each packet is next to the stream's least-delayed one: arrival time minus RTP time, against the smallest
-/// such difference seen (the one-way delay variation; the browser's capture clock and ours needn't agree).
-#[derive(Default)]
-struct Lateness {
-    started: Option<Instant>,
-    /// the last RTP timestamp, and the unwrapped count before it
-    last_rtp: Option<(u32, i64)>,
-    least_ms: Option<f64>,
+/// Seconds from the NTP epoch (1900) to the Unix epoch (1970).
+const NTP_UNIX_OFFSET_SECS: u64 = 2_208_988_800;
+
+/// A 32.32 fixed-point NTP time as Unix milliseconds.
+fn ntp_to_unix_ms(ntp: u64) -> f64 {
+    let seconds = (ntp >> 32) as f64 - NTP_UNIX_OFFSET_SECS as f64;
+    let fraction = (ntp & 0xffff_ffff) as f64 / (1u64 << 32) as f64;
+    (seconds + fraction) * 1000.0
 }
 
-impl Lateness {
-    fn of(&mut self, rtp_timestamp: u32, arrived: Instant) -> f64 {
-        let started = *self.started.get_or_insert(arrived);
-        let unwrapped = match self.last_rtp {
-            Some((last, unwrapped)) => unwrapped + rtp_timestamp.wrapping_sub(last) as i32 as i64,
-            None => 0,
-        };
-        self.last_rtp = Some((rtp_timestamp, unwrapped));
-        let offset_ms = arrived.duration_since(started).as_secs_f64() * 1000.0 - unwrapped as f64 / OPUS_RTP_CLOCK_HZ * 1000.0;
-        let least = self.least_ms.map_or(offset_ms, |least| least.min(offset_ms));
-        self.least_ms = Some(least);
-        offset_ms - least
-    }
+/// When the audio in a packet stamped `rtp_timestamp` was captured, on the page's wall clock (Unix ms), from the
+/// stream's sender report `(ntp, rtp)`: the RTP clock runs at `clock_hz` and wraps.
+fn capture_ms(rtp_timestamp: u32, (report_ntp, report_rtp): (u64, u32), clock_hz: f64) -> f64 {
+    let ticks = rtp_timestamp.wrapping_sub(report_rtp) as i32 as f64;
+    ntp_to_unix_ms(report_ntp) + ticks / clock_hz * 1000.0
 }
 
 /// A browser track and the encoding that turns its audio into messages.
 pub struct Microphone {
     pub track: Arc<dyn TrackRemote>,
     pub encoding: Arc<dyn MessageEncoding>,
+    /// the browser's RTCP sender reports: RTP time to its wall clock
+    pub sender_reports: Arc<SenderReports>,
+    /// the connection's clock sync (gateway clock minus the page's)
+    pub clock_offset_ms: Arc<Mutex<Option<f64>>>,
 }
 
 /// Publishes the browser's microphone track: each Opus packet decoded, encoded by its encoding and put on the key, until
 /// the channel or the track closes.
 pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session: zenoh::Session, shared: Arc<PubShared>, microphone: Microphone, blocker: impl Fn() -> Option<String>) {
-    let Microphone { track, encoding } = microphone;
+    let Microphone { track, encoding, sender_reports, clock_offset_ms } = microphone;
     let Some(zenoh_publisher) = publisher::declare(&dc, &label, &opts, &session).await else { return };
     let sample_rate = opts.sample_rate.unwrap_or(OPUS_RTP_CLOCK_HZ as u32);
     let mut decoder: Option<Decoder> = None;
     let mut admission = Admission::default();
-    let mut lateness = Lateness::default();
     loop {
         let packet = tokio::select! {
             event = track.poll() => match event {
@@ -112,14 +108,10 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
         if !admission.admit(&dc, &shared, &blocker).await {
             continue;
         }
-        let late_ms = lateness.of(packet.header.timestamp, Instant::now());
-        {
-            let mut stats = shared.stats.lock();
-            stats.last_age_ms = Some(late_ms);
-            if opts.latency_limit.is_some_and(|limit| late_ms > limit) {
-                stats.dropped_stale += 1;
-                continue;
-            }
+        // the page's capture time for the packet, as a data publisher stamps its puts: aged the same way
+        let captured_ms = sender_reports.get(packet.header.ssrc).map(|report| capture_ms(packet.header.timestamp, report, OPUS_RTP_CLOCK_HZ));
+        if !publisher::fresh(&shared, captured_ms, &clock_offset_ms, opts.latency_limit) {
+            continue;
         }
         let payload = packet.payload.to_vec();
         if payload.is_empty() {
@@ -180,7 +172,6 @@ fn malformed(shared: &PubShared, label: &Label, error: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use unsafe_libopus::{OPUS_APPLICATION_VOIP, opus_encode, opus_encoder_create, opus_encoder_destroy};
 
     fn opus_packet(channels: u8) -> Vec<u8> {
@@ -214,16 +205,15 @@ mod tests {
     }
 
     #[test]
-    fn lateness_is_against_the_least_delayed_packet() {
-        let mut lateness = Lateness::default();
-        let start = Instant::now();
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        // RTP timestamps start anywhere (here near the wrap); 960 ticks = 20 ms
-        let base = u32::MAX - 960;
-        assert_eq!(lateness.of(base, at(0)), 0.0);
-        assert_eq!(lateness.of(base.wrapping_add(960), at(20)), 0.0);
-        assert!((lateness.of(base.wrapping_add(1920), at(140)) - 100.0).abs() < 1e-6, "a packet 100 ms behind");
-        // an earlier-than-ever packet resets the baseline
-        assert_eq!(lateness.of(base.wrapping_add(2880), at(50)), 0.0);
+    fn capture_time_from_a_sender_report() {
+        // 2026-01-01T00:00:00Z plus half a second, as NTP
+        let unix_secs = 1_767_225_600u64;
+        let report_ntp = ((unix_secs + NTP_UNIX_OFFSET_SECS) << 32) | (1u64 << 31);
+        assert_eq!(ntp_to_unix_ms(report_ntp), unix_secs as f64 * 1000.0 + 500.0);
+        // the report's RTP time sits near the wrap; 960 ticks at 48 kHz = 20 ms either side
+        let report = (report_ntp, u32::MAX - 100);
+        let at = |rtp: u32| capture_ms(rtp, report, 48000.0) - ntp_to_unix_ms(report_ntp);
+        assert!((at((u32::MAX - 100).wrapping_add(960)) - 20.0).abs() < 1e-9);
+        assert!((at((u32::MAX - 100).wrapping_sub(960)) + 20.0).abs() < 1e-9);
     }
 }

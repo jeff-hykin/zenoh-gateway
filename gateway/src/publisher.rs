@@ -23,7 +23,7 @@ pub struct PubStats {
     pub malformed: u64,
     /// older than latencyLimit after clock correction
     pub dropped_stale: u64,
-    /// accepted without an age check because no clock offset was known yet
+    /// accepted without an age check: no clock offset yet (microphones: nor a sender report)
     pub unsynced: u64,
     pub rejected_tripped: u64,
     /// dropped because another client leases the key
@@ -110,6 +110,23 @@ impl Admission {
     }
 }
 
+/// Whether a put stamped `sent_at_ms` (the page's clock) is within `latency_limit` on the gateway's clock, through the
+/// connection's clock sync; records its age. Without a stamp or a clock offset yet it goes out, counted as `unsynced`.
+pub(crate) fn fresh(shared: &PubShared, sent_at_ms: Option<f64>, clock_offset_ms: &Mutex<Option<f64>>, latency_limit: Option<f64>) -> bool {
+    let mut stats = shared.stats.lock();
+    let (Some(sent_at_ms), Some(offset_ms)) = (sent_at_ms, *clock_offset_ms.lock()) else {
+        stats.unsynced += 1;
+        return true;
+    };
+    let age = age_ms(sent_at_ms, offset_ms, now_unix_ms());
+    stats.last_age_ms = Some(age);
+    if latency_limit.is_some_and(|limit| age > limit) {
+        stats.dropped_stale += 1;
+        return false;
+    }
+    true
+}
+
 /// Puts `payload` and counts the outcome.
 pub(crate) async fn put(publisher: &Publisher<'static>, payload: Vec<u8>, shared: &PubShared) {
     let result = publisher.put(payload).await;
@@ -133,24 +150,13 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
                 if !admission.admit(&dc, &shared, &blocker).await {
                     continue;
                 }
-                {
-                    let mut stats = shared.stats.lock();
-                    if message.data.len() < PUT_HEADER_LEN {
-                        stats.malformed += 1;
-                        continue;
-                    }
-                    let sent_at_ms = f64::from_le_bytes(message.data[..PUT_HEADER_LEN].try_into().unwrap());
-                    match *clock_offset_ms.lock() {
-                        Some(offset_ms) => {
-                            let age = age_ms(sent_at_ms, offset_ms, now_unix_ms());
-                            stats.last_age_ms = Some(age);
-                            if opts.latency_limit.is_some_and(|limit| age > limit) {
-                                stats.dropped_stale += 1;
-                                continue;
-                            }
-                        }
-                        None => stats.unsynced += 1,
-                    }
+                if message.data.len() < PUT_HEADER_LEN {
+                    shared.stats.lock().malformed += 1;
+                    continue;
+                }
+                let sent_at_ms = f64::from_le_bytes(message.data[..PUT_HEADER_LEN].try_into().unwrap());
+                if !fresh(&shared, Some(sent_at_ms), &clock_offset_ms, opts.latency_limit) {
+                    continue;
                 }
                 put(&publisher, message.data[PUT_HEADER_LEN..].to_vec(), &shared).await;
             }

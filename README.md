@@ -113,7 +113,7 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 
 **Microphone**: `publishAudio(key, track, { encoding })` sends an audio track (`getUserMedia`, which needs HTTPS or
 `http://localhost`) to the gateway as Opus; the gateway decodes each packet to PCM (`sampleRate`, default 48000) and puts
-the bytes its audio encoding's `encode_pcm` makes. Deadman, leases and `blocked` work as above; `put` doesn't.
+the bytes its audio encoding's `encode_pcm` makes. Deadman, leases, `blocked` and `latencyLimit` (capture to arrival, clock-synced) work as above; `put` doesn't.
 
 **Fields** messages arrive decoded in `msg.decoded`. For any other data encoding, `registerEncoding(name, decoder)`
 sets `msg.decoded = decoder(msg.bytes, msg)`. Video and audio need no decoder. Also exported: `Priority` (`REAL_TIME`

@@ -1950,8 +1950,8 @@ export class Query {
     }
 
     /** Replies that `key` (default: the query's key) was deleted. */
-    async replyDel(options: { key?: string, attachment?: Bytesish } = {}): Promise<void> {
-        await this.owner._request({ op: "replyDel", queryId: this.id, key: options.key ?? "", ...putRequestFields(options) }, pingTimeoutMs)
+    async replyDel(options: { key?: string, attachment?: Bytesish, timestamp?: number } = {}): Promise<void> {
+        await this.owner._request({ op: "replyDel", queryId: this.id, key: options.key ?? "", ...putRequestFields(options, this.owner.clockOffsetMs) }, pingTimeoutMs)
     }
 
     /** No more replies: the asker's get completes. (The gateway finalizes forgotten queries after two minutes.) */

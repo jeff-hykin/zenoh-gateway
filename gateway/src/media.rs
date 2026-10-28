@@ -16,6 +16,7 @@ use rtc::peer_connection::configuration::interceptor_registry::{CongestionFeedba
 use rtc::peer_connection::configuration::media_engine::MediaEngine;
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtcp::sender_report::SenderReport;
 use rtc::rtp::extension::HeaderExtension;
 use rtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension;
 use rtc::rtp_transceiver::rtp_sender::RTCRtpHeaderExtensionCapability;
@@ -188,8 +189,66 @@ impl Interceptor for KeyframeRequests {
     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
 }
 
-/// Track formats, RTCP reports, NACK and TWCC-fed GCC; returns the connection's video rates.
-pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
+/// The newest RTCP sender report of each of the browser's streams, by SSRC: (NTP wallclock, RTP timestamp) at one
+/// instant, which maps a packet's RTP timestamp to its capture time on the page's wall clock.
+#[derive(Default)]
+pub struct SenderReports(parking_lot::Mutex<HashMap<u32, (u64, u32)>>);
+
+impl SenderReports {
+    /// The newest (NTP time, RTP time) the stream `ssrc` reported.
+    pub fn get(&self, ssrc: u32) -> Option<(u64, u32)> {
+        self.0.lock().get(&ssrc).copied()
+    }
+}
+
+/// Files inbound sender reports in [`SenderReports`] (the chain ends them otherwise).
+struct SenderReportReader {
+    reports: Arc<SenderReports>,
+    read: VecDeque<TaggedPacket>,
+    write: VecDeque<TaggedPacket>,
+}
+
+impl rtc::sansio::Protocol<TaggedPacket, TaggedPacket, ()> for SenderReportReader {
+    type Rout = TaggedPacket;
+    type Wout = TaggedPacket;
+    type Eout = ();
+    type Error = rtc::shared::error::Error;
+    type Time = Instant;
+
+    fn handle_read(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
+        if let Packet::Rtcp(packets) = &message.message.packet {
+            for report in packets.iter().filter_map(|packet| packet.as_any().downcast_ref::<SenderReport>()) {
+                self.reports.0.lock().insert(report.ssrc, (report.ntp_time, report.rtp_time));
+            }
+        }
+        self.read.push_back(message);
+        Ok(())
+    }
+
+    fn poll_read(&mut self) -> Option<TaggedPacket> {
+        self.read.pop_front()
+    }
+
+    fn handle_write(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
+        self.write.push_back(message);
+        Ok(())
+    }
+
+    fn poll_write(&mut self) -> Option<TaggedPacket> {
+        self.write.pop_front()
+    }
+}
+
+impl Interceptor for SenderReportReader {
+    fn bind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
+}
+
+/// Track formats, RTCP reports, NACK and TWCC-fed GCC; returns the connection's video rates and the browser's sender
+/// reports.
+pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>, Arc<SenderReports>)> {
     let mut media_engine = MediaEngine::default();
     for (mime, payload_type) in FORMATS {
         let kind = if mime == OPUS { RtpCodecKind::Audio } else { RtpCodecKind::Video };
@@ -199,8 +258,12 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
     let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(0f64.to_bits()) });
     let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone() };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
-    let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default());
-    Ok((media_engine, registry, rate))
+    let reports = Arc::new(SenderReports::default());
+    let reader = SenderReportReader { reports: reports.clone(), read: VecDeque::new(), write: VecDeque::new() };
+    let registry = register_default_interceptors(registry, &mut media_engine)?
+        .with(Slot::Custom(14_000), KeyframeRequests::default())
+        .with(Slot::Custom(14_001), reader);
+    Ok((media_engine, registry, rate, reports))
 }
 
 pub struct MediaTrack {
