@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 372" width="960" height="372" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    .bg { fill: #ffffff; }
+    .ink { fill: #1f2328; }
+    .muted { fill: #59636e; }
+    .line { stroke: #8c959f; }
+    .card { fill: #f6f8fa; stroke: #d0d7de; }
+    .chrome { fill: #eaeef2; }
+    .gw { fill: #fff4e5; stroke: #e07b00; }
+    .gwink { fill: #b35900; }
+    .rtc { stroke: #e07b00; }
+    .rtcink { fill: #b35900; }
+    .z { stroke: #0969da; }
+    .zink { fill: #0969da; }
+    .node { fill: #ddf4ff; stroke: #0969da; }
+    .video { fill: #1f2328; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .ink { fill: #e6edf3; }
+      .muted { fill: #9198a1; }
+      .line { stroke: #3d444d; }
+      .card { fill: #151b23; stroke: #3d444d; }
+      .chrome { fill: #212830; }
+      .gw { fill: #2d1d0b; stroke: #f0883e; }
+      .gwink { fill: #f0a35e; }
+      .rtc { stroke: #f0883e; }
+      .rtcink { fill: #f0a35e; }
+      .z { stroke: #4493f8; }
+      .zink { fill: #4493f8; }
+      .node { fill: #0c2d4f; stroke: #4493f8; }
+      .video { fill: #000000; }
+    }
+  </style>
+  <defs><filter id="soft" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="8"/></filter></defs>
+  <rect class="bg" width="960" height="372" rx="12"/>
+
+  <!-- browser: a window turned toward the gateway -->
+  <g transform="translate(40,60) matrix(0.86,0.14,0,1,0,0)">
+    <rect x="4" y="10" width="230" height="200" rx="12" fill="#000000" opacity="0.18" filter="url(#soft)"/>
+    <rect class="card" width="230" height="200" rx="12" stroke-width="1.5"/>
+    <path class="chrome" d="M0 12a12 12 0 0 1 12-12h206a12 12 0 0 1 12 12v18H0z"/>
+    <circle cx="16" cy="15" r="4.5" fill="#ff5f57"/><circle cx="30" cy="15" r="4.5" fill="#febc2e"/><circle cx="44" cy="15" r="4.5" fill="#28c840"/>
+    <rect class="video" x="18" y="46" width="194" height="100" rx="8"/>
+    <path d="M104 80l26 16-26 16z" fill="#ffffff" opacity="0.85"/>
+    <rect class="chrome" x="18" y="160" width="120" height="10" rx="5"/>
+    <rect class="chrome" x="18" y="178" width="80" height="10" rx="5"/>
+  </g>
+  <text class="ink" x="139" y="330" font-size="15" font-weight="600" text-anchor="middle">Browser</text>
+  <text class="muted" x="139" y="348" font-size="12" text-anchor="middle">zenoh_gateway.ts · no install</text>
+
+  <!-- browser ↔ gateway -->
+  <g>
+    <line class="rtc" x1="284" y1="150" x2="380" y2="150" stroke-width="2.5"/>
+    <line class="rtc" x1="284" y1="166" x2="380" y2="166" stroke-width="2.5" stroke-dasharray="6 5"/>
+    <line class="rtc" x1="284" y1="182" x2="380" y2="182" stroke-width="2.5" stroke-dasharray="2 4"/>
+    <text class="rtcink" x="332" y="132" font-size="13" font-weight="600" text-anchor="middle">WebRTC</text>
+    <text class="muted" x="332" y="206" font-size="10.5" text-anchor="middle">a lane per stream</text>
+    <text class="muted" x="332" y="220" font-size="10.5" text-anchor="middle">weak wifi / phone</text>
+  </g>
+
+  <!-- gateway -->
+  <g transform="translate(390,84)">
+    <rect class="gw" width="190" height="168" rx="12" stroke-width="2"/>
+    <text class="gwink" x="95" y="30" font-size="15" font-weight="700" text-anchor="middle">zenoh-gateway</text>
+    <text class="muted" x="95" y="48" font-size="11" text-anchor="middle">Rust, in your process</text>
+    <g font-size="11.5" class="ink">
+      <text x="18" y="78">▸ bandwidth per browser</text>
+      <text x="18" y="98">▸ H.264 / AV1 / Opus encode</text>
+      <text x="18" y="118">▸ encodings (msg → bytes)</text>
+      <text x="18" y="138">▸ tokens · leases · deadman</text>
+    </g>
+  </g>
+  <text class="ink" x="485" y="330" font-size="15" font-weight="600" text-anchor="middle">Gateway</text>
+  <text class="muted" x="485" y="348" font-size="12" text-anchor="middle">a normal zenoh peer</text>
+
+  <!-- gateway ↔ network -->
+  <line class="z" x1="590" y1="168" x2="672" y2="168" stroke-width="2.5"/>
+  <text class="zink" x="631" y="152" font-size="13" font-weight="600" text-anchor="middle">zenoh</text>
+
+  <!-- network -->
+  <g class="line" stroke-width="1.5">
+    <line x1="700" y1="168" x2="770" y2="96"/>
+    <line x1="700" y1="168" x2="790" y2="196"/>
+    <line x1="770" y1="96" x2="868" y2="84"/>
+    <line x1="770" y1="96" x2="790" y2="196"/>
+    <line x1="790" y1="196" x2="884" y2="168"/>
+    <line x1="790" y1="196" x2="760" y2="276"/>
+    <line x1="868" y1="84" x2="884" y2="168"/>
+    <line x1="884" y1="168" x2="864" y2="268"/>
+    <line x1="760" y1="276" x2="864" y2="268"/>
+  </g>
+  <g stroke-width="1.5">
+    <circle class="node" cx="700" cy="168" r="22"/>
+    <circle class="node" cx="770" cy="96" r="22"/>
+    <circle class="node" cx="790" cy="196" r="22"/>
+    <circle class="node" cx="868" cy="84" r="22"/>
+    <circle class="node" cx="884" cy="168" r="22"/>
+    <circle class="node" cx="760" cy="276" r="22"/>
+    <circle class="node" cx="864" cy="268" r="22"/>
+  </g>
+  <g class="zink" font-size="9.5" font-weight="600" text-anchor="middle">
+    <text x="700" y="171">router</text>
+    <text x="770" y="99">camera</text>
+    <text x="790" y="199">mapper</text>
+    <text x="868" y="87">lidar</text>
+    <text x="884" y="171">arm</text>
+    <text x="760" y="279">planner</text>
+    <text x="864" y="271">robot</text>
+  </g>
+  <text class="ink" x="792" y="330" font-size="15" font-weight="600" text-anchor="middle">Your zenoh network</text>
+  <text class="muted" x="792" y="348" font-size="12" text-anchor="middle">publishers you don't have to change</text>
+
+  <text class="muted" x="24" y="34" font-size="13">The browser talks WebRTC to one gateway; the gateway is just another node on zenoh.</text>
+</svg>
