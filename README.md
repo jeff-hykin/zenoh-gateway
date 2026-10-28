@@ -1,11 +1,11 @@
 # zenoh-gateway
 
+![zenoh-gateway: browser ↔ gateway ↔ zenoh network](docs/architecture.svg)
+
 View and drive a [zenoh](https://zenoh.io) system from a browser, even over a weak link (a phone on bad wifi). A Rust
 library serves browsers over WebRTC; a dependency-free TypeScript client talks to it. Pictures arrive as video (H.264
 by default, AV1 built in, or any encoder you plug in), sound as Opus, everything else as bytes on per-stream data
 channels. A per-browser bandwidth allocator decides who gets what when the link is short.
-
-![zenoh-gateway: browser ↔ gateway ↔ zenoh network](docs/architecture.svg)
 
 - [zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli): the `zenoh-gateway` command, the example page
   and the end-to-end tests.
