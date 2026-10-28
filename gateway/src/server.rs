@@ -76,6 +76,13 @@ pub struct ServerBuilder {
     video_encoders: Vec<(VideoFormat, VideoEncoderFactory)>,
     video_policy: VideoPolicy,
     zenoh_signalling: Option<String>,
+    tls: Option<TlsSource>,
+}
+
+/// Where [`ServerBuilder::tls_pem`] / [`ServerBuilder::tls_files`] get the certificate chain and private key.
+enum TlsSource {
+    Pem { cert_chain: Vec<u8>, private_key: Vec<u8> },
+    Files { cert_chain: PathBuf, private_key: PathBuf },
 }
 
 impl Default for ServerBuilder {
@@ -94,6 +101,7 @@ impl Default for ServerBuilder {
             video_encoders: Vec::new(),
             video_policy: VideoPolicy::default(),
             zenoh_signalling: None,
+            tls: None,
         }
     }
 }
@@ -129,6 +137,19 @@ impl ServerBuilder {
     /// Serves a directory over HTTP (`/` serves `index.html`), read on every request so the UI is live-editable on disk.
     pub fn serve_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.serve_dir = Some(dir.into());
+        self
+    }
+
+    /// Serves HTTPS instead of HTTP with this certificate chain and private key (PEM), so the bearer token of
+    /// `POST /offer` never crosses the network in the clear. [`router`](Server::router) is unaffected.
+    pub fn tls_pem(mut self, cert_chain: impl Into<Vec<u8>>, private_key: impl Into<Vec<u8>>) -> Self {
+        self.tls = Some(TlsSource::Pem { cert_chain: cert_chain.into(), private_key: private_key.into() });
+        self
+    }
+
+    /// [`tls_pem`](Self::tls_pem) with the PEMs read from these files when the server is built.
+    pub fn tls_files(mut self, cert_chain: impl Into<PathBuf>, private_key: impl Into<PathBuf>) -> Self {
+        self.tls = Some(TlsSource::Files { cert_chain: cert_chain.into(), private_key: private_key.into() });
         self
     }
 
@@ -270,9 +291,18 @@ impl ServerBuilder {
             }
         };
         ensure!(self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0), "the UDP port range must be non-empty and above 0");
+        let tls = match self.tls {
+            None => None,
+            Some(TlsSource::Pem { cert_chain, private_key }) => Some(tls::server_config(&cert_chain, &private_key)?),
+            Some(TlsSource::Files { cert_chain, private_key }) => {
+                let cert_pem = std::fs::read(&cert_chain).with_context(|| format!("reading the TLS certificate chain {}", cert_chain.display()))?;
+                let key_pem = std::fs::read(&private_key).with_context(|| format!("reading the TLS private key {}", private_key.display()))?;
+                Some(tls::server_config(&cert_pem, &key_pem)?)
+            }
+        };
         let leases = Leases::new(self.lease_groups);
         let gateway = Gateway::new(session.clone(), codecs, AllocationConfig { max_bandwidth: self.max_bandwidth_bytes_per_sec, target_fraction: fraction }, leases, self.connect_config);
-        let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
+        let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, tls, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {
             ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");
             let tasks = signalling::serve(&inner, &name).await?;
@@ -288,6 +318,8 @@ struct Inner {
     session: zenoh::Session,
     owns_session: bool,
     serve_dir: Option<PathBuf>,
+    /// with [`ServerBuilder::tls_pem`] / [`ServerBuilder::tls_files`]: `bind` serves HTTPS
+    tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
     shut_down: AtomicBool,
     authorize: Option<Arc<Authorize>>,
     /// the zenoh signalling queryables' tasks
@@ -363,23 +395,25 @@ impl Server {
         router
     }
 
-    /// Binds the HTTP listener (e.g. `("0.0.0.0", 7448)`, or port 0) and serves on a task until [`RunningServer::shutdown`].
+    /// Binds the HTTP listener (e.g. `("0.0.0.0", 7448)`, or port 0) and serves on a task until [`RunningServer::shutdown`];
+    /// HTTPS with [`ServerBuilder::tls_pem`] / [`ServerBuilder::tls_files`].
     pub async fn bind(self, addr: impl ToSocketAddrs) -> Result<RunningServer> {
         let listener = tokio::net::TcpListener::bind(addr).await.context("binding the HTTP listener")?;
         let local_addr = listener.local_addr()?;
-        info!("zenoh-gateway listening on http://{local_addr}");
+        let scheme = if self.inner.tls.is_some() { "https" } else { "http" };
+        info!("zenoh-gateway listening on {scheme}://{local_addr}");
         if let Some(dir) = &self.inner.serve_dir {
             info!("serving {}", dir.display());
         }
         let (stop, stopped) = oneshot::channel::<()>();
         let app = self.router();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = stopped.await;
-                })
-                .await
-        });
+        let stopped = async move {
+            let _ = stopped.await;
+        };
+        let task = match self.inner.tls.clone() {
+            None => tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(stopped).await }),
+            Some(config) => tokio::spawn(async move { axum::serve(tls::Listener::new(listener, config), app).with_graceful_shutdown(stopped).await }),
+        };
         Ok(RunningServer { server: self, local_addr, stop: Some(stop), task })
     }
 
@@ -549,6 +583,78 @@ mod signalling {
             }
             (_, Some(offer)) => answer(inner, &headers, offer).await.map(|answer| serde_json::to_value(answer).unwrap_or_default()),
             (_, None) => Err((StatusCode::BAD_REQUEST, "no offer".to_owned())),
+        }
+    }
+}
+
+/// HTTPS for [`Server::bind`]: rustls over the TCP listener, each handshake on its own task so a slow client
+/// never holds up the others.
+mod tls {
+    use anyhow::{Context, Result, ensure};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinSet;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls::{ServerConfig, crypto};
+    use tokio_rustls::server::TlsStream;
+    use tokio_rustls::TlsAcceptor;
+
+    /// A rustls server config (ring, HTTP/1.1) from a PEM certificate chain and private key.
+    pub(super) fn server_config(cert_chain_pem: &[u8], private_key_pem: &[u8]) -> Result<Arc<ServerConfig>> {
+        let cert_chain = CertificateDer::pem_slice_iter(cert_chain_pem).collect::<Result<Vec<_>, _>>().context("reading the TLS certificate chain (PEM)")?;
+        ensure!(!cert_chain.is_empty(), "the TLS certificate chain PEM has no certificate");
+        let private_key = PrivateKeyDer::from_pem_slice(private_key_pem).context("reading the TLS private key (PEM)")?;
+        let mut config = ServerConfig::builder_with_provider(Arc::new(crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .context("TLS protocol versions")?
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, private_key)
+            .context("the TLS certificate chain and private key don't make a usable pair")?;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(Arc::new(config))
+    }
+
+    pub(super) struct Listener {
+        tcp: TcpListener,
+        acceptor: TlsAcceptor,
+        handshakes: JoinSet<Option<(TlsStream<TcpStream>, SocketAddr)>>,
+    }
+
+    impl Listener {
+        pub(super) fn new(tcp: TcpListener, config: Arc<ServerConfig>) -> Self {
+            Listener { tcp, acceptor: TlsAcceptor::from(config), handshakes: JoinSet::new() }
+        }
+    }
+
+    impl axum::serve::Listener for Listener {
+        type Io = TlsStream<TcpStream>;
+        type Addr = SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            loop {
+                tokio::select! {
+                    // axum's TCP accept retries its own errors, so it always yields a connection
+                    (tcp, addr) = axum::serve::Listener::accept(&mut self.tcp) => {
+                        let acceptor = self.acceptor.clone();
+                        self.handshakes.spawn(async move {
+                            match acceptor.accept(tcp).await {
+                                Ok(tls) => Some((tls, addr)),
+                                Err(error) => {
+                                    log::debug!("TLS handshake with {addr} failed: {error}");
+                                    None
+                                }
+                            }
+                        });
+                    }
+                    Some(Ok(Some(connection))) = self.handshakes.join_next() => return connection,
+                }
+            }
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            self.tcp.local_addr()
         }
     }
 }

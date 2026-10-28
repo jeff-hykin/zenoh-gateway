@@ -412,7 +412,7 @@ channel, so the callback runs per message.
 
 Microphone (browser → zenoh), not implemented, fits without redesign:
 - the page needs a secure context for `getUserMedia` (HTTPS, or `http://localhost`), so a robot's
-  gateway would be served over TLS (a reverse proxy, or `ServerBuilder` behind one);
+  gateway would be served over TLS (`ServerBuilder::tls_files` / `tls_pem`, or a reverse proxy);
 - the client adds a `sendonly` audio transceiver with the mic track and renegotiates
   (`{op: "renegotiate", publish: "<encoding>", sdp}`), and opens a `pub` channel naming that mid, as a
   video subscription names its track's;

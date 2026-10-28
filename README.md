@@ -144,6 +144,7 @@ tokio = { version = "1", features = ["full"] }
 let server = zenoh_gateway::Server::builder()
     .connect("tcp/192.168.1.2:7447")       // or .session(existing_session), or .zenoh_config(config)
     .serve_dir("ui")                       // optional static files
+    .tls_files("cert.pem", "key.pem")      // optional: HTTPS
     .encoding(TextUppercase)               // a message encoding, below
     .bandwidth_target_fraction(0.75)
     .build()
