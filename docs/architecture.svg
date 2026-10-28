@@ -102,7 +102,6 @@
     <text x="864" y="271">robot</text>
   </g>
   <text class="ink" x="792" y="330" font-size="15" font-weight="600" text-anchor="middle">Your zenoh network</text>
-  <text class="muted" x="792" y="348" font-size="12" text-anchor="middle">publishers you don't have to change</text>
 
   <text class="muted" x="24" y="34" font-size="13">The browser talks WebRTC to one gateway; the gateway is just another node on zenoh.</text>
 </svg>
