@@ -62,6 +62,10 @@ cmd.onTripped((reason) => {})     // "heartbeat" | "disconnected" | "shutdown" |
 cmd.blocked                       // why the gateway drops this publisher's puts now (another client's lease), else null
 cmd.close()
 
+// a microphone to zenoh (needs HTTPS or http://localhost), see "Audio"
+const [track] = (await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()
+const mic = z.publishAudio("robot/mic", track, { encoding: "my_audio", sampleRate: 16000 })  // a Publisher without put()
+
 const lease = await z.lease("arm", { maxSeconds: 60 })  // or { keys: ["robot/arm/**"] } for a group the server doesn't define; see "Leases"
 lease.onLost((reason) => {})      // "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" | "renewed"
 await lease.release()
@@ -410,17 +414,21 @@ renegotiates for `audio-opus`, as for video). The browser's jitter buffer smooth
 like reliable ones (never paced or thinned). Each sample also sends an empty frame on the `sub`
 channel, so the callback runs per message.
 
-Microphone (browser → zenoh), not implemented, fits without redesign:
-- the page needs a secure context for `getUserMedia` (HTTPS, or `http://localhost`), so a robot's
-  gateway would be served over TLS (`ServerBuilder::tls_files` / `tls_pem`, or a reverse proxy);
-- the client adds a `sendonly` audio transceiver with the mic track and renegotiates
-  (`{op: "renegotiate", publish: "<encoding>", sdp}`), and opens a `pub` channel naming that mid, as a
-  video subscription names its track's;
-- the gateway's `on_track` reads the Opus RTP, decodes it with libopus (`opus_decode`) to PCM and
-  hands it to the encoding's inverse of `decode` (e.g. `encode_pcm(&AudioPcm) -> Vec<u8>`, a new
-  `MessageEncoding` method with a default error), whose bytes are put on the key like any `pub` channel's,
-  with the same latency limit and deadman rules. Only the Opus decode and the `on_track` handler are
-  new; negotiation, encodings and publishing are the existing paths.
+Microphone (browser → zenoh), `publishAudio(key, track, { encoding, sampleRate, priority, latencyLimit })`:
+- the page needs a secure context for `getUserMedia` (HTTPS, or `http://localhost`);
+- the client adds a `sendonly` audio transceiver with the track and renegotiates (`{op: "renegotiate", sdp}`, no
+  `channel`: the gateway adds no track of its own, its answer receives), then opens a `pub` channel naming that mid
+  (label `mid`, opts `encoding` and `sampleRate`), as a video subscription names its track's;
+- the gateway's `on_track` files the browser's track under its mid at its first packet; the `pub` channel takes it (one
+  reader), so the channel may open before any audio flows;
+- each Opus RTP packet is decoded with libopus (`opus_decode`, at `sampleRate`: 8, 12, 16, 24 or 48 kHz, default 48, with
+  the packet's own channel count) and handed to the encoding's `encode_pcm(&AudioPcm) -> Vec<u8>` (a `MessageEncoding`
+  method with a default error; the encoding must be an audio one), whose bytes are put on the key. Unreadable packets
+  and `encode_pcm` errors count as `malformed`;
+- the publish grant, leases (`blocked`), the deadman and `priority` are a data-channel publisher's; `latencyLimit`
+  compares each packet's arrival against its RTP time, relative to the least-delayed packet so far (the page's capture
+  clock and the gateway's needn't agree), and drops later ones;
+- lost packets are skipped, not concealed (no PLC/FEC).
 
 ### Video
 

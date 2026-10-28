@@ -59,6 +59,7 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 |---|---|
 | `subscribe(key, options, callback)` → `Subscription` | `msg`: `{ key, kind, bytes, encoding?, attachment?, timestamp, seq, decoded?, video?, mediaStream? }` |
 | `publisher(key, options)` → `Publisher` | |
+| `publishAudio(key, track, { encoding, sampleRate?, priority?, latencyLimit? })` → `AudioPublisher` | a microphone to zenoh (below) |
 | `put(key, bytes, opts)`, `delete(key, opts)` | one zenoh put / delete |
 | `get(key, { parameters, payload, timeoutMs = 5000, ... })`, `querier(key, opts)` | zenoh queries |
 | `declareQueryable(key, { complete }, (query) => …)` | answer queries: `query.reply(...)`, `replyErr`, `replyDel`, `finalize()` |
@@ -109,6 +110,10 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 
 `Publisher`: `put(bytes, { timestamp })`, `setDeadman(bytes)`, `clearDeadman()`, `state`, `onTripped(fn)`, `tripReason`,
 `blocked` (why the gateway drops its puts, e.g. another client's lease), `sent`, `dropped`, `ready()`, `close()`.
+
+**Microphone**: `publishAudio(key, track, { encoding })` sends an audio track (`getUserMedia`, which needs HTTPS or
+`http://localhost`) to the gateway as Opus; the gateway decodes each packet to PCM (`sampleRate`, default 48000) and puts
+the bytes its audio encoding's `encode_pcm` makes. Deadman, leases and `blocked` work as above; `put` doesn't.
 
 **Fields** messages arrive decoded in `msg.decoded`. For any other data encoding, `registerEncoding(name, decoder)`
 sets `msg.decoded = decoder(msg.bytes, msg)`. Video and audio need no decoder. Also exported: `Priority` (`REAL_TIME`

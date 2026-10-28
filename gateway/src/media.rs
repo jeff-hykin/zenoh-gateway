@@ -427,9 +427,12 @@ const SIZE_BAND: f64 = 1.1;
 const SIZE_DOWN_SETTLE: Duration = Duration::from_secs(1);
 const SIZE_UP_SETTLE: Duration = Duration::from_secs(5);
 
+/// (source size, size in use, when it was picked)
+type SizeInUse = ((u32, u32), (u32, u32), Instant);
+
 /// The size to encode at: `wanted` (the bitrate policy's) once it is far enough from the size in use and that size has
 /// settled, else the size in use. A new source size, and full size, are taken at once.
-fn steady_size(current: Option<((u32, u32), (u32, u32), Instant)>, source: (u32, u32), wanted: (u32, u32), now: Instant) -> ((u32, u32), bool) {
+fn steady_size(current: Option<SizeInUse>, source: (u32, u32), wanted: (u32, u32), now: Instant) -> ((u32, u32), bool) {
     let Some((_, size, changed_at)) = current.filter(|(current_source, _, _)| *current_source == source) else {
         return (wanted, true);
     };
@@ -526,7 +529,7 @@ struct SessionState {
     source: (u32, u32),
     scale: f64,
     /// (source, size in use, when it was picked): see `steady_size`
-    size: Option<((u32, u32), (u32, u32), Instant)>,
+    size: Option<SizeInUse>,
 }
 
 struct SessionFrame {

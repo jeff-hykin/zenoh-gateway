@@ -11,6 +11,8 @@ use crate::pacing::SendGate;
 use crate::publisher::{self, PubShared};
 use crate::subscription::{self, SubShared, now_unix_ms};
 use crate::media::{self, MediaTrack, TrackClaim};
+use crate::microphone;
+use webrtc::media_stream::track_remote::TrackRemote;
 use base64::Engine;
 use log::{debug, info, warn};
 use serde::Deserialize;
@@ -172,6 +174,9 @@ struct PeerState {
     /// one renegotiation at a time
     negotiation: tokio::sync::Mutex<()>,
     tracks: Mutex<HashMap<String, Arc<MediaTrack>>>,
+    /// the browser's own tracks (microphones) by mid, from their first packet on; the counter ticks on each new one
+    remote_tracks: Mutex<HashMap<String, Arc<dyn TrackRemote>>>,
+    remote_tracks_added: tokio::sync::watch::Sender<u64>,
     video_rate: Arc<media::VideoRate>,
     config: AllocationConfig,
     gate: Arc<SendGate>,
@@ -251,6 +256,8 @@ impl PeerState {
             connection: Mutex::new(None),
             negotiation: tokio::sync::Mutex::new(()),
             tracks: Mutex::new(HashMap::new()),
+            remote_tracks: Mutex::new(HashMap::new()),
+            remote_tracks_added: tokio::sync::watch::Sender::new(0),
             video_rate,
             config,
             gate: Arc::default(),
@@ -265,6 +272,19 @@ impl PeerState {
             ever_connected: AtomicBool::new(false),
         };
         (state, api_events_receiver)
+    }
+
+    /// Takes the browser's track on transceiver `mid` (one publisher reads it), once its first packet arrived.
+    async fn take_remote_track(&self, mid: &str) -> Arc<dyn TrackRemote> {
+        let mut added = self.remote_tracks_added.subscribe();
+        loop {
+            if let Some(track) = self.remote_tracks.lock().remove(mid) {
+                return track;
+            }
+            if added.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     /// Resolves once the peer is dropped.
@@ -769,6 +789,31 @@ impl PeerConnectionEventHandler for Handler {
         }
     }
 
+    async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        // Must not block here either: the driver calls this while handling the track's first packet.
+        let Some(state) = self.state.upgrade().filter(|state| !state.gone.load(Ordering::Relaxed)) else { return };
+        let peer_id = self.peer_id;
+        tokio::spawn(async move {
+            let Some(connection) = state.connection.lock().clone() else { return };
+            for transceiver in connection.get_transceivers().await {
+                let Ok(Some(receiver)) = transceiver.receiver().await else { continue };
+                if !Arc::ptr_eq(receiver.track(), &track) {
+                    continue;
+                }
+                match transceiver.mid().await {
+                    Ok(Some(mid)) => {
+                        debug!("peer {peer_id}: the browser's track on mid {mid}");
+                        state.remote_tracks.lock().insert(mid, track);
+                        state.remote_tracks_added.send_modify(|count| *count += 1);
+                    }
+                    _ => warn!("peer {peer_id}: a browser track without a mid"),
+                }
+                return;
+            }
+            warn!("peer {peer_id}: a browser track on no transceiver");
+        });
+    }
+
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
         // Must not block here: the driver waits for this to return.
         let closing = dc.clone();
@@ -832,14 +877,32 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
             }
             Err(error) => Some(error),
         },
-        "pub" => match state.access().check(crate::auth::Action::Publish, &label.key).and_then(|()| PubOpts::parse(&label.opts)) {
-            Ok(opts) => {
+        "pub" => match state.access().check(crate::auth::Action::Publish, &label.key).and_then(|()| PubOpts::parse(&label.opts)).and_then(|opts| {
+            let encoding = microphone_encoding(&state, &label, &opts)?;
+            Ok((opts, encoding))
+        }) {
+            Ok((opts, encoding)) => {
                 let shared = Arc::new(PubShared::default());
-                register(json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit}), ChannelStats::Pub(shared.clone()));
+                register(
+                    json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit, "encoding": opts.encoding, "sampleRate": opts.sample_rate}),
+                    ChannelStats::Pub(shared.clone()),
+                );
                 state.send_accepted(label.id).await;
                 let (leases, key) = (state.leases.clone(), label.key.clone());
                 let blocker = move || leases.blocker(peer_id, &key);
-                publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker).await;
+                match (encoding, label.mid.as_deref()) {
+                    (Some(encoding), Some(mid)) => {
+                        // the microphone's first packet may come after its channel opens; the channel may close first
+                        let track = tokio::select! {
+                            track = state.take_remote_track(mid) => Some(track),
+                            () = microphone::closed(&dc) => None,
+                        };
+                        if let Some(track) = track {
+                            microphone::run(dc.clone(), label.clone(), opts, session, shared, microphone::Microphone { track, encoding }, blocker).await;
+                        }
+                    }
+                    _ => publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker).await,
+                }
                 None
             }
             Err(error) => Some(error),
@@ -882,6 +945,27 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         && let Some(id) = label.id
     {
         state.deadmen.lock().remove(&id);
+    }
+}
+
+/// A microphone publisher's encoding (label `mid` + opts `encoding`); `None` for a data-channel publisher.
+fn microphone_encoding(state: &PeerState, label: &Label, opts: &PubOpts) -> Result<Option<Arc<dyn crate::encoding::MessageEncoding>>, String> {
+    match (&label.mid, &opts.encoding) {
+        (None, None) => {
+            if opts.sample_rate.is_some() {
+                return Err("sampleRate is for microphone publishers (a mid and an encoding)".into());
+            }
+            Ok(None)
+        }
+        (Some(_), None) => Err("a microphone publisher needs an encoding (its encode_pcm makes the messages)".into()),
+        (None, Some(_)) => Err("an encoding on a publisher is for microphones: it needs the mid of a sendonly audio transceiver".into()),
+        (Some(_), Some(name)) => {
+            let encoding = state.codecs.get(name)?;
+            if encoding.output() != crate::encoding::EncodingOutput::Audio {
+                return Err(format!("{name} isn't an audio encoding (it sends {})", encoding.output().as_str()));
+            }
+            Ok(Some(encoding))
+        }
     }
 }
 

@@ -140,6 +140,16 @@ export interface PublisherOptions {
     latencyLimit?: number
 }
 
+/** `publishAudio`: the gateway decodes the browser's Opus and `encoding` (an audio encoding with `encode_pcm`) makes each message. */
+export interface AudioPublisherOptions {
+    encoding: string
+    /** the rate the audio is decoded at before `encoding` gets it: 8000, 12000, 16000, 24000 or 48000 (default) */
+    sampleRate?: number
+    priority?: number
+    /** drop packets that reach the gateway this many ms later than the stream's least-delayed one */
+    latencyLimit?: number
+}
+
 export interface ConnectOptions {
     /** default: the gateway's (`GET /zenoh-gateway/ice`, TURN credentials minted for this client) */
     iceServers?: RTCIceServer[]
@@ -1021,6 +1031,61 @@ export class Publisher extends Endpoint {
     }
 }
 
+/**
+ * A microphone (or any audio track) published to zenoh: the track goes to the gateway on a sendonly audio transceiver
+ * as Opus, the gateway decodes it and its `encoding` turns each packet into a message on the key. Deadman, leases and
+ * `blocked` work as for any publisher; `put` doesn't (the track is the data).
+ */
+export class AudioPublisher extends Publisher {
+    #transceiver: RTCRtpTransceiver | null = null
+
+    constructor(owner: ZenohGateway, id: number, key: string, readonly audioOptions: AudioPublisherOptions, readonly track: MediaStreamTrack) {
+        super(owner, id, key, { priority: audioOptions.priority, latencyLimit: audioOptions.latencyLimit })
+    }
+
+    override attach(peer: RTCPeerConnection): void {
+        const acceptance = this.beginAttempt()
+        this.#transceiver = null
+        this.owner._acquireSendTransceiver(peer, this.track).then((transceiver) => {
+            if (this.closed || acceptance !== this.acceptance) {
+                this.owner._releaseTransceiver(peer, transceiver)
+                return
+            }
+            this.#transceiver = transceiver
+            const { encoding, sampleRate, priority, latencyLimit } = this.audioOptions
+            const label = JSON.stringify({ type: "pub", key: this.key, id: this.id, opts: { encoding, sampleRate, priority, latencyLimit }, mid: transceiver.mid })
+            const channel = peer.createDataChannel(label, channelInit("reliable", undefined))
+            channel.onmessage = (event: MessageEvent) => {
+                this.blocked = JSON.parse(String(event.data)).blocked ?? null
+            }
+            this.channel = channel
+            this.watchChannel(channel, acceptance)
+        }, (error: Error) => acceptance.reject(new Error(`zenoh-gateway: audio renegotiation for ${this.key} failed: ${error.message}`)))
+    }
+
+    override put(): void {
+        throw new Error(`zenoh-gateway: ${this.key} publishes its audio track; put() is for data publishers`)
+    }
+
+    override _trip(reason: string): void {
+        this.#release()
+        super._trip(reason)
+    }
+
+    override close(): void {
+        this.#release()
+        super.close()
+    }
+
+    #release(): void {
+        const peer = this.owner._peer
+        if (this.#transceiver && peer) {
+            this.owner._releaseTransceiver(peer, this.#transceiver)
+        }
+        this.#transceiver = null
+    }
+}
+
 /** An exclusive right to publish on a group of keys among this gateway's clients (SPEC "Leases"). */
 export class Lease {
     /** why it ended: "heartbeat" | "maxSeconds" | "disconnected" | "force-expired by peer N" | "released" */
@@ -1189,6 +1254,28 @@ export class ZenohGateway {
             await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
             if (response.mid !== transceiver.mid) {
                 throw new Error(`gateway bound mid ${String(response.mid)}, expected ${String(transceiver.mid)}`)
+            }
+            return transceiver
+        }
+        const result = this.#negotiation.then(run, run)
+        this.#negotiation = result.catch(() => {})
+        return result
+    }
+
+    /** A new sendonly audio transceiver carrying `track` to the gateway, added through a renegotiation over `control`. */
+    _acquireSendTransceiver(peer: RTCPeerConnection, track: MediaStreamTrack): Promise<RTCRtpTransceiver> {
+        const run = async () => {
+            await this.#connected
+            if (peer !== this.#peer) {
+                throw new Error("connection replaced")
+            }
+            const transceiver = peer.addTransceiver(track, { direction: "sendonly" })
+            await peer.setLocalDescription(await peer.createOffer())
+            const offer = peer.localDescription
+            const response = await this._request({ op: "renegotiate", sdp: { type: offer?.type, sdp: offer?.sdp } }, openTimeoutMs)
+            await peer.setRemoteDescription(response.sdp as RTCSessionDescriptionInit)
+            if (!transceiver.mid) {
+                throw new Error("the transceiver got no mid")
             }
             return transceiver
         }
@@ -1420,6 +1507,16 @@ export class ZenohGateway {
 
     publisher(key: string, options: PublisherOptions = {}): Publisher {
         const publisher = new Publisher(this, this.#nextId++, key, { ...options })
+        this.#addEndpoint(publisher)
+        return publisher
+    }
+
+    /**
+     * Publishes an audio track (e.g. `(await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0]`;
+     * the page needs a secure context: HTTPS or http://localhost) on `key`, through `options.encoding`.
+     */
+    publishAudio(key: string, track: MediaStreamTrack, options: AudioPublisherOptions): AudioPublisher {
+        const publisher = new AudioPublisher(this, this.#nextId++, key, { ...options }, track)
         this.#addEndpoint(publisher)
         return publisher
     }

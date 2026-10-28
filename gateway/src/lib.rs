@@ -51,6 +51,7 @@ pub mod fields;
 mod frame;
 mod ice;
 mod media;
+mod microphone;
 mod options;
 mod pacing;
 mod peer;

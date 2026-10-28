@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
+use zenoh::pubsub::Publisher;
 use zenoh::qos::{CongestionControl, Priority};
 
 /// Browser -> gateway put header: the browser's send time, in the browser's clock.
@@ -57,9 +58,8 @@ fn age_ms(sent_at_ms: f64, offset_ms: f64, gateway_now_ms: f64) -> f64 {
     gateway_now_ms - (sent_at_ms + offset_ms)
 }
 
-/// `blocker` says why a put may not go out now (another client's lease); the browser hears
-/// `{"blocked": reason | null}` on this channel whenever that changes.
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session: zenoh::Session, shared: Arc<PubShared>, clock_offset_ms: Arc<Mutex<Option<f64>>>, blocker: impl Fn() -> Option<String>) {
+/// Declares the zenoh publisher a `pub` channel puts through; closes the channel if zenoh refuses.
+pub(crate) async fn declare(dc: &Arc<dyn DataChannel>, label: &Label, opts: &PubOpts, session: &zenoh::Session) -> Option<Publisher<'static>> {
     let priority = opts.zenoh_priority().unwrap_or_default();
     let congestion_control = if opts.delivery == DeliveryKind::Reliable { CongestionControl::Block } else { CongestionControl::Drop };
     let publisher = session
@@ -68,35 +68,73 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
         .congestion_control(congestion_control)
         .express(is_express(priority))
         .await;
-    let publisher = match publisher {
-        Ok(publisher) => publisher,
+    match publisher {
+        Ok(publisher) => {
+            debug!("publisher {:?} priority={priority:?} congestion={congestion_control:?} latencyLimit={:?}", label.key, opts.latency_limit);
+            Some(publisher)
+        }
         Err(error) => {
             warn!("declare publisher {:?} failed: {error}", label.key);
             let _ = dc.close().await;
-            return;
+            None
         }
-    };
-    debug!("publisher {:?} priority={priority:?} congestion={congestion_control:?} latencyLimit={:?}", label.key, opts.latency_limit);
-    let mut blocked: Option<String> = None;
+    }
+}
+
+/// Whether a put may go out now: not after the deadman fired, nor while another client leases the key (`blocker` says
+/// why not). The browser hears `{"blocked": reason | null}` on the channel whenever that changes.
+#[derive(Default)]
+pub(crate) struct Admission {
+    blocked: Option<String>,
+}
+
+impl Admission {
+    /// Counts the message as received, and as rejected when it may not go out.
+    pub(crate) async fn admit(&mut self, dc: &Arc<dyn DataChannel>, shared: &PubShared, blocker: &impl Fn() -> Option<String>) -> bool {
+        let now_blocked = blocker();
+        if now_blocked != self.blocked {
+            self.blocked = now_blocked;
+            let _ = dc.send_text(&serde_json::json!({"blocked": self.blocked}).to_string()).await;
+        }
+        let mut stats = shared.stats.lock();
+        stats.received += 1;
+        if shared.tripped.load(Ordering::Acquire) {
+            stats.rejected_tripped += 1;
+            return false;
+        }
+        if self.blocked.is_some() {
+            stats.rejected_leased += 1;
+            return false;
+        }
+        true
+    }
+}
+
+/// Puts `payload` and counts the outcome.
+pub(crate) async fn put(publisher: &Publisher<'static>, payload: Vec<u8>, shared: &PubShared) {
+    let result = publisher.put(payload).await;
+    let mut stats = shared.stats.lock();
+    match result {
+        Ok(()) => stats.put += 1,
+        Err(error) => {
+            stats.put_errors += 1;
+            warn!("put {:?} failed: {error}", publisher.key_expr());
+        }
+    }
+}
+
+/// `blocker` says why a put may not go out now (another client's lease).
+pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session: zenoh::Session, shared: Arc<PubShared>, clock_offset_ms: Arc<Mutex<Option<f64>>>, blocker: impl Fn() -> Option<String>) {
+    let Some(publisher) = declare(&dc, &label, &opts, &session).await else { return };
+    let mut admission = Admission::default();
     while let Some(event) = dc.poll().await {
         match event {
             DataChannelEvent::OnMessage(message) => {
-                let now_blocked = blocker();
-                if now_blocked != blocked {
-                    blocked = now_blocked;
-                    let _ = dc.send_text(&serde_json::json!({"blocked": blocked}).to_string()).await;
+                if !admission.admit(&dc, &shared, &blocker).await {
+                    continue;
                 }
                 {
                     let mut stats = shared.stats.lock();
-                    stats.received += 1;
-                    if shared.tripped.load(Ordering::Acquire) {
-                        stats.rejected_tripped += 1;
-                        continue;
-                    }
-                    if blocked.is_some() {
-                        stats.rejected_leased += 1;
-                        continue;
-                    }
                     if message.data.len() < PUT_HEADER_LEN {
                         stats.malformed += 1;
                         continue;
@@ -114,15 +152,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
                         None => stats.unsynced += 1,
                     }
                 }
-                let result = publisher.put(message.data[PUT_HEADER_LEN..].to_vec()).await;
-                let mut stats = shared.stats.lock();
-                match result {
-                    Ok(()) => stats.put += 1,
-                    Err(error) => {
-                        stats.put_errors += 1;
-                        warn!("put {:?} failed: {error}", label.key);
-                    }
-                }
+                put(&publisher, message.data[PUT_HEADER_LEN..].to_vec(), &shared).await;
             }
             DataChannelEvent::OnClose => break,
             _ => {}

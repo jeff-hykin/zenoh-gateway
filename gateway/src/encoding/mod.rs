@@ -262,10 +262,13 @@ impl fmt::Debug for AudioPcm {
 }
 
 impl AudioPcm {
+    /// The rates Opus encodes and decodes at.
+    pub const SAMPLE_RATES: [u32; 5] = [8000, 12000, 16000, 24000, 48000];
+
     /// Fails unless the rate is one Opus takes (8, 12, 16, 24 or 48 kHz; resample others), there
     /// are 1 or 2 channels and the samples are a whole number of frames.
     pub fn new(sample_rate: u32, channels: u8, samples: Vec<i16>) -> Result<Self> {
-        ensure!([8000, 12000, 16000, 24000, 48000].contains(&sample_rate), "Opus takes 8, 12, 16, 24 or 48 kHz, not {sample_rate} Hz");
+        ensure!(Self::SAMPLE_RATES.contains(&sample_rate), "Opus takes 8, 12, 16, 24 or 48 kHz, not {sample_rate} Hz");
         ensure!((1..=2).contains(&channels) && samples.len().is_multiple_of(channels as usize), "{} samples are not whole frames of {channels} (1 or 2) channels", samples.len());
         Ok(AudioPcm { sample_rate, channels, samples })
     }
@@ -414,6 +417,14 @@ pub trait MessageEncoding: Send + Sync {
     fn encode(&self, frame: &DecodedFrame, options: &EncodeOptions) -> Result<Vec<u8>> {
         let _ = (frame, options);
         Err(anyhow!("encoding {:?} has no data-channel encoder", self.name()))
+    }
+
+    /// Microphone publishers (`publishAudio`): the message to put for `pcm`, the browser's audio decoded from Opus
+    /// (one packet, usually 20 ms). The inverse of an audio encoding's [`decode`](Self::decode); runs on tokio's
+    /// blocking pool. Default: an error (the encoding only decodes).
+    fn encode_pcm(&self, pcm: &AudioPcm) -> Result<Vec<u8>> {
+        let _ = pcm;
+        Err(anyhow!("encoding {:?} can't encode microphone audio (no encode_pcm)", self.name()))
     }
 
     /// The allocator's prior for the data channel: expected bytes per message as sent (after

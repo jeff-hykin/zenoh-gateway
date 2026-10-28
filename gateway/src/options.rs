@@ -2,7 +2,7 @@
 
 use crate::encoding::registry::EncodingRegistry;
 use crate::encoding::registry::Resolved;
-use crate::encoding::{Channel, Compress, EncodingOutput, VideoFormat, VideoPolicy};
+use crate::encoding::{AudioPcm, Channel, Compress, EncodingOutput, VideoFormat, VideoPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -66,6 +66,11 @@ pub struct PubOpts {
     pub priority: Option<u8>,
     /// Drop puts whose (clock-corrected) send time is older than this many ms.
     pub latency_limit: Option<f64>,
+    /// microphone publishers (label `mid`: the browser's sendonly audio transceiver): the encoding whose `encode_pcm`
+    /// turns the decoded audio into messages
+    pub encoding: Option<String>,
+    /// microphone publishers: the rate the Opus audio is decoded at (default 48 kHz, Opus's own)
+    pub sample_rate: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -233,6 +238,11 @@ impl PubOpts {
         let parsed: PubOpts = serde_json::from_value(opts.clone()).map_err(|e| e.to_string())?;
         check_priority(parsed.priority)?;
         check_positive("latencyLimit", parsed.latency_limit)?;
+        if let Some(rate) = parsed.sample_rate
+            && !AudioPcm::SAMPLE_RATES.contains(&rate)
+        {
+            return Err(format!("sampleRate {rate} isn't one Opus decodes at ({:?})", AudioPcm::SAMPLE_RATES));
+        }
         Ok(parsed)
     }
 
