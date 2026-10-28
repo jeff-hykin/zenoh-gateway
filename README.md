@@ -194,6 +194,7 @@ tokio = { version = "1", features = ["full"] }
 let server = zenoh_gateway::Server::builder()
     .connect("tcp/192.168.1.2:7447")       // or .session(existing_session), or .zenoh_config(config)
     .serve_dir("ui")                       // optional static files
+    .tls_files("cert.pem", "key.pem")      // optional: HTTPS
     .encoding(TextUppercase)               // a message encoding, below
     .build()
     .await?;
@@ -483,8 +484,8 @@ zenoh API from a page) are in
 - The default video encoder is software H.264 (openh264). Viewers of one stream at similar grants share one encode,
   but every stream still costs a core-share unless the server has a hardware encoder (`ServerBuilder::video_encoder`).
 - Audio goes to the browser only; the microphone direction is designed (SPEC "Audio") but not built.
-- Signaling is plain HTTP: a bearer token crosses the network in the clear unless the gateway sits behind
-  HTTPS (a reverse proxy).
+- Signaling is plain HTTP unless the server is given a certificate (`ServerBuilder::tls_files` / `tls_pem`, or
+  `--cert`/`--key` on the command); without one, a bearer token crosses the network in the clear.
 - Leases bind only this gateway's clients, and aren't re-taken after a reconnect.
 - Encodings are compiled into the application (encodings shipped from the browser as WASM are a later phase).
 - Changing a subscription's options means closing it and subscribing again.

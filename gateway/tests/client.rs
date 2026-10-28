@@ -844,3 +844,25 @@ async fn a_takeover_lease_moves_the_cameras_to_the_newest_viewer() {
     }
     running.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_serves_https_with_the_given_certificate() {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let server = Server::builder().session(session).tls_pem(certified.cert.pem(), certified.signing_key.serialize_pem()).build().await.unwrap();
+    let running = server.bind("127.0.0.1:0").await.unwrap();
+    let port = running.local_addr().port();
+    let https = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(certified.cert.pem().as_bytes()).unwrap())
+        .resolve("localhost", running.local_addr())
+        .build()
+        .unwrap();
+    let health: serde_json::Value = https.get(format!("https://localhost:{port}{}", zenoh_gateway::HEALTH_PATH)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(health["service"], "zenoh-gateway");
+    // the signaling route answers over HTTPS too (a malformed offer is refused, not dropped)
+    let offer = https.post(format!("https://localhost:{port}/offer")).json(&serde_json::json!({})).send().await.unwrap();
+    assert!(offer.status().is_client_error(), "POST /offer over HTTPS: {}", offer.status());
+    // plain HTTP on the same port gets no answer
+    assert!(reqwest::get(format!("http://127.0.0.1:{port}{}", zenoh_gateway::HEALTH_PATH)).await.is_err());
+    running.shutdown().await.unwrap();
+}

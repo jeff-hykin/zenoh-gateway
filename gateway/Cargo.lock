@@ -5020,7 +5020,7 @@ dependencies = [
 
 [[package]]
 name = "zenoh-gateway"
-version = "0.5.32"
+version = "0.5.33"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5035,11 +5035,13 @@ dependencies = [
  "openh264-sys2",
  "parking_lot",
  "rav1e",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
  "sha1",
  "tokio",
+ "tokio-rustls",
  "tower-http",
  "unsafe-libopus",
  "zenoh",
