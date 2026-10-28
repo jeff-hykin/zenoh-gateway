@@ -314,7 +314,7 @@ shared.
 ## Tests
 
 ```sh
-cd gateway && cargo test --all-features && cargo clippy --all-features --all-targets
+cd gateway && cargo test --all-features && cargo clippy --all-features --all-targets && cargo doc --no-deps
 deno task check                            # type-check the client
 ```
 
