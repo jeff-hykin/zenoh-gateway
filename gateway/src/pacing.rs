@@ -34,7 +34,7 @@ const QUIET_BYTES: usize = 8 * 1024;
 const ACK_HISTORY: Duration = Duration::from_secs(2);
 /// The typical round trip is the median over this long.
 const TYPICAL_RTT_WINDOW: Duration = Duration::from_secs(2);
-/// Ack round trips are kept this long for their minimum.
+/// Ack round trips are kept this long for their minimum (BBR's min_rtt filter: 10 s).
 const RTT_WINDOW: Duration = Duration::from_secs(10);
 
 struct Frame {

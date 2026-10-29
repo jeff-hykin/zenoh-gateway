@@ -13,6 +13,7 @@ use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, I
 use openh264::formats::YUVBuffer;
 use std::time::Duration;
 
+/// One H.264 macroblock: the smallest picture side an encoder is handed.
 const MIN_DIMENSION: u32 = 16;
 /// The default smallest picture (`VideoPolicy::min_resolution`).
 pub const MIN_RESOLUTION: (u32, u32) = (160, 64);

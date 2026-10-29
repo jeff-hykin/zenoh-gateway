@@ -354,7 +354,7 @@ const reconnectDelayMs = 1000
 const ackEveryBytes = 16 * 1024
 const ackDelayMs = 50
 // gateway stats (~1 KB per channel) take at most this share of the frontend's budget: polled every second, they were all
-// of a 100 kbit/s link and held the control channel's answers behind them
+// of a 100 kbit/s link and held the control channel's answers behind them; 5 % is RTCP's share of a session (RFC 3550)
 const statsBudgetShare = 0.05
 const maxStatsIntervalMs = 10_000
 // clock sync keeps the lowest-RTT sample among the most recent ones

@@ -36,14 +36,14 @@ use webrtc::rtp_transceiver::RtpSender;
 /// Every format a track can have, with the payload type the gateway offers it at.
 const FORMATS: [(&str, u8); 5] = [("video/H264", 102), ("video/VP8", 96), ("video/VP9", 98), ("video/AV1", 45), (OPUS, 111)];
 const OPUS: &str = "audio/opus";
-/// Google Congestion Control bounds, bits/s. It starts where the link estimator starts (`allocator::INITIAL_ESTIMATE`,
-/// 512 kbit/s), since video is allocated no more than that estimate. The ceiling is only a sanity bound (at 50 Mbit/s it
+/// Google Congestion Control bounds, bits/s. It starts where the link estimator starts
+/// (`ServerBuilder::initial_bandwidth_bytes_per_sec`, 512 kbit/s by default), since video is allocated no more than that estimate. The ceiling is only a sanity bound (at 50 Mbit/s it
 /// capped 8 HD cameras on an idle link): the link estimate and 1.5 x what video sent bound what video gets.
 const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
 /// Video RTP's clock (H.264, VP8, VP9 and AV1 all run at 90 kHz).
 const VIDEO_CLOCK_RATE: f64 = 90_000.0;
-/// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
+/// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`): libwebrtc's kDefaultPaceMultiplier.
 const PACING_FACTOR: f64 = 2.5;
 /// Video's queueing delay is measured against the least one-way delay over this long.
 const QUEUE_BASE_WINDOW: Duration = Duration::from_secs(10);
@@ -934,7 +934,7 @@ pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: S
 
 /// Resolution-scale steps the CPU governor moves by.
 const CPU_STEP: f64 = 0.1;
-/// Share of the frame interval an encode may take before the picture steps down.
+/// Share of the frame interval an encode may take before the picture steps down (libwebrtc's OveruseFrameDetector: 85 %).
 const CPU_HEADROOM: f64 = 0.85;
 /// Time after a step before the next, so the costs are measured at the new size.
 const CPU_SETTLE: Duration = Duration::from_secs(1);

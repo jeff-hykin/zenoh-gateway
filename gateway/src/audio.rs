@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use unsafe_libopus::{OPUS_APPLICATION_AUDIO, OpusEncoder, opus_encode, opus_encoder_create, opus_encoder_destroy};
 use webrtc::data_channel::DataChannel;
 
+/// One Opus packet's audio: WebRTC's default ptime (RFC 7587).
 const PACKET: Duration = Duration::from_millis(20);
 
 /// libopus (transpiled to Rust, so it builds wherever Rust does) for one rate and channel count.

@@ -52,6 +52,8 @@ const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
 const VIDEO_BRAKE_SPACING: Duration = Duration::from_millis(500);
 const VIDEO_QUEUE_ROUNDS: u32 = 2;
 const VIDEO_DELIVERY_WINDOW: Duration = Duration::from_secs(2);
+/// What a brake keeps of that most: libwebrtc's AimdRateControl backs off to 85 % of what was delivered.
+const VIDEO_BRAKE_BACKOFF: f64 = 0.85;
 
 /// Gateway-wide allocation settings (builder options / command-line flags).
 #[derive(Debug, Clone, Copy)]
@@ -468,7 +470,7 @@ impl PeerState {
     /// Video's own brake, from how long its packets wait in a queue (transport feedback's arrival times): video bypasses
     /// the send window, so without it the latency target held data only, and at full quality a camera kept a Wi-Fi
     /// queue of 150-650 ms. When the queue stays over half the latency target (one way, so about the target in a round
-    /// trip) for `VIDEO_QUEUE_ROUNDS` rounds, video is cut to 85% of the most it delivered over `VIDEO_DELIVERY_WINDOW`
+    /// trip) for `VIDEO_QUEUE_ROUNDS` rounds, video is cut to `VIDEO_BRAKE_BACKOFF` of the most it delivered over `VIDEO_DELIVERY_WINDOW`
     /// (cut from the last round's, a cut lowered what it delivered and the next cut went lower: a spiral), at most once
     /// per `VIDEO_BRAKE_SPACING`; under a quarter of the target it grows 25% a round (back in about a second), and lets
     /// go once at the budget.
@@ -489,7 +491,7 @@ impl PeerState {
         let mut brake = self.video_brake.lock();
         if high_rounds >= VIDEO_QUEUE_ROUNDS && recent_most > 0.0 {
             if brake.is_none_or(|(_, at)| now.duration_since(at) >= VIDEO_BRAKE_SPACING) {
-                let cap = brake.map_or(recent_most, |(cap, _)| cap.min(recent_most)) * 0.85;
+                let cap = brake.map_or(recent_most, |(cap, _)| cap.min(recent_most)) * VIDEO_BRAKE_BACKOFF;
                 *brake = Some((cap, now));
             }
         } else if queue_ms < target_ms / 4.0
