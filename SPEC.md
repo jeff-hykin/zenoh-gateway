@@ -159,7 +159,7 @@ the small messages these carry (big streams belong on subscriptions). Every requ
 
 | options | data channel init | gateway behavior when the channel is backed up |
 |---|---|---|
-| `delivery: "reliable"` | ordered, fully reliable | queue every sample; a sample that waited 2 s goes when a newer one of its key waits behind it |
+| `delivery: "reliable"` | ordered, fully reliable | queue every sample; a sample that waited `reliable_max_backlog` (default 2 s) goes when a newer one of its key waits behind it |
 | `delivery: "latest"` | unordered, maxPacketLifeTime 1000 ms (a lost chunk is retransmitted for 1 s: with no retransmits, a 200 KB message got through 3% of the time at 2% loss) | keep only the newest sample per key |
 | `+ maxAge: M` | latest: unordered, maxPacketLifeTime M | also drop anything older than M |
 
@@ -193,7 +193,7 @@ Drop otherwise, express for priority ≤ INTERACTIVE_HIGH.
 
 What `reliable` guarantees: samples of a key arrive in order, each at most once, and every one arrives while the page
 keeps up. Under congestion a key's queue on the gateway is bounded by time, not grown without limit: a sample that has
-waited 2 s is dropped once a newer sample of the same key waits behind it (so the newest is always delivered, and a key
+waited `reliable_max_backlog` (default 2 s) is dropped once a newer sample of the same key waits behind it (so the newest is always delivered, and a key
 that publishes once, like tf_static, never loses it). Drops count in `droppedQueue` and show as `seq` gaps. A stream that
 must coalesce by content (tf by child frame) needs an encoding that does it; the gateway doesn't parse payloads.
 
@@ -246,6 +246,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
 
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
+`initial_bandwidth_bytes_per_sec` (each browser's first guess, default 64 000), `reliable_max_backlog` (default 2 s),
 `encoding`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `ice_servers_fn`, `cloudflare_turn`, `udp_ports`,
 `video_encoder` (a factory per video format for every encoding without its own encoder, e.g. a hardware one from
 zenoh-dimos-codecs' encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
@@ -466,20 +467,26 @@ Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden pe
   its rate, 0.3: ~17 Mbit/s for 720p60, ~1.4 Mbit/s for 320x240 at 60 Hz). The encoder runs at what the allocator
   actually grants. Before its first frame the source's size is guessed from the sample (a 16:9 picture of 3 bytes per
   pixel) and priced by this policy, not by the raw sample's size.
-- The picture keeps the source's size (fitted into `maxResolution`) unless the grant would leave fewer than
-  `min_bits_per_pixel` (0.1) there; then it shrinks just enough, never below `minResolution` ([160, 64], aspect kept: it stops when one side reaches its value) or `minResolutionScale` (0), whichever is larger. Below
-  ~0.03 bit/pixel openh264 overshoots its target even at its coarsest quantizer, while above it a full-size picture
-  beat every smaller one at the same bitrate on the bench scene (after upscaling).
+- Fewer bits cost compression before size: the picture keeps the source's size (fitted into `maxResolution`) and
+  shrinks only as a last resort, never below `minResolution` ([160, 64], aspect kept: it stops when one side reaches
+  its value) or `minResolutionScale` (0), whichever is larger. On encoders that report their quantizer (openh264) it
+  shrinks only while frames come out coarser than `maxQp` (37, libwebrtc's H.264 high threshold), see below. Until
+  the first frame's quantizer is known, and on encoders that never report one, the picture is sized so the grant
+  leaves `min_bits_per_pixel` (0.1) a pixel: below ~0.03 bit/pixel openh264 overshoots its target even at its
+  coarsest quantizer.
 - The picture is sized for the link's bandwidth (times its gain while the link model probes), not the bitrate a brake
   or GCC cut holds video to, so a cut lowers the bitrate, not the size (each new size is a keyframe). In the link
   model's startup, video gets at most its gain times what video measurably delivered (never under the first guess),
   and the picture grows at once while video isn't queued at the link.
-- On encoders that report their quantizer (openh264), the picture shrinks below that while frames come out coarser
-  than `targetQp` (30) and the encoder spends its bitrate: pixels × (bitrate now / then) × 2^((targetQp − QP) / 6)
-  over the last second (H.264's bits halve each +6 QP), as libwebrtc's quality scaler does with thresholds instead.
-- Quality, for video, is the share of the most bits per frame: 0 is the smallest picture at the bit-per-pixel floor,
-  1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other encodings, but video's
-  `qualityToHzTradeoff` defaults to 1: it keeps its frame rate and shrinks the picture.
+- On encoders that report their quantizer (openh264), the quantizer sizes the picture: while frames come out coarser
+  than `maxQp` and the encoder spends its bitrate, it shrinks to pixels × (bitrate now / then) × 2^((targetQp − QP) / 6)
+  over the last second (H.264's bits halve each +6 QP; `targetQp` 30), as libwebrtc's quality scaler steps down past
+  its high threshold; at or under `maxQp` the size holds, and it grows back, up to full size, while frames come out
+  finer than `targetQp`.
+- Quality, for video, is the share of the most bits per frame: 0 is the fewest (the smallest picture at the
+  bit-per-pixel floor), 1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other
+  encodings, but video's `qualityToHzTradeoff` defaults to 1: it keeps its frame rate and spends fewer bits per frame
+  (a coarser quantizer at the same size, see above).
 - openh264 runs with frame skipping on (`frameDropping`: it holds its bitrate only by skipping frames; libwebrtc does
   the same) and frames timestamped one frame interval apart; bitrate and frame rate changes apply in place (no
   keyframe); a size change, or a change of its options, restarts it with one. Scene-change keyframes are off
@@ -503,7 +510,7 @@ BBR does (Cardwell et al., "BBR: Congestion-Based Congestion Control", 2016) and
 - **The link model** (`allocator::LinkModel`), every 250 ms (a round):
   - bandwidth = the most the frontend delivered in one round over the last 10 rounds: bytes the page acked, plus what
     video sent. A round in which the streams wanted less than their budget only counts if it delivered more (an idle
-    link says nothing about what it could carry). Starts at 64 KB/s, so a slow link isn't flooded.
+    link says nothing about what it could carry). Starts at `initial_bandwidth_bytes_per_sec` (default 64 KB/s), so a slow link isn't flooded.
   - round trip = the least send-to-ack time over the last 10 s, the page's ack interval included.
   - gain: 2/ln 2 while starting up (the bandwidth doubles each round), until three rounds that wanted more brought less
     than 25% growth; then a cycle of 1.25 (ask for more), 0.75 (drain what that queued) and 1 × 6.

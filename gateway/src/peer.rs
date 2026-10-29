@@ -65,6 +65,10 @@ pub struct AllocationConfig {
     pub put_timeout: Duration,
     /// the longest answering an offer or a renegotiation may take
     pub signalling_timeout: Duration,
+    /// each browser's first bandwidth guess, bytes/s, before anything is measured
+    pub initial_bandwidth: f64,
+    /// how long a `reliable` key's samples wait for a slow page before newer ones push them out
+    pub reliable_max_backlog: Duration,
 }
 
 /// What `ServerBuilder::put_timeout` defaults to.
@@ -271,8 +275,8 @@ impl PeerState {
             tracks: Mutex::new(HashMap::new()),
             video_rate,
             config,
-            gate: Arc::new(SendGate::new(config.stale_after)),
-            link: Mutex::new(LinkModel::default()),
+            gate: Arc::new(SendGate::new(config.stale_after, config.initial_bandwidth)),
+            link: Mutex::new(LinkModel::new(config.initial_bandwidth)),
             acked_total: AtomicU64::new(0),
             video_received: AtomicU64::new(0),
             video_brake: Mutex::new(None),
@@ -346,6 +350,9 @@ impl PeerState {
             let round = self.gate.take_round();
             log::debug!(target: "zenoh_gateway::link", "peer {}: round {round:?} video {:?} link-limited {video_link_limited} delivered {:.0}", self.peer_id, delivery.map(|delivery| delivery.bytes_per_sec), per_sec(delivered));
             link.update(now, interval_secs, round, delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
+            if let Some(cap) = self.config.max_bandwidth {
+                link.capped(cap);
+            }
             log::debug!(target: "zenoh_gateway::link", "peer {}: bandwidth {:.0} gain {:.2} starting up {} probing rtt {} window {:?}", self.peer_id, link.bandwidth_bytes_per_sec, link.gain, link.starting_up, link.probing_rtt(), link.window(Some(self.config.latency_target)));
             match known_bandwidth {
                 Some(known) => link.with_known_bandwidth(known),
@@ -366,8 +373,8 @@ impl PeerState {
             match (link.starting_up, self.video_rate.delivery()) {
                 // (never under the guess: a picture that compresses to little delivers little, and held to that its frame
                 // rate fell)
-                (true, Some(delivery)) => estimate.min((delivery.bytes_per_sec * link.gain).max(allocator::INITIAL_BANDWIDTH)),
-                (true, None) => estimate.min(allocator::INITIAL_BANDWIDTH),
+                (true, Some(delivery)) => estimate.min((delivery.bytes_per_sec * link.gain).max(self.config.initial_bandwidth)),
+                (true, None) => estimate.min(self.config.initial_bandwidth),
                 (false, _) => estimate,
             }
         } else {
@@ -703,7 +710,7 @@ impl Gateway {
     async fn answer_as(self: &Arc<Self>, peer_id: u64, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
         let request = ice::IceRequest { side: ice::IceSide::Gateway, token: token.clone() };
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
-        let (media_engine, interceptors, video_rate) = media::media_setup()?;
+        let (media_engine, interceptors, video_rate) = media::media_setup(self.allocation.initial_bandwidth)?;
         let (state, mut api_events) = PeerState::new(peer_id, self, video_rate, token, grant);
         let state = Arc::new(state);
         let mut pending = PendingPeer { gateway: Arc::downgrade(self), peer_id, state: state.clone(), connection: None, armed: true };
@@ -988,7 +995,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
             Ok((opts, resolved, track))
         }) {
             Ok((opts, resolved, track)) => {
-                let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone()));
+                let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone(), state.config.reliable_max_backlog));
                 register(opts.normalized(matches!(shared.channel, Channel::Video(_))), ChannelStats::Sub(shared.clone()));
                 // checked once registered, so a lease taken meanwhile either sees this subscription or is seen here
                 if let Some(reason) = state.leases.subscribe_blocker(peer_id, &label.key) {
@@ -1063,7 +1070,7 @@ async fn close_after_client(dc: &Arc<dyn DataChannel>) {
 }
 
 /// The options a running subscription may change (the rest decide what it is, so they need a new subscription).
-const UPDATABLE: [&str; 14] = [
+const UPDATABLE: [&str; 15] = [
     "maxHz",
     "minQuality",
     "qualityToHzTradeoff",
@@ -1076,6 +1083,7 @@ const UPDATABLE: [&str; 14] = [
     "keyframeIntervalMs",
     "sceneChangeKeyframes",
     "targetQp",
+    "maxQp",
     "playoutDelay",
     "encodeOptions",
 ];

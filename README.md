@@ -106,18 +106,19 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 | `maxHz` | none | never send a key faster |
 | `bandwidthPriority` | 1 | when bandwidth is short, a higher number keeps more bandwidth and quality (each stream gives up in proportion to demand / priority); 0 gives up everything first |
 | `minQuality` | 0 | the least quality the allocator picks for an encoded stream (the most is `encodeOptions.quality`) |
-| `qualityToHzTradeoff` | 0.5 (video: 1) | 0 = keep quality, drop Hz; 1 = keep Hz, drop quality (video: keep the frame rate, shrink the picture, as libwebrtc does for cameras) |
+| `qualityToHzTradeoff` | 0.5 (video: 1) | 0 = keep quality, drop Hz; 1 = keep Hz, drop quality (video: keep the frame rate and spend fewer bits per frame, a coarser quantizer at the same size) |
 | `encoding` | none (raw bytes) | a name from `z.encodings` (see [Encodings and channels](#encodings-and-channels)); the gateway rejects unknown names, listing them |
 | `channel` | from the encoding's output: pictures `"video-h264"`, sound `"audio-opus"`, else `"data"` | what the messages travel on: `"video-h264"`, `"video-vp8"`, `"video-vp9"`, `"video-av1"`, `"audio-opus"` or `"data"` |
 | `encodeOptions` | `{}` | passed to the encoding (each documents its own); `quality` (0–1, default 1) is the most the allocator picks, lowered when bandwidth is short |
 | `compress` | the encoding's (none without one) | `"zstd"` or `"none"`: zstd-compress each data-channel message (raw topics too); the client decompresses, so `msg.bytes` is always plain. Rejected on video and audio channels |
 | `maxBitrate` | the server's (~0.3 bit/pixel at the source's size and rate) | video channels: most bits/s the stream asks for; it encodes at what the allocator grants |
-| `minResolutionScale` | 0 | video channels: the picture keeps its full size unless the grant is under 0.1 bit/pixel there, and never shrinks below this share |
+| `minResolutionScale` | 0 | video channels: the picture never shrinks below this share (it keeps its full size unless frames come out coarser than `maxQp`) |
 | `minResolution` | [160, 64] | video channels: never shrinks below this (aspect kept: it stops when one side reaches its value) |
 | `maxResolution` | none | video channels: `[width, height]` box the picture is fitted into |
 | `frameDropping` | true | video channels: the encoder may skip a frame to hold its bitrate (as libwebrtc does for cameras; without it openh264 overshoots its bitrate) |
 | `keyframeIntervalMs` | 60000 | video channels: a keyframe at least this often, on top of the ones the browser asks for after a loss |
-| `targetQp` | 30 | video channels: the quantizer (H.264's 0-51) the picture's size aims for, on encoders that report it (openh264 does): the picture shrinks below what its bitrate affords while frames come out coarser, and grows back while finer. Lower = smaller, sharper |
+| `targetQp` | 30 | video channels: the quantizer (H.264's 0-51) a picture shrunk past `maxQp` aims for, on encoders that report it (openh264 does), and grows back under. Lower = smaller, sharper |
+| `maxQp` | 37 | video channels: fewer bits cost compression up to this quantizer, at full size; past it the picture shrinks as a last resort (libwebrtc's H.264 quality scaler's high threshold) |
 | `sceneChangeKeyframes` | false | video channels: a keyframe when the encoder sees a new scene (with frames skipped at low bitrates, a smoothly moving picture tripped it every few seconds) |
 | `metadata` | `true` | each encoded message comes with its sample's own header, `msg.header`: `{ stamp, sec, nanosec, frameId, seq? }`; `false` goes without (gateways before 0.5.32: video only) |
 | `playoutDelay` | `[0, 0]` | video channels: `[min, max]` ms the browser may hold a frame to smooth out jitter; `[0, 0]` shows each frame at once (after a non-zero min on the same track, `[10, 10]`: Firefox can't go back) |
@@ -127,7 +128,7 @@ the gateway's reason), `state` (`"connecting"`, `"open"`, `"rejected"`, `"closed
 (video and audio channels), `channelName` (the channel in use), `received`, `dropped`, `partialDropped`,
 `decodeErrors`, `gatewayStats`, `close()`, and `update(changes)`: changes `maxHz`, `minQuality`,
 `qualityToHzTradeoff`, `bandwidthPriority`, `maxBitrate`, `minResolutionScale`, `maxResolution`, `frameDropping`,
-`keyframeIntervalMs`, `sceneChangeKeyframes`, `targetQp`, `playoutDelay` or
+`keyframeIntervalMs`, `sceneChangeKeyframes`, `targetQp`, `maxQp`, `playoutDelay` or
 `encodeOptions.quality` on the running subscription (same channel and track, no resubscribe; `null` puts one back
 to its default). A changed picture size starts at a keyframe.
 
@@ -196,6 +197,8 @@ let server = zenoh_gateway::Server::builder()
     .serve_dir("ui")                       // optional static files
     .tls_files("cert.pem", "key.pem")      // optional: HTTPS
     .encoding(TextUppercase)               // a message encoding, below
+    .initial_bandwidth_bytes_per_sec(64_000.0)   // optional: each browser's first guess (the default)
+    .reliable_max_backlog(Duration::from_secs(2))  // optional: how long reliable samples wait for a slow page (the default)
     .build()
     .await?;
 let running = server.bind(("0.0.0.0", 7448)).await?;   // background task; port 0 = any free port

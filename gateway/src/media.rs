@@ -38,7 +38,6 @@ const OPUS: &str = "audio/opus";
 /// Google Congestion Control bounds, bits/s. It starts where the link estimator starts (`allocator::INITIAL_ESTIMATE`,
 /// 512 kbit/s), since video is allocated no more than that estimate. The ceiling is only a sanity bound (at 50 Mbit/s it
 /// capped 8 HD cameras on an idle link): the link estimate and 1.5 x what video sent bound what video gets.
-const GCC_INITIAL_BPS: f64 = crate::allocator::INITIAL_BANDWIDTH * 8.0;
 const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
 /// Video RTP's clock (H.264, VP8, VP9 and AV1 all run at 90 kHz).
@@ -350,7 +349,8 @@ impl VideoRate {
         self.received_bytes.load(Ordering::Relaxed)
     }
 
-    fn cap_bps(&self) -> f64 {
+    /// What the allocator lets video take, bits/s (the initial bandwidth guess until its first allocation).
+    pub fn cap_bps(&self) -> f64 {
         f64::from_bits(self.cap_bps.load(Ordering::Relaxed))
     }
 
@@ -514,8 +514,9 @@ impl Interceptor for KeyframeRequests {
     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
 }
 
-/// Track formats, RTCP reports, NACK and TWCC-fed GCC; returns the connection's video rates.
-pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
+/// Track formats, RTCP reports, NACK and TWCC-fed GCC (starting from `initial_bandwidth` bytes/s); returns the
+/// connection's video rates.
+pub fn media_setup(initial_bandwidth: f64) -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
     let mut media_engine = MediaEngine::default();
     for (mime, payload_type) in FORMATS {
         let kind = if mime == OPUS { RtpCodecKind::Audio } else { RtpCodecKind::Video };
@@ -523,8 +524,9 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>)> {
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: ABS_CAPTURE_TIME_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), link_bps: AtomicU64::new(0), size_ratio: AtomicU64::new(1f64.to_bits()), starting_up: AtomicBool::new(true), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default(), pacer: Default::default(), rtp: Default::default() });
-    let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new(), arrivals: VecDeque::new(), lost_at: f64::NEG_INFINITY };
+    let gcc_initial_bps = initial_bandwidth * 8.0;
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(gcc_initial_bps.to_bits()), cap_bps: AtomicU64::new(gcc_initial_bps.to_bits()), link_bps: AtomicU64::new(0), size_ratio: AtomicU64::new(1f64.to_bits()), starting_up: AtomicBool::new(true), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default(), pacer: Default::default(), rtp: Default::default() });
+    let estimator = ReportingEstimator { inner: Gcc::new(gcc_initial_bps, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new(), arrivals: VecDeque::new(), lost_at: f64::NEG_INFINITY };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default())
         .with(Slot::Custom(15_000), RtpTap { side: TapSide::Enqueue, rate: rate.clone(), read: VecDeque::new(), write: VecDeque::new() })
@@ -1005,10 +1007,12 @@ struct SessionState {
 /// Sizes the picture by the encoder's quantizer, as libwebrtc's quality scaler does, but by an equation instead of its
 /// thresholds and steps: H.264's bits per frame halve each +6 QP, so at the bitrate now the picture that reaches
 /// `VideoPolicy::target_qp` has `pixels x (bitrate now / bitrate then) x 2^((target - QP) / 6)`, from the average QP of
-/// the last `SIZE_DOWN_SETTLE` of delta frames at the size in use. A picture too big for its bitrate (openh264 then
-/// skips frames, as at 0.1 bit/pixel on a 500 kbit/s link: 2 of 3) shrinks; one that compresses well grows back up to
-/// the size its bitrate affords (`video::target`). A coarse quantizer shrinks the picture only while the encoder spends
-/// its bitrate: one with bits to spare (a still picture, nothing to code) isn't short of them.
+/// the last `SIZE_DOWN_SETTLE` of delta frames at the size in use. Fewer bits cost compression first: the picture
+/// shrinks only while frames come out coarser than `VideoPolicy::max_qp` (then toward `target_qp`, as libwebrtc's
+/// quality scaler steps down past its high threshold), as a picture too big for its bitrate does (openh264 then skips
+/// frames, as at 0.1 bit/pixel on a 500 kbit/s link: 2 of 3); one that compresses well grows back, up to full size. A
+/// coarse quantizer shrinks the picture only while the encoder spends its bitrate: one with bits to spare (a still
+/// picture, nothing to code) isn't short of them.
 #[derive(Default)]
 struct QpScaler {
     /// (when, QP, bits, bits/s the picture was sized for, bits/s the encoder was given) of each delta frame at `size`
@@ -1032,7 +1036,7 @@ impl QpScaler {
     }
 
     /// The share of `source`'s width and height the picture should take at `bitrate`, once a frame was measured.
-    fn scale(&self, source: (u32, u32), bitrate: f64, target_qp: f64) -> Option<f64> {
+    fn scale(&self, source: (u32, u32), bitrate: f64, target_qp: f64, max_qp: f64) -> Option<f64> {
         if self.frames.is_empty() || source.0 == 0 {
             return None;
         }
@@ -1045,7 +1049,9 @@ impl QpScaler {
         let qp_factor = 2f64.powf((target_qp - qp) / 6.0);
         let qp_factor = if spent < given { qp_factor.max(1.0) } else { qp_factor };
         let pixels = self.size.0 as f64 * self.size.1 as f64 * (bitrate / then.max(1.0)) * qp_factor;
-        Some((pixels / (source.0 as f64 * source.1 as f64)).sqrt())
+        let (aimed, now) = ((pixels / (source.0 as f64 * source.1 as f64)).sqrt(), (self.size.0 as f64 / source.0 as f64).min(1.0));
+        // (at or under max_qp a lower bitrate costs compression: the size holds, growing only while frames come out fine)
+        Some(if qp > max_qp && spent >= given { aimed } else { aimed.max(now) })
     }
 }
 
@@ -1187,7 +1193,7 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         // (only while bandwidth is short: granted its whole demand, the policy's bits per pixel already set the quality at
         // full size, and a coarse quantizer shrank a 20 Mbit/s link's picture to 1184x666)
         let most = session.policy.frame_bytes(state.source, hz.max(0.1), 1.0) * 8.0 * hz.max(0.1);
-        let qp_scale = (bitrate < most).then(|| state.qp.scale(state.source, size_bitrate, session.policy.target_qp)).flatten();
+        let qp_scale = (bitrate < most).then(|| state.qp.scale(state.source, size_bitrate, session.policy.target_qp, session.policy.max_qp)).flatten();
         let (scale, source) = (state.scale, state.source);
         let floor = session.policy.floor_scale(source);
         out.scale_cap = state.governor.scale_cap(scale, floor, hz, Instant::now());
@@ -1357,7 +1363,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             // (a frame the encoder renders itself: its size once it has encoded one, no floor before)
             _ => shared.video_source().unwrap_or_default(),
         };
-        let (quality, bitrate, hz) = shared.video_grant(&key, source);
+        let (quality, bitrate, hz) = shared.video_grant(&key, source, track.rate.cap_bps());
         frame_interval = crate::secs(1.0 / hz.max(0.1));
         let previous = member.session.take();
         let Channel::Video(format) = shared.channel else { return };
@@ -1482,6 +1488,32 @@ mod tests {
         dropped.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(1), reader).await.expect("the reader ends").unwrap();
         assert_eq!(Arc::strong_count(&held), 1, "and lets go of the track");
+    }
+
+    #[test]
+    fn fewer_bits_cost_compression_before_size() {
+        use super::QpScaler;
+        use std::time::{Duration, Instant};
+        let (source, t0) = ((320, 240), Instant::now());
+        // frames at full size, sized for 230 kbit/s and spending all of it
+        let measured = |qp: f64| {
+            let mut scaler = QpScaler::default();
+            for frame in 0..20u64 {
+                scaler.observe(t0 + Duration::from_millis(50 * frame), source, qp, 230_000.0 / 20.0, 230_000.0, 230_000.0);
+            }
+            scaler
+        };
+        // the grant falls to 96 kbit/s (allocation.js's 12 KB/s): frames at QP 30 (<= maxQp 37) keep the full picture
+        assert_eq!(measured(30.0).scale(source, 96_000.0, 30.0, 37.0), Some(1.0), "a coarser quantizer, not a smaller picture");
+        // past maxQp the encoder is out of compression: the picture shrinks toward targetQp
+        let shrunk = measured(43.0).scale(source, 96_000.0, 30.0, 37.0).unwrap();
+        assert!(shrunk < 0.5, "shrinks as a last resort: {shrunk}");
+        // and the size by QP wins over the bits-per-pixel guess once the quantizer is known
+        let policy = crate::encoding::video::VideoPolicy::default();
+        let sized = crate::encoding::video::target(&policy, source, 0.3, 96_000.0, 96_000.0, Some(1.0), 20.0, 1.0, false);
+        assert_eq!((sized.width, sized.height), (320, 240));
+        let guessed = crate::encoding::video::target(&policy, source, 0.3, 96_000.0, 96_000.0, None, 20.0, 1.0, false);
+        assert!(guessed.width < 320, "until then the bits-per-pixel floor guesses a size: {}", guessed.width);
     }
 
     #[test]

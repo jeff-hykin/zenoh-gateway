@@ -8,7 +8,8 @@
 //   a while to cross);
 // - frames moving: >= 10 shown/s from 500 kbit/s up, >= 3 below, no freeze over 2 s;
 // - the link used: video >= 40% of a link the camera could fill (its most is ~8 Mbit/s here), on clean links;
-// - pictures shrinking with the link, never under minResolution ([160, 64]: 160x90 for 16:9).
+// - pictures never growing as the link slows (fewer bits cost compression first; a picture shrinks once frames pass
+//   maxQp), never under minResolution ([160, 64]: 160x90 for 16:9).
 // Usage: deno run --allow-all --unstable-net client/test/video_battery.ts [cell name ...]   (default: every cell; BROWSER=firefox;
 // REPEAT=3)
 

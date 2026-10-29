@@ -124,13 +124,13 @@ pub struct SendGate {
 
 impl Default for SendGate {
     fn default() -> Self {
-        SendGate::new(crate::allocator::DEFAULT_STALE_AFTER)
+        SendGate::new(crate::allocator::DEFAULT_STALE_AFTER, crate::allocator::DEFAULT_INITIAL_BANDWIDTH)
     }
 }
 
 impl SendGate {
-    pub fn new(stale_after: Duration) -> Self {
-        let (rate, window) = crate::allocator::LinkModel::default().pacing(None);
+    pub fn new(stale_after: Duration, initial_bandwidth: f64) -> Self {
+        let (rate, window) = crate::allocator::LinkModel::new(initial_bandwidth).pacing(None);
         SendGate {
             stale_after,
             strict_busy: AtomicUsize::new(0),
@@ -146,7 +146,7 @@ impl SendGate {
                 held_by_target: false,
                 stalled: false,
                 round: RoundSamples::default(),
-                bandwidth: crate::allocator::INITIAL_BANDWIDTH,
+                bandwidth: initial_bandwidth,
                 epoch_started: Instant::now(),
                 epoch_acked: 0.0,
                 window,
