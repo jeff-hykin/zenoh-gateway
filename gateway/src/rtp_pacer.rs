@@ -98,7 +98,6 @@ struct Queued {
     deadline: Instant,
     /// (SSRC, RTP timestamp): the frame it belongs to
     frame: (u32, u32),
-    keyframe: bool,
 }
 
 pub struct AgedPacer {
@@ -263,7 +262,7 @@ impl rtc::sansio::Protocol<TaggedPacket, TaggedPacket, ()> for AgedPacer {
         self.queued_bits += bits;
         let since = message.now;
         let deadline = self.deadline(since, frame_bits_so_far);
-        self.queue.push_back(Queued { packet: message, bits, since, deadline, frame, keyframe });
+        self.queue.push_back(Queued { packet: message, bits, since, deadline, frame });
         self.publish(since);
         Ok(())
     }
@@ -387,6 +386,8 @@ mod tests {
         pacer.handle_write(rtp(1, 500, start)).unwrap();
         pacer.handle_write(rtp(2, 500, start)).unwrap();
         pacer.handle_write(rtp(3, 600, start)).unwrap();
-        assert_eq!(pacer.queue.iter().map(|queued| queued.keyframe).collect::<Vec<_>>(), [true, true, false]);
+        assert_eq!(*shared.keyframes.lock().get(&SSRC).unwrap(), Some(500));
+        // the next frame isn't a keyframe, so nothing is flushed
+        assert_eq!(pacer.queue.len(), 3);
     }
 }
