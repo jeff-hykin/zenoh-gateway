@@ -259,6 +259,12 @@ function check(cell: Cell, windows: any[], from: number, to: number, label: stri
     if (estimate > 2.5 * bytesPerSec) {
         fail(`link estimate ${round(estimate / 1000)} KB/s > 2.5x the link's ${bytesPerSec / 1000}`)
     }
+    // a key with no allocation reads Infinity, which every comparison below would let through
+    for (const key of ["robot/cam0", "robot/cloud0", "robot/map"]) {
+        if (constrained > 0 && !Number.isFinite(fraction(key))) {
+            fail(`no allocation for ${key} while constrained`)
+        }
+    }
     if (constrained > 0 && fraction("robot/cam0") > fraction("robot/cloud0") + 0.05) {
         fail(`camera (bandwidthPriority 0.1) kept ${fraction("robot/cam0").toFixed(2)} of its demand, more than the clouds (10) ${fraction("robot/cloud0").toFixed(2)}`)
     }

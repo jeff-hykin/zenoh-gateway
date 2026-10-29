@@ -112,7 +112,9 @@ async fn get_with_options_and_rich_replies() {
     let querier =
         client.querier("api/get/*", GetOptions { consolidation: Some(ConsolidationMode::None), timeout: Some(Duration::from_secs(2)), ..Default::default() });
     let replies = querier.get_with(Some("b=2"), None, None).await.unwrap();
-    assert!(replies.iter().any(|reply| reply.bytes.starts_with(b"b=2|")), "{replies:?}");
+    assert_eq!(replies.len(), 3, "no consolidation: the echo, the error and the delete: {replies:?}");
+    let echo = replies.iter().find(|reply| !reply.error && !reply.delete).unwrap();
+    assert_eq!(echo.bytes, b"b=2|||", "only the parameters arrived: {replies:?}");
     assert!(querier.matching_status().await.unwrap(), "a queryable answers api/get/*");
     client.close().await;
     running.shutdown().await.unwrap();

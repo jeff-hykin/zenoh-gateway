@@ -116,6 +116,7 @@ async fn list_topics_and_get() {
     assert_eq!(topics.len(), 1, "{topics:?}");
     assert_eq!((topics[0].key.as_str(), topics[0].sources.as_slice()), ("listed/robot/camera", &["token".to_owned()][..]));
     let replies = client.get("answers/*", Duration::from_secs(2)).await.unwrap();
+    assert_eq!(replies.len(), 1, "one queryable answers: {replies:?}");
     assert_eq!((replies[0].key.as_deref(), replies[0].bytes.as_slice()), (Some("answers/42"), &b"forty-two"[..]));
     assert!(client.clock_offset_ms().unwrap().abs() < 50.0, "same machine: offset ~0");
     client.close().await;

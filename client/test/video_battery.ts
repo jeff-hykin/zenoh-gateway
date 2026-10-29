@@ -234,7 +234,7 @@ for (const cell of chosen) {
             failures.push(`${name}: video used ${Math.round(use * 100)}% of the link (< 40%) at ${phase.size}`)
         }
         const [width, height] = phase.size.split("x").map(Number)
-        if (width < 160 && height < 64) {
+        if (width < 160 || height < 64) {
             failures.push(`${name}: ${phase.size} is under minResolution [160, 64]`)
         }
         if (cell.clean) {

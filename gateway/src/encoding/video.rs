@@ -518,7 +518,8 @@ mod tests {
         let first = encode(&mut encoder, &frame, 1e6, false);
         assert!(first.keyframe && first.data.starts_with(&[0, 0, 0, 1]));
         assert_eq!((first.width, first.height), (320, 240));
-        assert!(!encode(&mut encoder, &frame, 1e6, false).keyframe);
+        let second = encode(&mut encoder, &frame, 1e6, false);
+        assert!(!second.keyframe && second.data.len() < first.data.len(), "a delta frame of the same picture: {} vs {} bytes", second.data.len(), first.data.len());
         assert!(!encode(&mut encoder, &frame, 2e6, false).keyframe, "a new bitrate applies in place");
         assert!(encode(&mut encoder, &frame, 2e6, true).keyframe, "asked for");
         let low = encode(&mut encoder, &frame, 1e3, false);

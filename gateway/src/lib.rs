@@ -109,7 +109,7 @@ mod tests {
         super::spawn_isolated("test".into(), async { panic!("boom") }, async move { closed_tx.send(()).unwrap() }).await.unwrap();
         closed_rx.await.expect("on_panic ran");
         let (unused_tx, unused_rx) = tokio::sync::oneshot::channel::<()>();
-        super::spawn_isolated("test".into(), async {}, async move { drop(unused_tx) }).await.unwrap();
-        drop(unused_rx);
+        super::spawn_isolated("test".into(), async {}, async move { unused_tx.send(()).unwrap() }).await.unwrap();
+        assert!(unused_rx.await.is_err(), "on_panic ran for a task that didn't panic");
     }
 }
