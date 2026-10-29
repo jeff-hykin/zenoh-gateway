@@ -39,10 +39,6 @@ const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 /// A page's probeMs is capped: its subscriber on the filter kept the peer alive until it ended.
 const MAX_LIST_PROBE_MS: u64 = 10_000;
 const LIVELINESS_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
-/// A connection that stays `disconnected` this long is treated as gone.
-const DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
-/// An answered connection that hasn't connected this long after is treated as gone (ICE may never report `failed`).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest a shutdown waits for one browser connection to close.
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often each frontend's bandwidth is re-estimated and re-allocated.
@@ -72,12 +68,20 @@ pub struct AllocationConfig {
     pub initial_bandwidth: f64,
     /// how long a `reliable` key's samples wait for a slow page before newer ones push them out
     pub reliable_max_backlog: Duration,
+    /// how long a connection may stay `disconnected` before it is treated as gone
+    pub disconnected_grace: Duration,
+    /// how long an answered connection may take to connect before it is treated as gone
+    pub connect_timeout: Duration,
 }
 
 /// What `ServerBuilder::put_timeout` defaults to.
 pub const DEFAULT_PUT_TIMEOUT: Duration = Duration::from_secs(5);
 /// What `ServerBuilder::signalling_timeout` defaults to.
 pub const DEFAULT_SIGNALLING_TIMEOUT: Duration = Duration::from_secs(20);
+/// What `ServerBuilder::disconnected_grace` defaults to.
+pub const DEFAULT_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
+/// What `ServerBuilder::connect_timeout` defaults to.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How the gateway's side of each connection reaches browsers (builder options / command-line flags).
 #[derive(Debug, Clone, Default)]
@@ -813,10 +817,10 @@ impl Gateway {
             self.drop_peer(peer_id, "disconnected");
         }
         // a browser that gave up before connecting (a phone retrying over a bad link) may never move ICE to `failed`
-        let gateway = Arc::downgrade(self);
+        let (gateway, connect_timeout) = (Arc::downgrade(self), self.allocation.connect_timeout);
         tokio::spawn(async move {
             tokio::select! {
-                () = tokio::time::sleep(CONNECT_TIMEOUT) => {}
+                () = tokio::time::sleep(connect_timeout) => {}
                 () = watched.wait_gone() => return,
             }
             if !watched.ever_connected.load(Ordering::Relaxed) && let Some(gateway) = gateway.upgrade() {
@@ -959,8 +963,9 @@ impl PeerConnectionEventHandler for Handler {
             // ICE may sit in `disconnected` without ever reaching `failed`
             RTCPeerConnectionState::Disconnected => {
                 let (gateway, state, peer_id) = (self.gateway.clone(), self.state.clone(), self.peer_id);
+                let Some(grace) = gateway.upgrade().map(|gateway| gateway.allocation.disconnected_grace) else { return };
                 tokio::spawn(async move {
-                    tokio::time::sleep(DISCONNECTED_GRACE).await;
+                    tokio::time::sleep(grace).await;
                     let still_down = state.upgrade().is_some_and(|state| *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected));
                     if still_down && let Some(gateway) = gateway.upgrade() {
                         gateway.drop_peer(peer_id, "disconnected");

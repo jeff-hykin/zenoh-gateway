@@ -74,6 +74,8 @@ pub struct ServerBuilder {
     put_timeout: Duration,
     encode_timeout: Duration,
     signalling_timeout: Duration,
+    disconnected_grace: Duration,
+    connect_timeout: Duration,
     encodings: Vec<Arc<dyn MessageEncoding>>,
     authorize: Option<Arc<Authorize>>,
     lease_groups: HashMap<String, Vec<String>>,
@@ -107,6 +109,8 @@ impl Default for ServerBuilder {
             put_timeout: crate::peer::DEFAULT_PUT_TIMEOUT,
             encode_timeout: crate::encoding::registry::DEFAULT_ENCODE_TIMEOUT,
             signalling_timeout: crate::peer::DEFAULT_SIGNALLING_TIMEOUT,
+            disconnected_grace: crate::peer::DEFAULT_DISCONNECTED_GRACE,
+            connect_timeout: crate::peer::DEFAULT_CONNECT_TIMEOUT,
             encodings: Vec::new(),
             authorize: None,
             lease_groups: HashMap::new(),
@@ -224,6 +228,20 @@ impl ServerBuilder {
     /// the request fails and what it set up is closed.
     pub fn signalling_timeout(mut self, timeout: Duration) -> Self {
         self.signalling_timeout = timeout;
+        self
+    }
+
+    /// How long a browser connection may sit in `disconnected` before it is dropped as gone (default 15 s): ICE may
+    /// stay there without ever reaching `failed`.
+    pub fn disconnected_grace(mut self, grace: Duration) -> Self {
+        self.disconnected_grace = grace;
+        self
+    }
+
+    /// How long an answered browser connection may take to connect before it is dropped as gone (default 30 s): a
+    /// browser that gave up first may never move ICE to `failed`.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 
@@ -359,6 +377,7 @@ impl ServerBuilder {
         ensure!(!self.reliable_max_backlog.is_zero(), "reliable_max_backlog must be more than 0");
         ensure!(!self.stale_after.is_zero(), "stale_after must be more than 0");
         ensure!(!self.put_timeout.is_zero() && !self.encode_timeout.is_zero() && !self.signalling_timeout.is_zero(), "put, encode and signalling timeouts must be more than 0");
+        ensure!(!self.disconnected_grace.is_zero() && !self.connect_timeout.is_zero(), "disconnected_grace and connect_timeout must be more than 0");
         self.video_policy.validate()?;
         let codecs = EncodingRegistry::new(self.encodings)?.with_video(self.video_encoders, self.video_policy).with_encode_timeout(self.encode_timeout);
         let mut config = self.zenoh_config.unwrap_or_default();
@@ -397,6 +416,8 @@ impl ServerBuilder {
             signalling_timeout: self.signalling_timeout,
             initial_bandwidth: self.initial_bandwidth_bytes_per_sec,
             reliable_max_backlog: self.reliable_max_backlog,
+            disconnected_grace: self.disconnected_grace,
+            connect_timeout: self.connect_timeout,
         }, leases, self.connect_config);
         let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, tls, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {

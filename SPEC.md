@@ -251,6 +251,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
 `initial_bandwidth_bytes_per_sec` (each browser's first guess, default 64 000), `reliable_max_backlog` (default 2 s),
+`disconnected_grace` (how long a connection may stay disconnected, default 15 s), `connect_timeout` (default 30 s),
 `encoding`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `ice_servers_fn`, `cloudflare_turn`, `udp_ports`,
 `video_encoder` (a factory per video format for every encoding without its own encoder, e.g. a hardware one from
 zenoh-dimos-codecs' encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
@@ -756,7 +757,7 @@ resolving so the gateway has an offset before the first put.
   `heartbeatHz` beats; every beat is also a clock-sync ping.
 - `publisher.setDeadman(bytes)` stores (at most) one deadman per publisher stream per frontend on the gateway.
 - When that frontend's heartbeat misses `heartbeatMisses` beats, when it disconnects (control channel
-  closes, connection fails, or stays disconnected 15 s), or when the gateway shuts down (SIGINT/SIGTERM,
+  closes, connection fails, or stays disconnected `disconnected_grace`, default 15 s), or when the gateway shuts down (SIGINT/SIGTERM,
   or the embedding application's `shutdown()`), the
   gateway publishes every armed deadman of that frontend **once**, at REAL_TIME with CongestionControl
   Block (reliable), before anything else on that stream.
