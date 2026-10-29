@@ -630,8 +630,6 @@ export function encodePut(payload: Uint8Array, sentAtMs: number): Uint8Array<Arr
     return frame
 }
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
-
 function waitOpen(channel: RTCDataChannel, timeoutMs: number): Promise<void> {
     if (channel.readyState === "open") {
         return Promise.resolve()
@@ -2290,7 +2288,7 @@ export class ZenohGateway {
             if (endpoint instanceof Subscription) {
                 entry.received += endpoint.received
                 entry.dropped += endpoint.dropped
-                entry.backlogBytes += gateway ? Number(gateway.stats.queuedBytes) + Number(gateway.stats.outstandingBytes) : 0
+                entry.backlogBytes += gateway ? Number(gateway.stats.queuedBytes) + Number(gateway.stats.unconsumedBytes) : 0
             } else {
                 entry.received += endpoint.sent
                 entry.dropped += endpoint.dropped + (gateway ? Number(gateway.stats.droppedStale) : 0)
