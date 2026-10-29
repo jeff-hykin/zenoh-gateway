@@ -375,6 +375,9 @@ impl PeerState {
             let round = self.gate.take_round();
             log::debug!(target: "zenoh_gateway::link", "peer {}: round {round:?} video {:?} link-limited {video_link_limited} delivered {:.0}", self.peer_id, delivery.map(|delivery| delivery.bytes_per_sec), per_sec(delivered));
             link.update(now, interval_secs, round, delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
+            if let Some(cap) = self.config.max_bandwidth {
+                link.capped(cap);
+            }
             log::debug!(target: "zenoh_gateway::link", "peer {}: bandwidth {:.0} gain {:.2} starting up {} probing rtt {} window {:?}", self.peer_id, link.bandwidth_bytes_per_sec, link.gain, link.starting_up, link.probing_rtt(), link.window(Some(self.config.latency_target)));
             match known_bandwidth {
                 Some(known) => link.with_known_bandwidth(known),
@@ -1159,7 +1162,7 @@ fn microphone_encoding(state: &PeerState, label: &Label, opts: &PubOpts) -> Resu
 }
 
 /// The options a running subscription may change (the rest decide what it is, so they need a new subscription).
-const UPDATABLE: [&str; 14] = [
+const UPDATABLE: [&str; 15] = [
     "maxHz",
     "minQuality",
     "qualityToHzTradeoff",
@@ -1172,6 +1175,7 @@ const UPDATABLE: [&str; 14] = [
     "keyframeIntervalMs",
     "sceneChangeKeyframes",
     "targetQp",
+    "maxQp",
     "playoutDelay",
     "encodeOptions",
 ];

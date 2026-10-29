@@ -150,8 +150,11 @@ pub struct SubscribeOptions {
     pub keyframe_interval_ms: Option<f64>,
     /// video channels: a keyframe when the encoder sees a new scene (default false)
     pub scene_change_keyframes: Option<bool>,
-    /// video channels: the quantizer (H.264's 0-51) the picture's size aims for, on encoders that report it (default 30)
+    /// video channels: the quantizer (H.264's 0-51) a picture shrunk past `max_qp` aims for, on encoders that report it (default 30)
     pub target_qp: Option<f64>,
+    /// video channels: frames coarser than this quantizer (H.264's 0-51) shrink the picture; at or under it fewer bits
+    /// cost compression, not size (default 37)
+    pub max_qp: Option<f64>,
     /// video channels: (min, max) ms the browser may hold a frame to smooth out jitter (default (0, 0): show at once)
     pub playout_delay: Option<(f64, f64)>,
     /// each encoded message with its sample's own header (stamp, frame id, seq): Some(true) everywhere, Some(false)
@@ -1126,7 +1129,7 @@ impl Subscription {
 
     /// Changes the running subscription's options in place (same channel and track): any of maxHz, minQuality,
     /// qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale, minResolution, maxResolution, frameDropping,
-    /// keyframeIntervalMs, sceneChangeKeyframes, targetQp, playoutDelay and encodeOptions.quality, as JSON (`null` puts one back to its default). Returns the options now in force.
+    /// keyframeIntervalMs, sceneChangeKeyframes, targetQp, maxQp, playoutDelay and encodeOptions.quality, as JSON (`null` puts one back to its default). Returns the options now in force.
     pub async fn update(&self, changes: Value) -> Result<Value> {
         let inner = self.client.upgrade().context("the client closed")?;
         let mut reply = inner.request(json!({"op": "updateSubscription", "subId": self.id, "opts": changes}), PING_TIMEOUT).await?;

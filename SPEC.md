@@ -478,20 +478,26 @@ Bitrate and size (the video policy: `ServerBuilder::video_policy`, overridden pe
   its rate, 0.3: ~17 Mbit/s for 720p60, ~1.4 Mbit/s for 320x240 at 60 Hz). The encoder runs at what the allocator
   actually grants. Before its first frame the source's size is guessed from the sample (a 16:9 picture of 3 bytes per
   pixel) and priced by this policy, not by the raw sample's size.
-- The picture keeps the source's size (fitted into `maxResolution`) unless the grant would leave fewer than
-  `min_bits_per_pixel` (0.1) there; then it shrinks just enough, never below `minResolution` ([160, 64], aspect kept: it stops when one side reaches its value) or `minResolutionScale` (0), whichever is larger. Below
-  ~0.03 bit/pixel openh264 overshoots its target even at its coarsest quantizer, while above it a full-size picture
-  beat every smaller one at the same bitrate on the bench scene (after upscaling).
+- Fewer bits cost compression before size: the picture keeps the source's size (fitted into `maxResolution`) and
+  shrinks only as a last resort, never below `minResolution` ([160, 64], aspect kept: it stops when one side reaches
+  its value) or `minResolutionScale` (0), whichever is larger. On encoders that report their quantizer (openh264) it
+  shrinks only while frames come out coarser than `maxQp` (37, libwebrtc's H.264 high threshold), see below. Until
+  the first frame's quantizer is known, and on encoders that never report one, the picture is sized so the grant
+  leaves `min_bits_per_pixel` (0.1) a pixel: below ~0.03 bit/pixel openh264 overshoots its target even at its
+  coarsest quantizer.
 - The picture is sized for the link's bandwidth (times its gain while the link model probes), not the bitrate a brake
   or GCC cut holds video to, so a cut lowers the bitrate, not the size (each new size is a keyframe). In the link
   model's startup, video gets at most its gain times what video measurably delivered (never under the first guess),
   and the picture grows at once while video isn't queued at the link.
-- On encoders that report their quantizer (openh264), the picture shrinks below that while frames come out coarser
-  than `targetQp` (30) and the encoder spends its bitrate: pixels × (bitrate now / then) × 2^((targetQp − QP) / 6)
-  over the last second (H.264's bits halve each +6 QP), as libwebrtc's quality scaler does with thresholds instead.
-- Quality, for video, is the share of the most bits per frame: 0 is the smallest picture at the bit-per-pixel floor,
-  1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other encodings, but video's
-  `qualityToHzTradeoff` defaults to 1: it keeps its frame rate and shrinks the picture.
+- On encoders that report their quantizer (openh264), the quantizer sizes the picture: while frames come out coarser
+  than `maxQp` and the encoder spends its bitrate, it shrinks to pixels × (bitrate now / then) × 2^((targetQp − QP) / 6)
+  over the last second (H.264's bits halve each +6 QP; `targetQp` 30), as libwebrtc's quality scaler steps down past
+  its high threshold; at or under `maxQp` the size holds, and it grows back, up to full size, while frames come out
+  finer than `targetQp`.
+- Quality, for video, is the share of the most bits per frame: 0 is the fewest (the smallest picture at the
+  bit-per-pixel floor), 1 is `maxBitrate` / rate, linear between. The allocator trades it against Hz as for other
+  encodings, but video's `qualityToHzTradeoff` defaults to 1: it keeps its frame rate and spends fewer bits per frame
+  (a coarser quantizer at the same size, see above).
 - openh264 runs with frame skipping on (`frameDropping`: it holds its bitrate only by skipping frames; libwebrtc does
   the same) and frames timestamped one frame interval apart; bitrate and frame rate changes apply in place (no
   keyframe); a size change, or a change of its options, restarts it with one. Scene-change keyframes are off

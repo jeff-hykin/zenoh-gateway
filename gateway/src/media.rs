@@ -350,7 +350,8 @@ impl VideoRate {
         self.received_bytes.load(Ordering::Relaxed)
     }
 
-    fn cap_bps(&self) -> f64 {
+    /// What the allocator lets video take, bits/s (the initial bandwidth guess until its first allocation).
+    pub fn cap_bps(&self) -> f64 {
         f64::from_bits(self.cap_bps.load(Ordering::Relaxed))
     }
 
@@ -1070,10 +1071,12 @@ struct SessionState {
 /// Sizes the picture by the encoder's quantizer, as libwebrtc's quality scaler does, but by an equation instead of its
 /// thresholds and steps: H.264's bits per frame halve each +6 QP, so at the bitrate now the picture that reaches
 /// `VideoPolicy::target_qp` has `pixels x (bitrate now / bitrate then) x 2^((target - QP) / 6)`, from the average QP of
-/// the last `SIZE_DOWN_SETTLE` of delta frames at the size in use. A picture too big for its bitrate (openh264 then
-/// skips frames, as at 0.1 bit/pixel on a 500 kbit/s link: 2 of 3) shrinks; one that compresses well grows back up to
-/// the size its bitrate affords (`video::target`). A coarse quantizer shrinks the picture only while the encoder spends
-/// its bitrate: one with bits to spare (a still picture, nothing to code) isn't short of them.
+/// the last `SIZE_DOWN_SETTLE` of delta frames at the size in use. Fewer bits cost compression first: the picture
+/// shrinks only while frames come out coarser than `VideoPolicy::max_qp` (then toward `target_qp`, as libwebrtc's
+/// quality scaler steps down past its high threshold), as a picture too big for its bitrate does (openh264 then skips
+/// frames, as at 0.1 bit/pixel on a 500 kbit/s link: 2 of 3); one that compresses well grows back, up to full size. A
+/// coarse quantizer shrinks the picture only while the encoder spends its bitrate: one with bits to spare (a still
+/// picture, nothing to code) isn't short of them.
 #[derive(Default)]
 struct QpScaler {
     /// (when, QP, bits, bits/s the picture was sized for, bits/s the encoder was given) of each delta frame at `size`
@@ -1096,8 +1099,9 @@ impl QpScaler {
         }
     }
 
-    /// The share of `source`'s width and height the picture should take at `bitrate`, once a frame was measured.
-    fn scale(&self, source: (u32, u32), bitrate: f64, target_qp: f64) -> Option<f64> {
+    /// The share of `source`'s width and height the picture should take at `bitrate`, once a frame was measured, and
+    /// whether that is a shrink for coarse frames (past `max_qp`).
+    fn scale(&self, source: (u32, u32), bitrate: f64, target_qp: f64, max_qp: f64) -> Option<(f64, bool)> {
         if self.frames.is_empty() || source.0 == 0 {
             return None;
         }
@@ -1110,7 +1114,10 @@ impl QpScaler {
         let qp_factor = 2f64.powf((target_qp - qp) / 6.0);
         let qp_factor = if spent < given { qp_factor.max(1.0) } else { qp_factor };
         let pixels = self.size.0 as f64 * self.size.1 as f64 * (bitrate / then.max(1.0)) * qp_factor;
-        Some((pixels / (source.0 as f64 * source.1 as f64)).sqrt())
+        let (aimed, now) = ((pixels / (source.0 as f64 * source.1 as f64)).sqrt(), (self.size.0 as f64 / source.0 as f64).min(1.0));
+        // (at or under max_qp a lower bitrate costs compression: the size holds, growing only while frames come out fine)
+        let coarse = qp > max_qp && spent >= given;
+        Some(if coarse { (aimed, aimed < now) } else { (aimed.max(now), false) })
     }
 }
 
@@ -1252,7 +1259,8 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         // (only while bandwidth is short: granted its whole demand, the policy's bits per pixel already set the quality at
         // full size, and a coarse quantizer shrank a 20 Mbit/s link's picture to 1184x666)
         let most = session.policy.frame_bytes(state.source, hz.max(0.1), 1.0) * 8.0 * hz.max(0.1);
-        let qp_scale = (bitrate < most).then(|| state.qp.scale(state.source, size_bitrate, session.policy.target_qp)).flatten();
+        let by_qp = (bitrate < most).then(|| state.qp.scale(state.source, size_bitrate, session.policy.target_qp, session.policy.max_qp)).flatten();
+        let qp_scale = by_qp.map(|(scale, _)| scale);
         let (scale, source) = (state.scale, state.source);
         let floor = session.policy.floor_scale(source);
         out.scale_cap = state.governor.scale_cap(scale, floor, hz, Instant::now());
@@ -1260,9 +1268,9 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         let now = Instant::now();
         let (size, changed) = steady_size(state.size, source, (target.width, target.height), now, starting_up, state.qp_shrunk);
         if changed {
-            // the quantizer set it when its size is under the bitrate's
-            let by_bitrate = session.policy.size(source, size_bitrate.max(1.0), hz.max(0.1), out.scale_cap);
-            state.qp_shrunk = size.0 < by_bitrate.0;
+            // (only coarse frames past maxQp hold a shrunk picture back from full size: a picture still small from a
+            // low first grant, its frames fine, sat at 160x120 after a quick resubscribe)
+            state.qp_shrunk = by_qp.is_some_and(|(_, shrinking)| shrinking);
             state.size = Some((source, size, now));
         }
         (target.width, target.height) = size;
@@ -1422,7 +1430,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             // (a frame the encoder renders itself: its size once it has encoded one, no floor before)
             _ => shared.video_source().unwrap_or_default(),
         };
-        let (quality, bitrate, hz) = shared.video_grant(&key, source);
+        let (quality, bitrate, hz) = shared.video_grant(&key, source, track.rate.cap_bps());
         frame_interval = crate::secs(1.0 / hz.max(0.1));
         let previous = member.session.take();
         let Channel::Video(format) = shared.channel else { return };
@@ -1547,6 +1555,32 @@ mod tests {
         dropped.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(1), reader).await.expect("the reader ends").unwrap();
         assert_eq!(Arc::strong_count(&held), 1, "and lets go of the track");
+    }
+
+    #[test]
+    fn fewer_bits_cost_compression_before_size() {
+        use super::QpScaler;
+        use std::time::{Duration, Instant};
+        let (source, t0) = ((320, 240), Instant::now());
+        // frames at full size, sized for 230 kbit/s and spending all of it
+        let measured = |qp: f64| {
+            let mut scaler = QpScaler::default();
+            for frame in 0..20u64 {
+                scaler.observe(t0 + Duration::from_millis(50 * frame), source, qp, 230_000.0 / 20.0, 230_000.0, 230_000.0);
+            }
+            scaler
+        };
+        // the grant falls to 96 kbit/s (allocation.js's 12 KB/s): frames at QP 30 (<= maxQp 37) keep the full picture
+        assert_eq!(measured(30.0).scale(source, 96_000.0, 30.0, 37.0), Some((1.0, false)), "a coarser quantizer, not a smaller picture");
+        // past maxQp the encoder is out of compression: the picture shrinks toward targetQp
+        let (shrunk, by_qp) = measured(43.0).scale(source, 96_000.0, 30.0, 37.0).unwrap();
+        assert!(shrunk < 0.5 && by_qp, "shrinks as a last resort: {shrunk}");
+        // and the size by QP wins over the bits-per-pixel guess once the quantizer is known
+        let policy = crate::encoding::video::VideoPolicy::default();
+        let sized = crate::encoding::video::target(&policy, source, 0.3, 96_000.0, 96_000.0, Some(1.0), 20.0, 1.0, false);
+        assert_eq!((sized.width, sized.height), (320, 240));
+        let guessed = crate::encoding::video::target(&policy, source, 0.3, 96_000.0, 96_000.0, None, 20.0, 1.0, false);
+        assert!(guessed.width < 320, "until then the bits-per-pixel floor guesses a size: {}", guessed.width);
     }
 
     #[test]

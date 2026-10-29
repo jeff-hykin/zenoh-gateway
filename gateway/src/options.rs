@@ -60,6 +60,8 @@ pub struct SubOpts {
     pub keyframe_interval_ms: Option<f64>,
     pub scene_change_keyframes: Option<bool>,
     pub target_qp: Option<f64>,
+    /// video channels: frames coarser than this quantizer shrink the picture (see `VideoPolicy::max_qp`)
+    pub max_qp: Option<f64>,
     /// video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once)
     pub playout_delay: Option<(f64, f64)>,
     /// each message's own header (stamp, frame id, seq; see `MessageEncoding::header`) sent with it: true = on every
@@ -123,6 +125,7 @@ impl SubOpts {
         check_positive("maxBitrate", parsed.max_bitrate)?;
         check_positive("keyframeIntervalMs", parsed.keyframe_interval_ms)?;
         check("targetQp", parsed.target_qp, |qp| (0.0..=51.0).contains(&qp), "within [0, 51]")?;
+        check("maxQp", parsed.max_qp, |qp| (0.0..=51.0).contains(&qp), "within [0, 51]")?;
         check("minResolutionScale", parsed.min_resolution_scale, |scale| (0.0..=1.0).contains(&scale), "within [0, 1]")?;
         if parsed.min_resolution.is_some_and(|(width, height)| width < 16 || height < 16) {
             return Err("minResolution must be at least [16, 16]".into());
@@ -183,9 +186,10 @@ impl SubOpts {
                 || self.keyframe_interval_ms.is_some()
                 || self.scene_change_keyframes.is_some()
                 || self.target_qp.is_some()
+                || self.max_qp.is_some()
                 || self.playout_delay.is_some())
         {
-            return Err(format!("maxBitrate, minResolutionScale, minResolution, maxResolution, frameDropping, keyframeIntervalMs, sceneChangeKeyframes, targetQp and playoutDelay are for video channels, not {}", channel.as_str()));
+            return Err(format!("maxBitrate, minResolutionScale, minResolution, maxResolution, frameDropping, keyframeIntervalMs, sceneChangeKeyframes, targetQp, maxQp and playoutDelay are for video channels, not {}", channel.as_str()));
         }
         if let Channel::Video(format) = channel {
             registry.video_encoder(&*encoding, format)?;
@@ -220,6 +224,8 @@ impl SubOpts {
             keyframe_interval: self.keyframe_interval_ms.map_or(server.keyframe_interval, |ms| crate::secs(ms / 1000.0)),
             scene_change_keyframes: self.scene_change_keyframes.unwrap_or(server.scene_change_keyframes),
             target_qp: self.target_qp.unwrap_or(server.target_qp),
+            // (never under targetQp: a page that aims coarser shrinks only past where it aims)
+            max_qp: self.max_qp.unwrap_or(server.max_qp).max(self.target_qp.unwrap_or(server.target_qp)),
             ..server
         }
     }
@@ -268,6 +274,7 @@ impl SubOpts {
             "keyframeIntervalMs": self.keyframe_interval_ms,
             "sceneChangeKeyframes": self.scene_change_keyframes,
             "targetQp": self.target_qp,
+            "maxQp": self.max_qp,
             "playoutDelay": self.playout_delay.unwrap_or((0.0, 0.0)),
             "metadata": self.metadata,
         })

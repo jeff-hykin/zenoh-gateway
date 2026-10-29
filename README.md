@@ -86,18 +86,19 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 | `maxHz` | none | never send faster |
 | `bandwidthPriority` | 1 | higher keeps more when bandwidth is short; 0 gives up first |
 | `minQuality` | 0 | the lowest quality the allocator may pick |
-| `qualityToHzTradeoff` | 0.5 (video: 1) | 0 = keep quality, drop rate; 1 = keep rate, drop quality (video: shrink the picture) |
+| `qualityToHzTradeoff` | 0.5 (video: 1) | 0 = keep quality, drop rate; 1 = keep rate, drop quality (video: fewer bits per frame at the same size) |
 | `encoding` | none (raw bytes) | a name from `z.encodings` |
 | `channel` | from the encoding | `"video-h264"`, `"video-vp8"`, `"video-vp9"`, `"video-av1"`, `"audio-opus"` or `"data"` |
 | `encodeOptions` | `{}` | for the encoding; `quality` (0–1, default 1) is the most the allocator picks |
 | `compress` | the encoding's | `"zstd"` or `"none"` (data channels); `msg.bytes` is always decompressed |
 | `maxBitrate` | ~0.3 bit/pixel | video: the most bits/s it asks for |
-| `minResolutionScale` | 0 | video: full size unless the grant is under 0.1 bit/pixel, never smaller than this share |
+| `minResolutionScale` | 0 | video: never smaller than this share (the picture keeps full size unless frames pass `maxQp`) |
 | `minResolution` | `[160, 64]` | video: never shrinks below this |
 | `maxResolution` | none | video: `[width, height]` box the picture fits in |
 | `frameDropping` | true | video: the encoder may skip a frame to hold its bitrate |
 | `keyframeIntervalMs` | 60000 | video: a keyframe at least this often |
-| `targetQp` | 30 | video: the quantizer the picture's size aims for (lower = smaller, sharper) |
+| `targetQp` | 30 | video: the quantizer a shrunk picture aims for, and grows back under (lower = smaller, sharper) |
+| `maxQp` | 37 | video: fewer bits cost compression up to this quantizer; past it the picture shrinks (libwebrtc's threshold) |
 | `sceneChangeKeyframes` | false | video: a keyframe on a scene change |
 | `metadata` | `true` | `msg.header`: `{ stamp, sec, nanosec, frameId, seq? }` from the sample |
 | `playoutDelay` | `[0, 0]` | video: `[min, max]` ms the browser may hold a frame; `[0, 0]` shows each at once |
@@ -105,7 +106,7 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 `Subscription`: `ready()`, `state`, `mediaStream`, `channelName`, `received`, `dropped`, `partialDropped`,
 `decodeErrors`, `gatewayStats`, `rejectionReason`, `close()`, and `update(changes)`, which changes `maxHz`,
 `minQuality`, `qualityToHzTradeoff`, `bandwidthPriority`, `maxBitrate`, `minResolutionScale`, `maxResolution`,
-`frameDropping`, `keyframeIntervalMs`, `sceneChangeKeyframes`, `targetQp`, `playoutDelay` or `encodeOptions.quality` in place, with no resubscribe (`null` restores a default).
+`frameDropping`, `keyframeIntervalMs`, `sceneChangeKeyframes`, `targetQp`, `maxQp`, `playoutDelay` or `encodeOptions.quality` in place, with no resubscribe (`null` restores a default).
 
 ### Publisher options and methods
 

@@ -197,8 +197,10 @@ export interface SubscribeOptions {
     keyframeIntervalMs?: number
     /** video channels: a keyframe when the encoder sees a new scene (default false: at low bitrates they cost more than they fix) */
     sceneChangeKeyframes?: boolean
-    /** video channels: the quantizer (H.264's 0-51) the picture's size aims for: lower = smaller, sharper (default 30) */
+    /** video channels: the quantizer (H.264's 0-51) a picture shrunk past `maxQp` aims for, and grows back under: lower = smaller, sharper (default 30) */
     targetQp?: number
+    /** video channels: frames coarser than this quantizer (H.264's 0-51) shrink the picture; at or under it fewer bits cost compression, not size (default 37, libwebrtc's) */
+    maxQp?: number
     /** video channels: [min, max] ms the browser may hold a frame to smooth out jitter (default [0, 0]: show at once) */
     playoutDelay?: [number, number]
     /** each encoded message comes with its sample's own header (`msg.header`: stamp, frameId, seq), default true; false
@@ -208,7 +210,7 @@ export interface SubscribeOptions {
 
 /** What `Subscription.update` may change on a running subscription; `null` puts an option back to its default. */
 export type SubscriptionUpdate = {
-    [option in "maxHz" | "minQuality" | "qualityToHzTradeoff" | "bandwidthPriority" | "maxBitrate" | "minResolutionScale" | "minResolution" | "maxResolution" | "frameDropping" | "keyframeIntervalMs" | "sceneChangeKeyframes" | "targetQp" | "playoutDelay"]?:
+    [option in "maxHz" | "minQuality" | "qualityToHzTradeoff" | "bandwidthPriority" | "maxBitrate" | "minResolutionScale" | "minResolution" | "maxResolution" | "frameDropping" | "keyframeIntervalMs" | "sceneChangeKeyframes" | "targetQp" | "maxQp" | "playoutDelay"]?:
         SubscribeOptions[option] | null
 } & { encodeOptions?: { quality?: number } }
 

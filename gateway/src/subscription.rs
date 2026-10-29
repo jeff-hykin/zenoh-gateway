@@ -118,7 +118,9 @@ pub struct Pending {
 #[derive(Default)]
 struct KeyQueue {
     items: VecDeque<Pending>,
-    last_sent: Option<Instant>,
+    /// when the next sample may go: one interval on from the last one's due time, not from when it went (libwebrtc's
+    /// FramerateController: spacing from send times held a 20 Hz camera granted 20 Hz to 12.6, each frame a hair early)
+    next_due: Option<Instant>,
     /// arrivals since the allocator last looked, and the resulting source rate
     arrivals: u32,
     rate_hz: f64,
@@ -390,9 +392,11 @@ impl SubShared {
         self.allocated_key_hz(rate, &state.allocation).unwrap_or(wanted)
     }
 
-    /// What a video key is granted: (quality, bits/s, frames/s). Before the first allocation, its floor picture at
-    /// `source`'s size: a camera with no grant once fell back to the most it may ask for and took a 100 kbit/s link down.
-    pub fn video_grant(&self, key: &str, source: (u32, u32)) -> (f64, f64, f64) {
+    /// What a video key is granted: (quality, bits/s, frames/s). Before the first allocation, `start_bps` (what video may
+    /// take on the link now, as libwebrtc sizes a first picture from its start bitrate), at most its demand and at least its
+    /// floor picture: a camera with no grant once fell back to the most it may ask for and took a 100 kbit/s link down,
+    /// and at its floor alone each new subscription started at a quarter of the picture and grew back over a second.
+    pub fn video_grant(&self, key: &str, source: (u32, u32), start_bps: f64) -> (f64, f64, f64) {
         let hz = self.key_hz(key);
         let state = self.state.lock();
         let allocation = &state.allocation;
@@ -401,8 +405,9 @@ impl SubShared {
             return (quality, allocation.budget_bytes_per_sec * 8.0 * (hz / allocation.hz).min(1.0), hz);
         }
         let quality = self.tuning().quality_range.0;
-        let floor = self.tuning().video_policy.frame_bytes(source, hz, quality);
-        (quality, floor * 8.0 * hz, hz)
+        let policy = self.tuning().video_policy;
+        let (floor, most) = (policy.frame_bytes(source, hz, quality) * 8.0 * hz, policy.frame_bytes(source, hz, self.tuning().quality_range.1) * 8.0 * hz);
+        (quality, start_bps.min(most).max(floor), hz)
     }
 
     /// Per-key Hz cap from the allocation (None = no allocation cap).
@@ -696,18 +701,17 @@ impl SubShared {
             let Some(head) = queue.items.front() else {
                 continue;
             };
-            match (self.key_interval(queue, &state.allocation, state.probing), queue.last_sent) {
+            match (self.key_interval(queue, &state.allocation, state.probing), queue.next_due) {
                 (Spacing::Never, _) => continue,
-                (Spacing::Every(interval), Some(last_sent)) if last_sent + interval > now => {
-                    let ready_at = last_sent + interval;
-                    wake_at = Some(wake_at.map_or(ready_at, |w| w.min(ready_at)));
+                (Spacing::Every(_), Some(due)) if due > now => {
+                    wake_at = Some(wake_at.map_or(due, |w| w.min(due)));
                     continue;
                 }
                 // a video key held to fewer frames than its source sends: once its spacing is up, the next frame to
                 // arrive goes rather than the one that waited out the spacing (up to a source interval old: at 2.7 of 5
                 // Hz that was 100 ms p50 of the picture's age), unless no frame comes within a source interval
-                (Spacing::Every(interval), Some(last_sent)) if matches!(self.channel, Channel::Video(_)) && queue.rate_hz > 0.0 && head.arrived < last_sent + interval => {
-                    let fresh_by = last_sent + interval + crate::secs(1.0 / queue.rate_hz);
+                (Spacing::Every(_), Some(due)) if matches!(self.channel, Channel::Video(_)) && queue.rate_hz > 0.0 && head.arrived < due => {
+                    let fresh_by = due + crate::secs(1.0 / queue.rate_hz);
                     if now < fresh_by {
                         wake_at = Some(wake_at.map_or(fresh_by, |w| w.min(fresh_by)));
                         continue;
@@ -727,9 +731,20 @@ impl SubShared {
         if !take {
             return (Some((key, None)), wake_at);
         }
+        let spacing = self.key_interval(&state.keys[&key], &state.allocation, state.probing);
         let queue = state.keys.get_mut(&key).unwrap();
         let item = queue.items.pop_front().unwrap();
-        queue.last_sent = Some(now);
+        queue.next_due = match spacing {
+            // on schedule: the next is due an interval after this one was
+            Spacing::Every(interval) => Some(match queue.next_due {
+                Some(due) if now < due + interval => due + interval,
+                // (first, or after a pause: a fresh schedule, video's half an interval early so a source at the granted
+                // rate, its frames a little early or late, isn't cut to every other one, as libwebrtc starts it)
+                _ if matches!(self.channel, Channel::Video(_)) => now + interval / 2,
+                _ => now + interval,
+            }),
+            _ => None,
+        };
         state.stats.unqueue(&item);
         (Some((key, Some(item))), wake_at)
     }
@@ -1136,8 +1151,9 @@ mod tests {
             let mut state = sub.state.lock();
             let queue = state.keys.entry("map".into()).or_default();
             queue.rate_hz = 1e-30;
-            queue.last_sent = Some(Instant::now());
+            queue.next_due = Some(Instant::now());
             queue.items.push_back(pending(1, 3, Instant::now()));
+            (state.stats.queued, state.stats.queued_bytes) = (1, 10);
             state.allocation = Allocation { constrained: true, hz_fraction: 0.5, ..Default::default() };
         }
         let _ = sub.pick(Instant::now());
@@ -1292,6 +1308,28 @@ mod tests {
         let noisy = item(noise.clone());
         let body = raw_body(Compress::Zstd, &noisy).await;
         assert_eq!((body.flags(), body.bytes()), (0, &noise[..]), "incompressible bytes go as they are");
+    }
+
+    #[test]
+    fn a_camera_at_its_granted_rate_keeps_every_frame() {
+        // a 20 Hz camera, its frames 2 ms early or late, granted its measured 19.9 Hz: spacing from send times held it to
+        // 12.6 Hz (a frame a hair early waited a whole source interval for a fresher one, which then also came early)
+        let registry = Arc::new(EncodingRegistry::new([]).unwrap());
+        let resolved = Resolved { encoding: None, channel: Channel::Video(crate::encoding::video::VideoFormat::H264), output: EncodingOutput::Video };
+        let shared = SubShared::new(&SubOpts::parse(&serde_json::json!({"maxHz": 20})).unwrap(), resolved, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG);
+        {
+            let mut state = shared.state.lock();
+            state.keys.entry("cam".into()).or_default().rate_hz = 19.9;
+            state.allocation = Allocation { constrained: true, hz_fraction: 1.0, ..Default::default() };
+        }
+        let t0 = Instant::now();
+        let sent = (0..100u32).filter(|frame| {
+            let jitter = if frame % 2 == 0 { 2 } else { -2 };
+            let arrived = t0 + Duration::from_millis((50 * *frame as i64 + 10 + jitter) as u64);
+            insert(&shared, "cam", pending(*frame, 5, arrived), Some(1));
+            shared.pick(arrived + Duration::from_millis(1)).0.is_some()
+        }).count();
+        assert!(sent >= 97, "{sent} of 100 frames went");
     }
 
     #[test]

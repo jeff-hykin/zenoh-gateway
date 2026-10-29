@@ -447,6 +447,15 @@ impl LinkModel {
         self.probing_rtt
     }
 
+    /// Ends startup once the host's cap (`ServerBuilder::max_bandwidth`, bytes/s) is under the estimate: the cap, not the
+    /// link, holds the page back, so nothing beats the first guess and startup, waiting for a sample that does, never
+    /// ended (a 12 KB/s cap under the 64 KB/s guess stayed in startup, offered 2.89x, its picture sized for that).
+    pub fn capped(&mut self, cap: f64) {
+        if self.starting_up && cap < self.bandwidth_bytes_per_sec {
+            (self.starting_up, self.cycle, self.gain) = (false, 1, PROBE_GAINS[1]);
+        }
+    }
+
     /// This model with the host's known `bandwidth` (bytes/s) in place of its estimate: no startup, no probes.
     pub fn with_known_bandwidth(&self, bandwidth: f64) -> Self {
         Self { bandwidth_bytes_per_sec: bandwidth, gain: 1.0, starting_up: false, probing_rtt: false, ..self.clone() }
@@ -748,6 +757,33 @@ mod tests {
         assert!(!model.starting_up, "estimates {:?}", &estimates[200..]);
         let least = estimates[40..].iter().copied().fold(f64::INFINITY, f64::min);
         assert!(least >= 450_000.0, "and the estimate stands: {least}");
+    }
+
+    #[test]
+    fn a_slow_link_under_the_first_guess_leaves_startup_and_an_idle_page_does_not() {
+        // a 250 kbit/s link (31 KB/s, under the 64 KB/s guess) with more to send: link-limited rounds stop growing
+        let mut slow = LinkModel::default();
+        page(&mut slow, Instant::now(), 0..80, 31_250.0, 100_000.0, 0.0);
+        assert!(!slow.starting_up, "a real bottleneck ends startup");
+        // a page sending 12 KB/s on a fast link is app-limited: no bottleneck found, startup stays (BBR's rule)
+        let mut idle = LinkModel::default();
+        page(&mut idle, Instant::now(), 0..20, 2_500_000.0, 6_000.0, 6_000.0);
+        assert!(idle.starting_up, "app-limited rounds don't end startup");
+    }
+
+    #[test]
+    fn a_page_under_the_first_guess_leaves_startup() {
+        // 12 KB/s of data and video (a page capped at 12 KB/s, below the 64 KB/s first guess): nothing ever beats the
+        // estimate, so no round gave a sample and startup, which waited for one, never ended (startingUp true, gain 2.89)
+        let mut model = LinkModel::default();
+        page(&mut model, Instant::now(), 0..40, 12_000.0, 6_000.0, 6_000.0);
+        assert!(model.starting_up, "nothing beat the guess: no sample ends startup by itself");
+        model.capped(12_000.0);
+        assert!(!model.starting_up);
+        assert_eq!(model.gain, PROBE_GAINS[model.cycle], "the probe cycle's gain, not startup's");
+        let mut fast = LinkModel::default();
+        fast.capped(10_000_000.0);
+        assert!(fast.starting_up, "a cap over the estimate leaves startup to the link");
     }
 
     #[test]

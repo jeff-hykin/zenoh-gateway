@@ -1,9 +1,10 @@
 //! Video encoders: the [`VideoEncoder`] trait, the default one (pictures, RGB8 or I420, to H.264 with openh264,
 //! constrained baseline), and the [`VideoPolicy`] that turns a stream's grant into a picture size.
 //!
-//! The allocator grants each video stream bytes/s and a frame rate; the encoder runs at that bitrate. The picture keeps
-//! its full size unless the grant would leave fewer than `min_bits_per_pixel` there (an encoder at its coarsest
-//! quantizer overshoots below that), then it shrinks just enough, never below `MIN_RESOLUTION` (or `min_resolution_scale`).
+//! The allocator grants each video stream bytes/s and a frame rate; the encoder runs at that bitrate. Fewer bits cost
+//! compression, not size: the picture keeps its full size and shrinks only as a last resort, while the encoder's frames
+//! come out coarser than `max_qp` (or, on an encoder that doesn't report its quantizer, and before the first frame says,
+//! while the grant would leave fewer than `min_bits_per_pixel`), never below `MIN_RESOLUTION` (or `min_resolution_scale`).
 
 use crate::encoding::{DecodedFrame, PixelFormat, VideoImage};
 use anyhow::{Result, anyhow, ensure};
@@ -29,7 +30,8 @@ pub struct VideoPolicy {
     pub max_bitrate: Option<f64>,
     /// See `max_bitrate` (default 0.3: ~17 Mbit/s for 720p60).
     pub max_bits_per_pixel: f64,
-    /// Below this many bits per pixel per frame the picture shrinks (default 0.1: openh264's coarsest quantizer
+    /// Below this many bits per pixel per frame the picture shrinks, on encoders that don't report their quantizer and
+    /// until the first frame does (default 0.1: openh264's coarsest quantizer
     /// still overshoots below ~0.03 on a busy scene, and at 0.05 a short link kept 720p at a few hundred kbit/s, whose
     /// keyframes then queued in the pacer for hundreds of ms).
     pub min_bits_per_pixel: f64,
@@ -49,14 +51,17 @@ pub struct VideoPolicy {
     /// frames skipped to hold a 1 Mbit/s bitrate, a smoothly moving picture tripped it every ~4 s, each keyframe ~21 KB,
     /// 170 ms of the link). A lost frame is still recovered by the browser's PLI.
     pub scene_change_keyframes: bool,
-    /// The quantizer the picture's size aims for, on encoders that report theirs (default 30, H.264's 0-51 scale: the
+    /// The quantizer a picture shrunk past `max_qp` aims for, and grows back under, on encoders that report theirs (default 30, H.264's 0-51 scale: the
     /// middle of libwebrtc's 24-37, past which its quality scaler moves the picture). Lower: a smaller, sharper picture.
     pub target_qp: f64,
+    /// Frames coarser than this quantizer shrink the picture, toward `target_qp`; at or under it the picture keeps its
+    /// size and fewer bits cost compression (default 37, libwebrtc's H.264 quality scaler's high threshold).
+    pub max_qp: f64,
 }
 
 impl Default for VideoPolicy {
     fn default() -> Self {
-        VideoPolicy { max_bitrate: None, max_bits_per_pixel: 0.3, min_bits_per_pixel: 0.1, min_resolution_scale: 0.0, min_resolution: MIN_RESOLUTION, max_resolution: None, frame_dropping: true, keyframe_interval: Duration::from_secs(60), scene_change_keyframes: false, target_qp: 30.0 }
+        VideoPolicy { max_bitrate: None, max_bits_per_pixel: 0.3, min_bits_per_pixel: 0.1, min_resolution_scale: 0.0, min_resolution: MIN_RESOLUTION, max_resolution: None, frame_dropping: true, keyframe_interval: Duration::from_secs(60), scene_change_keyframes: false, target_qp: 30.0, max_qp: 37.0 }
     }
 }
 
@@ -70,6 +75,7 @@ impl VideoPolicy {
         ensure!(self.max_resolution.is_none_or(|(width, height)| width >= MIN_DIMENSION && height >= MIN_DIMENSION), "max resolution must be at least {MIN_DIMENSION}x{MIN_DIMENSION}");
         ensure!(!self.keyframe_interval.is_zero(), "keyframe interval must be positive");
         ensure!((0.0..=51.0).contains(&self.target_qp), "target QP must be within [0, 51]");
+        ensure!((self.target_qp..=51.0).contains(&self.max_qp), "max QP must be within [target QP, 51]");
         Ok(())
     }
 
@@ -419,19 +425,15 @@ impl VideoEncoder for H264Encoder {
     }
 }
 
-/// The target for a grant of `bitrate_bps` at `hz` for a `source`-sized picture, at most `scale_cap` of its size. The
-/// picture is sized for `size_bitrate_bps` (see `VideoRate::size_ratio`) at the policy's `min_bits_per_pixel`, or at
-/// `qp_scale` of the source (see `QpScaler`) when that is smaller: as libwebrtc picks a first size from the bitrate and
-/// its quality scaler takes it down while frames come out coarse (sized by the quantizer alone, a fast link's picture
-/// started small, where the encoder can't spend more bits, and stayed small).
+/// The target for a grant of `bitrate_bps` at `hz` for a `source`-sized picture, at most `scale_cap` of its size. Once
+/// the encoder's quantizer is known the picture is `qp_scale` of the source (see `QpScaler`: full size unless frames come
+/// out coarser than `max_qp`); until then, or on an encoder that doesn't report it, sized for `size_bitrate_bps` (see
+/// `VideoRate::size_ratio`) at the policy's `min_bits_per_pixel`, as libwebrtc picks a first size from the bitrate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn target(policy: &VideoPolicy, source: (u32, u32), quality: f64, bitrate_bps: f64, size_bitrate_bps: f64, qp_scale: Option<f64>, hz: f64, scale_cap: f64, keyframe: bool) -> VideoTarget {
     let (fps, bitrate_bps) = (hz.max(0.1), bitrate_bps.max(MIN_BITRATE));
     let by_bitrate = policy.size(source, size_bitrate_bps.max(MIN_BITRATE), fps, scale_cap);
-    let (width, height) = match qp_scale.map(|scale| policy.scaled(source, scale, scale_cap)) {
-        Some(by_qp) if by_qp.0 < by_bitrate.0 => by_qp,
-        _ => by_bitrate,
-    };
+    let (width, height) = qp_scale.map_or(by_bitrate, |scale| policy.scaled(source, scale, scale_cap));
     VideoTarget { quality, width, height, bitrate_bps: bitrate_bps as u32, fps, keyframe, frame_dropping: policy.frame_dropping, keyframe_interval: policy.keyframe_interval, scene_change_keyframes: policy.scene_change_keyframes }
 }
 
