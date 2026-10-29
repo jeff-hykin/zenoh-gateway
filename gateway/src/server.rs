@@ -67,6 +67,8 @@ pub struct ServerBuilder {
     connect: Vec<String>,
     serve_dir: Option<PathBuf>,
     max_bandwidth_bytes_per_sec: Option<f64>,
+    initial_bandwidth_bytes_per_sec: f64,
+    reliable_max_backlog: Duration,
     latency_target: Duration,
     stale_after: Duration,
     put_timeout: Duration,
@@ -98,6 +100,8 @@ impl Default for ServerBuilder {
             connect: Vec::new(),
             serve_dir: None,
             max_bandwidth_bytes_per_sec: None,
+            initial_bandwidth_bytes_per_sec: crate::allocator::DEFAULT_INITIAL_BANDWIDTH,
+            reliable_max_backlog: crate::subscription::DEFAULT_RELIABLE_MAX_BACKLOG,
             latency_target: crate::allocator::DEFAULT_LATENCY_TARGET,
             stale_after: crate::allocator::DEFAULT_STALE_AFTER,
             put_timeout: crate::peer::DEFAULT_PUT_TIMEOUT,
@@ -167,6 +171,20 @@ impl ServerBuilder {
     /// Caps every browser's bandwidth budget (bytes/s) below its estimate, e.g. for a known-slow link. Default: no cap.
     pub fn max_bandwidth_bytes_per_sec(mut self, bytes_per_sec: f64) -> Self {
         self.max_bandwidth_bytes_per_sec = Some(bytes_per_sec);
+        self
+    }
+
+    /// Each browser's first bandwidth guess, bytes/s, before anything is measured (default 64 000, 512 kbit/s). Startup
+    /// grows it by what the link delivers each round; a higher guess fills a fast link sooner but can flood a slow one.
+    pub fn initial_bandwidth_bytes_per_sec(mut self, bytes_per_sec: f64) -> Self {
+        self.initial_bandwidth_bytes_per_sec = bytes_per_sec;
+        self
+    }
+
+    /// How long a `reliable` subscription's samples may wait for a page that can't keep up (default 2 s) before newer
+    /// ones push the oldest out (order kept; the drops show as `seq` gaps and in `droppedQueue`).
+    pub fn reliable_max_backlog(mut self, backlog: Duration) -> Self {
+        self.reliable_max_backlog = backlog;
         self
     }
 
@@ -336,6 +354,9 @@ impl ServerBuilder {
             ensure!(cap.is_finite() && cap > 0.0, "max bandwidth must be a positive number of bytes/s, got {cap}");
         }
         ensure!(!self.latency_target.is_zero(), "latency target must be more than 0");
+        let initial = self.initial_bandwidth_bytes_per_sec;
+        ensure!(initial.is_finite() && initial > 0.0, "initial bandwidth must be a positive number of bytes/s, got {initial}");
+        ensure!(!self.reliable_max_backlog.is_zero(), "reliable_max_backlog must be more than 0");
         ensure!(!self.stale_after.is_zero(), "stale_after must be more than 0");
         ensure!(!self.put_timeout.is_zero() && !self.encode_timeout.is_zero() && !self.signalling_timeout.is_zero(), "put, encode and signalling timeouts must be more than 0");
         self.video_policy.validate()?;
@@ -374,6 +395,8 @@ impl ServerBuilder {
             stale_after: self.stale_after,
             put_timeout: self.put_timeout,
             signalling_timeout: self.signalling_timeout,
+            initial_bandwidth: self.initial_bandwidth_bytes_per_sec,
+            reliable_max_backlog: self.reliable_max_backlog,
         }, leases, self.connect_config);
         let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, tls, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {

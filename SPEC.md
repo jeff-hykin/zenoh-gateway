@@ -163,7 +163,7 @@ the small messages these carry (big streams belong on subscriptions). Every requ
 
 | options | data channel init | gateway behavior when the channel is backed up |
 |---|---|---|
-| `delivery: "reliable"` | ordered, fully reliable | queue every sample; a sample that waited 2 s goes when a newer one of its key waits behind it |
+| `delivery: "reliable"` | ordered, fully reliable | queue every sample; a sample that waited `reliable_max_backlog` (default 2 s) goes when a newer one of its key waits behind it |
 | `delivery: "latest"` | unordered, maxPacketLifeTime 1000 ms (a lost chunk is retransmitted for 1 s: with no retransmits, a 200 KB message got through 3% of the time at 2% loss) | keep only the newest sample per key |
 | `+ maxAge: M` | latest: unordered, maxPacketLifeTime M | also drop anything older than M |
 
@@ -197,7 +197,7 @@ Drop otherwise, express for priority ≤ INTERACTIVE_HIGH.
 
 What `reliable` guarantees: samples of a key arrive in order, each at most once, and every one arrives while the page
 keeps up. Under congestion a key's queue on the gateway is bounded by time, not grown without limit: a sample that has
-waited 2 s is dropped once a newer sample of the same key waits behind it (so the newest is always delivered, and a key
+waited `reliable_max_backlog` (default 2 s) is dropped once a newer sample of the same key waits behind it (so the newest is always delivered, and a key
 that publishes once, like tf_static, never loses it). Drops count in `droppedQueue` and show as `seq` gaps. A stream that
 must coalesce by content (tf by child frame) needs an encoding that does it; the gateway doesn't parse payloads.
 
@@ -250,6 +250,7 @@ it shares the wire code: the media engine and interceptors, the frame format, `f
 
 `Server::builder()` takes the zenoh config (`zenoh_config`, `zenoh_config_file`, repeatable `connect`)
 or an existing `session` (never closed by the server), `serve_dir`, `max_bandwidth_bytes_per_sec`,
+`initial_bandwidth_bytes_per_sec` (each browser's first guess, default 64 000), `reliable_max_backlog` (default 2 s),
 `encoding`s, `authorize`, `lease_group`, `ice_servers`, `turn_secret`, `ice_servers_fn`, `cloudflare_turn`, `udp_ports`,
 `video_encoder` (a factory per video format for every encoding without its own encoder, e.g. a hardware one from
 zenoh-dimos-codecs' encoders) and `video_policy` (see "Video"); `build().await` validates them and opens the session. Then
@@ -514,7 +515,7 @@ BBR does (Cardwell et al., "BBR: Congestion-Based Congestion Control", 2016) and
 - **The link model** (`allocator::LinkModel`), every 250 ms (a round):
   - bandwidth = the most the frontend delivered in one round over the last 10 rounds: bytes the page acked, plus what
     video sent. A round in which the streams wanted less than their budget only counts if it delivered more (an idle
-    link says nothing about what it could carry). Starts at 64 KB/s, so a slow link isn't flooded.
+    link says nothing about what it could carry). Starts at `initial_bandwidth_bytes_per_sec` (default 64 KB/s), so a slow link isn't flooded.
   - round trip = the least send-to-ack time over the last 10 s, the page's ack interval included.
   - gain: 2/ln 2 while starting up (the bandwidth doubles each round), until three rounds that wanted more brought less
     than 25% growth; then a cycle of 1.25 (ask for more), 0.75 (drain what that queued) and 1 × 6.

@@ -150,6 +150,9 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkModel {
+    /// the first guess, and the least startup's estimate falls to (`ServerBuilder::initial_bandwidth_bytes_per_sec`)
+    #[serde(skip)]
+    initial_bandwidth: f64,
     pub bandwidth_bytes_per_sec: f64,
     pub delivered_bytes_per_sec: f64,
     pub gain: f64,
@@ -209,9 +212,10 @@ pub struct LinkModel {
     round_link_limited: bool,
 }
 
-/// The first guess, 512 kbit/s: low enough not to flood a slow link (1 MB/s plus video filled a 2 Mbit/s link's queue
-/// and SCTP's backoff silenced the page for 20 s), and startup doubles it every round.
-pub const INITIAL_BANDWIDTH: f64 = 64_000.0;
+/// What `ServerBuilder::initial_bandwidth_bytes_per_sec` defaults to, the first guess: 512 kbit/s, low enough not to
+/// flood a slow link (1 MB/s plus video filled a 2 Mbit/s link's queue and SCTP's backoff silenced the page for 20 s),
+/// and startup doubles it every round.
+pub const DEFAULT_INITIAL_BANDWIDTH: f64 = 64_000.0;
 /// A 500 kbit/s link: on a path slower than the latency target, faster links may keep more in flight by the square root
 /// of their speed over this.
 pub const SLOW_LINK: f64 = 62_500.0;
@@ -243,8 +247,16 @@ const MIN_WINDOW: usize = 4 * 1200;
 
 impl Default for LinkModel {
     fn default() -> Self {
+        LinkModel::new(DEFAULT_INITIAL_BANDWIDTH)
+    }
+}
+
+impl LinkModel {
+    /// A link not measured yet, first guessed at `initial_bandwidth` bytes/s.
+    pub fn new(initial_bandwidth: f64) -> Self {
         LinkModel {
-            bandwidth_bytes_per_sec: INITIAL_BANDWIDTH,
+            initial_bandwidth,
+            bandwidth_bytes_per_sec: initial_bandwidth,
             delivered_bytes_per_sec: 0.0,
             gain: STARTUP_GAIN,
             starting_up: true,
@@ -343,7 +355,7 @@ impl LinkModel {
             // (with no sample in the window the estimate stands: aged out by time alone, a page whose demand stayed under
             // the link fell back to the first guess every 10 s, as BBR's max filter doesn't)
             if measured > 0.0 {
-                self.bandwidth_bytes_per_sec = measured.max(INITIAL_BANDWIDTH);
+                self.bandwidth_bytes_per_sec = measured.max(self.initial_bandwidth);
             }
             if measured >= STARTUP_GROWTH * self.startup_level {
                 (self.startup_level, self.stalled_rounds, self.grew_at) = (measured, 0, Some(now));
@@ -488,6 +500,14 @@ mod tests {
     fn transcoded(tradeoff: f64, max_hz: f64) -> Demand {
         // price grows with quality: 100 bytes at q=0 .. 1100 at q=1
         Demand { priority: 1.0, max_hz, quality_range: Some((0.0, 1.0)), tradeoff, price: Box::new(|q| 100.0 + 1000.0 * q), fixed_bytes_per_sec: None, shrinks_last: false }
+    }
+
+    #[test]
+    fn the_first_guess_is_configurable() {
+        let model = LinkModel::new(250_000.0);
+        assert_eq!(model.bandwidth_bytes_per_sec, 250_000.0);
+        assert_eq!(model.pacing(None).0, 250_000.0 * STARTUP_GAIN);
+        assert_eq!(LinkModel::default().bandwidth_bytes_per_sec, DEFAULT_INITIAL_BANDWIDTH);
     }
 
     #[test]
@@ -702,7 +722,7 @@ mod tests {
     fn video_alone_below_the_link_keeps_its_estimate() {
         // one 1 MB/s camera on a 2.5 MB/s link: never link-limited, so never leaves startup; video's samples count only
         // when higher than the estimate, and 10 s after the last record the window is empty and startup's
-        // `measured.max(INITIAL_BANDWIDTH)` puts the estimate (and video's grant) back at 64 KB/s x gain
+        // `measured.max(initial_bandwidth)` puts the estimate (and video's grant) back at 64 KB/s x gain
         let mut model = LinkModel::default();
         let estimates = page(&mut model, Instant::now(), 0..240, 2_500_000.0, 0.0, 1_000_000.0);
         let least = estimates[20..].iter().copied().fold(f64::INFINITY, f64::min);

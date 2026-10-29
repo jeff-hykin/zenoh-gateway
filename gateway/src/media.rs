@@ -39,7 +39,6 @@ const OPUS: &str = "audio/opus";
 /// Google Congestion Control bounds, bits/s. It starts where the link estimator starts (`allocator::INITIAL_ESTIMATE`,
 /// 512 kbit/s), since video is allocated no more than that estimate. The ceiling is only a sanity bound (at 50 Mbit/s it
 /// capped 8 HD cameras on an idle link): the link estimate and 1.5 x what video sent bound what video gets.
-const GCC_INITIAL_BPS: f64 = crate::allocator::INITIAL_BANDWIDTH * 8.0;
 const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
 /// Video RTP's clock (H.264, VP8, VP9 and AV1 all run at 90 kHz).
@@ -572,9 +571,9 @@ impl Interceptor for SenderReportReader {
     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
 }
 
-/// Track formats, RTCP reports, NACK and TWCC-fed GCC; returns the connection's video rates and the browser's sender
-/// reports.
-pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>, Arc<SenderReports>)> {
+/// Track formats, RTCP reports, NACK and TWCC-fed GCC (starting from `initial_bandwidth` bytes/s); returns the
+/// connection's video rates and the browser's sender reports.
+pub fn media_setup(initial_bandwidth: f64) -> Result<(MediaEngine, Registry, Arc<VideoRate>, Arc<SenderReports>)> {
     let mut media_engine = MediaEngine::default();
     for (mime, payload_type) in FORMATS {
         let kind = if mime == OPUS { RtpCodecKind::Audio } else { RtpCodecKind::Video };
@@ -582,8 +581,9 @@ pub fn media_setup() -> Result<(MediaEngine, Registry, Arc<VideoRate>, Arc<Sende
     }
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
     media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: ABS_CAPTURE_TIME_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), cap_bps: AtomicU64::new(GCC_INITIAL_BPS.to_bits()), link_bps: AtomicU64::new(0), size_ratio: AtomicU64::new(1f64.to_bits()), starting_up: AtomicBool::new(true), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default(), pacer: Default::default(), rtp: Default::default() });
-    let estimator = ReportingEstimator { inner: Gcc::new(GCC_INITIAL_BPS, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new(), arrivals: VecDeque::new(), lost_at: f64::NEG_INFINITY };
+    let gcc_initial_bps = initial_bandwidth * 8.0;
+    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(gcc_initial_bps.to_bits()), cap_bps: AtomicU64::new(gcc_initial_bps.to_bits()), link_bps: AtomicU64::new(0), size_ratio: AtomicU64::new(1f64.to_bits()), starting_up: AtomicBool::new(true), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default(), pacer: Default::default(), rtp: Default::default() });
+    let estimator = ReportingEstimator { inner: Gcc::new(gcc_initial_bps, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new(), arrivals: VecDeque::new(), lost_at: f64::NEG_INFINITY };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let reports = Arc::new(SenderReports::default());
     let reader = SenderReportReader { reports: reports.clone(), read: VecDeque::new(), write: VecDeque::new() };

@@ -159,7 +159,8 @@ let server = zenoh_gateway::Server::builder()
     .serve_dir("ui")                       // optional static files
     .tls_files("cert.pem", "key.pem")      // optional: HTTPS
     .encoding(TextUppercase)               // a message encoding, below
-    .bandwidth_target_fraction(0.75)
+    .initial_bandwidth_bytes_per_sec(64_000.0)   // optional: each browser's first guess (the default)
+    .reliable_max_backlog(Duration::from_secs(2))  // optional: how long reliable samples wait for a slow page (the default)
     .build()
     .await?;
 let running = server.bind(("0.0.0.0", 7448)).await?;   // port 0 = any free port

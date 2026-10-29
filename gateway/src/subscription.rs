@@ -30,9 +30,10 @@ const FRAME_OVERHEAD_BYTES: f64 = 90.0;
 pub const PACKET_OVERHEAD_BYTES: u64 = 80;
 /// A video stream's price is at most this times its measured frame size (scaled by quality).
 const VIDEO_PRICE_HEADROOM: f64 = 1.5;
-/// A `reliable` key's samples that have waited this long are dropped while a newer one waits behind them (a page that
-/// can't keep up would otherwise grow the queue without bound); order is kept and the drops show as `seq` gaps.
-const RELIABLE_MAX_BACKLOG: Duration = Duration::from_secs(2);
+/// What `ServerBuilder::reliable_max_backlog` defaults to: a `reliable` key's samples that have waited this long are
+/// dropped while a newer one waits behind them (a page that can't keep up would otherwise grow the queue without bound);
+/// order is kept and the drops show as `seq` gaps.
+pub const DEFAULT_RELIABLE_MAX_BACKLOG: Duration = Duration::from_secs(2);
 /// Streams at this zenoh priority or more urgent (2 INTERACTIVE_HIGH, 1 REAL_TIME) bypass allocation and pacing.
 const STRICT_PRIORITY: u8 = 2;
 
@@ -219,6 +220,8 @@ impl Tuning {
 
 pub struct SubShared {
     delivery: Delivery,
+    /// a `reliable` key's longest wait before newer samples push its oldest out (`ServerBuilder::reliable_max_backlog`)
+    reliable_max_backlog: Duration,
     priority_override: Option<u8>,
     pub codec: Option<Arc<dyn MessageEncoding>>,
     /// what the frames travel on, and what the encoding sends there
@@ -271,7 +274,7 @@ fn sample_timestamp_ms(sample: &Sample) -> f64 {
 }
 
 impl SubShared {
-    pub fn new(opts: &SubOpts, resolved: Resolved, codecs: Arc<EncodingRegistry>, gate: Arc<SendGate>) -> Self {
+    pub fn new(opts: &SubOpts, resolved: Resolved, codecs: Arc<EncodingRegistry>, gate: Arc<SendGate>, reliable_max_backlog: Duration) -> Self {
         let Resolved { encoding: codec, channel, output } = resolved;
         static NEXT_STREAM: AtomicUsize = AtomicUsize::new(0);
         SubShared {
@@ -279,6 +282,7 @@ impl SubShared {
             stream_id: NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
             sample_priority: AtomicU8::new(0),
             delivery: opts.delivery(),
+            reliable_max_backlog,
             tuning: Mutex::new(Tuning::new(opts, codecs.video_policy, matches!(channel, Channel::Video(_)))),
             priority_override: opts.priority,
             key_prefix: codec.as_ref().and_then(|codec| codec.key_prefix()).map(|prefix| format!("{}/", prefix.trim_end_matches('/'))),
@@ -435,7 +439,7 @@ impl SubShared {
     }
 
     /// Reserved at its measured rate, never paced or shrunk: strict-priority and audio streams. (Reliable ones shrink
-    /// last, see `allocator`, their queue bounded by `RELIABLE_MAX_BACKLOG`.)
+    /// last, see `allocator`, their queue bounded by `reliable_max_backlog`.)
     pub fn reserved(&self) -> bool {
         self.is_strict() || self.channel == Channel::Audio
     }
@@ -636,7 +640,7 @@ impl SubShared {
             queue.last_arrival = Some(Instant::now());
             // trimmed here too: a sender blocked on a stalled page never reaches `next`, and the queue grew without bound
             let max_age = self.delivery.max_age_ms.map(|max_age_ms| crate::secs(max_age_ms / 1000.0));
-            if let Some(limit) = max_age.or(self.delivery.reliable.then_some(RELIABLE_MAX_BACKLOG)) {
+            if let Some(limit) = max_age.or(self.delivery.reliable.then_some(self.reliable_max_backlog)) {
                 let now = Instant::now();
                 while queue.items.len() > 1 && queue.items.front().is_some_and(|item| now.duration_since(item.arrived) > limit) {
                     state.stats.unqueue(&queue.items.pop_front().unwrap());
@@ -680,7 +684,7 @@ impl SubShared {
             }
         } else if self.delivery.reliable {
             for queue in state.keys.values_mut() {
-                while queue.items.len() > 1 && queue.items.front().is_some_and(|item| now.duration_since(item.arrived) > RELIABLE_MAX_BACKLOG) {
+                while queue.items.len() > 1 && queue.items.front().is_some_and(|item| now.duration_since(item.arrived) > self.reliable_max_backlog) {
                     state.stats.unqueue(&queue.items.pop_front().unwrap());
                     state.stats.dropped_queue += 1;
                 }
@@ -1108,7 +1112,7 @@ mod tests {
 
     fn shared(opts: &str) -> SubShared {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
-        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default())
+        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG)
     }
 
     #[test]
@@ -1247,12 +1251,27 @@ mod tests {
             insert(&shared, "tf", pending(seq, 5, t0 + Duration::from_millis(100 * seq as u64)), None);
         }
         // 2.25 s later the first three have waited past the limit; the newest of them would be kept if it were alone
-        let now = t0 + RELIABLE_MAX_BACKLOG + Duration::from_millis(250);
+        let now = t0 + DEFAULT_RELIABLE_MAX_BACKLOG + Duration::from_millis(250);
         let seqs: Vec<u32> = std::iter::from_fn(|| shared.pick(now).0.map(|(_, item)| item.seq)).collect();
         assert_eq!(seqs, vec![3, 4], "in order, the stale ones dropped");
         assert_eq!(shared.stats().dropped_queue, 3);
         insert(&shared, "tf", pending(9, 5, t0), None);
         assert_eq!(shared.pick(now).0.map(|(_, item)| item.seq), Some(9), "a lone sample is never dropped for age");
+    }
+
+    #[test]
+    fn reliable_max_backlog_sets_how_long_a_backlog_waits() {
+        let registry = Arc::new(EncodingRegistry::new([]).unwrap());
+        let opts = SubOpts::parse(&serde_json::json!({"delivery":"reliable"})).unwrap();
+        let shared = SubShared::new(&opts, Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), Duration::from_millis(500));
+        let t0 = Instant::now();
+        for seq in 0..3 {
+            insert(&shared, "tf", pending(seq, 5, t0 + Duration::from_millis(400 * seq as u64)), None);
+        }
+        // at 1 s, 0 (1 s old) and 1 (0.6 s old) waited past 500 ms; the default 2 s would have kept all three
+        let now = t0 + Duration::from_secs(1);
+        let seqs: Vec<u32> = std::iter::from_fn(|| shared.pick(now).0.map(|(_, item)| item.seq)).collect();
+        assert_eq!(seqs, vec![2]);
     }
 
     #[tokio::test]
