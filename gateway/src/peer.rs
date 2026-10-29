@@ -1011,7 +1011,14 @@ impl PeerConnectionEventHandler for Handler {
 
 async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>, state: Arc<PeerState>) {
     let peer_id = state.peer_id;
-    let raw_label = dc.label().await.unwrap_or_default();
+    let raw_label = match dc.label().await {
+        Ok(label) => label,
+        Err(error) => {
+            warn!("peer {peer_id}: channel without a readable label: {error}");
+            let _ = dc.close().await;
+            return;
+        }
+    };
     if raw_label == "control" {
         *state.control.lock() = Some(dc.clone());
         tokio::select! {
@@ -1446,8 +1453,8 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             }
             "stats" => {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock(), "rttMs": *state.rtt_ms.lock()});
-                let heartbeat = serde_json::to_value(state.heartbeat.lock().clone()).unwrap_or_default();
-                let bandwidth = serde_json::to_value(state.bandwidth.lock().clone()).unwrap_or_default();
+                let heartbeat = json!(state.heartbeat.lock().clone());
+                let bandwidth = json!(state.bandwidth.lock().clone());
                 ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth, "memory": state.memory_counts()}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
@@ -1470,17 +1477,22 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                     ok(&request.id, json!({}))
                 }
             },
-            "releaseLease" => {
-                state.leases.end(request.group.as_deref().unwrap_or_default(), |holder, _| holder == state.peer_id);
-                ok(&request.id, json!({}))
-            }
-            "clearDeadman" => {
-                let pub_id = request.pub_id.unwrap_or_default();
-                if let Some(deadman) = state.deadmen.lock().remove(&pub_id) {
-                    deadman.shared.stats.lock().deadman_armed = false;
+            "releaseLease" => match request.group.as_deref() {
+                Some(group) => {
+                    state.leases.end(group, |holder, _| holder == state.peer_id);
+                    ok(&request.id, json!({}))
                 }
-                ok(&request.id, json!({}))
-            }
+                None => fail(&request.id, "releaseLease needs group"),
+            },
+            "clearDeadman" => match request.pub_id {
+                Some(pub_id) => {
+                    if let Some(deadman) = state.deadmen.lock().remove(&pub_id) {
+                        deadman.shared.stats.lock().deadman_armed = false;
+                    }
+                    ok(&request.id, json!({}))
+                }
+                None => fail(&request.id, "clearDeadman needs pubId"),
+            },
             other => fail(&request.id, format!("unknown op {other}")),
         };
         let _ = dc.send_text(&response.to_string()).await;
@@ -1633,7 +1645,9 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
 
 /// Ends another client's lease, with the grant's forceExpire right.
 async fn expire_lease(state: &PeerState, request: &ControlRequest) -> Value {
-    let group = request.group.as_deref().unwrap_or_default();
+    let Some(group) = request.group.as_deref() else {
+        return fail(&request.id, "expireLease needs group");
+    };
     if !state.grant.force_expire {
         return fail(&request.id, format!("not authorized to force-expire lease {group:?}"));
     }
@@ -1739,8 +1753,8 @@ fn collect_stats(state: &PeerState) -> Vec<Value> {
         .values()
         .map(|entry| {
             let (stats, allocation) = match &entry.stats {
-                ChannelStats::Sub(shared) => (serde_json::to_value(shared.stats()).unwrap_or_default(), serde_json::to_value(shared.allocation()).unwrap_or_default()),
-                ChannelStats::Pub(shared) => (serde_json::to_value(shared.snapshot()).unwrap_or_default(), Value::Null),
+                ChannelStats::Sub(shared) => (json!(shared.stats()), json!(shared.allocation())),
+                ChannelStats::Pub(shared) => (json!(shared.snapshot()), Value::Null),
             };
             json!({"id": entry.label.id, "type": entry.label.kind, "key": entry.label.key, "opts": entry.opts, "stats": stats, "allocation": allocation})
         })

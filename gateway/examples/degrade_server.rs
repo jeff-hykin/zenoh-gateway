@@ -102,7 +102,9 @@ fn publish(session: &zenoh::Session, key: &'static str, bytes: usize, hz: f64) {
             ticker.tick().await;
             payload[..4].copy_from_slice(&frame.to_le_bytes());
             frame = frame.wrapping_add(1);
-            let _ = session.put(key, payload.clone()).await;
+            if let Err(error) = session.put(key, payload.clone()).await {
+                eprintln!("put {key} failed: {error}");
+            }
         }
     });
 }
@@ -141,7 +143,9 @@ async fn main() -> Result<()> {
         .callback(move |sample| {
             let (echo, payload) = (echo.clone(), sample.payload().to_bytes().to_vec());
             tokio::spawn(async move {
-                let _ = echo.put("robot/cmd_vel_echo", payload).await;
+                if let Err(error) = echo.put("robot/cmd_vel_echo", payload).await {
+                    eprintln!("put robot/cmd_vel_echo failed: {error}");
+                }
             });
         })
         .await

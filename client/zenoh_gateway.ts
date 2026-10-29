@@ -1763,7 +1763,10 @@ export class ZenohGateway {
         let iceServers = this.options.iceServers
         let iceTransportPolicy = this.options.iceTransportPolicy
         if (iceServers === undefined) {
-            const response = await fetch(`${this.url}/zenoh-gateway/ice`, { headers: auth }).catch(() => null)
+            const response = await fetch(`${this.url}/zenoh-gateway/ice`, { headers: auth }).catch((error) => {
+                console.warn("zenoh-gateway: fetching ICE servers failed; connecting without any", error)
+                return null
+            })
             await this.#refuseIfUnauthorized(response)
             const ice = response?.ok ? await response.json() : {}
             iceServers = (ice.iceServers ?? []) as RTCIceServer[]
@@ -1945,7 +1948,8 @@ export class ZenohGateway {
         let response: ControlResponse
         try {
             response = JSON.parse(text)
-        } catch {
+        } catch (error) {
+            console.error("zenoh-gateway: control message is not JSON", error)
             return
         }
         if (response.event === "query" || response.event === "liveliness" || response.event === "matching") {

@@ -146,17 +146,25 @@ pub(crate) fn fresh(shared: &PubShared, sent_at_ms: Option<f64>, clock_offset_ms
     }
 }
 
-/// Puts `payload` and counts the outcome.
-pub(crate) async fn put(publisher: &Publisher<'static>, payload: Vec<u8>, shared: &PubShared) {
-    let result = publisher.put(payload).await;
+/// Counts a put's outcome, `None` being one zenoh held past its deadline.
+fn count(shared: &PubShared, key: &impl std::fmt::Debug, result: Option<zenoh::Result<()>>) {
     let mut stats = shared.stats.lock();
     match result {
-        Ok(()) => stats.put += 1,
-        Err(error) => {
+        Some(Ok(())) => stats.put += 1,
+        Some(Err(error)) => {
             stats.put_errors += 1;
-            warn!("put {:?} failed: {error}", publisher.key_expr());
+            warn!("put {key:?} failed: {error}");
+        }
+        None => {
+            stats.put_errors += 1;
+            warn!("put {key:?} gave up: zenoh held it past its deadline");
         }
     }
+}
+
+/// Puts `payload` and counts the outcome.
+pub(crate) async fn put(publisher: &Publisher<'static>, payload: Vec<u8>, shared: &PubShared) {
+    count(shared, publisher.key_expr(), Some(publisher.put(payload).await));
 }
 
 /// `blocker` says why a put may not go out now (another client's lease); see [`Admission`].
@@ -187,18 +195,7 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
             event = dc.poll() => event,
             result = async { putting.as_mut().expect("guarded").await }, if putting.is_some() => {
                 putting = None;
-                let mut stats = shared.stats.lock();
-                match result {
-                    Some(Ok(())) => stats.put += 1,
-                    Some(Err(error)) => {
-                        stats.put_errors += 1;
-                        warn!("put {:?} failed: {error}", label.key);
-                    }
-                    None => {
-                        stats.put_errors += 1;
-                        warn!("put {:?} gave up: zenoh held it past its deadline", label.key);
-                    }
-                }
+                count(&shared, &label.key, result);
                 continue;
             }
         };
@@ -236,10 +233,10 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
     }
     // what the page sent before it closed still goes, each by its own deadline
     if let Some(put) = putting {
-        put.await;
+        count(&shared, &label.key, put.await);
     }
     for next in waiting {
-        let _ = tokio::time::timeout(next.expires.saturating_duration_since(Instant::now()), publisher.put(next.payload)).await;
+        count(&shared, &label.key, tokio::time::timeout(next.expires.saturating_duration_since(Instant::now()), publisher.put(next.payload)).await.ok());
     }
     debug!("publisher {:?} closed", label.key);
 }

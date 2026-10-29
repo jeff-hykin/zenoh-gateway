@@ -14,7 +14,9 @@ fn publish(session: &zenoh::Session, key: &'static str, bytes: usize, hz: f64) {
         let mut ticker = tokio::time::interval(Duration::from_secs_f64(1.0 / hz));
         loop {
             ticker.tick().await;
-            let _ = session.put(key, payload.clone()).await;
+            if let Err(error) = session.put(key, payload.clone()).await {
+                eprintln!("put {key} failed: {error}");
+            }
         }
     });
 }

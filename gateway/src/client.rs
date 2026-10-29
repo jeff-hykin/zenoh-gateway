@@ -30,7 +30,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 pub use api::*;
 use base64::Engine;
 use bytes::BytesMut;
-use log::warn;
+use log::{debug, warn};
 use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::Packet;
@@ -286,8 +286,9 @@ pub struct VideoFrameInfo {
     pub frame_id: Option<String>,
     /// that header whole (exact stamp, seq; 0.5.32+, from 0.5.31 rounded from `stamp`)
     pub header: Option<crate::MessageHeader>,
-    /// its sample's zenoh encoding and attachment, when they say something (0.5.32+, with `header`)
+    /// its sample's zenoh encoding, when it says something (0.5.32+, with `header`)
     pub encoding: Option<String>,
+    /// its sample's zenoh attachment, when it has one (0.5.32+, with `header`)
     pub attachment: Option<Vec<u8>>,
 }
 
@@ -1264,7 +1265,9 @@ impl SubscriptionTask {
             && let Some(slot) = &self.slot
         {
             assembler.last_pli = Instant::now();
-            let _ = slot.request_keyframe().await;
+            if let Err(error) = slot.request_keyframe().await {
+                debug!("zenoh-gateway client: keyframe request failed: {error:#}");
+            }
         }
         frame.map(Message::Video)
     }
@@ -1667,7 +1670,8 @@ impl Signalling {
         match reply.result() {
             Ok(sample) => Ok(serde_json::from_slice(&sample.payload().to_bytes())?),
             Err(error) => {
-                let error: Value = serde_json::from_slice(&error.payload().to_bytes()).unwrap_or_default();
+                let payload = error.payload().to_bytes();
+                let error: Value = serde_json::from_slice(&payload).unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&payload)}));
                 let reason = error["error"].as_str().unwrap_or("error");
                 if error["status"] == 401 {
                     bail!("gateway refused the token: {reason}");

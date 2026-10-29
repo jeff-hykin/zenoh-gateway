@@ -68,7 +68,9 @@ pub async fn relay(source_url: &str, camera_key: &str, codec: &str, bind: &str) 
     });
     tokio::spawn(async move {
         while let Some(payload) = pictures_rx.recv().await {
-            let _ = session.put(&key, payload).await;
+            if let Err(error) = session.put(&key, payload).await {
+                eprintln!("put {key} failed: {error}");
+            }
         }
     });
     server.bind(bind).await
