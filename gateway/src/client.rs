@@ -487,8 +487,12 @@ impl Shared {
     }
 
     fn on_control_message(&self, text: &str) {
-        let Ok(message) = serde_json::from_str::<Value>(text) else {
-            return;
+        let message = match serde_json::from_str::<Value>(text) {
+            Ok(message) => message,
+            Err(error) => {
+                warn!("zenoh-gateway client: control message is not JSON: {error}");
+                return;
+            }
         };
         let id = message["id"].as_u64().unwrap_or_default();
         let Some(event) = message["event"].as_str() else {
@@ -1002,7 +1006,7 @@ impl Client {
 
 /// The options as the gateway reads them: camelCase, unset ones left out.
 fn options_json(options: &impl Serialize) -> Value {
-    let mut value = serde_json::to_value(options).unwrap_or_default();
+    let mut value = json!(options);
     if let Value::Object(map) = &mut value {
         map.retain(|_, value| !value.is_null());
     }

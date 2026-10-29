@@ -727,7 +727,7 @@ mod signalling {
                 let (token, _) = inner.authorize(&headers).map_err(|reason| (StatusCode::UNAUTHORIZED, reason))?;
                 Ok(minted_ice_servers(inner, token).await)
             }
-            (_, Some(offer)) => answer(inner, &headers, offer).await.map(|answer| serde_json::to_value(answer).unwrap_or_default()),
+            (_, Some(offer)) => answer(inner, &headers, offer).await.map(|answer| serde_json::json!(answer)),
             (_, None) => Err((StatusCode::BAD_REQUEST, "no offer".to_owned())),
         }
     }
