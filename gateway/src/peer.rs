@@ -224,6 +224,8 @@ struct PeerState {
     gone_signal: tokio::sync::watch::Sender<bool>,
     /// reached `connected` at least once
     ever_connected: AtomicBool,
+    /// how many times it went `disconnected`: a grace timer acts only on the outage that started it
+    disconnects: AtomicU64,
     gateway: Weak<Gateway>,
     /// the bearer token it connected with, and what it may do
     token: Option<String>,
@@ -303,6 +305,7 @@ impl PeerState {
             gone: AtomicBool::new(false),
             gone_signal: tokio::sync::watch::Sender::new(false),
             ever_connected: AtomicBool::new(false),
+            disconnects: AtomicU64::new(0),
         };
         (state, api_events_receiver)
     }
@@ -964,9 +967,10 @@ impl PeerConnectionEventHandler for Handler {
             RTCPeerConnectionState::Disconnected => {
                 let (gateway, state, peer_id) = (self.gateway.clone(), self.state.clone(), self.peer_id);
                 let Some(grace) = gateway.upgrade().map(|gateway| gateway.allocation.disconnected_grace) else { return };
+                let Some(outage) = state.upgrade().map(|state| state.disconnects.fetch_add(1, Ordering::Relaxed) + 1) else { return };
                 tokio::spawn(async move {
                     tokio::time::sleep(grace).await;
-                    let still_down = state.upgrade().is_some_and(|state| *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected));
+                    let still_down = state.upgrade().is_some_and(|state| state.disconnects.load(Ordering::Relaxed) == outage && *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected));
                     if still_down && let Some(gateway) = gateway.upgrade() {
                         gateway.drop_peer(peer_id, "disconnected");
                     }
