@@ -266,7 +266,7 @@ fn reply_json(reply: &Reply) -> Value {
     }
 }
 
-fn ok(id: &Value, extra: Value) -> Value {
+pub(crate) fn ok(id: &Value, extra: Value) -> Value {
     let mut response = json!({"id": id, "ok": true});
     if let (Some(response), Value::Object(extra)) = (response.as_object_mut(), extra) {
         response.extend(extra);
@@ -274,7 +274,7 @@ fn ok(id: &Value, extra: Value) -> Value {
     response
 }
 
-fn fail(id: &Value, error: impl std::fmt::Display) -> Value {
+pub(crate) fn fail(id: &Value, error: impl std::fmt::Display) -> Value {
     json!({"id": id, "ok": false, "error": error.to_string()})
 }
 
@@ -303,37 +303,34 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
     api.reap_queries();
     let error = |error: zenoh::Error| error.to_string();
     match request.op.as_str() {
-        "put" => {
-            access.check(Action::Publish, &request.key)?;
-            let mut builder = session.put(&request.key, decode("bytes", &request.bytes)?.unwrap_or_default());
-            if let Some(encoding) = &request.encoding {
-                builder = builder.encoding(Encoding::from(encoding.as_str()));
+        "put" | "delete" => {
+            let put = request.op == "put";
+            access.check(if put { Action::Publish } else { Action::Delete }, &request.key)?;
+            // what a put and a delete share (their builders have no common trait outside zenoh's internals)
+            macro_rules! publish {
+                ($builder:expr) => {{
+                    let mut builder = $builder;
+                    if let Some(attachment) = decode("attachment", &request.attachment)? {
+                        builder = builder.attachment(attachment);
+                    }
+                    if let Some(priority) = priority(request.priority)? {
+                        builder = builder.priority(priority);
+                    }
+                    if let Some(congestion_control) = congestion_control(&request.congestion_control)? {
+                        builder = builder.congestion_control(congestion_control);
+                    }
+                    tokio::time::timeout(put_timeout, builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp))).await.map_err(|_| timed_out())?.map_err(error)?;
+                }};
             }
-            if let Some(attachment) = decode("attachment", &request.attachment)? {
-                builder = builder.attachment(attachment);
+            if put {
+                let mut builder = session.put(&request.key, decode("bytes", &request.bytes)?.unwrap_or_default());
+                if let Some(encoding) = &request.encoding {
+                    builder = builder.encoding(Encoding::from(encoding.as_str()));
+                }
+                publish!(builder);
+            } else {
+                publish!(session.delete(&request.key));
             }
-            if let Some(priority) = priority(request.priority)? {
-                builder = builder.priority(priority);
-            }
-            if let Some(congestion_control) = congestion_control(&request.congestion_control)? {
-                builder = builder.congestion_control(congestion_control);
-            }
-            tokio::time::timeout(put_timeout, builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp))).await.map_err(|_| timed_out())?.map_err(error)?;
-            Ok(json!({}))
-        }
-        "delete" => {
-            access.check(Action::Delete, &request.key)?;
-            let mut builder = session.delete(&request.key);
-            if let Some(attachment) = decode("attachment", &request.attachment)? {
-                builder = builder.attachment(attachment);
-            }
-            if let Some(priority) = priority(request.priority)? {
-                builder = builder.priority(priority);
-            }
-            if let Some(congestion_control) = congestion_control(&request.congestion_control)? {
-                builder = builder.congestion_control(congestion_control);
-            }
-            tokio::time::timeout(put_timeout, builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp))).await.map_err(|_| timed_out())?.map_err(error)?;
             Ok(json!({}))
         }
         "get" => {

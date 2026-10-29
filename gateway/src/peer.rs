@@ -1,7 +1,7 @@
 //! One browser = one PeerConnection; each data channel it opens is dispatched by its label.
 
 use crate::allocator::{self, LinkModel};
-use crate::api;
+use crate::api::{self, fail, ok};
 use crate::auth::{Grant, Leases};
 use crate::ice::{self, IceServer};
 use crate::encoding::registry::{EncodingRegistry, Resolved};
@@ -1380,18 +1380,6 @@ struct ControlRequest {
     opts: Option<Value>,
     /// setLinkBandwidth: the link's known bandwidth, bytes/s (absent or null: back to the estimate)
     bytes_per_sec: Option<f64>,
-}
-
-fn ok(id: &Value, extra: Value) -> Value {
-    let mut response = json!({"id": id, "ok": true});
-    if let (Some(response), Value::Object(extra)) = (response.as_object_mut(), extra) {
-        response.extend(extra);
-    }
-    response
-}
-
-fn fail(id: &Value, error: impl std::fmt::Display) -> Value {
-    json!({"id": id, "ok": false, "error": error.to_string()})
 }
 
 /// `control` channel: JSON requests in, JSON responses out (`{id, ok, ...}`), plus
