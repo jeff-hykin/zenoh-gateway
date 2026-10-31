@@ -334,9 +334,10 @@ good as BT.709 through openh264 and ~0.5 dB better through VideoToolbox. H.264 o
 - A video subscription decodes its next frame while it encodes the current one (two blocking-pool
   tasks), so the rate is set by the slower stage, not their sum.
 - CPU governor (per encode session): when scale+encode takes more than 85% of the frame interval, the ceiling on the
-  picture's scale drops 0.1 below the scale in use (never below `minResolutionScale`), at most once a second; it rises
-  0.1 when the encode cost predicted at the next step (∝ pixels) fits in 60% of the interval and 5 s have passed since
-  the last step (each resolution change restarts the encoder with a keyframe, so the ceiling must not flap). It only
+  picture's scale drops 0.1 below the scale in use (never below `minResolutionScale`), at most once a second, unless the
+  part of the cost that doesn't scale with pixels is past that alone; it rises 0.1 when the encode cost predicted at the
+  next step fits in 60% of the interval and 5 s have passed since the last step. The cost is predicted as a fixed part
+  plus a part ∝ pixels, fitted from the costs at the last two scales (all ∝ pixels before a second scale was measured) (each resolution change restarts the encoder with a keyframe, so the ceiling must not flap). It only
   lowers the size the bitrate policy picked, never the bitrate or the frame rate, so the two never fight; a hardware
   encoder rarely moves it. Decode time does not move it (a slow decode caps the rate at any resolution). Stats:
   `decodeMs`, `encodeMs`, `cpuScaleCap`, and `videoLatency` (smoothed per frame, ms: `sourceToReceivedMs` the sample's
