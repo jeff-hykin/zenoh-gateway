@@ -274,6 +274,9 @@ pub struct VideoTarget {
     pub keyframe_interval: Duration,
     /// See `VideoPolicy::scene_change_keyframes`.
     pub scene_change_keyframes: bool,
+    /// This frame's number in its session (rising): an encoder whose output trails its input says whose output it returned
+    /// with [`VideoEncoder::last_frame_id`].
+    pub frame_id: u64,
 }
 
 impl VideoTarget {
@@ -281,7 +284,7 @@ impl VideoTarget {
     /// dropping and keyframe interval: e.g. to try an encoder.
     pub fn new(width: u32, height: u32, bitrate_bps: u32, fps: f64) -> Self {
         let policy = VideoPolicy::default();
-        VideoTarget { quality: 1.0, width, height, bitrate_bps, fps, keyframe: false, frame_dropping: policy.frame_dropping, keyframe_interval: policy.keyframe_interval, scene_change_keyframes: policy.scene_change_keyframes }
+        VideoTarget { quality: 1.0, width, height, bitrate_bps, fps, keyframe: false, frame_dropping: policy.frame_dropping, keyframe_interval: policy.keyframe_interval, scene_change_keyframes: policy.scene_change_keyframes, frame_id: 0 }
     }
 }
 
@@ -313,6 +316,13 @@ pub trait VideoEncoder: Send {
     /// The average quantizer (H.264's 0-51 scale) of the frame `encode` last returned, if the encoder reports it: the
     /// picture's size then follows it (`VideoPolicy::target_qp`).
     fn last_qp(&self) -> Option<f64> {
+        None
+    }
+
+    /// The [`VideoTarget::frame_id`] of the frame `encode` last returned, for an encoder whose output trails its input
+    /// (a hardware pipeline holding a few frames): the gateway sends it with that frame's stamp, frame id and timing, not
+    /// the newest input's. `None` (the default): the frame it returned is the one it was just given.
+    fn last_frame_id(&self) -> Option<u64> {
         None
     }
 }
@@ -434,7 +444,7 @@ pub(crate) fn target(policy: &VideoPolicy, source: (u32, u32), quality: f64, bit
     let (fps, bitrate_bps) = (hz.max(0.1), bitrate_bps.max(MIN_BITRATE));
     let by_bitrate = policy.size(source, size_bitrate_bps.max(MIN_BITRATE), fps, scale_cap);
     let (width, height) = qp_scale.map_or(by_bitrate, |scale| policy.scaled(source, scale, scale_cap));
-    VideoTarget { quality, width, height, bitrate_bps: bitrate_bps as u32, fps, keyframe, frame_dropping: policy.frame_dropping, keyframe_interval: policy.keyframe_interval, scene_change_keyframes: policy.scene_change_keyframes }
+    VideoTarget { quality, width, height, bitrate_bps: bitrate_bps as u32, fps, keyframe, frame_dropping: policy.frame_dropping, keyframe_interval: policy.keyframe_interval, scene_change_keyframes: policy.scene_change_keyframes, frame_id: 0 }
 }
 
 #[cfg(test)]

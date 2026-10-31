@@ -1042,7 +1042,24 @@ struct SessionState {
     qp: QpScaler,
     /// the size in use is the quantizer's, under the bitrate's (see `steady_size`)
     qp_shrunk: bool,
+    /// inputs given to the encoder whose output hasn't come out, oldest first (see `VideoEncoder::last_frame_id`)
+    pending: VecDeque<Pending>,
+    next_frame_id: u64,
 }
+
+/// What a frame inside a pipelined encoder came with: its output goes out with these, not the newest input's.
+struct Pending {
+    frame_id: u64,
+    source: (u32, u32),
+    timestamp_ms: f64,
+    received_ms: f64,
+    header: Option<MessageHeader>,
+    sample: crate::frame::SampleMeta,
+}
+
+/// Inputs a session remembers for a pipelined encoder (it holds a few frames; one never answering for older ones
+/// doesn't grow it).
+const PENDING_MAX: usize = 32;
 
 /// Sizes the picture by the encoder's quantizer, as libwebrtc's quality scaler does, but by an equation instead of its
 /// thresholds and steps: H.264's bits per frame halve each +6 QP, so at the bitrate now the picture that reaches
@@ -1135,7 +1152,7 @@ impl VideoSessions {
                     Self::leave_locked(&mut sessions, &current, member);
                 }
                 oldest.filter(|oldest| sessions.iter().any(|session| Arc::ptr_eq(session, oldest))).unwrap_or_else(|| {
-                    let state = SessionState { encoder: None, governor: CpuGovernor::new(), log: VecDeque::new(), next_seq: 0, last_input: None, keyframe_wanted: true, source: (640, 480), scale: 1.0, size: None, qp: QpScaler::default(), qp_shrunk: false };
+                    let state = SessionState { encoder: None, governor: CpuGovernor::new(), log: VecDeque::new(), next_seq: 0, last_input: None, keyframe_wanted: true, source: (640, 480), scale: 1.0, size: None, qp: QpScaler::default(), qp_shrunk: false, pending: VecDeque::new(), next_frame_id: 0 };
                     let id = self.next_session.fetch_add(1, Ordering::Relaxed);
                     let session = Arc::new(EncodeSession { id, codec: codec.to_owned(), format, key: key.to_owned(), policy, grants: Mutex::default(), state: tokio::sync::Mutex::new(state) });
                     sessions.push(session.clone());
@@ -1247,6 +1264,13 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
             state.size = Some((source, size, now));
         }
         (target.width, target.height) = size;
+        target.frame_id = state.next_frame_id;
+        state.next_frame_id += 1;
+        let pending = Pending { frame_id: target.frame_id, source: state.source, timestamp_ms: input.timestamp_ms, received_ms: input.received_ms, header: header.clone(), sample: input.sample.clone() };
+        state.pending.push_back(pending);
+        if state.pending.len() > PENDING_MAX {
+            state.pending.pop_front();
+        }
         // (made on the blocking pool too: a hardware encoder's setup can block)
         let (existing, format, timeout) = (state.encoder.take(), session.format, codecs.encode_timeout);
         let decoded = input.decoded.clone();
@@ -1254,8 +1278,8 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
             let mut encoder = existing.map_or_else(|| codecs.video_encoder(&*codec, format), Ok)?;
             let started = Instant::now();
             let result = encoder.encode(&decoded, &target).map_err(|error| format!("{error:#}"));
-            let qp = encoder.last_qp();
-            Ok::<_, String>((encoder, result, started.elapsed().as_secs_f64() * 1000.0, qp))
+            let (qp, frame_id) = (encoder.last_qp(), encoder.last_frame_id());
+            Ok::<_, String>((encoder, result, started.elapsed().as_secs_f64() * 1000.0, qp, frame_id))
         });
         // an encode that hangs gives up its encoder (rebuilt next frame, from a keyframe) and the session's lock, which
         // every viewer of the session waits on
@@ -1266,7 +1290,7 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         };
         match encoded {
             Ok(Err(error)) => out.error = Some(error),
-            Ok(Ok((encoder, result, encode_ms, qp))) => {
+            Ok(Ok((encoder, result, encode_ms, qp, frame_id))) => {
                 state.encoder = Some(encoder);
                 // (a keyframe, or the rebuilt encoder's first frames, cost more than the size does)
                 let warm = state.size.is_some_and(|(.., changed_at)| changed_at.elapsed() >= CPU_WARMUP);
@@ -1289,7 +1313,15 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
                         state.keyframe_wanted &= !frame.keyframe;
                         let seq = state.next_seq;
                         state.next_seq += 1;
-                        let logged = SessionFrame { seq, source: state.source, frame, timestamp_ms: input.timestamp_ms, received_ms: input.received_ms, encoded_ms: crate::subscription::now_unix_ms(), encoded_by: member.id, header, sample: input.sample.clone() };
+                        // the input this output is from (a pipelined encoder's trails), and every older one is done
+                        let from = frame_id.unwrap_or(target.frame_id);
+                        let mut came_with = None;
+                        while state.pending.front().is_some_and(|pending| pending.frame_id <= from) {
+                            came_with = state.pending.pop_front().filter(|pending| pending.frame_id == from);
+                        }
+                        let Pending { source, timestamp_ms, received_ms, header, sample, .. } = came_with.unwrap_or(Pending { frame_id: from, source: state.source, timestamp_ms: input.timestamp_ms, received_ms: input.received_ms, header, sample: input.sample.clone() });
+                        let source = if is_picture { source } else { state.source };
+                        let logged = SessionFrame { seq, source, frame, timestamp_ms, received_ms, encoded_ms: crate::subscription::now_unix_ms(), encoded_by: member.id, header, sample };
                         state.log.push_back(Arc::new(logged));
                         if state.log.len() > SESSION_LOG {
                             state.log.pop_front();
@@ -1780,5 +1812,62 @@ mod tests {
         assert_eq!(f64::from_le_bytes(with[64..72].try_into().unwrap()), 101.0);
         assert_eq!((u16::from_le_bytes([with[72], with[73]]), &with[74..86]), (12, &b"cam2_optical"[..]), "0.5.31's layout first");
         assert_eq!(crate::frame::decode_header(&with[64..]), Some((sent[2].header.clone().unwrap(), Some(("image/raw".into(), Some(vec![9]))))), "then the exact stamp, seq and the sample's encoding and attachment");
+    }
+
+    /// Holds two frames, as a hardware pipeline does: each encode returns the frame given two calls before.
+    struct Lagging(VecDeque<u64>, Option<u64>);
+
+    impl VideoEncoder for Lagging {
+        fn format(&self) -> VideoFormat {
+            VideoFormat::H264
+        }
+
+        fn encode(&mut self, _: &DecodedFrame, target: &VideoTarget) -> anyhow::Result<Option<EncodedVideo>> {
+            self.0.push_back(target.frame_id);
+            self.1 = if self.0.len() > 2 { self.0.pop_front() } else { None };
+            Ok(self.1.map(|frame_id| EncodedVideo { data: vec![0; 10], width: target.width, height: target.height, keyframe: frame_id == 0 }))
+        }
+
+        fn last_frame_id(&self) -> Option<u64> {
+            self.1
+        }
+    }
+
+    struct LaggingCamera;
+
+    impl MessageEncoding for LaggingCamera {
+        fn name(&self) -> &str {
+            "lagging"
+        }
+
+        fn output(&self) -> EncodingOutput {
+            EncodingOutput::Video
+        }
+
+        fn video_encoder(&self, _: VideoFormat) -> Option<Box<dyn VideoEncoder>> {
+            Some(Box::new(Lagging(VecDeque::new(), None)))
+        }
+
+        fn decode(&self, _: &EncodingSample<'_>, _: crate::Channel) -> anyhow::Result<DecodedFrame> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pipelined_encoder_s_frames_keep_their_own_stamps() {
+        let codec: Arc<dyn MessageEncoding> = Arc::new(LaggingCamera);
+        let codecs = Arc::new(EncodingRegistry::new([codec.clone()]).unwrap());
+        let mut viewer = Member { id: 0, session: None, next_seq: None, synced: false, registry: None };
+        let mut sent = Vec::new();
+        for sample in 0..6u64 {
+            let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0 + sample as f64, "cam");
+            let session = codecs.video_sessions.place(viewer.session.take(), 0, ("lagging", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, 30.0, 4e6, false));
+            viewer.session = Some(session.clone());
+            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), timestamp_ms: sample as f64 * 33.0, received_ms: 1000.0 + sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
+            sent.extend(step(session, &mut viewer, input, codecs.clone(), codec.clone()).await.frames);
+        }
+        codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
+        let stamps: Vec<_> = sent.iter().map(|frame| (frame.header.as_ref().unwrap().stamp(), frame.timestamp_ms, frame.received_ms)).collect();
+        assert_eq!(stamps, vec![(100.0, 0.0, 1000.0), (101.0, 33.0, 1033.0), (102.0, 66.0, 1066.0), (103.0, 99.0, 1099.0)], "each output with the input it came from, two behind");
     }
 }
