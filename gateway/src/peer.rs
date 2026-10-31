@@ -1280,6 +1280,19 @@ fn ok(id: &Value, extra: Value) -> Value {
     response
 }
 
+/// The browser's address on the connection ICE picked, or `None` before it picked one.
+async fn remote_address(state: &PeerState) -> Option<String> {
+    let connection = state.connection.lock().clone()?;
+    let pair = connection.sctp().await?.transport().ice_transport().get_selected_candidate_pair().await.ok()??;
+    Some(pair.remote().address.clone())
+}
+
+/// Whether `address` is one of this machine's own (loopback, or an interface's: binding to it works); a name (a
+/// browser's mDNS `<uuid>.local`) can't be told, and is taken at the page's word.
+fn on_this_machine(address: &str) -> bool {
+    address.parse::<std::net::IpAddr>().map_or(true, |ip| ip.is_loopback() || std::net::UdpSocket::bind((ip, 0)).is_ok())
+}
+
 fn fail(id: &Value, error: impl std::fmt::Display) -> Value {
     json!({"id": id, "ok": false, "error": error.to_string()})
 }
@@ -1373,6 +1386,10 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             "updateSubscription" => update_subscription(&state, &request),
             "setLinkBandwidth" => match request.bytes_per_sec {
                 Some(known) if !(known.is_finite() && known > 0.0) => fail(&request.id, format!("bytesPerSec must be a positive number of bytes/s, got {known}")),
+                // a page through a tunnel (ssh -L) is on 127.0.0.1 too, but its media comes over the network: no known speed then
+                Some(_) if let Some(remote) = remote_address(&state).await.filter(|remote| !on_this_machine(remote)) => {
+                    fail(&request.id, format!("the page is at {remote}, not on this machine: the link's speed is estimated"))
+                }
                 known => {
                     *state.known_bandwidth.lock() = known;
                     ok(&request.id, json!({}))
@@ -1661,6 +1678,14 @@ fn collect_stats(state: &PeerState) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tunneled_page_is_not_on_this_machine() {
+        assert!(on_this_machine("127.0.0.1") && on_this_machine("::1"));
+        // TEST-NET-1: never one of this machine's addresses
+        assert!(!on_this_machine("192.0.2.7"));
+        assert!(on_this_machine("6f1c2a0e-9b1d-4e2f-8a3b-1c2d3e4f5a6b.local"), "a name is taken at the page's word");
+    }
 
     fn stream(bytes_per_message: f64, hz: f64) -> allocator::Demand {
         allocator::Demand { priority: 1.0, max_hz: hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None, shrinks_last: false }
