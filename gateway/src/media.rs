@@ -881,6 +881,13 @@ const CPU_SETTLE: Duration = Duration::from_secs(1);
 /// last step: a resolution change costs a keyframe, and a flapping ceiling grew the browser's jitter buffer.
 const CPU_UP_HEADROOM: f64 = 0.6;
 const CPU_UP_SETTLE: Duration = Duration::from_secs(5);
+/// A step up undone within `CPU_UP_SETTLE` doubles the wait before the next, up to this (libwebrtc's overuse detector
+/// backs off a failed ramp-up the same way): on the R1 the cap stepped 0.42 -> 0.52 -> 0.42 every ~6 s, a keyframe and a
+/// freeze each.
+const CPU_UP_SETTLE_MAX: Duration = Duration::from_secs(120);
+/// Encodes this soon after a new size aren't costs of the size: a new size rebuilds the encoder (nvv4l2h264enc's pipeline
+/// took 50-140 ms a frame on the R1 for its first frames), and counted, they undid every step up.
+const CPU_WARMUP: Duration = Duration::from_millis(500);
 /// Weight of the newest sample in the cost averages.
 const CPU_EWMA_GAIN: f64 = 0.2;
 
@@ -931,11 +938,15 @@ struct CpuGovernor {
     changed_at: Option<Instant>,
     /// the scale in use and its settled cost when the cap last moved
     before: Option<(f64, f64)>,
+    /// the wait before a step up (doubled by each step up that is undone)
+    up_settle: Duration,
+    /// when the cap last stepped up
+    stepped_up_at: Option<Instant>,
 }
 
 impl CpuGovernor {
     fn new() -> Self {
-        CpuGovernor { cap: 1.0, encode_ms: None, changed_at: None, before: None }
+        CpuGovernor { cap: 1.0, encode_ms: None, changed_at: None, before: None, up_settle: CPU_UP_SETTLE, stepped_up_at: None }
     }
 
     fn observe_encode(&mut self, ms: f64) {
@@ -970,10 +981,15 @@ impl CpuGovernor {
             let predict = |scale: f64| fixed + per_area * scale * scale;
             // (past the budget at any size, shrinking would cost the picture and keep the rate it has)
             if encode_ms > interval_ms * CPU_HEADROOM && current > floor + 1e-9 && fixed < interval_ms * CPU_HEADROOM {
+                if self.stepped_up_at.is_some_and(|at| now.duration_since(at) < self.up_settle.max(CPU_UP_SETTLE)) {
+                    self.up_settle = (self.up_settle * 2).min(CPU_UP_SETTLE_MAX);
+                }
+                self.stepped_up_at = None;
                 self.change((current - CPU_STEP).max(floor), current, encode_ms, now);
-            } else if self.cap < 1.0 && since_change.is_none_or(|elapsed| elapsed >= CPU_UP_SETTLE) {
+            } else if self.cap < 1.0 && since_change.is_none_or(|elapsed| elapsed >= self.up_settle) {
                 let next = (self.cap + CPU_STEP).min(1.0);
                 if predict(next) < interval_ms * CPU_UP_HEADROOM {
+                    self.stepped_up_at = Some(now);
                     self.change(next, current, encode_ms, now);
                 }
             }
@@ -1252,7 +1268,11 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
             Ok(Err(error)) => out.error = Some(error),
             Ok(Ok((encoder, result, encode_ms, qp))) => {
                 state.encoder = Some(encoder);
-                state.governor.observe_encode(encode_ms);
+                // (a keyframe, or the rebuilt encoder's first frames, cost more than the size does)
+                let warm = state.size.is_some_and(|(.., changed_at)| changed_at.elapsed() >= CPU_WARMUP);
+                if warm && result.as_ref().is_ok_and(|frame| frame.as_ref().is_none_or(|frame| !frame.keyframe)) {
+                    state.governor.observe_encode(encode_ms);
+                }
                 out.encode_ms = state.governor.encode_ms;
                 match result {
                     Ok(Some(frame)) => {
@@ -1623,7 +1643,7 @@ mod tests {
         }
         assert!((scale - 0.7).abs() < 1e-9, "stops at the first size that fits (25 ms), not at the floor: {scale}");
         // left at the floor (as an older gateway left it), it climbs back
-        let mut stuck = CpuGovernor { cap: 0.1, encode_ms: None, changed_at: Some(start), before: Some((0.2, cost(0.2))) };
+        let mut stuck = CpuGovernor { cap: 0.1, encode_ms: None, changed_at: Some(start), before: Some((0.2, cost(0.2))), ..CpuGovernor::new() };
         let (mut scale, mut at) = (0.1, start);
         for _ in 0..20 {
             at += CPU_UP_SETTLE;
@@ -1637,6 +1657,25 @@ mod tests {
         slow.scale_cap(1.0, 0.1, 30.0, start);
         slow.observe_encode(59.0);
         assert!((slow.scale_cap(0.9, 0.1, 30.0, start + CPU_SETTLE) - 0.9).abs() < 1e-9, "a step that saved 1 ms of 60 is the last");
+    }
+
+    /// The R1 at 0.42 -> 0.52: the step up fits by its prediction but not in practice, so each retry waits twice as long.
+    #[test]
+    fn cpu_governor_backs_off_a_step_up_that_is_undone() {
+        let start = Instant::now();
+        let mut governor = CpuGovernor { cap: 0.4, ..CpuGovernor::new() };
+        let (mut at, mut ups) = (start, Vec::new());
+        while at < start + Duration::from_secs(300) {
+            let scale = governor.cap;
+            governor.observe_encode(if scale > 0.45 { 30.0 } else { 9.0 });
+            if governor.scale_cap(scale, 0.1, 30.0, at) > scale + 1e-9 {
+                ups.push(at.duration_since(start).as_secs());
+            }
+            at += Duration::from_millis(100);
+        }
+        // every ~6 s before; now 11, 21, 41, 81 s apart, then every 2 min
+        let gaps: Vec<u64> = ups.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(ups.len() <= 6 && gaps.windows(2).all(|pair| pair[1] >= pair[0]) && gaps.last().is_some_and(|gap| *gap >= 100), "{ups:?}");
     }
 
     /// Counts the frames it encodes; each is a keyframe when asked for.
