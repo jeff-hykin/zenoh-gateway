@@ -25,6 +25,7 @@ pub use video::{EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoPolic
 use anyhow::{Result, anyhow, ensure};
 use std::any::Any;
 use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 /// What an encoding produces (on its default channel, or as [`MessageEncoding::output_on`] says).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -224,11 +225,37 @@ pub struct VideoImage {
     format: PixelFormat,
     data: Vec<u8>,
     header: Option<MessageHeader>,
+    /// a picture still in its JPEG ([`VideoImage::jpeg`]): `format` and `data` are its decode's, made on first use
+    jpeg: Option<Arc<Jpeg>>,
 }
+
+/// A [`VideoImage`]'s JPEG and its decode, made at most once.
+struct Jpeg {
+    bytes: Vec<u8>,
+    decode: fn(&[u8]) -> Result<VideoImage>,
+    decoded: OnceLock<std::result::Result<VideoImage, String>>,
+}
+
+impl Jpeg {
+    fn decoded(&self) -> Result<&VideoImage> {
+        self.decoded.get_or_init(|| (self.decode)(&self.bytes).map(|image| VideoImage { jpeg: None, header: None, ..image }).map_err(|error| format!("{error:#}"))).as_ref().map_err(|error| anyhow!("jpeg: {error}"))
+    }
+}
+
+impl PartialEq for Jpeg {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for Jpeg {}
 
 impl fmt::Debug for VideoImage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "VideoImage({}x{} {:?}, {} bytes)", self.width, self.height, self.format, self.data.len())
+        match &self.jpeg {
+            Some(jpeg) => write!(formatter, "VideoImage({}x{} JPEG, {} bytes)", self.width, self.height, jpeg.bytes.len()),
+            None => write!(formatter, "VideoImage({}x{} {:?}, {} bytes)", self.width, self.height, self.format, self.data.len()),
+        }
     }
 }
 
@@ -237,7 +264,7 @@ impl VideoImage {
     pub fn rgb8(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
         ensure!(width > 0 && height > 0, "empty image ({width}x{height})");
         ensure!(data.len() == width as usize * height as usize * 3, "rgb8 {width}x{height} needs {} bytes, got {}", width as usize * height as usize * 3, data.len());
-        Ok(VideoImage { width, height, format: PixelFormat::Rgb8, data, header: None })
+        Ok(VideoImage { width, height, format: PixelFormat::Rgb8, data, header: None, jpeg: None })
     }
 
     /// Planar I420; fails unless both sizes are even and non-zero and `data` is exactly
@@ -245,7 +272,30 @@ impl VideoImage {
     pub fn i420(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
         ensure!(width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2), "i420 needs even, non-zero sizes, got {width}x{height}");
         ensure!(data.len() == width as usize * height as usize * 3 / 2, "i420 {width}x{height} needs {} bytes, got {}", width as usize * height as usize * 3 / 2, data.len());
-        Ok(VideoImage { width, height, format: PixelFormat::I420, data, header: None })
+        Ok(VideoImage { width, height, format: PixelFormat::I420, data, header: None, jpeg: None })
+    }
+
+    /// A picture still in its JPEG, `width × height` (from its header): an encoder that takes JPEG (a hardware pipeline that
+    /// decodes, scales and encodes it without the CPU touching a pixel) reads [`jpeg_bytes`](Self::jpeg_bytes); anything
+    /// that reads [`format`](Self::format) or [`data`](Self::data) gets `decode`'s picture, made once on first use. On the
+    /// R1 the 1920x1536 camera's decode, scale and the copies into the encoder took 26-60 ms a frame on a loaded CPU; the
+    /// Jetson's JPEG decoder, converter and encoder in one pipeline took 4.
+    pub fn jpeg(width: u32, height: u32, bytes: Vec<u8>, decode: fn(&[u8]) -> Result<VideoImage>) -> Result<Self> {
+        ensure!(width > 0 && height > 0, "empty image ({width}x{height})");
+        Ok(VideoImage { width, height, format: PixelFormat::I420, data: Vec::new(), header: None, jpeg: Some(Arc::new(Jpeg { bytes, decode, decoded: OnceLock::new() })) })
+    }
+
+    /// The JPEG of a picture made by [`jpeg`](Self::jpeg).
+    pub fn jpeg_bytes(&self) -> Option<&[u8]> {
+        self.jpeg.as_ref().map(|jpeg| jpeg.bytes.as_slice())
+    }
+
+    /// The decoded picture: itself, or its JPEG's decode.
+    fn pixels(&self) -> Result<&VideoImage> {
+        match &self.jpeg {
+            Some(jpeg) => jpeg.decoded(),
+            None => Ok(self),
+        }
     }
 
     /// Width in pixels.
@@ -258,14 +308,20 @@ impl VideoImage {
         self.height
     }
 
-    /// The pixel layout of [`data`](Self::data).
+    /// The pixel layout of [`data`](Self::data) (a JPEG's is its decode's: I420 if it failed).
     pub fn format(&self) -> PixelFormat {
-        self.format
+        self.pixels().map_or(PixelFormat::I420, |image| image.format)
     }
 
-    /// The pixels, laid out as [`format`](Self::format) says.
+    /// The pixels, laid out as [`format`](Self::format) says (a JPEG that fails to decode has none).
     pub fn data(&self) -> &[u8] {
-        &self.data
+        match self.pixels() {
+            Ok(image) => &image.data,
+            Err(error) => {
+                log::warn!("{error:#}");
+                &[]
+            }
+        }
     }
 
     /// With its message's header (`stamp` in seconds, `frame_id` its TF frame): each picture's goes to the page with its
@@ -294,7 +350,11 @@ impl VideoImage {
     /// Box-filtered to `width × height` as I420 (BT.601 limited range), e.g. to a [`VideoTarget`]'s size; keeps the header.
     pub fn to_i420(&self, width: u32, height: u32) -> Result<VideoImage> {
         ensure!(width.is_multiple_of(2) && height.is_multiple_of(2), "i420 needs even sizes, got {width}x{height}");
-        Ok(VideoImage { header: self.header.clone(), ..VideoImage::i420(width, height, video::to_i420(self, width, height))? })
+        let pixels = self.pixels()?;
+        if (pixels.width, pixels.height, pixels.format) == (width, height, PixelFormat::I420) {
+            return Ok(VideoImage { header: self.header.clone(), jpeg: None, ..pixels.clone() });
+        }
+        Ok(VideoImage { header: self.header.clone(), ..VideoImage::i420(width, height, video::to_i420(pixels, width, height))? })
     }
 }
 
@@ -482,5 +542,32 @@ pub trait MessageEncoding: Send + Sync {
     /// priced by the gateway from its [`VideoPolicy`] instead, audio by what it sends.
     fn estimated_bytes(&self, payload_bytes: usize, options: &EncodeOptions) -> f64 {
         payload_bytes as f64 * (0.1 + 0.9 * options.quality.clamp(0.0, 1.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DECODES: AtomicUsize = AtomicUsize::new(0);
+
+    fn grey(bytes: &[u8]) -> Result<VideoImage> {
+        DECODES.fetch_add(1, Ordering::SeqCst);
+        ensure!(bytes == b"jpeg", "not a jpeg");
+        VideoImage::i420(4, 2, vec![128; 12])
+    }
+
+    #[test]
+    fn a_jpeg_picture_decodes_once_and_only_when_read() {
+        let image = VideoImage::jpeg(4, 2, b"jpeg".to_vec(), grey).unwrap().with_header(1.5, "cam");
+        let copy = image.clone();
+        assert_eq!((image.jpeg_bytes(), DECODES.load(Ordering::SeqCst)), (Some(&b"jpeg"[..]), 0), "the encoder's JPEG, no decode");
+        assert_eq!((copy.format(), copy.data().len(), image.data().len()), (PixelFormat::I420, 12, 12));
+        let small = image.to_i420(2, 2).unwrap();
+        assert_eq!((small.jpeg_bytes(), small.header(), small.data().len()), (None, Some((1.5, "cam")), 6));
+        assert_eq!(DECODES.load(Ordering::SeqCst), 1, "clones share the one decode");
+        let broken = VideoImage::jpeg(4, 2, b"junk".to_vec(), grey).unwrap();
+        assert!(broken.data().is_empty() && broken.to_i420(2, 2).is_err());
     }
 }
