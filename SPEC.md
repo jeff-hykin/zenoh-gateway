@@ -336,7 +336,9 @@ good as BT.709 through openh264 and ~0.5 dB better through VideoToolbox. H.264 o
 - CPU governor (per encode session): when scale+encode takes more than 85% of the frame interval, the ceiling on the
   picture's scale drops 0.1 below the scale in use (never below `minResolutionScale`), at most once a second, unless the
   part of the cost that doesn't scale with pixels is past that alone; it rises 0.1 when the encode cost predicted at the
-  next step fits in 60% of the interval and 5 s have passed since the last step. The cost is predicted as a fixed part
+  next step fits in 60% of the interval and 5 s have passed since the last step (doubled, up to 2 min, each time a step
+  up is undone within that wait). Encodes in the first 500 ms at a new size, and keyframes, aren't counted (a rebuilt
+  encoder's first frames cost more than the size does). The cost is predicted as a fixed part
   plus a part ∝ pixels, fitted from the costs at the last two scales (all ∝ pixels before a second scale was measured) (each resolution change restarts the encoder with a keyframe, so the ceiling must not flap). It only
   lowers the size the bitrate policy picked, never the bitrate or the frame rate, so the two never fight; a hardware
   encoder rarely moves it. Decode time does not move it (a slow decode caps the rate at any resolution). Stats:
@@ -405,7 +407,9 @@ runtime) backends, probed by encoding a test frame and wrapped in a fallback to 
 (`--video-encoder auto|software|videotoolbox|gstreamer`). Any encoder is fed from
 `VideoImage::to_i420(target.width, target.height)`
 (or the encoding's own frames, e.g. GPU buffers decoded into `DecodedFrame::Data`, which the encoder
-downcasts), returning access units. A camera that already sends H.264 can be passed through the
+downcasts), returning access units. An encoding may hand over a picture still in its JPEG (`VideoImage::jpeg(width,
+height, bytes, decode)`): an encoder that takes JPEG reads `jpeg_bytes()` (the Jetson's decodes, scales and encodes it
+on the GPU), and `format()`, `data()` or `to_i420` decode it on first use, once. A camera that already sends H.264 can be passed through the
 same way: the encoding's decode keeps the access unit and its encoder returns it (keyframes then
 come from the source). zenoh-gateway-cli's `examples/custom_codec.rs` has an encoding with its own AV1 encoder that
 `test/custom_codec.js` shows in Chrome.
