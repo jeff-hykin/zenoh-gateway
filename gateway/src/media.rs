@@ -916,22 +916,47 @@ fn ewma(average: Option<f64>, sample: f64) -> f64 {
 
 /// Keeps an encode session within what the cores can encode at its frame rate (on a small CPU the rate collapsed): past
 /// `CPU_HEADROOM` of the frame interval the picture's scale ceiling steps down from the scale in use (never below
-/// `minResolutionScale`), and back up when the encode cost predicted at the next step (it scales with pixels) fits. It
-/// only ever lowers the size the bitrate policy picked, never the bitrate or the rate, so the two can't fight; a
-/// hardware encoder rarely moves it. Decode cost never moves it: it overlaps encoding and does not depend on size.
+/// `minResolutionScale`), and back up when the encode cost predicted at the next step fits. It only ever lowers the size
+/// the bitrate policy picked, never the bitrate or the rate, so the two can't fight; a hardware encoder rarely moves it.
+/// Decode cost never moves it: it overlaps encoding and does not depend on size.
+///
+/// The cost is predicted as a part that scales with pixels plus a part that doesn't, fitted from the costs at the last
+/// two scales: on the R1 a hardware encode in a child process cost ~11 ms at any size (the full-size picture went over
+/// a pipe and was scaled there), and as if all of it scaled with pixels, the picture shrank to the floor (192x154) and,
+/// predicted at 4x the cost one step up, never grew back. It doesn't shrink when the part that doesn't scale is past the
+/// budget alone.
 struct CpuGovernor {
     cap: f64,
     encode_ms: Option<f64>,
     changed_at: Option<Instant>,
+    /// the scale in use and its settled cost when the cap last moved
+    before: Option<(f64, f64)>,
 }
 
 impl CpuGovernor {
     fn new() -> Self {
-        CpuGovernor { cap: 1.0, encode_ms: None, changed_at: None }
+        CpuGovernor { cap: 1.0, encode_ms: None, changed_at: None, before: None }
     }
 
     fn observe_encode(&mut self, ms: f64) {
         self.encode_ms = Some(ewma(self.encode_ms, ms));
+    }
+
+    /// The encode cost (ms) as `(fixed, per unit of scale squared)`, from `encode_ms` at `scale` and the cost before the
+    /// last step; all of it per pixel without one at another scale.
+    fn cost_model(&self, scale: f64, encode_ms: f64) -> (f64, f64) {
+        let proportional = (0.0, encode_ms / (scale * scale).max(1e-9));
+        let Some((before_scale, before_ms)) = self.before.filter(|(before_scale, _)| (before_scale - scale).abs() > 1e-9) else { return proportional };
+        let per_area = ((before_ms - encode_ms) / (before_scale * before_scale - scale * scale)).max(0.0);
+        let fixed = encode_ms - per_area * scale * scale;
+        if fixed < 0.0 { proportional } else { (fixed, per_area) }
+    }
+
+    fn change(&mut self, cap: f64, scale: f64, encode_ms: f64, now: Instant) {
+        self.before = Some((scale, encode_ms));
+        self.cap = cap;
+        self.encode_ms = None;
+        self.changed_at = Some(now);
     }
 
     /// The ceiling on the picture's scale, given the scale the last frame was encoded at.
@@ -941,16 +966,15 @@ impl CpuGovernor {
         if let (true, Some(encode_ms)) = (settled, self.encode_ms) {
             let interval_ms = 1000.0 / hz.max(0.1);
             let current = current.min(self.cap);
-            if encode_ms > interval_ms * CPU_HEADROOM && current > floor + 1e-9 {
-                self.cap = (current - CPU_STEP).max(floor);
-                self.encode_ms = None;
-                self.changed_at = Some(now);
+            let (fixed, per_area) = self.cost_model(current, encode_ms);
+            let predict = |scale: f64| fixed + per_area * scale * scale;
+            // (past the budget at any size, shrinking would cost the picture and keep the rate it has)
+            if encode_ms > interval_ms * CPU_HEADROOM && current > floor + 1e-9 && fixed < interval_ms * CPU_HEADROOM {
+                self.change((current - CPU_STEP).max(floor), current, encode_ms, now);
             } else if self.cap < 1.0 && since_change.is_none_or(|elapsed| elapsed >= CPU_UP_SETTLE) {
                 let next = (self.cap + CPU_STEP).min(1.0);
-                if encode_ms * (next / self.cap).powi(2) < interval_ms * CPU_UP_HEADROOM {
-                    self.cap = next;
-                    self.encode_ms = None;
-                    self.changed_at = Some(now);
+                if predict(next) < interval_ms * CPU_UP_HEADROOM {
+                    self.change(next, current, encode_ms, now);
                 }
             }
         }
@@ -1558,9 +1582,9 @@ mod tests {
         // 30 Hz leaves 33 ms a frame; encoding takes 50
         governor.observe_encode(50.0);
         assert!((governor.scale_cap(1.0, 0.25, 30.0, start) - 0.9).abs() < 1e-9, "one step down");
-        governor.observe_encode(50.0);
+        // (at 0.9 it costs 0.81 of that: all of it scales with pixels)
+        governor.observe_encode(40.5);
         assert!((governor.scale_cap(0.9, 0.25, 30.0, start + Duration::from_millis(100)) - 0.9).abs() < 1e-9, "settles before the next step");
-        governor.observe_encode(45.0);
         assert!((governor.scale_cap(0.9, 0.25, 30.0, start + CPU_SETTLE) - 0.8).abs() < 1e-9);
         // steps down from the scale in use: the bitrate policy had already shrunk the picture to 0.5
         let mut shrunk = CpuGovernor::new();
@@ -1583,6 +1607,36 @@ mod tests {
         assert!((near.scale_cap(1.0, 0.25, 30.0, start) - 0.9).abs() < 1e-9);
         near.observe_encode(17.0);
         assert!((near.scale_cap(0.9, 0.25, 30.0, start + CPU_UP_SETTLE) - 0.9).abs() < 1e-9, "17 ms now, ~21 predicted: stays");
+    }
+
+    /// The R1: a hardware encode in a child process costs 11 ms at any size plus 29 ms at full size, at 30 Hz (28 ms budget).
+    #[test]
+    fn cpu_governor_learns_the_cost_that_does_not_scale() {
+        let cost = |scale: f64| 11.0 + 29.0 * scale * scale;
+        let start = Instant::now();
+        let mut governor = CpuGovernor::new();
+        let (mut scale, mut at) = (1.0, start);
+        for _ in 0..20 {
+            governor.observe_encode(cost(scale));
+            scale = governor.scale_cap(scale, 0.1, 30.0, at);
+            at += CPU_UP_SETTLE;
+        }
+        assert!((scale - 0.7).abs() < 1e-9, "stops at the first size that fits (25 ms), not at the floor: {scale}");
+        // left at the floor (as an older gateway left it), it climbs back
+        let mut stuck = CpuGovernor { cap: 0.1, encode_ms: None, changed_at: Some(start), before: Some((0.2, cost(0.2))) };
+        let (mut scale, mut at) = (0.1, start);
+        for _ in 0..20 {
+            at += CPU_UP_SETTLE;
+            stuck.observe_encode(cost(scale));
+            scale = stuck.scale_cap(scale, 0.1, 30.0, at);
+        }
+        assert!(scale >= 0.5 - 1e-9 && cost(scale) < 1000.0 / 30.0 * CPU_HEADROOM, "climbs back: {scale}");
+        // past the budget at any size: keeps the picture
+        let mut slow = CpuGovernor::new();
+        slow.observe_encode(60.0);
+        slow.scale_cap(1.0, 0.1, 30.0, start);
+        slow.observe_encode(59.0);
+        assert!((slow.scale_cap(0.9, 0.1, 30.0, start + CPU_SETTLE) - 0.9).abs() < 1e-9, "a step that saved 1 ms of 60 is the last");
     }
 
     /// Counts the frames it encodes; each is a keyframe when asked for.
