@@ -409,7 +409,11 @@ runtime) backends, probed by encoding a test frame and wrapped in a fallback to 
 (or the encoding's own frames, e.g. GPU buffers decoded into `DecodedFrame::Data`, which the encoder
 downcasts), returning access units. An encoding may hand over a picture still in its JPEG (`VideoImage::jpeg(width,
 height, bytes, decode)`): an encoder that takes JPEG reads `jpeg_bytes()` (the Jetson's decodes, scales and encodes it
-on the GPU), and `format()`, `data()` or `to_i420` decode it on first use, once. A camera that already sends H.264 can be passed through the
+on the GPU), and `format()`, `data()` or `to_i420` decode it on first use, once. An encoder whose output trails its
+input (a hardware pipeline holding a few frames) says whose frame each output is (`VideoTarget::frame_id` in,
+`last_frame_id` out), so each goes out with its own stamp, frame id and timing; after each `encode` the gateway takes
+every frame still inside through `next_output(wait)` as it comes out, waiting until the next input is due (that wait is
+not counted as encoding cost). A camera that already sends H.264 can be passed through the
 same way: the encoding's decode keeps the access unit and its encoder returns it (keyframes then
 come from the source). zenoh-gateway-cli's `examples/custom_codec.rs` has an encoding with its own AV1 encoder that
 `test/custom_codec.js` shows in Chrome.
