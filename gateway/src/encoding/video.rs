@@ -326,11 +326,13 @@ pub trait VideoEncoder: Send {
         None
     }
 
-    /// Another frame that came out since the last `encode` or `next_output`, without new input; `None` once there is
-    /// none. A pipelined encoder returns one frame per `encode`, so frames that finish between inputs wait here: the
-    /// gateway takes every one after each `encode` (only one a call, a pipeline that fell 6 frames behind stayed 6 behind,
-    /// 100 ms at 60 Hz). `last_frame_id` and `last_qp` then describe this frame.
-    fn next_output(&mut self) -> Result<Option<EncodedVideo>> {
+    /// Another frame that came out since the last `encode` or `next_output`, without new input, waiting at most `wait`
+    /// for one while frames are still inside; `None` once none came (at once when none are inside). A pipelined encoder
+    /// returns one frame per `encode`, so frames that finish between inputs come out here: after each `encode` the
+    /// gateway takes every one, waiting until the next input is due (only one a call, a pipeline that fell 6 frames
+    /// behind stayed 6 behind, 100 ms at 60 Hz; without the wait, each frame waited for the next input, a frame time).
+    /// `last_frame_id` and `last_qp` then describe this frame.
+    fn next_output(&mut self, _wait: Duration) -> Result<Option<EncodedVideo>> {
         Ok(None)
     }
 }

@@ -1277,15 +1277,20 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         let encoding = tokio::task::spawn_blocking(move || {
             let mut encoder = existing.map_or_else(|| codecs.video_encoder(&*codec, format), Ok)?;
             let started = Instant::now();
-            // this frame's output (or an earlier one's), then any others that came out meanwhile
+            // this frame's output (or an earlier one's)
             let mut result = encoder.encode(&decoded, &target).map(|frame| frame.map(|frame| (frame, encoder.last_qp(), encoder.last_frame_id())).into_iter().collect::<Vec<_>>());
+            // (the wait below is not encoding work: the CPU governor only sees this)
+            let encode_ms = started.elapsed().as_secs_f64() * 1000.0;
+            // then every frame still inside a pipelined encoder, as it comes out, until the next input is due: taken only
+            // with the next input, each waited a frame time (33 ms at 30 Hz, 200 ms at 5)
+            let due = started + Duration::from_secs_f64(1.0 / target.fps.max(f64::MIN_POSITIVE)).min(timeout / 2);
             if let Ok(frames) = &mut result {
-                while let Ok(Some(frame)) = encoder.next_output() {
+                while let Ok(Some(frame)) = encoder.next_output(due.saturating_duration_since(Instant::now())) {
                     frames.push((frame, encoder.last_qp(), encoder.last_frame_id()));
                 }
             }
             let result = result.map_err(|error| format!("{error:#}"));
-            Ok::<_, String>((encoder, result, started.elapsed().as_secs_f64() * 1000.0))
+            Ok::<_, String>((encoder, result, encode_ms))
         });
         // an encode that hangs gives up its encoder (rebuilt next frame, from a keyframe) and the session's lock, which
         // every viewer of the session waits on
@@ -1887,14 +1892,14 @@ mod tests {
         fn encode(&mut self, _: &DecodedFrame, target: &VideoTarget) -> anyhow::Result<Option<EncodedVideo>> {
             self.0.push_back(target.frame_id);
             self.2 = self.0.len() >= 3;
-            self.next_output()
+            self.next_output(Duration::ZERO)
         }
 
         fn last_frame_id(&self) -> Option<u64> {
             self.1
         }
 
-        fn next_output(&mut self) -> anyhow::Result<Option<EncodedVideo>> {
+        fn next_output(&mut self, _: Duration) -> anyhow::Result<Option<EncodedVideo>> {
             self.1 = if self.2 { self.0.pop_front() } else { None };
             Ok(self.1.map(|frame_id| EncodedVideo { data: vec![0; 10], width: 64, height: 48, keyframe: frame_id == 0 }))
         }
@@ -1935,5 +1940,82 @@ mod tests {
         }
         codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
         assert_eq!(sent, vec![vec![], vec![], vec![100.0, 101.0, 102.0]], "all three at once, each with its own stamp, not one a call");
+    }
+
+    /// A hardware pipeline: each frame comes out `latency` after it went in, never inside `encode`.
+    struct Delayed(VecDeque<(u64, Instant)>, Option<u64>, Duration);
+
+    impl VideoEncoder for Delayed {
+        fn format(&self) -> VideoFormat {
+            VideoFormat::H264
+        }
+
+        fn encode(&mut self, _: &DecodedFrame, target: &VideoTarget) -> anyhow::Result<Option<EncodedVideo>> {
+            self.0.push_back((target.frame_id, Instant::now() + self.2));
+            Ok(None)
+        }
+
+        fn last_frame_id(&self) -> Option<u64> {
+            self.1
+        }
+
+        fn next_output(&mut self, wait: Duration) -> anyhow::Result<Option<EncodedVideo>> {
+            let Some(&(frame_id, ready_at)) = self.0.front() else { return Ok(None) };
+            if ready_at > Instant::now() + wait {
+                std::thread::sleep(wait);
+                return Ok(None);
+            }
+            std::thread::sleep(ready_at.saturating_duration_since(Instant::now()));
+            self.0.pop_front();
+            self.1 = Some(frame_id);
+            Ok(Some(EncodedVideo { data: vec![0; 10], width: 64, height: 48, keyframe: frame_id == 0 }))
+        }
+    }
+
+    struct DelayedCamera(Duration);
+
+    impl MessageEncoding for DelayedCamera {
+        fn name(&self) -> &str {
+            "delayed"
+        }
+
+        fn output(&self) -> EncodingOutput {
+            EncodingOutput::Video
+        }
+
+        fn video_encoder(&self, _: VideoFormat) -> Option<Box<dyn VideoEncoder>> {
+            Some(Box::new(Delayed(VecDeque::new(), None, self.0)))
+        }
+
+        fn decode(&self, _: &EncodingSample<'_>, _: crate::Channel) -> anyhow::Result<DecodedFrame> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    /// Steps `codec`'s session with one picture at `fps`: the stamps of the frames it sent, and how long it took.
+    async fn step_once(codec: Arc<dyn MessageEncoding>, name: &'static str, fps: f64) -> (Vec<f64>, Duration) {
+        let codecs = Arc::new(EncodingRegistry::new([codec.clone()]).unwrap());
+        let mut viewer = Member { id: 0, session: None, next_seq: None, synced: false, registry: None };
+        let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0, "cam");
+        let session = codecs.video_sessions.place(None, 0, (name, VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, fps, 4e6, false));
+        viewer.session = Some(session.clone());
+        let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), timestamp_ms: 0.0, received_ms: 0.0, hash: 0, quality: 1.0, keyframe_requested: false, sample: None };
+        let started = Instant::now();
+        let out = step(session, &mut viewer, input, codecs.clone(), codec).await;
+        codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
+        (out.frames.iter().map(|frame| frame.header.as_ref().unwrap().stamp()).collect(), started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn a_frame_still_in_the_pipeline_goes_out_when_it_comes_out_not_with_the_next_input() {
+        // out 20 ms after it went in, the next input due in 500 ms (2 Hz): sent in the same step, long before then
+        // (wide margins: macOS's timers can sleep several times what was asked)
+        let (stamps, took) = step_once(Arc::new(DelayedCamera(Duration::from_millis(20))), "delayed", 2.0).await;
+        assert_eq!(stamps, vec![100.0], "the frame that came out during the wait");
+        assert!(took < Duration::from_millis(400), "returned once it came out, not at the next input's time: {took:?}");
+        // out after the next input is due (3 s vs 500 ms): the step gives up at ~500 ms and the frame waits for the next
+        let (stamps, took) = step_once(Arc::new(DelayedCamera(Duration::from_secs(3))), "delayed", 2.0).await;
+        assert!(stamps.is_empty(), "nothing out yet");
+        assert!(took >= Duration::from_millis(450) && took < Duration::from_millis(2500), "waited until the next input was due: {took:?}");
     }
 }
