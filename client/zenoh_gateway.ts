@@ -104,7 +104,17 @@ export interface VideoFrameInfo {
 }
 
 /** A message's own header (ROS `std_msgs/Header`, dimos LCM's), which the gateway sends with what an encoding made of it. */
+export interface AcquisitionHeader {
+    clock_id: string
+    epoch: bigint
+    time_ns: bigint
+    source_id: string
+    sequence: bigint
+}
+
 export interface MessageHeader {
+    /** Source clock and reset identity; time_ns is not necessarily wall time. */
+    acquisition?: AcquisitionHeader
     /** seconds since the epoch (to about a microsecond; `sec` + `nanosec` are exact) */
     stamp: number
     sec: number
@@ -565,12 +575,30 @@ export function decodeHeader(bytes: Uint8Array): DecodedHeader | undefined {
     }
     const flags = bytes[end + 8]
     const header: MessageHeader = { stamp, sec: view.getInt32(end, true), nanosec: view.getUint32(end + 4, true), frameId, ...((flags & 1) !== 0 ? { seq: view.getUint32(end + 9, true) } : {}) }
-    if ((flags & 2) === 0) {
-        return { header }
-    }
     try {
-        const { encoding, attachment } = splitMeta(bytes.subarray(end + 13))
-        return { header, encoding, ...(attachment === undefined ? {} : { attachment }) }
+        let at = end + 13
+        const result: DecodedHeader = { header }
+        if ((flags & 2) !== 0) {
+            const { encoding, attachment } = splitMeta(bytes.subarray(at))
+            result.encoding = encoding
+            if (attachment !== undefined) result.attachment = attachment
+            const encodingLength = view.getUint16(at, true)
+            at += 2 + encodingLength
+            at += 4 + view.getUint32(at, true)
+        }
+        if ((flags & 4) !== 0) {
+            const string = () => {
+                const length = view.getUint16(at, true)
+                at += 2
+                if (at + length > bytes.byteLength) throw new RangeError("truncated acquisition header")
+                const value = keyDecoder.decode(bytes.subarray(at, at + length))
+                at += length
+                return value
+            }
+            const int64 = () => { const value = view.getBigInt64(at, true); at += 8; return value }
+            header.acquisition = { clock_id: string(), epoch: int64(), time_ns: int64(), source_id: string(), sequence: int64() }
+        }
+        return result
     } catch {
         return undefined
     }
