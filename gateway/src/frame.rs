@@ -60,7 +60,9 @@ pub type SampleMeta = Option<(String, Option<Vec<u8>>)>;
 /// `f64 stamp (s) | u16 frameIdLen | frameId utf8 | i32 sec | u32 nanosec | u8 flags | u32 seq`, flags bit0: `seq` is
 /// set; bit1: the sample's zenoh encoding and attachment follow (`u16 encodingLen | encoding utf8 | u32 attachmentLen |
 /// attachment`, e.g. rmw_zenoh's seq, timestamp and gid). (0.5.31 sent only up to `frameId`; readers take what is
-/// there.) None for a frame id or encoding past 64 KiB: nothing real is.
+/// there.) Bit2 appends acquisition metadata after the optional sample metadata:
+/// `u16 clockLen | clock utf8 | i64 epoch | i64 timeNs | u16 sourceLen | source utf8 | i64 sequence`.
+/// Old readers ignore this trailing extension. None if the complete header exceeds 64 KiB.
 pub fn encode_header(header: &crate::MessageHeader, sample: &SampleMeta) -> Option<Vec<u8>> {
     let frame_id = header.frame_id.as_bytes();
     let frame_id_len = u16::try_from(frame_id.len()).ok()?;
@@ -70,7 +72,7 @@ pub fn encode_header(header: &crate::MessageHeader, sample: &SampleMeta) -> Opti
     out.extend_from_slice(frame_id);
     out.extend_from_slice(&header.sec.to_le_bytes());
     out.extend_from_slice(&header.nanosec.to_le_bytes());
-    out.push(header.seq.is_some() as u8 | if sample.is_some() { 2 } else { 0 });
+    out.push(header.seq.is_some() as u8 | if sample.is_some() { 2 } else { 0 } | if header.acquisition.is_some() { 4 } else { 0 });
     out.extend_from_slice(&header.seq.unwrap_or(0).to_le_bytes());
     if let Some((encoding, attachment)) = sample {
         out.extend_from_slice(&u16::try_from(encoding.len()).ok()?.to_le_bytes());
@@ -79,6 +81,17 @@ pub fn encode_header(header: &crate::MessageHeader, sample: &SampleMeta) -> Opti
         out.extend_from_slice(&u32::try_from(attachment.len()).ok()?.to_le_bytes());
         out.extend_from_slice(attachment);
     }
+    if let Some(acquisition) = &header.acquisition {
+        out.extend_from_slice(&u16::try_from(acquisition.clock_id.len()).ok()?.to_le_bytes());
+        out.extend_from_slice(acquisition.clock_id.as_bytes());
+        out.extend_from_slice(&acquisition.epoch.to_le_bytes());
+        out.extend_from_slice(&acquisition.time_ns.to_le_bytes());
+        out.extend_from_slice(&u16::try_from(acquisition.source_id.len()).ok()?.to_le_bytes());
+        out.extend_from_slice(acquisition.source_id.as_bytes());
+        out.extend_from_slice(&acquisition.sequence.to_le_bytes());
+    }
+    // with_header uses a u16 length; never wrap it and corrupt the following payload.
+    u16::try_from(out.len()).ok()?;
     Some(out)
 }
 
@@ -103,16 +116,35 @@ pub fn decode_header(bytes: &[u8]) -> Option<(crate::MessageHeader, SampleMeta)>
         return Some((crate::MessageHeader::from_stamp(stamp, frame_id), None));
     };
     let word = |at: usize| u32::from_le_bytes(exact[at..at + 4].try_into().unwrap());
-    let header = crate::MessageHeader { sec: word(0) as i32, nanosec: word(4), frame_id, seq: (exact[8] & 1 != 0).then(|| word(9)) };
-    if exact[8] & 2 == 0 {
-        return Some((header, None));
+    let mut header = crate::MessageHeader { acquisition: None, sec: word(0) as i32, nanosec: word(4), frame_id, seq: (exact[8] & 1 != 0).then(|| word(9)) };
+    let mut at = at + 13;
+    let sample = if exact[8] & 2 != 0 {
+        let encoding_len = u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?) as usize;
+        at += 2;
+        let encoding = std::str::from_utf8(bytes.get(at..at + encoding_len)?).ok()?.to_owned();
+        at += encoding_len;
+        let attachment_len = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+        at += 4;
+        let attachment = bytes.get(at..at + attachment_len)?;
+        at += attachment_len;
+        Some((encoding, (!attachment.is_empty()).then(|| attachment.to_vec())))
+    } else { None };
+    if exact[8] & 4 != 0 {
+        let clock_len = u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?) as usize;
+        at += 2;
+        let clock_id = std::str::from_utf8(bytes.get(at..at + clock_len)?).ok()?.to_owned();
+        at += clock_len;
+        let epoch = i64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?);
+        let time_ns = i64::from_le_bytes(bytes.get(at + 8..at + 16)?.try_into().ok()?);
+        at += 16;
+        let source_len = u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?) as usize;
+        at += 2;
+        let source_id = std::str::from_utf8(bytes.get(at..at + source_len)?).ok()?.to_owned();
+        at += source_len;
+        let sequence = i64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?);
+        header.acquisition = Some(crate::AcquisitionHeader { clock_id, epoch, time_ns, source_id, sequence });
     }
-    let rest = &bytes[at + 13..];
-    let encoding_len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
-    let encoding = std::str::from_utf8(rest.get(2..2 + encoding_len)?).ok()?.to_owned();
-    let attachment_len = u32::from_le_bytes(rest.get(2 + encoding_len..6 + encoding_len)?.try_into().ok()?) as usize;
-    let attachment = rest.get(6 + encoding_len..6 + encoding_len + attachment_len)?;
-    Some((header, Some((encoding, (!attachment.is_empty()).then(|| attachment.to_vec())))))
+    Some((header, sample))
 }
 
 /// Splits a [`HEADER`] message into (its header, the sample's encoding and attachment, the rest).
@@ -168,7 +200,7 @@ pub fn chunk(payload: &[u8], index: u32, chunk_bytes: usize) -> &[u8] {
 mod tests {
     #[test]
     fn a_message_header_round_trips_exactly_and_reads_0_5_31_s_shorter_form() {
-        let header = crate::MessageHeader { sec: 1_761_350_400, nanosec: 123_456_789, frame_id: "mid360_link".into(), seq: Some(7) };
+        let header = crate::MessageHeader { acquisition: None, sec: 1_761_350_400, nanosec: 123_456_789, frame_id: "mid360_link".into(), seq: Some(7) };
         let bytes = super::encode_header(&header, &None).unwrap();
         assert_eq!(super::decode_header(&bytes), Some((header.clone(), None)), "nanoseconds an f64 stamp would lose survive");
         let message = super::with_header(&bytes, b"payload");
@@ -183,6 +215,26 @@ mod tests {
         assert!((old.nanosec as i64 - 123_456_789).abs() < 1_000, "rounded from the f64 stamp");
         assert_eq!(super::encode_header(&crate::MessageHeader { frame_id: "x".repeat(70_000), ..header }, &None), None, "no frame id is that long");
         assert_eq!(super::decode_header(&bytes[..9]), None, "cut short");
+    }
+
+    #[test]
+    fn acquisition_survives_data_and_video_headers_without_losing_int64_precision() {
+        for time_ns in [0, 1_761_350_400_123_456_789] {
+            let mut header = crate::MessageHeader::from_stamp(0.0, "g1/camera");
+            header.acquisition = Some(crate::AcquisitionHeader {
+                clock_id: "sim-proof".into(), epoch: 3, time_ns,
+                source_id: "camera".into(), sequence: i64::MAX,
+            });
+            for sample in [None, Some(("application/lcm".into(), Some(vec![1, 2, 3])))] {
+                let encoded = encode_header(&header, &sample).unwrap();
+                assert_eq!(decode_header(&encoded), Some((header.clone(), sample.clone())));
+                let packet = with_header(&encoded, b"pixels");
+                assert_eq!(split_header(&packet), Some((header.clone(), sample, &b"pixels"[..])));
+                // Every truncated acquisition extension must fail, not be mistaken for a valid reset.
+                let extension = encoded.len() - (2 + 9 + 16 + 2 + 6 + 8);
+                for end in extension..encoded.len() { assert!(decode_header(&encoded[..end]).is_none()); }
+            }
+        }
     }
 
     use super::*;
