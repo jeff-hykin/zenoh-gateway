@@ -63,7 +63,7 @@ impl MessageEncoding for Cam {
 /// A header from the sample's frame counter at `hz`: `seq` the counter, the stamp exact to the nanosecond.
 fn test_header(sample: &EncodingSample<'_>, hz: u32, frame_id: &str) -> MessageHeader {
     let frame = u32::from_le_bytes(sample.payload[..4].try_into().unwrap());
-    MessageHeader { sec: (frame / hz) as i32, nanosec: frame % hz * (1_000_000_000 / hz) + 7, frame_id: frame_id.into(), seq: Some(frame) }
+    MessageHeader { acquisition: None, sec: (frame / hz) as i32, nanosec: frame % hz * (1_000_000_000 / hz) + 7, frame_id: frame_id.into(), seq: Some(frame) }
 }
 
 struct Cloud;

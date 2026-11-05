@@ -154,6 +154,10 @@ the small messages these carry (big streams belong on subscriptions). Every requ
   `metadata` (JS client default true, sent when the gateway lists the `metadata` feature in its `encodings` reply) turns
   it on everywhere or, false, off; a page that doesn't say (clients before 0.5.32) gets it on video only, as 0.5.31 sent it.
   Raw messages are the whole sample, header included.
+- DimOS acquisition-stamped messages also carry `msg.header.acquisition`: `clock_id`, `epoch`, `time_ns`,
+  `source_id`, `sequence`. The three signed 64-bit integers are `bigint` in JavaScript. `frameId` remains on the
+  enclosing header. `time_ns` is source-clock time, including zero at a simulation reset; use the gateway's
+  `msg.timestamp` for delivery latency, not this acquisition time. The legacy header fields remain available.
 
 ## Delivery → transport mapping
 
@@ -782,6 +786,10 @@ resolving so the gateway has an offset before the first put.
   bit3: the message (decompressed) starts with `u16 encodingLen | encoding utf8 | u32 attachmentLen | attachment`
   ahead of the payload; bit4: the message (before decompression) starts with `u16 len |` that many bytes of its
   sample's header, `f64 stamp (s) | u16 frameIdLen | frameId utf8 | i32 sec | u32 nanosec | u8 flags (bit0: seq set) | u32 seq`.
+  Header flag bit1 appends `u16 encodingLen | encoding utf8 | u32 attachmentLen | attachment`.
+  Header flag bit2 appends, after any encoding/attachment, `u16 clockLen | clock utf8 | i64 epoch | i64 timeNs |
+  u16 sourceLen | source utf8 | i64 sequence`. This optional acquisition extension is shared by data and video.
+  Old readers ignore the trailing extension; the enclosing header including its extensions must fit in 65535 bytes.
 - `encodings` replies `{encodings: [{name, output}], features: ["metadata"]}` (no `features` before 0.5.32).
 - All chunks of one message have the same size, at most 64 KiB (bulk streams use smaller ones, see
   "Bandwidth allocation").

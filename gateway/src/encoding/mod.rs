@@ -194,6 +194,8 @@ pub enum PixelFormat {
 /// [`MessageEncoding::header`] reads it so the gateway can send it with every message ([`frame::encode_header`](crate::frame::encode_header)).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageHeader {
+    /// Acquisition clock and reset identity, when supplied by the source. Its time is not wall time.
+    pub acquisition: Option<AcquisitionHeader>,
     /// whole seconds since the epoch
     pub sec: i32,
     /// nanoseconds past `sec`
@@ -204,16 +206,31 @@ pub struct MessageHeader {
     pub seq: Option<u32>,
 }
 
+/// DimOS acquisition metadata. `frame_id` remains on [`MessageHeader`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AcquisitionHeader {
+    /// Identity of the source clock (simulation time is distinct from wall time).
+    pub clock_id: String,
+    /// Reset counter within this clock.
+    pub epoch: i64,
+    /// Acquisition time in nanoseconds on this clock.
+    pub time_ns: i64,
+    /// Producer of the sample.
+    pub source_id: String,
+    /// Producer sequence number, preserved without narrowing to the legacy u32.
+    pub sequence: i64,
+}
+
 impl MessageHeader {
     /// The stamp in seconds (to about a microsecond: an `f64` can't hold every nanosecond since 1970).
     pub fn stamp(&self) -> f64 {
-        self.sec as f64 + self.nanosec as f64 * 1e-9
+        self.acquisition.as_ref().map_or(self.sec as f64 + self.nanosec as f64 * 1e-9, |header| header.time_ns as f64 * 1e-9)
     }
 
     /// From a stamp in seconds, which is all some sources have.
     pub fn from_stamp(stamp: f64, frame_id: impl Into<String>) -> Self {
         let sec = stamp.floor();
-        MessageHeader { sec: sec as i32, nanosec: (((stamp - sec) * 1e9).round() as u32).min(999_999_999), frame_id: frame_id.into(), seq: None }
+        MessageHeader { acquisition: None, sec: sec as i32, nanosec: (((stamp - sec) * 1e9).round() as u32).min(999_999_999), frame_id: frame_id.into(), seq: None }
     }
 }
 

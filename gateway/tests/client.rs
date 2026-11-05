@@ -49,7 +49,7 @@ impl MessageEncoding for ByteFields {
     }
 
     fn header(&self, sample: &EncodingSample<'_>) -> Option<MessageHeader> {
-        Some(MessageHeader { sec: 1_761_350_400, nanosec: 987_654_321, frame_id: format!("frame_{}", sample.payload.len()), seq: Some(42) })
+        Some(MessageHeader { acquisition: None, sec: 1_761_350_400, nanosec: 987_654_321, frame_id: format!("frame_{}", sample.payload.len()), seq: Some(42) })
     }
 
     fn encode(&self, frame: &DecodedFrame, _options: &EncodeOptions) -> Result<Vec<u8>> {
@@ -150,7 +150,7 @@ async fn encoded_messages_carry_their_sample_s_header_when_asked() {
     let mut attached = client.subscribe("fields/attached", SubscribeOptions { encoding: Some("test-fields".into()), metadata: Some(true), ..Default::default() }).await.unwrap();
     let Message::Data(message) = timeout(Duration::from_secs(10), attached.recv()).await.unwrap().unwrap() else { panic!("not data") };
     assert_eq!((message.encoding.as_deref(), message.attachment.as_deref(), message.header.map(|header| header.frame_id)), (Some("application/cdr"), Some(&[5u8, 6][..]), Some("frame_2".into())), "the zenoh sample's encoding and attachment too");
-    let exact = MessageHeader { sec: 1_761_350_400, nanosec: 987_654_321, frame_id: "frame_3".into(), seq: Some(42) };
+    let exact = MessageHeader { acquisition: None, sec: 1_761_350_400, nanosec: 987_654_321, frame_id: "frame_3".into(), seq: Some(42) };
     for (metadata, compress, expected) in [(Some(true), None, Some(exact.clone())), (Some(true), Some(Compress::Zstd), Some(exact)), (Some(false), None, None), (None, None, None)] {
         let mut subscription = client.subscribe("fields/x", SubscribeOptions { encoding: Some("test-fields".into()), metadata, compress, ..Default::default() }).await.unwrap();
         let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
