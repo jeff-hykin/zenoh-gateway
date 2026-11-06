@@ -1044,19 +1044,31 @@ pub enum Sent {
 
 /// Sends whole messages on a subscription's channel: chunking, the frontend's send gate (bulk) or the strict tier, and
 /// the stats.
+/// The SCTP send priority of the channels the page can't wait on: control, heartbeat and strict-tier subscriptions
+/// (DCEP's "high", RFC 8832 §5.1; every other channel stays at the priority the browser opened it with, which is
+/// the same for all). Their messages go before bulk already queued in SCTP: one SCTP queue for every channel held the
+/// M20 controller's heartbeat replies 200-350 ms behind lidar chunks while the link itself had no queue.
+pub const URGENT_CHANNEL_PRIORITY: u16 = 512;
+
 pub struct MessageSender {
     next_frame_id: u32,
     warned_send_error: bool,
+    /// the channel's priority was raised to `URGENT_CHANNEL_PRIORITY` (once the subscription is strict)
+    urgent: bool,
 }
 
 impl MessageSender {
     pub fn new() -> Self {
-        MessageSender { next_frame_id: 0, warned_send_error: false }
+        MessageSender { next_frame_id: 0, warned_send_error: false, urgent: false }
     }
 
     pub async fn send(&mut self, dc: &Arc<dyn DataChannel>, shared: &SubShared, key: &str, item: &Pending, payload: &[u8], flags: u8) -> Sent {
         // strict: whole message at once, bulk held off meanwhile; bulk: small paced chunks
         let strict_turn = shared.is_strict().then(|| shared.gate.strict_turn());
+        // (strict can come with the first sample's published priority, so it is raised here, once)
+        if strict_turn.is_some() && !self.urgent {
+            self.urgent = dc.set_priority(URGENT_CHANNEL_PRIORITY).await.is_ok();
+        }
         let chunk_bytes = if strict_turn.is_some() { frame::CHUNK_BYTES } else { shared.gate.chunk_bytes() };
         let chunk_count = frame::chunk_count(payload.len(), chunk_bytes);
         let mut message_bytes = 0usize;

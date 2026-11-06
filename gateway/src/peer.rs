@@ -1031,6 +1031,8 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         }
     };
     if raw_label == "control" {
+        // the page's requests are answered ahead of queued bulk (see `subscription::URGENT_CHANNEL_PRIORITY`)
+        let _ = dc.set_priority(subscription::URGENT_CHANNEL_PRIORITY).await;
         *state.control.lock() = Some(dc.clone());
         tokio::select! {
             () = run_control(dc, state.clone()) => {}
@@ -1115,6 +1117,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
         },
         "heartbeat" => match HeartbeatOpts::parse(&label.opts) {
             Ok(opts) => {
+                let _ = dc.set_priority(subscription::URGENT_CHANNEL_PRIORITY).await;
                 run_heartbeat(dc.clone(), opts, state.clone()).await;
                 None
             }

@@ -371,13 +371,19 @@ const defaultPacketLifetimeMs = 1000
 // latencyLimit says otherwise: on a slow uplink commands otherwise queued without bound and reached the robot seconds late
 const reliablePublisherMaxBacklogMs = 2000
 
-/** Delivery -> data channel reliability (SPEC "Delivery -> transport mapping"). */
-function channelInit(delivery: Delivery | undefined, maxAge: number | undefined): RTCDataChannelInit {
+/** Delivery -> data channel reliability (SPEC "Delivery -> transport mapping"); `urgent` channels (control, heartbeat,
+ *  strict-priority streams) ask for priority "high", for a browser that schedules its own sends by it (the gateway sets
+ *  its side's priority itself: Chrome sends DCEP priority 0 for every channel, SPEC "SCTP priority"). */
+function channelInit(delivery: Delivery | undefined, maxAge: number | undefined, urgent = false): RTCDataChannelInit {
+    const priority = urgent ? { priority: "high" } : {}
     if (delivery === "reliable") {
-        return { ordered: true }
+        return { ordered: true, ...priority } as RTCDataChannelInit
     }
-    return { ordered: false, maxPacketLifeTime: Math.min(65535, Math.round(maxAge || defaultPacketLifetimeMs)) }
+    return { ordered: false, maxPacketLifeTime: Math.min(65535, Math.round(maxAge || defaultPacketLifetimeMs)), ...priority } as RTCDataChannelInit
 }
+
+/** A stream the gateway sends in its strict tier (SPEC "Strict-priority tier"): INTERACTIVE_HIGH or more urgent. */
+const isStrict = (priority: number | undefined) => priority !== undefined && priority <= Priority.INTERACTIVE_HIGH
 
 function toBytes(value: Bytesish): Uint8Array {
     if (typeof value === "string") {
@@ -973,7 +979,7 @@ export class Subscription extends Endpoint {
         const { metadata, ...options } = this.options
         const opts = this.owner.features.includes("metadata") ? { ...options, metadata: metadata ?? true } : options
         const label = JSON.stringify({ type: "sub", key: this.key, id: this.id, opts, ...(mid === null ? {} : { mid }) })
-        const channel = peer.createDataChannel(label, channelInit(this.options.delivery, this.options.maxAge))
+        const channel = peer.createDataChannel(label, channelInit(this.options.delivery, this.options.maxAge, isStrict(this.options.priority)))
         channel.binaryType = "arraybuffer"
         channel.onmessage = (event: MessageEvent) => {
             if (event.data instanceof ArrayBuffer) {
@@ -1228,7 +1234,7 @@ export class Publisher extends Endpoint {
         const { delivery, priority, latencyLimit } = this.options
         const label = JSON.stringify({ type: "pub", key: this.key, id: this.id, opts: { delivery, priority, latencyLimit } })
         const acceptance = this.beginAttempt()
-        const channel = peer.createDataChannel(label, channelInit(delivery, undefined))
+        const channel = peer.createDataChannel(label, channelInit(delivery, undefined, isStrict(priority)))
         channel.binaryType = "arraybuffer"
         channel.bufferedAmountLowThreshold = resumeBytes
         channel.onbufferedamountlow = () => this.#flush()
@@ -1773,7 +1779,7 @@ export class ZenohGateway {
         }
         this.iceServers = iceServers
         const peer = new RTCPeerConnection({ iceServers, iceTransportPolicy: iceTransportPolicy ?? "all" })
-        const control = peer.createDataChannel("control", { ordered: true })
+        const control = peer.createDataChannel("control", { ordered: true, priority: "high" } as RTCDataChannelInit)
         this.#peer = peer
         this.#control = control
         control.onmessage = (event: MessageEvent) => this.#onControlMessage(String(event.data))
@@ -1855,7 +1861,7 @@ export class ZenohGateway {
 
     #attachHeartbeat(peer: RTCPeerConnection): void {
         const label = JSON.stringify({ type: "heartbeat", opts: { hz: this.options.heartbeatHz, misses: this.options.heartbeatMisses } })
-        const heartbeat = peer.createDataChannel(label, { ordered: false, maxRetransmits: 0 })
+        const heartbeat = peer.createDataChannel(label, { ordered: false, maxRetransmits: 0, priority: "high" } as RTCDataChannelInit)
         heartbeat.onmessage = (event: MessageEvent) => {
             try {
                 const reply = JSON.parse(String(event.data))

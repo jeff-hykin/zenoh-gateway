@@ -40,6 +40,9 @@ const cells: Cell[] = [
     ...(Deno.args.includes("soak") ? [{ name: "soak", seconds: Number(Deno.env.get("SOAK_SECONDS") ?? 1200), schedule: [[0, 2_500_000]] as [number, number][], delayMs: 30, jitterMs: 0, loss: 0 }] : []),
     // a 5 s Wi-Fi stall on a fast link: the estimate must not collapse with it (it once fell to 1 KB/s and took 4 min back)
     { name: "stall", seconds: 50, schedule: [[0, 2_500_000], [20, 1_000], [25, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
+    // the M20 (2026-11-05): lidar clouds over Wi-Fi whose rate dips for a few seconds; the controller's heartbeat RTT went to
+    // ~1 s behind the queue the clouds kept while the estimate still held the faster rate
+    { name: "m20", seconds: 45, schedule: [[0, 1_250_000], [20, 400_000], [30, 1_250_000]], delayMs: 10, jitterMs: 20, loss: 0, subscribe: ["clouds", "cmd_vel"], serverEnv: { CLOUD_BYTES: "100000" } },
     { name: "step", seconds: 90, schedule: [[0, 2_500_000], [30, 125_000], [60, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0 },
     // page shapes the full page never produces, only when named: the link model must find and keep the link's rate
     // when nothing is link-limited, or only video is, or data comes in rare bursts
@@ -48,6 +51,8 @@ const cells: Cell[] = [
         { name: "video_tf", seconds: 60, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["cams", "tf"], serverEnv: { CAMS: "1" }, shape: true },
         { name: "video_slow", seconds: 60, schedule: [[0, 125_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["cams"], serverEnv: { CAMS: "1" }, shape: true },
         { name: "map_sparse", seconds: 80, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["map"], serverEnv: { MAP_HZ: "0.05" }, shape: true },
+        // the m20 link with nothing but the page's own commands: the floor its round trips can't beat
+        { name: "m20_idle", seconds: 45, schedule: [[0, 1_250_000], [20, 400_000], [30, 1_250_000]], delayMs: 10, jitterMs: 20, loss: 0, subscribe: ["cmd_vel"], serverEnv: { CLOUD_BYTES: "100000" } },
         { name: "tf_only", seconds: 40, schedule: [[0, 2_500_000]], delayMs: 30, jitterMs: 0, loss: 0, subscribe: ["tf"], shape: true },
     ] as Cell[]).filter((cell) => Deno.args.includes(cell.name)),
 ]
@@ -99,6 +104,10 @@ async function runCell(cell: Cell) {
         })
         // astral retries evaluate 5x on a 10 s deadline: long runs need more
         ;(page as any).timeout = (cell.seconds + 60) * 1000
+        // the shaper's own downlink queue (ms at the current rate), every 100 ms: where the page's replies really wait
+        const queueSamples: { at: number; bytes: number }[] = []
+        const evaluated = performance.now()
+        const queueSampler = setInterval(() => queueSamples.push({ at: performance.now() - evaluated, bytes: link.offeredDown.queuedBytes ?? 0 }), 100)
         const windows = await page.evaluate(async (url: string, seconds: number, windowMs: number, diagnose: boolean, subscribe: string[], trace: boolean) => {
             const wants = (group: string) => subscribe.includes(group)
             const { connect, Priority } = await import("/client/zenoh_gateway.js")
@@ -152,6 +161,14 @@ async function runCell(cell: Cell) {
                 cmdVel.put(payload)
                 current().echoSent++
             }, 50)
+            // how late the page's own timers run: a busy page reads everything late, the heartbeat replies too
+            let lagLast = performance.now()
+            const lagTimer = setInterval(() => {
+                const now = performance.now()
+                const window = current() as any
+                window.lagMs = Math.max(window.lagMs ?? 0, now - lagLast - 50)
+                lagLast = now
+            }, 50)
             // what the Controller's drive hold reads: the heartbeat RTT, or how long it has been silent
             let lastRtt: number | null = null
             let lastRttAt = performance.now()
@@ -199,6 +216,10 @@ async function runCell(cell: Cell) {
             client.close()
             return windows.slice(0, Math.floor((seconds * 1000) / windowMs))
         }, { args: [link.url, cell.seconds, windowMs, diagnose, cell.subscribe ?? ["cams", "clouds", "map", "pose", "tf", "cmd", "cmd_vel"], cell.shape ?? false] })
+        clearInterval(queueSampler)
+        windows.forEach((window: any, index: number) => {
+            window.shaperQueueBytes = queueSamples.filter((sample) => Math.floor(sample.at / windowMs) === index).map((sample) => sample.bytes)
+        })
         const seconds = (performance.now() - link.startedAt()) / 1000
         const rate = (offered: { bytes: number; packets: number }) => `${Math.round(offered.bytes / seconds / 100) / 10} KB/s in ${Math.round(offered.packets / seconds)} packets/s`
         console.log(`  offered: down ${rate(link.offeredDown)}, up ${rate(link.offeredUp)}`)
@@ -220,6 +241,32 @@ const percentile = (values: number[], q: number) => {
 }
 const median = (values: number[]) => percentile(values.filter(Number.isFinite), 0.5)
 const round = (value: number) => Number.isFinite(value) ? Math.round(value) : value
+
+/** The M20 cell: through the whole run, dip included, the heartbeat RTT and cmd_vel stay within the latency target (300 ms,
+ * the gateway's default) while the clouds still carry at least 40% of what the link does. */
+function checkUrgentDuringDip(cell: Cell, windows: any[]): string[] {
+    const failures: string[] = []
+    const target = 300
+    const linkAt = (seconds: number) => cell.schedule.filter(([at]) => at <= seconds).at(-1)![1]
+    for (const [label, from, to] of [["before", 5, 20], ["dip", 20, 30], ["after", 30, cell.seconds]] as [string, number, number][]) {
+        const span = windows.filter((_, index) => index * windowMs / 1000 >= from && index * windowMs / 1000 < to)
+        const rttP95 = percentile(span.flatMap((window) => window.rtt), 0.95)
+        const echoP95 = percentile(span.flatMap((window) => window.echo), 0.95)
+        const cloudBytes = span.reduce((sum, window) => sum + (window.bytes["robot/cloud0"] ?? 0) + (window.bytes["robot/cloud1"] ?? 0), 0) / (span.length * windowMs / 1000)
+        const link = span.reduce((sum, _, index) => sum + linkAt(from + index * windowMs / 1000), 0) / span.length
+        console.log(`  ${label.padEnd(10)} rtt p95 ${round(rttP95)} ms | cmd_vel p95 ${round(echoP95)} ms | clouds ${round(cloudBytes / 1000)} KB/s on ${round(link / 1000)} (${(cloudBytes / link * 100).toFixed(0)}%)`)
+        if (!(rttP95 < target)) {
+            failures.push(`${cell.name} ${label}: heartbeat RTT p95 ${round(rttP95)} ms >= ${target}`)
+        }
+        if (!(echoP95 < target)) {
+            failures.push(`${cell.name} ${label}: cmd_vel round trip p95 ${round(echoP95)} ms >= ${target}`)
+        }
+        if (!(cloudBytes >= 0.4 * link)) {
+            failures.push(`${cell.name} ${label}: clouds ${round(cloudBytes / 1000)} KB/s, under 40% of the link's ${round(link / 1000)}`)
+        }
+    }
+    return failures
+}
 
 /** Checks one stretch of a run against its link; returns the failures. */
 function check(cell: Cell, windows: any[], from: number, to: number, label: string, bytesPerSec: number): string[] {
@@ -329,6 +376,8 @@ try {
             if (cloudHz(70, 90) < 0.5 * cloudHz(10, 30)) {
                 failures.push(`step: clouds ${cloudHz(70, 90).toFixed(1)} Hz 10-30 s after recovery, under half the ${cloudHz(10, 30).toFixed(1)} Hz before the drop`)
             }
+        } else if (cell.name.startsWith("m20")) {
+            failures.push(...checkUrgentDuringDip(cell, windows))
         } else {
             failures.push(...check(cell, windows, Math.max(4, cell.seconds - 16), cell.seconds, "steady", cell.schedule[0][1]))
         }

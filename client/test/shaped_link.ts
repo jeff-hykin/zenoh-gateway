@@ -10,7 +10,7 @@ export type LinkShape = { schedule: [number, number][]; delayMs: number; jitterM
 const queueSeconds = 1
 
 /** One direction of the link: rate-limited (by the cell's schedule) drop-tail queue, then delay + jitter, with loss. */
-export function shapedDirection(cell: LinkShape, linkStart: () => number, deliver: (data: Uint8Array) => void, offered: { bytes: number; packets: number }) {
+export function shapedDirection(cell: LinkShape, linkStart: () => number, deliver: (data: Uint8Array) => void, offered: { bytes: number; packets: number; queuedBytes?: number }) {
     const rateNow = () => {
         const t = (performance.now() - linkStart()) / 1000
         return cell.schedule.filter(([at]) => t >= at).at(-1)![1]
@@ -40,6 +40,7 @@ export function shapedDirection(cell: LinkShape, linkStart: () => number, delive
             }
             queue.shift()
             queuedBytes -= data.length
+            offered.queuedBytes = queuedBytes
             freeAt = leaves
             // packets stay in order: a jitter drop never lets one overtake the one before it
             lastDeliverAt = Math.max(lastDeliverAt, leaves + delayNow(leaves))
@@ -55,6 +56,7 @@ export function shapedDirection(cell: LinkShape, linkStart: () => number, delive
         }
         queue.push({ data, arrived: performance.now() })
         queuedBytes += data.length
+        offered.queuedBytes = queuedBytes
         if (!draining) {
             draining = true
             drain()
