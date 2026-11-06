@@ -296,6 +296,18 @@ impl SendGate {
     /// `lifetime`: for a lossy frame, how long SCTP tries to deliver it (its channel's maxPacketLifeTime); `None` for
     /// a reliable one.
     pub fn frame_sent(&self, stream: usize, bytes: usize, lifetime: Option<Duration>) -> u64 {
+        self.sent(stream, bytes, lifetime, false)
+    }
+
+    /// `frame_sent` for a strict stream's frame: it never waits on the window, so it isn't held back by the link (nor
+    /// takes the mark from the bulk frame that was): what it delivers is its own rate. Ahead of bulk in SCTP, strict
+    /// frames kept arriving while a step down left bulk stuck in SCTP's loss recovery, and read as the link they dragged
+    /// the estimate to their own 7 KB/s, under which bulk got no budget and never probed again.
+    pub fn strict_frame_sent(&self, stream: usize, bytes: usize, lifetime: Option<Duration>) -> u64 {
+        self.sent(stream, bytes, lifetime, true)
+    }
+
+    fn sent(&self, stream: usize, bytes: usize, lifetime: Option<Duration>, strict: bool) -> u64 {
         let lossy = lifetime.is_some();
         let mut path = self.path.lock();
         let now = Instant::now();
@@ -305,7 +317,8 @@ impl SendGate {
         path.next += 1;
         let quiet = path.in_flight <= QUIET_BYTES;
         path.in_flight += bytes;
-        let frame = Frame { stream, bytes, lossy, lifetime, sent_at: now, link_limited: std::mem::take(&mut path.held), latency_limited: std::mem::take(&mut path.held_by_target), quiet };
+        let (link_limited, latency_limited) = if strict { (false, false) } else { (std::mem::take(&mut path.held), std::mem::take(&mut path.held_by_target)) };
+        let frame = Frame { stream, bytes, lossy, lifetime, sent_at: now, link_limited, latency_limited, quiet };
         path.frames.insert(order, frame);
         order
     }
@@ -489,6 +502,17 @@ mod tests {
         gate.frames_dropped([later]);
         assert_eq!(gate.in_flight(), 0);
         assert!(gate.take_round().min_rtt_ms.is_some());
+    }
+
+    #[test]
+    fn a_strict_frame_is_never_a_sample_of_the_link_nor_takes_a_held_bulk_frames_mark() {
+        let gate = gate(1e6, 10_000);
+        // bulk was held back by the window, then a strict frame goes first: its delivery is its own rate
+        gate.path.lock().held = true;
+        let strict = gate.strict_frame_sent(1, 100, None);
+        assert!(!gate.path.lock().frames[&strict].link_limited);
+        let bulk = gate.frame_sent(2, 1000, None);
+        assert!(gate.path.lock().frames[&bulk].link_limited, "the mark stays for the bulk frame that waited");
     }
 
     #[test]

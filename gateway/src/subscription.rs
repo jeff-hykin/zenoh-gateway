@@ -1110,7 +1110,8 @@ impl MessageSender {
             message_bytes += frame_len;
             {
                 let mut state = shared.state.lock();
-                let order = shared.gate.frame_sent(shared.stream_id, frame_len + PACKET_OVERHEAD_BYTES as usize, shared.packet_lifetime());
+                let wire_bytes = frame_len + PACKET_OVERHEAD_BYTES as usize;
+                let order = if strict_turn.is_some() { shared.gate.strict_frame_sent(shared.stream_id, wire_bytes, shared.packet_lifetime()) } else { shared.gate.frame_sent(shared.stream_id, wire_bytes, shared.packet_lifetime()) };
                 state.unconsumed.push_back((frame_id, frame_len, order, Instant::now()));
                 state.stats.unconsumed_bytes += frame_len;
                 state.stats.frames_sent += 1;
