@@ -231,6 +231,10 @@ export interface ConnectOptions {
     /** the link's known bandwidth (bytes/s), used by the gateway in place of its estimate (no probing; video sized for it
      *  from the first frame), e.g. for a page on the gateway's own machine; the host's cap still applies. Default: estimated */
     linkBandwidthBytesPerSec?: number
+    /** the id this page keeps for its link across connections: a connection back within the gateway's link memory
+     *  (default 10 min) starts from the link's last estimate instead of re-measuring it. Default: one kept in
+     *  localStorage (where there is one); null: none */
+    linkId?: string | null
     reconnect?: boolean
     /** ms the page may be hidden or frozen, or the connection "disconnected", before the client starts a fresh
      *  connection at once instead of catching up or waiting for the browser to declare the old one failed (default 2000;
@@ -1416,7 +1420,7 @@ export class Lease {
     }
 }
 
-type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec">
+type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec" | "linkId">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec" | "linkId">
 
 export class ZenohGateway {
     state: ConnectionState = "connecting"
@@ -1713,6 +1717,11 @@ export class ZenohGateway {
             const listed = await this._request({ op: "encodings" }, pingTimeoutMs)
             this.encodings = Object.freeze(listed.encodings as EncodingInfo[])
             this.features = Object.freeze((listed.features ?? []) as string[])
+            const linkId = this.options.linkId === undefined ? keptLinkId() : this.options.linkId
+            if (linkId) {
+                // (a gateway before 0.5.38 has no resumeLink: it measures the link from its first guess, as ever)
+                await this._request({ op: "resumeLink", linkId }, pingTimeoutMs).catch(() => null)
+            }
             // a few quick samples so the gateway knows the clock offset before the first put
             for (let index = 0; index < initialClockPings; index++) {
                 await this.#controlPing()
@@ -2203,6 +2212,23 @@ export class ZenohGateway {
 }
 
 /** Connects to a zenoh-gateway server, e.g. `await connect("http://robot.local:7448")`. */
+/** This browser's link id (`ConnectOptions.linkId`), kept in localStorage; null where there is none (a worker, Deno). */
+function keptLinkId(): string | null {
+    const key = "zenoh-gateway.linkId"
+    try {
+        const kept = globalThis.localStorage?.getItem(key)
+        if (kept) {
+            return kept
+        }
+        const made = crypto.randomUUID()
+        globalThis.localStorage?.setItem(key, made)
+        return globalThis.localStorage ? made : null
+    } catch {
+        // (storage blocked: a private window, a sandboxed frame)
+        return null
+    }
+}
+
 export async function connect(url: string, options: ConnectOptions = {}): Promise<ZenohGateway> {
     const client = new ZenohGateway(url, options)
     await client._open()

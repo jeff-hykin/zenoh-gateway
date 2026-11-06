@@ -525,6 +525,8 @@ BBR does (Cardwell et al., "BBR: Congestion-Based Congestion Control", 2016) and
     than 25% growth; then a cycle of 1.25 (ask for more), 0.75 (drain what that queued) and 1 × 6.
   - Nothing reacts to a delay or a loss, so a Wi-Fi path whose round trip swings 0–400 ms reads as the bandwidth it
     delivers. A link that slows delivers less, and its old maximum ages out within 10 rounds.
+  - A connection that sent `resumeLink` with an id under which another closed within `link_memory` (10 min) starts
+    from that one's bandwidth and path round trip, past startup.
 - **Budget** = min(`--max-bandwidth-bytes-per-sec` if set, bandwidth × gain): what the allocator divides, and the pacing
   rate.
 - **In flight.** Every data frame counts from when it goes to SCTP until the page acks it (or acks a lossy frame sent
@@ -775,7 +777,10 @@ resolving so the gateway has an offset before the first put.
 - One extra channel labeled `control` carries JSON request/response (`get`, `listTopics`, `stats`, `ping`,
   `encodings`, `renegotiate`, `setDeadman`, `clearDeadman`, `lease {group, keys?, maxSeconds?}`,
   `releaseLease {group}`, `expireLease {group}`, `setLinkBandwidth {bytesPerSec}` (the link's known speed in place of
-  the estimate; null: back to the estimate), `updateSubscription {subId, opts}` (changes a running
+  the estimate; null: back to the estimate), `resumeLink {linkId}` (the page's own id for its link, 1-128 bytes, kept
+  across connections: a connection back within `ServerBuilder::link_memory`, default 10 min, of one that closed under the
+  same id starts from that link's estimate instead of startup's first guess, then probes and drops as any link does;
+  replies `{seededBytesPerSec}`, null when there was nothing to start from), `updateSubscription {subId, opts}` (changes a running
   subscription's maxHz, minQuality, qualityToHzTradeoff, bandwidthPriority, maxBitrate, minResolutionScale,
   maxResolution, playoutDelay or encodeOptions.quality; replies `{opts}`, the options now in force), plus the ops in "The rest of the zenoh API") and events:
   `accepted` / `rejected` (per sub/pub channel, by label id), `tripped`, `leaseLost {group, reason}`, `query`,
