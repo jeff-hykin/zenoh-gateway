@@ -1043,16 +1043,19 @@ pub enum Sent {
 
 /// Sends whole messages on a subscription's channel: chunking, the frontend's send gate (bulk) or the strict tier, and
 /// the stats.
-/// The SCTP send priority of the channels the page can't wait on: control, heartbeat and strict-tier subscriptions
-/// (DCEP's "high", RFC 8832 §5.1; every other channel stays at the priority the browser opened it with, which is
-/// the same for all). Their messages go before bulk already queued in SCTP: one SCTP queue for every channel held the
-/// M20 controller's heartbeat replies 200-350 ms behind lidar chunks while the link itself had no queue.
-pub const URGENT_CHANNEL_PRIORITY: u16 = 512;
+/// SCTP send priorities (DCEP's, RFC 8832 §5.1; every other channel stays at the one the browser opened it with, the
+/// same for all): their messages go before what lower ones already queued in SCTP. One SCTP queue for every channel
+/// held the M20 controller's heartbeat replies 200-350 ms behind lidar chunks while the link itself had no queue.
+/// Heartbeat and strict-tier subscriptions: "extra high".
+pub const REAL_TIME_CHANNEL_PRIORITY: u16 = 1024;
+/// The control channel: "high", ahead of bulk but behind the real-time streams (its replies can be big: a stats reply or
+/// a get's samples at the top held a 125 KB/s link's strict commands 100+ ms).
+pub const CONTROL_CHANNEL_PRIORITY: u16 = 512;
 
 pub struct MessageSender {
     next_frame_id: u32,
     warned_send_error: bool,
-    /// the channel's priority was raised to `URGENT_CHANNEL_PRIORITY` (once the subscription is strict)
+    /// the channel's priority was raised to `REAL_TIME_CHANNEL_PRIORITY` (once the subscription is strict)
     urgent: bool,
 }
 
@@ -1066,7 +1069,7 @@ impl MessageSender {
         let strict_turn = shared.is_strict().then(|| shared.gate.strict_turn());
         // (strict can come with the first sample's published priority, so it is raised here, once)
         if strict_turn.is_some() && !self.urgent {
-            self.urgent = dc.set_priority(URGENT_CHANNEL_PRIORITY).await.is_ok();
+            self.urgent = dc.set_priority(REAL_TIME_CHANNEL_PRIORITY).await.is_ok();
         }
         let chunk_bytes = if strict_turn.is_some() { frame::CHUNK_BYTES } else { shared.gate.chunk_bytes() };
         let chunk_count = frame::chunk_count(payload.len(), chunk_bytes);
