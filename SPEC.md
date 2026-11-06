@@ -541,9 +541,10 @@ BBR does (Cardwell et al., "BBR: Congestion-Based Congestion Control", 2016) and
 - **Strict-priority tier.** A subscription whose priority (its `priority` option, else the published priority of its
   samples) is INTERACTIVE_HIGH (2) or more urgent bypasses allocation and pacing: its measured rate is reserved off the
   top, and while it sends a message no bulk chunk starts.
-- **SCTP priority.** The `control` and heartbeat channels, and strict-tier subscriptions, are sent at SCTP priority 512
-  (DCEP "high"; the gateway's webrtc fork schedules streams by priority, RFC 8260's priority scheduler), every other
-  channel at the one the browser opened it with (Chrome: 0 for all). What SCTP already holds of bulk data (its own
+- **SCTP priority.** The heartbeat channel and strict-tier subscriptions are sent at SCTP priority 1024 (DCEP "extra
+  high"), the `control` channel at 512 ("high"; its replies can be big), every other channel at the one the browser
+  opened it with (Chrome: 0 for all); the gateway's webrtc fork schedules streams by priority (RFC 8260's priority
+  scheduler). What SCTP already holds of bulk data (its own
   congestion window lets it send less than the gateway released) no longer goes first: one queue for every channel held
   heartbeat replies 200-350 ms behind lidar while the link itself had no queue. A message under way still finishes.
 - **One big message at a time.** A bulk stream whose messages span more than one chunk takes the frontend's message
