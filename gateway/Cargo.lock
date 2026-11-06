@@ -5440,9 +5440,9 @@ dependencies = [
 
 [[package]]
 name = "zenoh-web-rtc"
-version = "0.21.0-zw.5"
+version = "0.21.0-zw.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cceb89d718c303e36d5f3613329ea1beb7e60f722321c19b7b7cc4eb890e6172"
+checksum = "cc0a29e0798582a57ff429184fbf0ea56e2a106749c09f22b1f22d23eab5cc3e"
 dependencies = [
  "bytes",
  "hex",
@@ -5476,9 +5476,9 @@ dependencies = [
 
 [[package]]
 name = "zenoh-web-rtc-datachannel"
-version = "0.21.0-zw.5"
+version = "0.21.0-zw.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "493c37bf199e8202dd4eb3369177ac403137bb76113edca3ed35e48a963a3da9"
+checksum = "2e984237acd841ac990de8b36b3b08ed58b8f9e62fc45e9cf65af6def4bfe875"
 dependencies = [
  "bytes",
  "log",
@@ -5489,9 +5489,9 @@ dependencies = [
 
 [[package]]
 name = "zenoh-web-rtc-sctp"
-version = "0.21.0-zw.5"
+version = "0.21.0-zw.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dde5f85f89f192961b9b849b2d0b097a1d44d87cefe97243558f84973581d00"
+checksum = "9fd062f61b123cd18658aad60300e76524f629b14ddbc07ae1b9cd3179fac376"
 dependencies = [
  "bytes",
  "crc32c",
@@ -5505,9 +5505,9 @@ dependencies = [
 
 [[package]]
 name = "zenoh-web-rtc-srtp"
-version = "0.21.0-zw.5"
+version = "0.21.0-zw.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cb58a574fd8b0d072149597bbdc54ace4808e765ebf5259f7824b665feeb7c1"
+checksum = "00f0044c736d2cf70e0909a9cd0de6867ed6fb97a5f7ac8e584ec2ce402c9f1a"
 dependencies = [
  "byteorder",
  "bytes",
@@ -5519,9 +5519,9 @@ dependencies = [
 
 [[package]]
 name = "zenoh-web-webrtc"
-version = "0.21.0-zw.5"
+version = "0.21.0-zw.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9070e8e2c64a32a06ac540c18c9c93eba12b7ed204aa0d1fbe3dac88f1dbba9"
+checksum = "34d2e9b3cc89196ff6f3bb0e39cd845c1ba074f00eb7d2b14313d0d3095e0e6f"
 dependencies = [
  "async-broadcast",
  "async-channel",
