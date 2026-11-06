@@ -69,6 +69,7 @@ pub struct ServerBuilder {
     max_bandwidth_bytes_per_sec: Option<f64>,
     initial_bandwidth_bytes_per_sec: f64,
     reliable_max_backlog: Duration,
+    link_memory: Duration,
     latency_target: Duration,
     stale_after: Duration,
     put_timeout: Duration,
@@ -104,6 +105,7 @@ impl Default for ServerBuilder {
             max_bandwidth_bytes_per_sec: None,
             initial_bandwidth_bytes_per_sec: crate::allocator::DEFAULT_INITIAL_BANDWIDTH,
             reliable_max_backlog: crate::subscription::DEFAULT_RELIABLE_MAX_BACKLOG,
+            link_memory: crate::allocator::DEFAULT_LINK_MEMORY,
             latency_target: crate::allocator::DEFAULT_LATENCY_TARGET,
             stale_after: crate::allocator::DEFAULT_STALE_AFTER,
             put_timeout: crate::peer::DEFAULT_PUT_TIMEOUT,
@@ -182,6 +184,14 @@ impl ServerBuilder {
     /// grows it by what the link delivers each round; a higher guess fills a fast link sooner but can flood a slow one.
     pub fn initial_bandwidth_bytes_per_sec(mut self, bytes_per_sec: f64) -> Self {
         self.initial_bandwidth_bytes_per_sec = bytes_per_sec;
+        self
+    }
+
+    /// How long a closed connection's link estimate is kept for its page reconnecting (default 10 min): a page that sends
+    /// `resumeLink` with the id it kept starts from that estimate instead of re-measuring the link from the first guess
+    /// (it only seeds the estimate, which the link then moves as ever). Zero keeps nothing.
+    pub fn link_memory(mut self, memory: Duration) -> Self {
+        self.link_memory = memory;
         self
     }
 
@@ -418,6 +428,7 @@ impl ServerBuilder {
             reliable_max_backlog: self.reliable_max_backlog,
             disconnected_grace: self.disconnected_grace,
             connect_timeout: self.connect_timeout,
+            link_memory: self.link_memory,
         }, leases, self.connect_config);
         let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, tls, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
         if let Some(name) = self.zenoh_signalling {

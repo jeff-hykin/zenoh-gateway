@@ -212,6 +212,13 @@ pub struct LinkModel {
     round_link_limited: bool,
 }
 
+/// A link's last estimate, kept for a page that reconnects (see `LinkModel::seeded`).
+#[derive(Debug, Clone, Copy)]
+pub struct LinkSeed {
+    pub bandwidth_bytes_per_sec: f64,
+    pub path_rtt_ms: Option<f64>,
+}
+
 /// What `ServerBuilder::initial_bandwidth_bytes_per_sec` defaults to, the first guess: 512 kbit/s, low enough not to
 /// flood a slow link (1 MB/s plus video filled a 2 Mbit/s link's queue and SCTP's backoff silenced the page for 20 s),
 /// and startup doubles it every round.
@@ -219,6 +226,8 @@ pub const DEFAULT_INITIAL_BANDWIDTH: f64 = 64_000.0;
 /// A 500 kbit/s link: on a path slower than the latency target, faster links may keep more in flight by the square root
 /// of their speed over this.
 pub const SLOW_LINK: f64 = 62_500.0;
+/// What `ServerBuilder::link_memory` defaults to: a page that reconnects within this starts from its link's last estimate.
+pub const DEFAULT_LINK_MEMORY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// What `ServerBuilder::stale_after` defaults to.
 pub const DEFAULT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 /// What `ServerBuilder::latency_target` defaults to.
@@ -456,6 +465,24 @@ impl LinkModel {
         }
     }
 
+    /// What a reconnect within `ServerBuilder::link_memory` starts from (`seeded`): the bandwidth and the path's round trip.
+    pub fn seed(&self) -> Option<LinkSeed> {
+        (!self.starting_up).then_some(LinkSeed { bandwidth_bytes_per_sec: self.bandwidth_bytes_per_sec, path_rtt_ms: self.path_rtt_ms.or(self.min_rtt_ms) })
+    }
+
+    /// Starts from a link measured moments ago in place of startup's first guess: the estimate is the seed's and the probe
+    /// cycle runs from there, so a link that got slower lowers it as any would (it isn't held). Only while still starting
+    /// up: a model that measured anything keeps its own.
+    pub fn seeded(&mut self, seed: LinkSeed) -> bool {
+        if !self.starting_up || !(seed.bandwidth_bytes_per_sec.is_finite() && seed.bandwidth_bytes_per_sec > 0.0) {
+            return false;
+        }
+        (self.starting_up, self.cycle, self.gain) = (false, 1, PROBE_GAINS[1]);
+        (self.bandwidth_bytes_per_sec, self.probe_level) = (seed.bandwidth_bytes_per_sec, seed.bandwidth_bytes_per_sec);
+        self.path_rtt_ms = self.path_rtt_ms.or(seed.path_rtt_ms);
+        true
+    }
+
     /// This model with the host's known `bandwidth` (bytes/s) in place of its estimate: no startup, no probes.
     pub fn with_known_bandwidth(&self, bandwidth: f64) -> Self {
         Self { bandwidth_bytes_per_sec: bandwidth, gain: 1.0, starting_up: false, probing_rtt: false, ..self.clone() }
@@ -605,6 +632,25 @@ mod tests {
     const ROUND_MS: u64 = 600;
 
     /// Rounds of `ROUND_MS` (one rate sample long, as a real round is at least) on a link that carries `capacity` bytes/s: delivered is what the budget allowed, up to it.
+    #[test]
+    fn a_reconnect_starts_from_the_last_estimate_and_the_link_still_moves_it() {
+        let mut first = LinkModel::default();
+        let start = Instant::now();
+        assert!(first.seed().is_none(), "nothing measured: nothing to keep");
+        let now = run(&mut first, start, 0..40, 1_000_000.0, true);
+        let seed = first.seed().unwrap();
+        // the reconnect: past startup, at the last estimate, from its first round
+        let mut again = LinkModel::new(DEFAULT_INITIAL_BANDWIDTH);
+        assert!(again.seeded(seed));
+        assert!(!again.starting_up && again.bandwidth_bytes_per_sec == seed.bandwidth_bytes_per_sec);
+        assert!(!again.seeded(seed), "seeded once");
+        // it only seeds: a slower link brings the estimate down as on any connection
+        run(&mut again, now, 0..80, 200_000.0, true);
+        assert!(again.bandwidth_bytes_per_sec < 300_000.0, "{}", again.bandwidth_bytes_per_sec);
+        // a model that measured anything keeps its own
+        assert!(!first.seeded(LinkSeed { bandwidth_bytes_per_sec: 50_000.0, path_rtt_ms: None }));
+    }
+
     fn run(model: &mut LinkModel, start: Instant, rounds: std::ops::Range<u32>, capacity: f64, link_limited: bool) -> Instant {
         let mut now = start;
         for round in rounds {

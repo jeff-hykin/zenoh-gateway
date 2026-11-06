@@ -43,6 +43,8 @@ const LIVELINESS_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often each frontend's bandwidth is re-estimated and re-allocated.
 const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
+/// The longest `resumeLink` id kept (a page's own random id; anything longer is refused, not stored).
+const MAX_LINK_ID_LEN: usize = 128;
 /// Video's queue brake (see `PeerState::video_cap`): cuts at most this often, after the queue was high this many rounds
 /// in a row, from the most video delivered over this long.
 const VIDEO_BRAKE_SPACING: Duration = Duration::from_millis(500);
@@ -72,6 +74,8 @@ pub struct AllocationConfig {
     pub disconnected_grace: Duration,
     /// how long an answered connection may take to connect before it is treated as gone
     pub connect_timeout: Duration,
+    /// how long a closed connection's link estimate is kept for its page reconnecting (`resumeLink`)
+    pub link_memory: Duration,
 }
 
 /// What `ServerBuilder::put_timeout` defaults to.
@@ -207,6 +211,10 @@ struct PeerState {
     config: AllocationConfig,
     /// the link bandwidth (bytes/s) the page gave (`setLinkBandwidth`), used in place of the estimate
     known_bandwidth: Mutex<Option<f64>>,
+    /// the id the page keeps for its link across connections (`resumeLink`): this connection's estimate is kept under it
+    link_id: Mutex<Option<String>>,
+    /// the gateway's seeds, for `resumeLink`
+    link_seeds: Arc<Mutex<HashMap<String, (allocator::LinkSeed, Instant)>>>,
     gate: Arc<SendGate>,
     link: Mutex<LinkModel>,
     /// `SendGate::acked_total` at the last allocation
@@ -278,6 +286,8 @@ impl PeerState {
             codecs: gateway.codecs.clone(),
             known_bandwidth: Mutex::new(None),
             catalog: gateway.catalog.clone(),
+            link_id: Mutex::new(None),
+            link_seeds: gateway.link_seeds.clone(),
             channels: Mutex::new(HashMap::new()),
             next_channel: AtomicU64::new(0),
             connection_state: Mutex::new(None),
@@ -635,19 +645,23 @@ pub struct Gateway {
     pub connect_config: ConnectConfig,
     /// with `udp_ports`: peer id -> its port
     udp_ports_in_use: Mutex<HashMap<u64, u16>>,
+    /// a page's link id (`resumeLink`) -> its link's estimate when it closed, and when; kept `link_memory`
+    link_seeds: Arc<Mutex<HashMap<String, (allocator::LinkSeed, Instant)>>>,
 }
 
 impl Gateway {
     pub fn new(session: zenoh::Session, codecs: EncodingRegistry, catalog: Arc<crate::catalog::TopicCatalog>, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
         let codecs = Arc::new(codecs);
-        // the shared decode/encode results expire whether or not any frontend is left to ask
-        let weak = Arc::downgrade(&codecs);
+        // the shared decode/encode results, and the links' seeds, expire whether or not any frontend is left to ask
+        let link_seeds: Arc<Mutex<HashMap<String, (allocator::LinkSeed, Instant)>>> = Default::default();
+        let (weak, weak_seeds, link_memory) = (Arc::downgrade(&codecs), Arc::downgrade(&link_seeds), allocation.link_memory);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             loop {
                 ticker.tick().await;
-                let Some(codecs) = weak.upgrade() else { break };
+                let (Some(codecs), Some(seeds)) = (weak.upgrade(), weak_seeds.upgrade()) else { break };
                 codecs.sweep();
+                seeds.lock().retain(|_, (_, at)| at.elapsed() < link_memory);
             }
         });
         Arc::new(Gateway {
@@ -660,6 +674,7 @@ impl Gateway {
             leases: Arc::new(leases),
             connect_config,
             udp_ports_in_use: Mutex::new(HashMap::new()),
+            link_seeds,
         })
     }
 
@@ -838,6 +853,11 @@ impl Gateway {
         self.leases.release_all(peer_id);
         if let Some(entry) = self.peers.lock().remove(&peer_id) {
             info!("peer {peer_id}: gone ({reason})");
+            // kept for the page reconnecting (a page that never measured its link leaves nothing)
+            let link_id = entry.state.link_id.lock().take();
+            if let (Some(link_id), Some(seed)) = (link_id, entry.state.link.lock().seed()) {
+                self.link_seeds.lock().insert(link_id, (seed, Instant::now()));
+            }
             entry.state.gone.store(true, Ordering::Relaxed);
             // the channels of a browser that vanished never report their own close; closed before the gone signal,
             // which cancels the channel tasks (a subscription cancelled first would never be closed)
@@ -1383,6 +1403,8 @@ struct ControlRequest {
     opts: Option<Value>,
     /// setLinkBandwidth: the link's known bandwidth, bytes/s (absent or null: back to the estimate)
     bytes_per_sec: Option<f64>,
+    /// resumeLink: the id the page keeps for its link across connections
+    link_id: Option<String>,
 }
 
 /// `control` channel: JSON requests in, JSON responses out (`{id, ok, ...}`), plus
@@ -1478,6 +1500,16 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                     *state.known_bandwidth.lock() = known;
                     ok(&request.id, json!({}))
                 }
+            },
+            "resumeLink" => match request.link_id {
+                Some(link_id) if link_id.is_empty() || link_id.len() > MAX_LINK_ID_LEN => fail(&request.id, format!("linkId must be 1-{MAX_LINK_ID_LEN} bytes")),
+                Some(link_id) => {
+                    let seed = state.link_seeds.lock().get(&link_id).filter(|(_, at)| at.elapsed() < state.config.link_memory).map(|(seed, _)| *seed);
+                    let seeded = seed.filter(|seed| state.link.lock().seeded(*seed));
+                    *state.link_id.lock() = Some(link_id);
+                    ok(&request.id, json!({"seededBytesPerSec": seeded.map(|seed| seed.bandwidth_bytes_per_sec)}))
+                }
+                None => fail(&request.id, "resumeLink needs a linkId"),
             },
             "releaseLease" => match request.group.as_deref() {
                 Some(group) => {
