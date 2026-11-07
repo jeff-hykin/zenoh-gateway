@@ -73,7 +73,8 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         let decoding = start_decode(&shared, &codec, key, item);
         let crate::media::Decoding { key, item, task } = decoding;
         let decoded = match crate::media::finish_decode(task, shared.codecs.encode_timeout).await {
-            Ok((decoded, ..)) => decoded,
+            Ok(Some((decoded, ..))) => decoded,
+            Ok(None) => continue,
             Err(error) => {
                 shared.record_encoding_error(&error);
                 continue;

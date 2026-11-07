@@ -180,6 +180,14 @@ impl<'a> EncodingSample<'a> {
     }
 }
 
+/// One key's decoder, from [`MessageEncoding::stream_decoder`]: fed that key's samples in arrival order, each decoded
+/// with the state the ones before it left.
+pub trait StreamDecoder: Send {
+    /// Decodes the next sample: its picture, `None` when it has none to show yet (e.g. a predicted frame before any
+    /// keyframe, or after a broken one), or an error (counted in the subscription's `encodingErrors`).
+    fn feed(&mut self, sample: &EncodingSample<'_>, channel: Channel) -> Result<Option<DecodedFrame>>;
+}
+
 /// Pixel layout of a [`VideoImage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PixelFormat {
@@ -518,6 +526,19 @@ pub trait MessageEncoding: Send + Sync {
     /// whatever [`encode`](Self::encode) takes. An error skips the message and is counted in the subscription's
     /// `encodingErrors` stats.
     fn decode(&self, sample: &EncodingSample<'_>, channel: Channel) -> Result<DecodedFrame>;
+
+    /// For samples that depend on the ones before them (video with predicted frames): a decoder for one key of one
+    /// subscription, which the gateway feeds every sample of that key in arrival order (also the ones it never sends,
+    /// from the latest keyframe on), in place of [`decode`](Self::decode). Default `None`: each sample decodes alone.
+    fn stream_decoder(&self) -> Option<Box<dyn StreamDecoder>> {
+        None
+    }
+
+    /// With a [`stream_decoder`](Self::stream_decoder): whether decoding can start at this sample (a keyframe). The
+    /// gateway keeps a key's samples from the latest one that can on, and none before the first. Default `true`.
+    fn starts_stream(&self, _sample: &EncodingSample<'_>) -> bool {
+        true
+    }
 
     /// The sample's own header (stamp, frame id, seq), read cheaply (it is called for every message sent). The gateway
     /// sends it with the message on every channel unless the subscription says `metadata: false`, since what an

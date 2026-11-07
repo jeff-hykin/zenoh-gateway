@@ -3,7 +3,7 @@
 
 use crate::allocator::{Allocation, Demand};
 use crate::encoding::registry::{self, EncodingRegistry, Resolved};
-use crate::encoding::{Channel, Compress, EncodeOptions, EncodingOutput, EncodingSample, MessageEncoding, VideoPolicy};
+use crate::encoding::{Channel, Compress, DecodedFrame, EncodeOptions, EncodingOutput, EncodingSample, MessageEncoding, StreamDecoder, VideoPolicy};
 use crate::frame;
 use crate::options::{Delivery, Label, SubOpts};
 use crate::pacing::SendGate;
@@ -127,6 +127,55 @@ struct KeyQueue {
     /// the latest sample's arrival: a key quiet for `stale_after` with nothing queued is forgotten (kept, every key a
     /// wildcard subscription ever matched stayed for its life)
     last_arrival: Option<Instant>,
+    /// its stream decoder, when the encoding decodes samples in order (made at the key's first keyframe)
+    stream: Option<Arc<KeyStream>>,
+}
+
+/// A stream-decoded key: its decoder, and its samples not yet fed to it, from the latest keyframe on. (Two locks: the
+/// zenoh callback queues a sample while a decode holds the decoder.)
+pub struct KeyStream {
+    unfed: Mutex<VecDeque<(u32, ZBytes, Encoding)>>,
+    decoder: Mutex<Box<dyn StreamDecoder>>,
+}
+
+impl KeyStream {
+    /// Feeds the decoder the samples up to and including `seq`'s, in order: `seq`'s picture, or `None` when it has none
+    /// (or a keyframe since replaced it, or an earlier decode already fed it).
+    pub fn decode_through(&self, key: &str, seq: u32, channel: Channel) -> anyhow::Result<Option<DecodedFrame>> {
+        let mut decoder = self.decoder.lock();
+        let due: Vec<_> = {
+            let mut unfed = self.unfed.lock();
+            let count = unfed.iter().take_while(|(queued, _, _)| (seq.wrapping_sub(*queued) as i32) >= 0).count();
+            unfed.drain(..count).collect()
+        };
+        let Some(&(last, _, _)) = due.last() else { return Ok(None) };
+        let mut picture = None;
+        for (queued, payload, encoding) in &due {
+            // (an earlier sample's error is its own: the decoder resyncs, and the sample asked for still decodes)
+            let fed = decoder.feed(&EncodingSample::new(key, &payload.to_bytes(), encoding), channel);
+            if *queued == last {
+                picture = fed?;
+            }
+        }
+        Ok(picture.filter(|_| last == seq))
+    }
+}
+
+/// Queues a sample for its key's stream decoder: a keyframe drops the samples before it (and makes the decoder at the
+/// key's first), and samples before the first keyframe are dropped (nothing can decode them).
+fn queue_for_stream(queue: &mut KeyQueue, codec: Option<&dyn MessageEncoding>, key: &str, pending: &Pending) {
+    let Some(codec) = codec else { return };
+    let payload = pending.payload.to_bytes();
+    let starts = codec.starts_stream(&EncodingSample::new(key, &payload, &pending.encoding));
+    if queue.stream.is_none() && starts {
+        queue.stream = codec.stream_decoder().map(|decoder| Arc::new(KeyStream { unfed: Mutex::default(), decoder: Mutex::new(decoder) }));
+    }
+    let Some(stream) = &queue.stream else { return };
+    let mut unfed = stream.unfed.lock();
+    if starts {
+        unfed.clear();
+    }
+    unfed.push_back((pending.seq, pending.payload.clone(), pending.encoding.clone()));
 }
 
 /// How often a key may send.
@@ -252,6 +301,8 @@ pub struct SubShared {
     closed_signal: tokio::sync::watch::Sender<bool>,
     /// ended by another client's lease on its key
     pub leased_away: AtomicBool,
+    /// a media channel whose encoding has a stream decoder: each key's samples are fed to it in order
+    streams: bool,
 }
 
 pub fn now_unix_ms() -> f64 {
@@ -279,7 +330,9 @@ impl SubShared {
     pub fn new(opts: &SubOpts, resolved: Resolved, codecs: Arc<EncodingRegistry>, gate: Arc<SendGate>, reliable_max_backlog: Duration) -> Self {
         let Resolved { encoding: codec, channel, output } = resolved;
         static NEXT_STREAM: AtomicUsize = AtomicUsize::new(0);
+        let streams = channel != Channel::Data && codec.as_ref().is_some_and(|codec| codec.stream_decoder().is_some());
         SubShared {
+            streams,
             gate,
             stream_id: NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
             sample_priority: AtomicU8::new(0),
@@ -640,6 +693,9 @@ impl SubShared {
                 Some(queue) => queue,
                 None => state.keys.entry(key.to_owned()).or_default(),
             };
+            if self.streams {
+                queue_for_stream(queue, self.codec.as_deref(), key, &pending);
+            }
             queue.items.push_back(pending);
             queue.arrivals += 1;
             queue.last_arrival = Some(Instant::now());
@@ -661,6 +717,16 @@ impl SubShared {
             }
         }
         self.data_ready.notify_one();
+    }
+
+    /// Whether this subscription feeds each key's samples to its encoding's stream decoder.
+    pub fn streams(&self) -> bool {
+        self.streams
+    }
+
+    /// The stream decoder of `key` (none before its first keyframe).
+    pub fn key_stream(&self, key: &str) -> Option<Arc<KeyStream>> {
+        self.state.lock().keys.get(key).and_then(|queue| queue.stream.clone())
     }
 
     /// Next frame to send (highest priority, then oldest), or when to look again.
@@ -1196,6 +1262,67 @@ mod tests {
             arrived,
             priority,
         }
+    }
+
+    /// Payloads are one byte: `b'K'` a keyframe, anything else predicted. Its pictures are the payloads fed so far.
+    struct Chain;
+
+    struct ChainDecoder(Vec<u8>);
+
+    impl StreamDecoder for ChainDecoder {
+        fn feed(&mut self, sample: &EncodingSample<'_>, _: Channel) -> anyhow::Result<Option<DecodedFrame>> {
+            anyhow::ensure!(sample.payload != b"X", "broken");
+            self.0.extend_from_slice(sample.payload);
+            Ok(Some(DecodedFrame::data(self.0.clone())))
+        }
+    }
+
+    impl MessageEncoding for Chain {
+        fn name(&self) -> &str {
+            "chain"
+        }
+
+        fn output(&self) -> EncodingOutput {
+            EncodingOutput::Video
+        }
+
+        fn decode(&self, _: &EncodingSample<'_>, _: Channel) -> anyhow::Result<DecodedFrame> {
+            anyhow::bail!("decoded alone")
+        }
+
+        fn stream_decoder(&self) -> Option<Box<dyn StreamDecoder>> {
+            Some(Box::new(ChainDecoder(Vec::new())))
+        }
+
+        fn starts_stream(&self, sample: &EncodingSample<'_>) -> bool {
+            sample.payload == b"K"
+        }
+    }
+
+    #[test]
+    fn a_stream_decoder_is_fed_every_sample_in_order_from_the_latest_keyframe() {
+        let mut queue = KeyQueue::default();
+        let push = |queue: &mut KeyQueue, seq: u32, payload: &[u8]| queue_for_stream(queue, Some(&Chain), "cam", &Pending { payload: ZBytes::from(payload.to_vec()), ..pending(seq, 5, Instant::now()) });
+        let picture = |stream: &KeyStream, seq: u32| stream.decode_through("cam", seq, Channel::Video(crate::encoding::video::VideoFormat::H264)).map(|frame| frame.map(|frame| frame.downcast::<Vec<u8>>().unwrap().clone()));
+        push(&mut queue, 0, b"p");
+        assert!(queue.stream.is_none(), "nothing before the first keyframe");
+        for (seq, payload) in [(1, b"K"), (2, b"a"), (3, b"b"), (4, b"c")] {
+            push(&mut queue, seq, payload);
+        }
+        let stream = queue.stream.clone().unwrap();
+        assert_eq!(picture(&stream, 3).unwrap(), Some(b"Kab".to_vec()), "the skipped samples are fed too");
+        assert_eq!(picture(&stream, 2).unwrap(), None, "already fed");
+        assert_eq!(picture(&stream, 4).unwrap(), Some(b"Kabc".to_vec()));
+        for (seq, payload) in [(5, b"d"), (6, b"K"), (7, b"e")] {
+            push(&mut queue, seq, payload);
+        }
+        assert_eq!(picture(&stream, 5).unwrap(), None, "a keyframe since dropped it");
+        assert_eq!(picture(&stream, 7).unwrap(), Some(b"KabcKe".to_vec()), "fed from the keyframe on");
+        push(&mut queue, 8, b"X");
+        push(&mut queue, 9, b"f");
+        assert_eq!(picture(&stream, 9).unwrap(), Some(b"KabcKef".to_vec()), "an earlier sample's error is its own");
+        push(&mut queue, 10, b"X");
+        assert!(picture(&stream, 10).is_err());
     }
 
     fn insert(shared: &SubShared, key: &str, item: Pending, cap: Option<usize>) {

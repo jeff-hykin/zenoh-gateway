@@ -835,8 +835,9 @@ pub(crate) struct FrameTimes {
     pub(crate) written_ms: f64,
 }
 
-/// A decoded frame and whether another frontend's decode was reused, or the decode error.
-type DecodeOutcome = std::result::Result<(Arc<DecodedFrame>, bool), String>;
+/// A decoded frame and whether another frontend's decode was reused, `None` when a stream decoder has no picture for
+/// the sample (it is skipped), or the decode error.
+type DecodeOutcome = std::result::Result<Option<(Arc<DecodedFrame>, bool)>, String>;
 
 /// A picked frame and its decode, running on the blocking pool.
 pub struct Decoding {
@@ -846,27 +847,37 @@ pub struct Decoding {
     pub task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>,
 }
 
-/// A decode's frame, whether it was another frontend's, the ms it took and the sample's identity; or why there is none.
+/// A decode's frame, whether it was another frontend's, the ms it took and the sample's identity (`None`: a stream
+/// decoder's sample with no picture); or why there is none.
 /// Given up after `timeout` (`ServerBuilder::encode_timeout`): a hung decoder keeps only its blocking thread.
-pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>, timeout: Duration) -> std::result::Result<(Arc<DecodedFrame>, bool, f64, u64), String> {
+pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>, timeout: Duration) -> std::result::Result<Option<(Arc<DecodedFrame>, bool, f64, u64)>, String> {
     match tokio::time::timeout(timeout, task).await {
-        Ok(Ok((Ok((decoded, reused)), ms, hash))) => Ok((decoded, reused, ms, hash)),
+        Ok(Ok((Ok(decoded), ms, hash))) => Ok(decoded.map(|(decoded, reused)| (decoded, reused, ms, hash))),
         Ok(Ok((Err(error), _, _))) => Err(error),
         Ok(Err(error)) => Err(format!("decoder task failed: {error}")),
         Err(_) => Err(format!("decode took over {timeout:?}: skipped")),
     }
 }
 
-/// Starts decoding a picked sample.
+/// Starts decoding a picked sample: on its own (shared across frontends), or with its key's stream decoder, fed the
+/// samples before it first.
 pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: String, item: subscription::Pending) -> Decoding {
     let payload = item.payload.to_bytes().into_owned();
-    let (hash_key, encoding, codecs, codec, channel) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone(), shared.channel);
+    let (hash_key, encoding, codecs, codec, channel, seq) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone(), shared.channel, item.seq);
+    let stream = shared.streams().then(|| shared.key_stream(&key));
     let task = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let sample = EncodingSample::new(&hash_key, &payload, &encoding);
         let hash = registry::sample_hash(&sample);
-        let (decoded, reused) = codecs.decode_shared(&*codec, &sample, hash, channel);
-        (decoded.map(|decoded| (decoded, reused)), started.elapsed().as_secs_f64() * 1000.0, hash)
+        let decoded = match stream {
+            // (before the key's first keyframe there is no decoder, and nothing to show)
+            Some(stream) => stream.map_or(Ok(None), |stream| stream.decode_through(&hash_key, seq, channel).map_err(|error| format!("{error:#}"))).map(|decoded| decoded.map(|decoded| (Arc::new(decoded), false))),
+            None => {
+                let (decoded, reused) = codecs.decode_shared(&*codec, &sample, hash, channel);
+                decoded.map(|decoded| Some((decoded, reused)))
+            }
+        };
+        (decoded, started.elapsed().as_secs_f64() * 1000.0, hash)
     });
     Decoding { key, item, task }
 }
@@ -1433,7 +1444,8 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         let depth = decode_ahead(decode_ms, encode_ms);
         let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth - 1, &shared, &codec).await;
         let (decoded, hash) = match finished {
-            Ok((decoded, reused, ms, hash)) => {
+            Ok(None) => continue,
+            Ok(Some((decoded, reused, ms, hash))) => {
                 if !reused {
                     decode_ms = Some(ewma(decode_ms, ms));
                 }
